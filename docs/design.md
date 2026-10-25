@@ -354,14 +354,14 @@ In-game checks on the author's machine:
 - **Profile** (tested by the Rust-stack agent in a probe host):
   - `panic = "unwind"`, with `catch_unwind` at every extern boundary. A panic hook logs, and a kill switch makes hooks tail-call the original. With `panic = "abort"`, `catch_unwind` does nothing.
   - `lto = "fat"`, `codegen-units = 1`, `opt-level = 3`, `debug = "line-tables-only"`.
-  - Static CRT (`+crt-static`): imports are kernel32/ntdll/bcryptprimitives only.
+  - Static CRT (`+crt-static`): no VCRUNTIME, MSVCP or UCRT import. The Task 1 artefact imports `KERNEL32.dll`/`kernel32.dll`, `ntdll.dll` and `api-ms-win-core-synch-l1-2-0.dll` (Rust std's `WaitOnAddress`, a Windows 8+ api-set). Release checks therefore test that the CRT DLLs are absent; they do not use a whitelist.
 - **Toolchain:** update to the latest stable before the first build.
 - **Crates:** latest on crates.io on 2026-10-25, vetted, probe built and loaded:
 
   | Crate | Version | Why |
   |---|---|---|
   | `windows-sys` | 0.61.2 | Win32 bindings; 1 transitive dependency. Note: `BOOL` is now `windows_sys::core::BOOL`. |
-  | `minhook` | 0.9.0 | Inline hooks. Upstream MinHook freezes other threads while installing. Stress test: 300 cycles with 6 busy threads, exit 0 (`retour` and `detour` crashed 5 of 5). `initialize()` can panic, so it runs inside `catch_unwind`. |
+  | `minhook` | 0.9.0 | Inline hooks. Upstream MinHook freezes other threads while installing. Stress test: 300 cycles with 6 busy threads, exit 0 (`retour` and `detour` crashed 5 of 5). `initialize()` can panic, so it runs inside `catch_unwind`. Transitive (from `cargo tree`): `tracing` 0.1.44 with `tracing-core`, `pin-project-lite`, `once_cell` and the build-time proc-macro set (`tracing-attributes`, `proc-macro2`, `quote`, `syn`, `unicode-ident`); `log` (already direct); and the build-time C driver `cc` 1.10.0 with `find-msvc-tools` and `shlex`. |
   | `ash` | 0.38.0, `default-features = false` | Vulkan types only; no dependencies. Missing newer structs are defined by hand (6.5). |
   | `configparser` | 3.3.0 | Ini parsing; no dependencies. Dual MIT / LGPL-3.0: we elect MIT. |
   | `log` + `fern` | 0.4.34 + 0.7.1 | File logging; 1 extra dependency. |
