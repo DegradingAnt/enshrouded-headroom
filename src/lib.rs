@@ -59,7 +59,11 @@ fn start() {
 /// Called by Ultimate ASI Loader once the game process is up. Must never unwind into the loader.
 #[no_mangle]
 pub extern "C" fn InitializeASI() {
-    let _ = std::panic::catch_unwind(start);
+    if let Err(payload) = std::panic::catch_unwind(start) {
+        // Never drop the payload: `panic_any` can carry a value whose destructor panics, and a
+        // panic here would unwind into the loader. Forgetting leaks a few bytes, once.
+        std::mem::forget(payload);
+    }
 }
 
 /// `DllMain` only turns off thread notifications; all real work waits for `InitializeASI`.

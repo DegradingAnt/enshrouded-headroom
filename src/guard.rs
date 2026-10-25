@@ -8,13 +8,13 @@
 //! The panic hook ([`install_panic_hook`]) is separate: it only decides where panic text goes.
 
 use std::any::Any;
+use std::cell::Cell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// A part of the mod that can be switched off on its own.
 ///
-/// Each variant owns one bit of the disabled mask. Keep `Governor` the last variant, or move
-/// the `LAST` constant below with it.
+/// Each variant owns one bit of the disabled mask, given by its `index`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Feature {
     TextureBudget,
@@ -28,16 +28,55 @@ pub enum Feature {
     Governor,
 }
 
-/// The highest-numbered variant. The mask is a `u32`, so its index must stay below 32.
-const LAST: Feature = Feature::Governor;
-const _: () = assert!((LAST as u32) < u32::BITS);
-
 impl Feature {
+    /// Every variant, in `index` order. Rust cannot list an enum's variants by itself, so this is
+    /// kept by hand; the check below and the tests catch a stale entry, a wrong order and a list
+    /// that outgrows the mask.
+    const ALL: [Feature; 9] = [
+        Feature::TextureBudget,
+        Feature::AsyncCompute,
+        Feature::StartupScales,
+        Feature::ObjectDistance,
+        Feature::ScatterDistance,
+        Feature::TerrainDistance,
+        Feature::VkWrap,
+        Feature::Reflex,
+        Feature::Governor,
+    ];
+
+    /// This feature's position in the disabled mask.
+    ///
+    /// One arm per variant and no wildcard: a new variant does not compile until it is given a
+    /// position here.
+    const fn index(self) -> u32 {
+        match self {
+            Feature::TextureBudget => 0,
+            Feature::AsyncCompute => 1,
+            Feature::StartupScales => 2,
+            Feature::ObjectDistance => 3,
+            Feature::ScatterDistance => 4,
+            Feature::TerrainDistance => 5,
+            Feature::VkWrap => 6,
+            Feature::Reflex => 7,
+            Feature::Governor => 8,
+        }
+    }
+
     /// This feature's bit in the disabled mask.
-    fn bit(self) -> u32 {
-        1 << (self as u32)
+    const fn bit(self) -> u32 {
+        1 << self.index()
     }
 }
+
+// Compile-time check: `ALL` is in index order, and every index fits the `u32` mask.
+const _: () = {
+    let mut i = 0;
+    while i < Feature::ALL.len() {
+        assert!(Feature::ALL[i].index() == i as u32);
+        i += 1;
+    }
+    assert!(Feature::ALL.len() <= u32::BITS as usize);
+};
 
 /// Features that have been switched off, one bit per [`Feature`]. Process-global: a switched-off
 /// feature never comes back until the game restarts.
@@ -80,12 +119,19 @@ pub fn guard<T>(f: Feature, fallback: impl FnOnce() -> T, body: impl FnOnce() ->
     if is_disabled(f) {
         return fallback();
     }
-    // AssertUnwindSafe: after a panic the feature is off and `body` is never run again, so no
-    // caller can observe state that the panic left half-updated.
+    // AssertUnwindSafe: once `disable` has run, no call that starts later runs `body`, so those
+    // calls never see state this panic left half-written. A call already in flight on another
+    // thread still can. Hook bodies must therefore keep their atomics consistent at every point
+    // where they can panic.
     match catch_unwind(AssertUnwindSafe(body)) {
         Ok(value) => value,
         Err(payload) => {
-            disable(f, &format!("panic: {}", payload_message(payload.as_ref())));
+            let why = format!("panic: {}", payload_message(payload.as_ref()));
+            // Never drop the payload: `panic_any` can carry a value whose destructor panics, and
+            // that panic would unwind out of this function. Forgetting leaks a few bytes, once
+            // per disabled feature.
+            std::mem::forget(payload);
+            disable(f, &why);
             fallback()
         }
     }
@@ -114,12 +160,43 @@ fn format_panic(thread: Option<&str>, location: Option<(&str, u32, u32)>, messag
     }
 }
 
+thread_local! {
+    /// Set while this thread's panic hook is running.
+    static IN_HOOK: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Marks the current thread as "inside the panic hook" until dropped.
+struct HookScope;
+
+impl HookScope {
+    /// `None` if this thread is already inside the hook (or its thread-local storage is gone).
+    fn enter() -> Option<HookScope> {
+        match IN_HOOK.try_with(|flag| flag.replace(true)) {
+            Ok(false) => Some(HookScope),
+            _ => None,
+        }
+    }
+}
+
+impl Drop for HookScope {
+    fn drop(&mut self) {
+        let _ = IN_HOOK.try_with(|flag| flag.set(false));
+    }
+}
+
 /// Send panic text to the log instead of stderr.
 ///
 /// This replaces the process-wide panic hook and does not call the previous one. The game has
 /// no console, so stderr text would be lost anyway; the log is where a player can find it.
+///
+/// A hook that is entered while this thread is already inside it logs nothing. Today std aborts
+/// the process on a panic inside a hook, so that cannot happen; the flag is the cheap guard
+/// against logging into a lock this thread already holds, should that ever change.
 pub fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
+        let Some(_scope) = HookScope::enter() else {
+            return;
+        };
         let thread = std::thread::current();
         let location = info.location().map(|l| (l.file(), l.line(), l.column()));
         let text = format_panic(thread.name(), location, payload_message(info.payload()));
@@ -138,19 +215,8 @@ mod tests {
     //   Reflex          disabled by guard_catches_panic_and_disables
     //   ObjectDistance  disabled by disabled_feature_runs_fallback_and_skips_body
     //   AsyncCompute    disabled by guard_catches_panic_with_string_payload
+    //   StartupScales   disabled by guard_survives_a_payload_whose_drop_panics
     // The bit-mask logic is tested on a local mask, not on DISABLED.
-
-    const ALL: [Feature; 9] = [
-        Feature::TextureBudget,
-        Feature::AsyncCompute,
-        Feature::StartupScales,
-        Feature::ObjectDistance,
-        Feature::ScatterDistance,
-        Feature::TerrainDistance,
-        Feature::VkWrap,
-        Feature::Reflex,
-        Feature::Governor,
-    ];
 
     #[test]
     fn guard_returns_body_value() {
@@ -181,6 +247,26 @@ mod tests {
         assert!(!body_ran.load(Ordering::Relaxed));
     }
 
+    /// A panic payload whose destructor panics.
+    struct DropBomb;
+
+    impl Drop for DropBomb {
+        fn drop(&mut self) {
+            panic!("drop boom");
+        }
+    }
+
+    #[test]
+    fn guard_survives_a_payload_whose_drop_panics() {
+        let value = guard(
+            Feature::StartupScales,
+            || 1,
+            || std::panic::panic_any(DropBomb),
+        );
+        assert_eq!(value, 1);
+        assert!(is_disabled(Feature::StartupScales));
+    }
+
     #[test]
     fn guard_catches_panic_with_string_payload() {
         let n = 3;
@@ -194,12 +280,47 @@ mod tests {
     #[test]
     fn every_feature_has_its_own_bit() {
         let mut seen = 0u32;
-        for f in ALL {
+        for f in Feature::ALL {
             assert_ne!(f.bit(), 0, "{f:?}");
             assert_eq!(seen & f.bit(), 0, "{f:?} shares a bit");
             seen |= f.bit();
         }
-        assert_eq!(seen.count_ones() as usize, ALL.len());
+        assert_eq!(seen.count_ones() as usize, Feature::ALL.len());
+    }
+
+    #[test]
+    fn all_lists_every_variant_in_index_order() {
+        for (position, f) in Feature::ALL.iter().enumerate() {
+            assert_eq!(f.index() as usize, position, "{f:?}");
+        }
+        // `Feature::index` is an exhaustive match, so a new variant cannot be missed there. The
+        // hand-kept `ALL` can be, so count the variants in this file's own source.
+        let source = include_str!("guard.rs");
+        let variants = source
+            .split("pub enum Feature {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .unwrap_or_default()
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with("//") && line.ends_with(','))
+            .count();
+        assert_eq!(variants, Feature::ALL.len(), "Feature::ALL is out of date");
+    }
+
+    #[test]
+    fn hook_scope_is_not_reentrant_resets_on_drop_and_is_per_thread() {
+        let first = HookScope::enter();
+        assert!(first.is_some());
+        assert!(HookScope::enter().is_none(), "nested entry, same thread");
+        assert!(
+            std::thread::spawn(|| HookScope::enter().is_some())
+                .join()
+                .unwrap(),
+            "another thread is not affected"
+        );
+        drop(first);
+        assert!(HookScope::enter().is_some(), "entry works after the scope");
     }
 
     #[test]
@@ -208,7 +329,7 @@ mod tests {
         assert!(mark(&mask, Feature::VkWrap), "first mark is new");
         assert!(!mark(&mask, Feature::VkWrap), "second mark is not new");
         assert!(has(&mask, Feature::VkWrap));
-        for f in ALL.into_iter().filter(|f| *f != Feature::VkWrap) {
+        for f in Feature::ALL.into_iter().filter(|f| *f != Feature::VkWrap) {
             assert!(!has(&mask, f), "{f:?} must stay enabled");
         }
     }

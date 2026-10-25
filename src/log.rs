@@ -9,6 +9,7 @@
 //! module is `crate::log`. At the crate root, write `::log::` for the crate.
 
 use std::fs::{File, OpenOptions};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -21,7 +22,7 @@ pub const LOG_FILE_NAME: &str = "enshrouded-headroom.log";
 /// Sub-folder of `%LOCALAPPDATA%` used when the preferred folder is not writable.
 const FALLBACK_DIR_NAME: &str = "enshrouded-headroom";
 
-/// Set once a logger has been installed (or is being installed) by this module.
+/// Taken by the one `init` call that may install the logger; see [`init_with`].
 static LOGGER_CLAIMED: AtomicBool = AtomicBool::new(false);
 
 /// Start logging and return the folder that holds the log file.
@@ -29,8 +30,10 @@ static LOGGER_CLAIMED: AtomicBool = AtomicBool::new(false);
 /// The result is `preferred_dir` when the log file can be created there, else
 /// `%LOCALAPPDATA%\enshrouded-headroom\` (created if missing), with a warning in the log that
 /// says why. An empty `preferred_dir` means "no preferred folder" and goes straight to the
-/// fallback. If neither folder works, logging stays off and the fallback path is still returned
-/// (or `preferred_dir` when `%LOCALAPPDATA%` is not set). It never panics.
+/// fallback. If neither folder works, logging stays off and the fallback path is still returned.
+/// If there is no fallback either (`preferred_dir` is empty and `%LOCALAPPDATA%` is not set),
+/// the result is `preferred_dir` itself, an EMPTY path, which means "no usable folder". It never
+/// panics.
 ///
 /// `level` is the highest level that is written. It is applied with `log::set_max_level`, so
 /// later code can raise or lower it by calling that function again.
@@ -46,52 +49,110 @@ pub fn init(preferred_dir: &Path, level: LevelFilter) -> PathBuf {
 
 /// [`init`] with the fallback folder passed in, so tests need not touch `%LOCALAPPDATA%`.
 fn init_with(preferred: &Path, fallback: Option<PathBuf>, level: LevelFilter) -> PathBuf {
-    let why_not_preferred = if preferred.as_os_str().is_empty() {
-        "the module folder is unknown".to_owned()
-    } else {
-        match open_log_file(preferred) {
-            Ok(file) => {
-                install(file, level);
-                return preferred.to_path_buf();
+    // The first call claims the process-wide logger slot and alone truncates the file. It does so
+    // when it opens the file, so a truncation that fails is an open that fails and the next
+    // folder is tried; the log can never silently mix two runs. Every other call opens without
+    // truncating, so it cannot cut the file under the logger that is already writing to it.
+    let owner = !LOGGER_CLAIMED.swap(true, Ordering::AcqRel);
+    let Chosen { dir, file, notice } = choose_folder(preferred, fallback, owner);
+    let installed = match file {
+        Some(file) if owner => install(file, level),
+        Some(_) => false,
+        None => {
+            if owner {
+                // Nothing was installed: leave the slot to a later call.
+                LOGGER_CLAIMED.store(false, Ordering::Release);
             }
-            Err(err) => format!("cannot write to {}: {err}", preferred.display()),
+            false
+        }
+    };
+    // The notice says where the log is. That is only true if this call's file became the log.
+    if let Some(notice) = notice.filter(|_| installed) {
+        log::warn!("{notice}");
+    }
+    dir
+}
+
+/// Where the log goes, as decided by [`choose_folder`].
+struct Chosen {
+    /// The folder to report.
+    dir: PathBuf,
+    /// The opened log file, or `None` when no folder could be used.
+    file: Option<File>,
+    /// Set when the log file is in the fallback folder: what to tell the log about that.
+    notice: Option<String>,
+}
+
+/// Open the log file in `preferred`, else in `fallback` (created if missing). `truncate` empties
+/// an existing file as it is opened.
+fn choose_folder(preferred: &Path, fallback: Option<PathBuf>, truncate: bool) -> Chosen {
+    let preferred_error = if preferred.as_os_str().is_empty() {
+        None
+    } else {
+        match open_log_file(preferred, truncate) {
+            Ok(file) => {
+                return Chosen {
+                    dir: preferred.to_path_buf(),
+                    file: Some(file),
+                    notice: None,
+                }
+            }
+            Err(err) => Some(err),
         }
     };
     let Some(fallback) = fallback else {
-        return preferred.to_path_buf();
+        return Chosen {
+            dir: preferred.to_path_buf(),
+            file: None,
+            notice: None,
+        };
     };
-    if let Ok(file) = std::fs::create_dir_all(&fallback).and_then(|()| open_log_file(&fallback)) {
-        install(file, level);
-        log::warn!(
-            "{why_not_preferred}; logging to {} instead",
-            fallback.display()
-        );
+    let file = std::fs::create_dir_all(&fallback)
+        .and_then(|()| open_log_file(&fallback, truncate))
+        .ok();
+    let notice = file
+        .as_ref()
+        .map(|_| fallback_notice(preferred, preferred_error.as_ref(), &fallback));
+    Chosen {
+        dir: fallback,
+        file,
+        notice,
     }
-    fallback
 }
 
-/// Open the log file in `dir` for writing without truncating it. Directories are not created
-/// here: the preferred folder is the one the `.asi` sits in, so it exists or it is unusable.
-fn open_log_file(dir: &Path) -> std::io::Result<File> {
+/// The warning that says why the log is in the fallback folder.
+fn fallback_notice(preferred: &Path, error: Option<&io::Error>, fallback: &Path) -> String {
+    match error {
+        Some(err) => format!(
+            "cannot write to {}: {err}; logging to {} instead",
+            preferred.display(),
+            fallback.display()
+        ),
+        None => format!(
+            "no preferred log folder; logging to {} instead",
+            fallback.display()
+        ),
+    }
+}
+
+/// Open the log file in `dir` for writing. Directories are not created here: the preferred folder
+/// is the one the `.asi` sits in, so it exists or it is unusable.
+fn open_log_file(dir: &Path, truncate: bool) -> io::Result<File> {
     OpenOptions::new()
         .write(true)
         .create(true)
-        .truncate(false)
+        .truncate(truncate)
         .open(dir.join(LOG_FILE_NAME))
 }
 
-/// Make `file` the process logger, unless this module already did that.
-fn install(file: File, level: LevelFilter) {
-    if LOGGER_CLAIMED.swap(true, Ordering::AcqRel) {
-        return;
+/// Make `file` the process logger. `false` if some other logger was already set.
+fn install(file: File, level: LevelFilter) -> bool {
+    if dispatch(file).apply().is_err() {
+        return false;
     }
-    // A new log for every run. Only the call that installs the logger truncates, so a repeated
-    // `init` cannot cut the file under the logger that is already writing to it.
-    let _ = file.set_len(0);
-    if dispatch(file).apply().is_ok() {
-        // `apply` opened the gate fully; narrow it to the requested level.
-        log::set_max_level(level);
-    }
+    // `apply` opened the gate fully; narrow it to the requested level.
+    log::set_max_level(level);
+    true
 }
 
 /// The logger: one line per record, `[seconds-since-init LEVEL] message`, flushed per record.
@@ -102,11 +163,17 @@ fn dispatch(file: File) -> fern::Dispatch {
     let start = Instant::now();
     fern::Dispatch::new()
         .format(move |out, message, record| {
-            out.finish(format_args!(
+            // Build the whole line before fern sees it. Fern writes `format_args!` output while
+            // it holds the output lock (we do not enable its `meta-logging-in-format` feature,
+            // which would format first), and `message` can run any `Display` code. If that code
+            // panicked, or logged, the panic hook would then wait for a lock its own thread
+            // holds. Formatted here, user code runs before any lock is taken.
+            let line = format!(
                 "[{:>8.3}s {:<5}] {message}",
                 start.elapsed().as_secs_f64(),
                 record.level()
-            ))
+            );
+            out.finish(format_args!("{line}"));
         })
         .chain(file)
 }
@@ -114,8 +181,11 @@ fn dispatch(file: File) -> fern::Dispatch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use log::Log;
+    use log::{Level, Log, Record};
+    use std::fmt;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     // The `log` crate takes one logger per process and these tests run in parallel, so whichever
     // test installs the logger first wins; the others must still get a folder back. Tests that
@@ -145,6 +215,70 @@ mod tests {
             log::LevelFilter::Info,
         );
         assert!(p.starts_with(std::env::var("LOCALAPPDATA").unwrap()));
+    }
+
+    #[test]
+    fn fallback_notice_names_the_error_and_the_fallback() {
+        let denied = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
+        assert_eq!(
+            fallback_notice(
+                Path::new(r"C:\game\plugins"),
+                Some(&denied),
+                Path::new(r"C:\Users\me\AppData\Local\enshrouded-headroom")
+            ),
+            concat!(
+                r"cannot write to C:\game\plugins: denied; ",
+                r"logging to C:\Users\me\AppData\Local\enshrouded-headroom instead"
+            )
+        );
+        assert_eq!(
+            fallback_notice(Path::new(""), None, Path::new(r"C:\fb")),
+            r"no preferred log folder; logging to C:\fb instead"
+        );
+    }
+
+    #[test]
+    fn notice_only_when_the_log_ended_up_in_the_fallback() {
+        with_scratch("notice", |base| {
+            let fallback = base.join("fb");
+            // Preferred folder works: no notice, and the fallback is not touched.
+            let chosen = choose_folder(base, Some(fallback.clone()), false);
+            assert!(chosen.file.is_some() && chosen.notice.is_none());
+            assert!(!fallback.exists());
+            // Preferred folder fails, fallback works: a notice that names both.
+            let missing = base.join("missing");
+            let chosen = choose_folder(&missing, Some(fallback.clone()), false);
+            assert!(chosen.file.is_some());
+            let notice = chosen.notice.expect("a notice for the fallback");
+            assert!(notice.starts_with(&format!("cannot write to {}", missing.display())));
+            assert!(notice.ends_with(&format!("logging to {} instead", fallback.display())));
+            // Neither works: no file and no notice (there is no log to put it in).
+            let blocker = base.join("a-file");
+            std::fs::write(&blocker, b"x").unwrap();
+            let chosen = choose_folder(&missing, Some(blocker.join("fb")), false);
+            assert!(chosen.file.is_none() && chosen.notice.is_none());
+        });
+    }
+
+    #[test]
+    fn only_the_installing_call_truncates_the_log() {
+        with_scratch("truncate", |dir| {
+            let path = dir.join(LOG_FILE_NAME);
+            std::fs::write(&path, b"old run\n").unwrap();
+            // A call that does not own the logger keeps what the owner is writing.
+            drop(choose_folder(dir, None, false).file);
+            assert_eq!(std::fs::read(&path).unwrap(), b"old run\n");
+            // The owner starts a new log as it opens the file.
+            drop(choose_folder(dir, None, true).file);
+            assert_eq!(std::fs::read(&path).unwrap(), b"");
+        });
+    }
+
+    #[test]
+    fn empty_preferred_dir_and_no_fallback_gives_an_empty_path() {
+        assert!(init_with(Path::new(""), None, LevelFilter::Info)
+            .as_os_str()
+            .is_empty());
     }
 
     #[test]
@@ -195,6 +329,67 @@ mod tests {
                 LevelFilter::Info,
             );
             assert_eq!(used, fallback);
+            assert!(!fallback.exists(), "no folder below a regular file");
+            assert!(
+                !base.join("missing").join(LOG_FILE_NAME).exists(),
+                "no log file in the preferred folder"
+            );
+        });
+    }
+
+    /// A `Display` that logs through the same logger while it is being formatted, then panics.
+    /// This is what a panic hook does on a thread whose `Display` panicked inside `log!`.
+    struct LogsThenPanics<'a>(&'a dyn Log);
+
+    impl fmt::Display for LogsThenPanics<'_> {
+        fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.0.log(
+                &Record::builder()
+                    .args(format_args!("logged from inside Display"))
+                    .level(Level::Error)
+                    .target("t")
+                    .build(),
+            );
+            panic!("display boom");
+        }
+    }
+
+    #[test]
+    fn a_record_whose_display_panics_does_not_hang_the_logger() {
+        with_scratch("display-panic", |dir| {
+            let path = dir.join(LOG_FILE_NAME);
+            let file = File::create(&path).unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            // A separate thread, so that a deadlock fails this test after the timeout instead of
+            // hanging the whole test run.
+            std::thread::spawn(move || {
+                let (_, logger) = dispatch(file).into_log();
+                let panicked = catch_unwind(AssertUnwindSafe(|| {
+                    logger.log(
+                        &Record::builder()
+                            .args(format_args!("{}", LogsThenPanics(&*logger)))
+                            .level(Level::Info)
+                            .target("t")
+                            .build(),
+                    );
+                }))
+                .is_err();
+                logger.log(
+                    &Record::builder()
+                        .args(format_args!("after the panic"))
+                        .level(Level::Info)
+                        .target("t")
+                        .build(),
+                );
+                let _ = tx.send(panicked);
+            });
+            let panicked = rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the logger hung: a Display that logs and panics deadlocked it");
+            assert!(panicked, "the Display panic must reach the caller");
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(text.contains("logged from inside Display"), "{text:?}");
+            assert!(text.contains("after the panic"), "{text:?}");
         });
     }
 
