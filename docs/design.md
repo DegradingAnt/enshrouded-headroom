@@ -255,13 +255,31 @@ Each knob states:
   - The brick disp32 is at match +9 of its signature (both in RE-NOTES).
   - At start-up the mod allocates one page within ±2 GB of the game image, writes one float (90.0) into it, and points both disp32 fields at that float.
   - The shared `.rdata` constant 90.0 has 27 other users and is never written.
-- **Capacity:**
-  - The instance buffer holds 0x14000 instances, enough for 90 m at full density (density × distance² ≤ 8,100, from the agent's analysis). Going farther needs more capacity.
-  - Capacity is doubled ONLY if `EnableScatterDistance = 1`, and only after the build has found and patched EVERY use of that capacity in the scatter code together: the shader constant at `0x140074d52`, the allocation at `0x1400745e0`, and any indirect-argument or clear sizes (review finding 8).
-  - The build task lists all references to `0x14000` and to the instance-buffer size in the scatter functions. If any use stays unaccounted for, capacity is not changed and this knob's maximum is 90 m, i.e. it is inactive.
+- **Capacity (research 2026-10-25, which replaces the doubling plan):**
+  - The buffers are fixed per scene view: `ScatteredObjectData[0x14000]` and two `DetailScatteringInstanceData[0x14000]`. One GPU counter (A) fills the 0x14000 budget for both scatter passes each frame. The game reads that counter back to the CPU: last value at entry+0x14, peak at +0x1c, a warn level of 0xf000 (75 %) at +0x20, and the cap of 0x14000 at +0x24.
+  - The exe has no CPU-side clamp. The only bound is the shader constant `scatteredObjectCapacity` (`0x140074d52`). The 0x14000 at `0x1400745e0` is counter METADATA, not a buffer size, so patching it would cause an overflow. **Capacity is never changed.**
+  - **Scatter counter probe (7.2a):** a pre-hook on `FUN_1400767a0` reads counter A every 30th frame. It self-checks the pointer chain (warn must be 0xf000 and cap 0x14000; otherwise the probe stays off and the knob stays at 90 m) and publishes the last value.
+  - **Live headroom rule:** the governor raises this knob from r to r_next only while `last × (r_next / r)² < 0xf000`, and steps down at once when `last ≥ 0xf000`. The readback is at least one frame late; the 25 % gap between warn and cap is the margin.
+  - **Hard ceiling:** r_max = 90 × sqrt(0xf000 / peak₉₀), where peak₉₀ is measured once at vanilla 90 m in the densest grass (the author's measurement session, `[Debug] ScatterProbe = 1`). Until it is measured, the ceiling is 90 m and the knob is inactive.
+  - Not covered: the brick gate's own `maxCullElements` (`BrickCullingShaderParameters` +0xec8). The measurement session also watches for missing bricks at the raised distance.
 - **Baseline:** the knob acts only when the published detail-scattering level is High (3). At a lower level, the player's choice is the floor and the knob stays at step 0.
-- **Steps:** 90 → 100 → 110 → 120 → 127 m. 127 m is the most that doubled capacity allows at density 1.0.
+- **Steps:** 90 → 100 → 110 → 120 → 127 m, cut at the measured ceiling r_max. The live headroom rule can hold the knob below that.
 - **When a change applies:** the governor writes the float in the mod's page, an aligned 4-byte store, and both passes read it on their next run.
+
+### 7.2a Scatter counter probe (the author, 2026-10-25: "Add it to v1")
+
+- **Hook:** a minhook pre-hook on `FUN_1400767a0(_, pass)`. Its signature is the 14-byte prologue `48 89 54 24 10 55 53 57 41 55 41 56 41 57`, unique in build f68140a3 (checked 2026-10-26). Like the terrain signature it is fragile across updates; a mismatch leaves the probe off.
+- **Pointer chain** (research write-up; a HYPOTHESIS until the runtime self-check passes):
+  - obj = [pass+0x18];
+  - pool = [[pass+0x8]+0x20];
+  - entry(h) = [pool+0x48] + (h & 0xffff) × 0x40, for h = [obj+0x8] (counter A), [obj+0xc] (B) and [obj+0x10] (C).
+  - Every pointer is checked readable (VirtualQuery) before it is read.
+- **Rules:**
+  - The hook samples every 30th call, publishes atomics only, never logs, and always calls the original.
+  - The self-check requires A.warn = 0xf000 and A.cap = 0x14000. On a failure, the probe turns off for the session (once, logged by the governor thread).
+  - It runs inside `guard(Feature::ScatterDistance, ...)`.
+- **Debug output:** with `[Debug] ScatterProbe = 1` and `LogLevel = debug`, the governor thread logs A, B and C (last and peak) every 2 s, and the session peak of A at exit.
+- **Measurement session (the author, once per build):** grass quality High, mod distance left at vanilla 90 m, stand in the densest grass for 60 s, then send the log. The controller computes r_max and records it in the RE notes. The release uses r_max as the knob's ceiling.
 
 ### 7.3 Terrain detail distance (`TerrainDistance`): priority 3
 
@@ -309,6 +327,10 @@ The governor raises 7.1, then 7.2, then 7.3. The order is re-checked after the i
 - `EnableScatterDistance = 1`, `MaxScatterDistance = 4`
 - `EnableTerrainDistance = 1`, `MaxTerrainDistance = 4`
 - `DecoDistanceScale = 1.0`, `DistantObjectsScale = 1.0`, `TerrainRingScale = 1.0`
+
+`[Debug]` (honoured only with `LogLevel = debug`; not in the default file):
+- `ScatterProbe = 0 | 1`: log the scatter counters (7.2a).
+- `ForceStepObjectDistance`, `ForceStepScatterDistance`, `ForceStepTerrainDistance = 0..=4`: hold that knob at a fixed step for testing (pre-flight ruling for Task 17).
 
 Unknown keys and out-of-range values are logged. Out-of-range values are clamped.
 

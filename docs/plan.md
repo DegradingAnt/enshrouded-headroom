@@ -728,6 +728,46 @@ fn gov() -> Governor { Governor::new(Config::default().governor, vec![KnobSpec{e
 - [ ] **Step 5:** Run `cargo test scatter_distance::` and expect PASS. Run the ignored test `scatter_sigs_unique_in_game_exe` and expect PASS.
 - [ ] **Step 6:** Commit: `feat(knobs): grass distance redirect with audited capacity`.
 
+### Task 13b: Scatter counter probe (added 2026-10-25; the author: "Add it to v1")
+
+Spec: `docs/design.md` sections 7.2 ("Capacity") and 7.2a. Evidence: `(the author's notes, not in this repo)` (the pointer chain is in its "brief changes" list, and the refuter's check confirmed the counter layout from the bytes).
+
+**Files:**
+- Create: `src/features/scatter_probe.rs`
+- Modify: `src/sigs.rs` (add `SCATTER_FRAME_FN` to `ALL`), `src/config.rs` (add the `[Debug]` section with `ScatterProbe`)
+
+**Interfaces:**
+- Consumes: `scan::{Module, Pattern, find_in_sections}` (start-up only), `sigs::SCATTER_FRAME_FN`, `minhook`, `guard::{guard, Feature::ScatterDistance}`.
+- Produces:
+  - `pub const SCATTER_FRAME_FN: Sig = Sig { name: "SCATTER_FRAME_FN", pattern: "48 89 54 24 10 55 53 57 41 55 41 56 41 57", sections: &[".text"], patch_offsets: &[0] }`. It is unique in build f68140a3 at 0x1400767a0 (controller, 2026-10-26). The existing sigs tests extend to cover it; it is a prologue, so it has no imm sites.
+  - `pub struct CounterSample { pub last: u32, pub peak: u32, pub warn: u32, pub cap: u32 }`
+  - `pub const WARN_A: u32 = 0xf000; pub const CAP_A: u32 = 0x14000;`
+  - `pub unsafe fn read_counters(pass: usize, readable: impl Fn(usize, usize) -> bool) -> Option<[CounterSample; 3]>`. It follows the chain below, calls `readable(addr, len)` before EVERY read, and returns `None` if any check fails or if counter A's `warn != WARN_A` or `cap != CAP_A` (the self-check). Chain: obj = [pass+0x18]; pool = [[pass+0x8]+0x20]; base = [pool+0x48]; entry(h) = base + (h & 0xffff) × 0x40, for h = u32 at [obj+0x8] (A), [obj+0xc] (B), [obj+0x10] (C). Each sample: last = u32 at entry+0x14, peak = u32 at +0x1c, warn = u32 at +0x20, cap = u32 at +0x24.
+  - `pub fn is_readable(addr: usize, len: usize) -> bool`: VirtualQuery says MEM_COMMIT, a readable protection, not PAGE_GUARD, and the range fits in one region. Reuse Task 4's protection logic if it is public; otherwise copy its tested rule and say so.
+  - `pub fn headroom_ok(last: u32, r_now: f32, r_next: f32) -> bool` = `last as f64 * (r_next / r_now)² < WARN_A as f64`. False for a non-finite or non-positive r_now.
+  - `pub fn ceiling_step(steps: &[f32], r_max: f32) -> usize`: the highest index whose distance is <= r_max; 0 if none is.
+  - `pub const R_MAX_M: f32 = 90.0;` (the measured ceiling; stays 90.0 until the author's measurement session sets it).
+  - Published state: `pub static PROBE_OK: AtomicBool` (false until the first self-check passes; false for good after a failure), `pub static LAST_A: AtomicU32`, `pub static PEAK_A: AtomicU32`, `pub static LAST_B: AtomicU32`, `pub static LAST_C: AtomicU32`, `pub static FAILED: AtomicBool`.
+  - `pub unsafe fn install(m: &Module) -> Result<(), String>`. It is called from `entry::start` (Task 6) when `EnableScatterDistance = 1` or `[Debug] ScatterProbe = 1`. It finds `SCATTER_FRAME_FN` and creates a minhook pre-hook, queued and enabled with the other hooks. The hook body runs inside `guard(Feature::ScatterDistance, call_original, ...)`. Every 30th call it runs `read_counters(rdx, is_readable)` and publishes the result: success stores the values and sets `PROBE_OK`; failure sets `FAILED` and clears `PROBE_OK`. It then calls the original with the same arguments. It never logs and never allocates.
+- `config.rs`: add `DebugCfg { scatter_probe: bool, force_step_object: Option<u8>, force_step_scatter: Option<u8>, force_step_terrain: Option<u8> }` under `[Debug]`. ForceStep keys take `0..=4`; absent means None; out of range clamps with a warning. All of it is honoured only when `LogLevel = debug`; the gating is the consumer's job (Task 15). This also covers the ForceStep keys from the pre-flight ruling for Task 15, so Task 15 only consumes them. `[Debug]` is NOT written into the default ini.
+
+- [ ] **Step 1: Write the failing tests:**
+  - `headroom_ok(0xf000 / 2, 90.0, 100.0)` is true (0x7800 × 1.234 < 0xf000); `headroom_ok(0xe000, 90.0, 100.0)` is false; `headroom_ok(1, 0.0, 100.0)` is false.
+  - `ceiling_step(&[90.0, 100.0, 110.0, 120.0, 127.0], 112.0) == 2`; `ceiling_step(.., 80.0) == 0`; `ceiling_step(.., 127.0) == 4`.
+  - `read_counters` on a fake chain built in a test-owned buffer of real addresses gives A = {last, peak, 0xf000, 0x14000} and the B and C values; changing A.warn to 0xe000 gives None; a `readable` that refuses one link gives None, and that link is never read (the closure records the calls).
+  - `is_readable` on a `VirtualAlloc(PAGE_NOACCESS)` page is false, and on a `PAGE_READWRITE` page is true.
+  - The sigs tests cover `SCATTER_FRAME_FN` (it is in `ALL` and has offset 0). The ignored exe test finds it at 0x1400767a0.
+  - Config: `[Debug]\nScatterProbe=1\nForceStepScatterDistance=7` gives scatter_probe true, force_step_scatter Some(4) and one warning; the default file has no `[Debug]` and gives DebugCfg::default().
+- [ ] **Step 2:** Run `cargo test --lib -- scatter_probe:: sigs:: config::` and expect FAIL.
+- [ ] **Step 3:** Implement. `read_counters` uses `core::ptr::read_unaligned` on each checked address.
+- [ ] **Step 4:** Run the tests and the ignored exe test; expect PASS.
+- [ ] **Step 5:** Commit: `feat(scatter): GPU counter probe with self-check and headroom rule`.
+- [ ] **Step 6 (the author, after Task 17's install):** the measurement session from spec 7.2a. The controller computes r_max = 90 × sqrt(0xf000 / peak_A), rounds it DOWN to a whole metre, sets `R_MAX_M`, records the measurement in RE-NOTES, and commits it as `chore(scatter): measured ceiling r_max = N m`.
+
+Task 15 consumes this module. The governor's knob 1 is enabled only while `SCATTER_LEVEL == 3 && EnableScatterDistance && PROBE_OK`. A raise from step s to s+1 needs `s + 1 <= ceiling_step(SCATTER_STEPS, R_MAX_M)` and `headroom_ok(LAST_A, r_s, r_{s+1})`. If `LAST_A >= WARN_A`, step down one at once. If `FAILED` becomes true, reset to step 0 and log it once. With `[Debug] ScatterProbe = 1` and `LogLevel = debug`, the governor thread logs A, B and C every 2 s.
+
+---
+
 ### Task 14: Terrain detail distance
 
 **Files:**
