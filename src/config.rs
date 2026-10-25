@@ -5,7 +5,7 @@
 //! The caller logs the warnings. Section and key names are not case sensitive.
 
 use std::collections::HashSet;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
 
@@ -47,6 +47,17 @@ pub enum TextureBudget {
     Off,
     /// A fixed budget in GiB (2 to 8).
     Gib(f64),
+}
+
+impl TextureBudget {
+    /// How the settings file spells this value.
+    fn ini_text(self) -> String {
+        match self {
+            TextureBudget::Auto => "auto".to_owned(),
+            TextureBudget::Off => "off".to_owned(),
+            TextureBudget::Gib(gib) => gib.to_string(),
+        }
+    }
 }
 
 /// `[General] AsyncCompute`.
@@ -342,12 +353,40 @@ pub fn load_or_create(dir: &Path) -> (Config, Vec<String>) {
     }
 }
 
-/// Write `DEFAULT_INI` to `path`, creating `dir` first. `create_new` makes sure a file that
-/// appeared in the meantime is never overwritten.
+/// Write `DEFAULT_INI` to `path`, creating `dir` first.
 fn write_default(dir: &Path, path: &Path) -> io::Result<()> {
+    create_new_file(dir, path, |file| file.write_all(DEFAULT_INI.as_bytes()))
+}
+
+/// Create `path` (and `dir` before it) and fill it with `fill`. `create_new` makes sure a file that
+/// appeared in the meantime is never overwritten. If `fill` fails, the file this call created is
+/// removed: a half-written settings file would be read as it is, and never repaired.
+fn create_new_file(
+    dir: &Path,
+    path: &Path,
+    fill: impl FnOnce(&mut File) -> io::Result<()>,
+) -> io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-    file.write_all(DEFAULT_INI.as_bytes())
+    if let Err(error) = fill(&mut file) {
+        // Windows cannot delete a file that is still open.
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// The most characters of the player's own text that one warning repeats.
+const MAX_ECHO_CHARS: usize = 64;
+
+/// `text`, cut to `MAX_ECHO_CHARS` characters (on a character boundary) with `…` added if it was
+/// cut. A value or key can be as long as the file, and a log line must not be.
+fn shorten(text: &str) -> String {
+    match text.char_indices().nth(MAX_ECHO_CHARS) {
+        Some((end, _)) => format!("{}…", &text[..end]),
+        None => text.to_owned(),
+    }
 }
 
 /// A number as a person types it. A decimal comma (`0,9`) counts. `nan` and `inf` do not.
@@ -384,6 +423,7 @@ impl Reader {
 
     /// Warn that `text` is not a valid value for `[section] key`.
     fn not_valid(&mut self, section: &str, key: &str, text: &str, expected: &str, default: &str) {
+        let text = shorten(text);
         self.warnings.push(format!(
             "[{section}] {key}: \"{text}\" is not {expected}, using the default {default}"
         ));
@@ -393,6 +433,8 @@ impl Reader {
     fn clamp(&mut self, section: &str, key: &str, value: f64, lo: f64, hi: f64) -> f64 {
         let kept = value.clamp(lo, hi);
         if !(lo..=hi).contains(&value) {
+            // `1e300` prints as 301 digits.
+            let value = shorten(&value.to_string());
             self.warnings.push(format!(
                 "[{section}] {key}: {value} is outside {lo}..={hi}, using {kept}"
             ));
@@ -413,7 +455,8 @@ impl Reader {
         }
     }
 
-    /// A whole number in `lo..=hi`. With `zero_ok`, `0` is allowed as well.
+    /// A whole number in `lo..=hi`. With `zero_ok`, `0` is allowed as well. A number with a zero
+    /// fraction counts as whole (`60.0`, `4,0`); `60.5` does not.
     fn int(
         &mut self,
         section: &str,
@@ -426,10 +469,13 @@ impl Reader {
         let Some(text) = self.raw(section, key) else {
             return default;
         };
-        let Ok(value) = text.parse::<i64>() else {
+        let Some(number) = parse_number(&text).filter(|number| number.fract() == 0.0) else {
             self.not_valid(section, key, &text, "a whole number", &default.to_string());
             return default;
         };
+        // A float-to-integer `as` cast saturates, so a huge number becomes `i64::MAX` or `i64::MIN`
+        // and is then clamped like any other number that is too big.
+        let value = number as i64;
         let kept = if zero_ok && value == 0 {
             0
         } else {
@@ -513,7 +559,7 @@ impl Reader {
                         "TextureBudget",
                         &text,
                         "auto, off or a number of GiB",
-                        "auto",
+                        &default.ini_text(),
                     );
                     default
                 }
@@ -532,13 +578,13 @@ impl Reader {
                      default, are ignored"
                         .to_owned()
                 } else {
-                    format!("[{section}]: unknown section, ignored")
+                    format!("[{}]: unknown section, ignored", shorten(section))
                 });
                 continue;
             };
             for key in keys.keys() {
                 if !self.used.contains(&(section.clone(), key.clone())) {
-                    unknown.push(format!("[{known}] {key}: unknown key, ignored"));
+                    unknown.push(format!("[{known}] {}: unknown key, ignored", shorten(key)));
                 }
             }
         }
@@ -971,8 +1017,8 @@ mod tests {
             ("Governor", "WindowSeconds", "nan"),
             ("Governor", "HitchFactor", "inf"),
             ("Governor", "BlockSeconds", "-inf"),
-            ("Governor", "MinVramFreeMiB", "1e3"),
-            ("Governor", "MinVramFreeMiB", "99999999999999999999"),
+            ("Governor", "MinVramFreeMiB", "100.5"),
+            ("Knobs", "MaxObjectDistance", "2,5"),
             ("Knobs", "MaxObjectDistance", "many"),
             ("Knobs", "EnableScatterDistance", "yes"),
             ("Knobs", "TerrainRingScale", "1.0.0"),
@@ -998,8 +1044,9 @@ mod tests {
             "[General]\nColour=blue\nEnabled=1\n[Nope]\nX=1\nY=2\n[Knobs]\nMaxObjectDistance=3\nZed=1\n",
         );
         assert_eq!(c.knobs.max_object_distance, 3);
-        assert_eq!(w.len(), 3, "{w:?}"); // Colour, [Nope] once (not X and Y), Zed
-                                         // configparser lower-cases names it does not know, so match without regard to case.
+        // One warning each for Colour, [Nope] (once, not for X and Y) and Zed.
+        assert_eq!(w.len(), 3, "{w:?}");
+        // configparser lower-cases names it does not know, so match without regard to case.
         assert!(w.iter().any(|m| m.to_lowercase().contains("nope")));
         assert!(w.iter().any(|m| m.to_lowercase().contains("colour")));
         assert!(w.iter().any(|m| m.to_lowercase().contains("zed")));
@@ -1035,6 +1082,37 @@ mod tests {
     }
 
     #[test]
+    fn inline_comments_and_spaces_are_ignored_for_every_value_type() {
+        // int, bool, choice, TextureBudget and float keys, each with spaces and an inline comment.
+        let (c, w) = parse(
+            "[General]\n\
+             Enabled = 0 # note\n\
+             Reflex = on ; note\n\
+             AsyncCompute =  game   # note\n\
+             TextureBudget = 6 ; note\n\
+             LogLevel\t=\twarn\t; note\n\
+             [Governor]\n\
+             TargetFps = 60 ; note\n\
+             MinVramFreeMiB  =  2048   # note\n\
+             HitchFactor = 3 ; note\n\
+             [Knobs]\n\
+             MaxObjectDistance = 2 # note\n\
+             EnableTerrainDistance = false ; note\n",
+        );
+        assert!(w.is_empty(), "{w:?}");
+        assert!(!c.general.enabled);
+        assert_eq!(c.general.reflex, ReflexMode::On);
+        assert_eq!(c.general.async_compute, AsyncCompute::Game);
+        assert_eq!(c.general.texture_budget, TextureBudget::Gib(6.0));
+        assert_eq!(c.general.log_level, LogLevel::Warn);
+        assert_eq!(c.governor.target_fps, 60);
+        assert_eq!(c.governor.min_vram_free_mib, 2048);
+        assert_eq!(c.governor.hitch_factor, 3.0);
+        assert_eq!(c.knobs.max_object_distance, 2);
+        assert!(!c.knobs.enable_terrain_distance);
+    }
+
+    #[test]
     fn a_leading_byte_order_mark_is_ignored() {
         let (c, w) = parse("\u{feff}[General]\nEnabled=0\n");
         assert!(w.is_empty(), "{w:?}");
@@ -1058,7 +1136,19 @@ mod tests {
         let long_key = format!("[Governor]\n{}=1\n", "k".repeat(100_000));
         let long_value = format!("[Governor]\nRaiseBelow={}\n", "9".repeat(100_000));
         let many_sections = "[a]\n".repeat(10_000);
+        let long_section = format!("[{}]\nX=1\n", "s".repeat(100_000));
+        // Multi-byte characters, so that a cut at 64 bytes would fall inside one.
+        let long_unknown_key = format!("[Knobs]\n{}=1\n", "é".repeat(1_000));
+        let long_bad_bool = format!("[General]\nEnabled={}\n", "é".repeat(1_000));
+        let long_bad_choice = format!("[General]\nReflex={}\n", "😀".repeat(1_000));
+        let long_bad_budget = format!("[General]\nTextureBudget={}\n", "ß".repeat(1_000));
+        let long_bad_int = format!("[Governor]\nTargetFps={}.5\n", "7".repeat(1_000));
         let inputs = [
+            // 301 digits when printed.
+            "[Governor]\nHitchFactor=1e300\n",
+            "[Governor]\nHitchFactor=-1e300\n",
+            "[Governor]\nTargetFps=1e300\n",
+            "[Governor]\nTargetFps=-1e300\n",
             "",
             "[",
             "]",
@@ -1091,10 +1181,156 @@ mod tests {
             &long_key,
             &long_value,
             &many_sections,
+            &long_section,
+            &long_unknown_key,
+            &long_bad_bool,
+            &long_bad_choice,
+            &long_bad_budget,
+            &long_bad_int,
         ];
         for text in inputs {
-            let (c, _w) = parse(text);
+            let (c, w) = parse(text);
             assert_in_range(&c);
+            // A warning repeats at most 64 characters of the player's text, plus the fixed words.
+            for warning in &w {
+                assert!(
+                    warning.chars().count() <= MAX_WARNING_CHARS,
+                    "{} characters: {warning}",
+                    warning.chars().count()
+                );
+            }
+        }
+    }
+
+    /// No warning is longer than this, however long the text it is about. The longest fixed text is
+    /// about 100 characters, and the player's own text adds at most `MAX_ECHO_CHARS` + 1.
+    const MAX_WARNING_CHARS: usize = 200;
+
+    #[test]
+    fn shorten_cuts_on_a_character_boundary() {
+        assert_eq!(shorten(""), "");
+        assert_eq!(shorten("short"), "short");
+        let exact = "a".repeat(MAX_ECHO_CHARS);
+        assert_eq!(shorten(&exact), exact);
+        assert_eq!(shorten(&format!("{exact}b")), format!("{exact}…"));
+        // 2-byte and 4-byte characters: the cut is by character, not by byte.
+        let long = "é".repeat(MAX_ECHO_CHARS + 10);
+        assert_eq!(shorten(&long), format!("{}…", "é".repeat(MAX_ECHO_CHARS)));
+        let long = "😀".repeat(MAX_ECHO_CHARS + 10);
+        assert_eq!(shorten(&long), format!("{}…", "😀".repeat(MAX_ECHO_CHARS)));
+    }
+
+    #[test]
+    fn long_values_and_keys_are_cut_in_the_warning() {
+        let value = "x".repeat(500);
+        let (_, w) = one("General", "Reflex", &value);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].contains(&format!("{}…", "x".repeat(MAX_ECHO_CHARS))),
+            "{}",
+            w[0]
+        );
+        assert!(!w[0].contains(&"x".repeat(MAX_ECHO_CHARS + 1)), "{}", w[0]);
+        let (_, w) = parse(&format!("[Knobs]\n{}=1\n", "k".repeat(500)));
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].contains(&format!("{}…", "k".repeat(MAX_ECHO_CHARS))),
+            "{}",
+            w[0]
+        );
+        assert!(!w[0].contains(&"k".repeat(MAX_ECHO_CHARS + 1)), "{}", w[0]);
+        // A number prints at full length (1e300 is 301 digits) but the warning shows 64 of them.
+        let (c, w) = one("Governor", "HitchFactor", "1e300");
+        assert_eq!(c.governor.hitch_factor, 5.0);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains('…'), "{}", w[0]);
+    }
+
+    #[test]
+    fn integer_keys_accept_a_number_with_a_zero_fraction() {
+        for (given, expected) in [
+            ("60.0", 60),
+            ("60,0", 60),
+            ("144.00", 144),
+            ("3e2", 300),
+            ("0.0", 0),
+            ("0,0", 0),
+            ("-0", 0),
+            ("+75", 75),
+        ] {
+            let (c, w) = one("Governor", "TargetFps", given);
+            assert_eq!(c.governor.target_fps, expected, "TargetFps={given}");
+            assert!(w.is_empty(), "TargetFps={given}: {w:?}");
+        }
+        // 0.0 turns the governor off, the same as 0.
+        let (c, w) = one("Governor", "TargetFps", "0.0");
+        assert_eq!(c.governor.target_fps, 0);
+        assert!(w.is_empty(), "{w:?}");
+        for (key, given, expected) in [
+            ("MaxObjectDistance", "4,0", 4),
+            ("MaxScatterDistance", "2.0", 2),
+            ("MaxTerrainDistance", "0.0", 0),
+        ] {
+            let (c, w) = one("Knobs", key, given);
+            assert_eq!(number(&c, key), f64::from(expected), "{key}={given}");
+            assert!(w.is_empty(), "{key}={given}: {w:?}");
+        }
+        let (c, w) = one("Governor", "MinVramFreeMiB", "1e3");
+        assert_eq!(c.governor.min_vram_free_mib, 1000);
+        assert!(w.is_empty(), "{w:?}");
+    }
+
+    #[test]
+    fn integer_keys_still_clamp_and_still_reject_a_fraction() {
+        // Not whole: not valid, so the default, with one warning.
+        for (section, key, given) in [
+            ("Governor", "TargetFps", "60.5"),
+            ("Governor", "TargetFps", "60,5"),
+            ("Governor", "TargetFps", "0.5"),
+            ("Governor", "MinVramFreeMiB", "1024.001"),
+            ("Knobs", "MaxScatterDistance", "3.5"),
+        ] {
+            let (c, w) = one(section, key, given);
+            assert_eq!(c, Config::default(), "{key}={given}");
+            assert_eq!(w.len(), 1, "{key}={given}: {w:?}");
+        }
+        // Whole but out of range: clamped, with one warning (also above the old i64 limit).
+        for (given, expected) in [
+            ("20.0", 30),
+            ("400,0", 360),
+            ("99999999999999999999", 360),
+            ("-99999999999999999999", 30),
+        ] {
+            let (c, w) = one("Governor", "TargetFps", given);
+            assert_eq!(c.governor.target_fps, expected, "TargetFps={given}");
+            assert_eq!(w.len(), 1, "TargetFps={given}: {w:?}");
+        }
+        let (c, w) = one("Governor", "MinVramFreeMiB", "99999999999999999999");
+        assert_eq!(c.governor.min_vram_free_mib, 8192);
+        assert_eq!(w.len(), 1, "{w:?}");
+    }
+
+    #[test]
+    fn texture_budget_warning_names_the_default_it_was_given() {
+        let reader = |text: &str| {
+            let mut ini = Ini::new();
+            ini.read(format!("[General]\nTextureBudget={text}\n"))
+                .unwrap();
+            Reader {
+                ini,
+                used: HashSet::new(),
+                warnings: Vec::new(),
+            }
+        };
+        for (default, named) in [
+            (TextureBudget::Auto, "default auto"),
+            (TextureBudget::Off, "default off"),
+            (TextureBudget::Gib(6.5), "default 6.5"),
+        ] {
+            let mut r = reader("lots");
+            assert_eq!(r.texture_budget(default), default);
+            assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
+            assert!(r.warnings[0].contains(named), "{}", r.warnings[0]);
         }
     }
 
@@ -1145,6 +1381,43 @@ mod tests {
         let (c, w) = load_or_create(&d.join("blocker").join("sub"));
         assert_eq!(c, Config::default());
         assert_eq!(w.len(), 1, "{w:?}");
+    }
+
+    #[test]
+    fn a_failed_write_removes_the_file_this_call_created() {
+        let d = tempdir_in_target("cfg_failed_write");
+        let path = d.join(INI_FILE_NAME);
+        // The real creation and clean-up code runs; only the write itself is made to fail, half
+        // way, the way a full disk would.
+        let result = create_new_file(&d, &path, |file| {
+            file.write_all(b"[General]\nEna")?;
+            Err(io::Error::other("disk full"))
+        });
+        assert_eq!(result.unwrap_err().to_string(), "disk full");
+        assert!(!path.exists(), "the half-written file must be gone");
+        // So the next start finds no file and writes a whole one.
+        let (c, w) = load_or_create(&d);
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(c, Config::default());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), DEFAULT_INI);
+    }
+
+    #[test]
+    fn a_failed_write_never_removes_a_file_that_was_already_there() {
+        let d = tempdir_in_target("cfg_failed_write_existing");
+        let path = d.join(INI_FILE_NAME);
+        std::fs::write(&path, "[Governor]\nTargetFps=100\n").unwrap();
+        let mut fill_ran = false;
+        let result = create_new_file(&d, &path, |_| {
+            fill_ran = true;
+            Ok(())
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert!(!fill_ran, "an existing file is not written to");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[Governor]\nTargetFps=100\n"
+        );
     }
 
     #[test]
