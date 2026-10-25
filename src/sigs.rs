@@ -5,8 +5,9 @@
 //! tasks patch. Source: `docs/re-notes.md`, section "Signature table".
 //!
 //! Where a pattern ends before its patch site in the RE-notes table, it is extended here so a
-//! match also proves the original bytes at every patch offset (`VOXEL_HIGH_IMMS`,
-//! `ASYNC_OVERRIDE`). `TEXTURE_TABLE` is not in this file: Task 7 builds it from data.
+//! match also proves the original bytes at the patch offsets (`VOXEL_HIGH_IMMS`, and
+//! `ASYNC_OVERRIDE` except its one `??` byte at +11). `TEXTURE_TABLE` is not in this file: Task 7
+//! builds it from data.
 
 /// One signature: where to look, what to look for, and where inside the match to patch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,8 +31,8 @@ impl Sig {
     }
 }
 
-/// Scene-settings function (post-hook). The pattern starts inside the function, not at its
-/// entry (0x1400f72b0), so the match address is not the function address.
+/// Scene-settings function (post-hook). The pattern starts at the function entry, so the match
+/// VA is the function (0x1400f72b0 in f68140a3); hook at match + `patch_offset()` (0).
 pub const SCENE_SETTINGS_FN: Sig = Sig {
     name: "SCENE_SETTINGS_FN",
     pattern: "41 8b 00 f3 0f 10 0d ?? ?? ?? ?? 89 81 08 03 00 00 f3 41 0f 10 40 04 f3 0f 58 c1 f3 0f 11 81 0c 03 00 00 0f 57 c0 41 0f 2f 40 08 76 ?? f3 0f 10 05 ?? ?? ?? ?? eb ?? f3 0f 10 05 ?? ?? ?? ?? f3 41 0f 59 40 08 45 33 c9",
@@ -98,7 +99,9 @@ pub const VOXEL_HIGH_IMMS: Sig = Sig {
 };
 
 /// Async compute override. Task 8 writes 16 bytes at +3, which end at +19. Anchor 0x1408490d2.
-/// Extended past the RE-notes table so the match proves the original bytes.
+/// Extended past the RE-notes table so the match covers the whole patch. It proves every byte
+/// of the 16-byte patch EXCEPT +11 (the `jz rel8` displacement, a `??`): Task 8 must compare all
+/// 16 ORIGINAL bytes itself before it writes, and not rely on this match for that byte.
 pub const ASYNC_OVERRIDE: Sig = Sig {
     name: "ASYNC_OVERRIDE",
     pattern: "88 4d 3e 44 38 b6 89 52 03 00 74 ?? 0f b6 86 88 52 03 00",
@@ -237,5 +240,26 @@ mod tests {
         // Task 8 writes 16 bytes at +3, which end at +19: the pattern must reach that far.
         assert_eq!(tokens(&ASYNC_OVERRIDE).len(), 19);
         assert_eq!(ASYNC_OVERRIDE.patch_offset() + 16, 19);
+    }
+
+    /// Of the 16 patch bytes (+3..+19) the match fixes every one but +11, the `jz rel8`
+    /// displacement. Task 8 checks all 16 original bytes itself, so this test pins the gap.
+    #[test]
+    fn async_override_has_exactly_one_wildcard_in_its_patch() {
+        let t = tokens(&ASYNC_OVERRIDE);
+        let start = ASYNC_OVERRIDE.patch_offset();
+        let patch = t.get(start..start + 16).expect("pattern reaches +19");
+        let wild: Vec<usize> = patch
+            .iter()
+            .enumerate()
+            .filter(|(_, tok)| **tok == "??")
+            .map(|(i, _)| start + i)
+            .collect();
+        assert_eq!(wild, [11]);
+        assert_eq!(
+            t.get(10),
+            Some(&"74"),
+            "the jz opcode just before the displacement"
+        );
     }
 }

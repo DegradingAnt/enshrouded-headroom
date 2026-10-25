@@ -7,14 +7,15 @@
 //!
 //! # Safety of the in-place scan
 //!
-//! The PE headers of the exe are read from memory, so nothing in them is trusted. Every header
-//! read is bounded by a `VirtualQuery` region and by `SizeOfImage`, with checked arithmetic. A
-//! slice over a section is made only after `VirtualQuery` has reported every page of its range
-//! committed and readable, and only if the range lies inside both `SizeOfImage` and the
-//! [`Module`] the caller passed in. If any check fails, the result is [`ScanError::NotFound`] and
-//! nothing is read. Another thread could still change the page protection between the check and
-//! the scan; the scan runs once at start-up, from `InitializeASI`, over `.text` and `.rdata`,
-//! which the game does not change at that point.
+//! The PE headers of the exe are read from memory, so nothing in them is trusted. Header bytes
+//! are copied from one readable `VirtualQuery` region (at most 64 KiB, and at most `Module.size`
+//! when known); parsing then requires the section table to end inside `SizeOfImage`, and every
+//! read uses checked arithmetic. A slice over a section is made only after `VirtualQuery` has
+//! reported every page of its range committed, readable and part of the module's own allocation,
+//! and only if the range lies inside both `SizeOfImage` and the [`Module`] the caller passed in.
+//! If any check fails, the result is [`ScanError::NotFound`] and nothing is read. The check is
+//! `VirtualQuery` first, scan second, so [`find_in_sections`] is for start-up only; see the
+//! "Start-up only" rule on that function.
 
 use std::ffi::c_void;
 use std::fmt;
@@ -214,7 +215,9 @@ impl SectionHeader {
         !name.is_empty() && self.name.get(..len) == Some(name.as_bytes())
     }
 
-    /// `(rva, length)` of the section in memory, or `None` if it is empty or ends past `limit`.
+    /// `(rva, length)` of the section in memory, or `None` if it ends past `limit`. An empty
+    /// section (VirtualSize and SizeOfRawData both 0) is `Some((rva, 0))`, not `None`, so the
+    /// caller can tell "nothing to search" from "outside the module".
     fn mem_range(&self, limit: usize) -> Option<(usize, usize)> {
         // VirtualSize 0 means "use the raw size".
         let len = match self.virtual_size {
@@ -223,7 +226,7 @@ impl SectionHeader {
         };
         let rva = self.virtual_address as usize;
         let end = rva.checked_add(len)?;
-        (len != 0 && end <= limit).then_some((rva, len))
+        (end <= limit).then_some((rva, len))
     }
 }
 
@@ -318,8 +321,10 @@ fn protect_is_readable(protect: u32) -> bool {
 }
 
 /// How many bytes from `addr` to the end of its `VirtualQuery` region are committed and
-/// readable. Zero if `addr` is unmapped, reserved only, no-access or a guard page.
-fn readable_run(addr: usize) -> usize {
+/// readable. Zero if `addr` is unmapped, reserved only, no-access or a guard page, or if its
+/// region belongs to a different allocation than the one starting at `alloc_base`. (A loaded
+/// image is one allocation, so a section slice can never run into an unrelated neighbour.)
+fn readable_run(addr: usize, alloc_base: usize) -> usize {
     let mut info = MEMORY_BASIC_INFORMATION::default();
     // SAFETY: `info` is a valid buffer of exactly the size passed. VirtualQuery accepts any
     // address, reads no memory at it, and reports failure by returning 0.
@@ -332,6 +337,7 @@ fn readable_run(addr: usize) -> usize {
     };
     if written < size_of::<MEMORY_BASIC_INFORMATION>()
         || info.State != MEM_COMMIT
+        || info.AllocationBase as usize != alloc_base
         || !protect_is_readable(info.Protect)
     {
         return 0;
@@ -359,9 +365,10 @@ fn walk_readable(addr: usize, len: usize, run: impl Fn(usize) -> usize) -> bool 
 }
 
 /// Copy up to `limit` (and [`MAX_HEADER_COPY`]) bytes from `base`, only from the one readable
-/// region that starts there. A copy, so no reference to live memory outlives this call.
+/// region that starts there, and only if `base` is the start of its allocation (an image's base
+/// always is). A copy, so no reference to live memory outlives this call.
 fn read_headers(base: usize, limit: usize) -> Option<Vec<u8>> {
-    let len = readable_run(base).min(limit).min(MAX_HEADER_COPY);
+    let len = readable_run(base, base).min(limit).min(MAX_HEADER_COPY);
     if len < MIN_HEADER_COPY {
         return None;
     }
@@ -384,6 +391,8 @@ fn read_pe(m: &Module) -> Option<PeInfo> {
 ///
 /// If the headers in memory cannot be read or are not a PE32+ image, `size` is 0 and every
 /// search in the module comes back `NotFound`.
+///
+/// Start-up only, like [`find_in_sections`]: see the rule there.
 pub fn main_module() -> Module {
     // SAFETY: a null module name asks for the handle of the process's own exe; it has no
     // preconditions and returns null on failure.
@@ -403,7 +412,20 @@ pub fn main_module() -> Module {
 ///
 /// Uniqueness counts across all the named sections together; a name given twice counts once.
 /// Every named section must exist, lie inside the module and `SizeOfImage`, and be fully
-/// committed and readable, or the result is `NotFound` (see the module docs).
+/// committed and readable inside the module's own allocation (`m.base` must be the start of
+/// that allocation, as an image base is), or the result is `NotFound` (see the module docs). A
+/// named section that is empty (VirtualSize and SizeOfRawData both 0) has nothing to search and
+/// is skipped.
+///
+/// # Start-up only
+///
+/// Call this only from `InitializeASI` / `entry::start`, on one thread, before the game's
+/// `WinMain` runs. Never call it from a hook or from the governor thread. Reasons:
+/// - it forms a `&[u8]` over live image memory, which is sound only while nothing else writes
+///   that memory; at start-up the game and the hooks are not running yet;
+/// - the readability check is `VirtualQuery` first and the scan second, so a protection change
+///   in between (another thread) would fault;
+/// - it logs and allocates on failure, which hooks must never do.
 pub fn find_in_sections(m: &Module, sections: &[&str], pat: &Pattern) -> Result<usize, ScanError> {
     let Some(pe) = read_pe(m) else {
         ::log::warn!("scan: no readable PE headers at {:#x}", m.base);
@@ -427,15 +449,21 @@ pub fn find_in_sections(m: &Module, sections: &[&str], pat: &Pattern) -> Result<
                 ::log::warn!("scan: section {name} lies outside the module");
                 return Err(ScanError::NotFound);
             };
-            if !walk_readable(va, len, readable_run) {
+            if len == 0 {
+                ::log::warn!("scan: section {name} is empty");
+                continue;
+            }
+            if !walk_readable(va, len, |at| readable_run(at, m.base)) {
                 ::log::warn!("scan: section {name} is not fully readable");
                 return Err(ScanError::NotFound);
             }
             // SAFETY: `walk_readable` just confirmed every page of `[va, va + len)` committed
-            // and readable; `len` is at most `SizeOfImage`, which is under `u32::MAX`, so it fits
-            // `isize`; `u8` has no alignment or validity requirement. The image stays mapped for
-            // the life of the process, and the bytes are only read (see the module docs on
-            // concurrent changes).
+            // and readable, all inside the allocation that starts at `m.base`; `len` is at most
+            // `SizeOfImage`, which is under `u32::MAX`, so it fits `isize`; `u8` has no
+            // alignment or validity requirement. The bytes are only read, and the slice does not
+            // leave this function. That nothing writes the memory meanwhile, and that the
+            // protection does not change between the check and the read, rests on the
+            // "Start-up only" rule in this function's docs: callers must follow it.
             let bytes = unsafe { std::slice::from_raw_parts(va as *const u8, len) };
             regions.push((va, bytes));
         }
@@ -751,8 +779,12 @@ mod tests {
             Some((0x1000, 0x3000))
         );
         assert_eq!(h(0x3001, 0x1000, 0).mem_range(0x4000), None);
-        // Empty, and the 32-bit extreme.
-        assert_eq!(h(0, 0x1000, 0).mem_range(0x4000), None);
+        // Empty (VirtualSize and SizeOfRawData both 0) is not "outside": it has length 0. It is
+        // outside only if it sits past the limit.
+        assert_eq!(h(0, 0x1000, 0).mem_range(0x4000), Some((0x1000, 0)));
+        assert_eq!(h(0, 0x4000, 0).mem_range(0x4000), Some((0x4000, 0)));
+        assert_eq!(h(0, 0x4001, 0).mem_range(0x4000), None);
+        // The 32-bit extreme.
         assert_eq!(
             h(u32::MAX, u32::MAX, 0).mem_range(usize::MAX),
             Some((u32::MAX as usize, u32::MAX as usize))
@@ -914,6 +946,19 @@ mod tests {
             assert!(!p.is_null());
             Pages(p, len)
         }
+        /// Commit `len` bytes at exactly `addr` (a free, 64 KiB-aligned range), or `None`.
+        fn at(addr: usize, len: usize) -> Option<Pages> {
+            // SAFETY: asks for a specific free range; the OS refuses if it is taken.
+            let p = unsafe {
+                VirtualAlloc(
+                    addr as *const c_void,
+                    len,
+                    MEM_COMMIT | MEM_RESERVE,
+                    PAGE_READWRITE,
+                )
+            };
+            (!p.is_null()).then_some(Pages(p, len))
+        }
         fn addr(&self) -> usize {
             self.0 as usize
         }
@@ -942,50 +987,139 @@ mod tests {
     fn readable_run_reads_the_real_page_protections() {
         let pages = Pages::new(4);
         let a = pages.addr();
-        assert_eq!(
-            readable_run(a),
-            0x4000,
-            "four committed RW pages are one region"
-        );
-        assert_eq!(readable_run(a + 0x10), 0x4000 - 0x10, "mid-page address");
+        // The walk the scanner uses: the allocation base is the allocation's own address.
+        let run = |at: usize| readable_run(at, a);
+        assert_eq!(run(a), 0x4000, "four committed RW pages are one region");
+        assert_eq!(run(a + 0x10), 0x4000 - 0x10, "mid-page address");
         pages.protect(1, PAGE_NOACCESS);
         pages.protect(2, PAGE_GUARD | PAGE_READWRITE);
         pages.protect(3, PAGE_READONLY);
-        assert_eq!(readable_run(a), 0x1000);
-        assert_eq!(readable_run(a + 0x1000), 0, "NOACCESS");
-        assert_eq!(readable_run(a + 0x2800), 0, "GUARD");
-        assert_eq!(readable_run(a + 0x3000), 0x1000, "READONLY");
-        assert!(walk_readable(a, 0x1000, readable_run));
-        assert!(!walk_readable(a, 0x2000, readable_run));
+        assert_eq!(run(a), 0x1000);
+        assert_eq!(run(a + 0x1000), 0, "NOACCESS");
+        assert_eq!(run(a + 0x2800), 0, "GUARD");
+        assert_eq!(run(a + 0x3000), 0x1000, "READONLY");
+        assert!(walk_readable(a, 0x1000, run));
+        assert!(!walk_readable(a, 0x2000, run));
         assert!(
-            !walk_readable(a + 0xff0, 0x20, readable_run),
+            !walk_readable(a + 0xff0, 0x20, run),
             "crosses into NOACCESS"
         );
         pages.protect(1, PAGE_READONLY);
         pages.protect(2, PAGE_READWRITE);
         assert!(
-            walk_readable(a, 0x4000, readable_run),
+            walk_readable(a, 0x4000, run),
             "RW + RO pages are different regions, all readable"
         );
         assert!(
-            !walk_readable(a, 0x4001, readable_run),
+            !walk_readable(a, 0x4001, run),
             "one byte past the allocation"
         );
     }
 
     #[test]
     fn readable_run_is_zero_for_unmapped_and_reserved_memory() {
-        assert_eq!(readable_run(0), 0);
-        assert_eq!(readable_run(0x1000), 0);
-        assert_eq!(readable_run(usize::MAX), 0);
-        assert_eq!(readable_run(usize::MAX - 0xfff), 0);
+        assert_eq!(readable_run(0, 0), 0);
+        assert_eq!(readable_run(0x1000, 0x1000), 0);
+        assert_eq!(readable_run(usize::MAX, usize::MAX), 0);
+        assert_eq!(readable_run(usize::MAX - 0xfff, usize::MAX - 0xfff), 0);
         // Reserved but never committed.
         // SAFETY: a fresh anonymous reservation, freed below.
         let p = unsafe { VirtualAlloc(null(), 0x2000, MEM_RESERVE, PAGE_NOACCESS) };
         assert!(!p.is_null());
-        assert_eq!(readable_run(p as usize), 0);
+        assert_eq!(readable_run(p as usize, p as usize), 0);
         // SAFETY: `p` is the base the reservation returned.
         unsafe { VirtualFree(p, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn readable_run_refuses_another_allocation() {
+        let pages = Pages::new(2);
+        let a = pages.addr();
+        assert_eq!(readable_run(a, a), 0x2000);
+        // Right address, wrong claimed allocation base: not the module's own memory.
+        assert_eq!(readable_run(a, a + 0x1000), 0);
+        assert_eq!(
+            readable_run(a + 0x1000, a + 0x1000),
+            0,
+            "not an allocation base"
+        );
+        assert_eq!(readable_run(a + 0x1000, 0), 0);
+    }
+
+    /// Two committed RW allocations of 64 KiB each, one directly after the other (an allocation
+    /// always starts on a 64 KiB boundary, so adjacent ones are separate allocations).
+    fn adjacent_allocations() -> (Pages, Pages) {
+        const SPAN: usize = 0x10000;
+        for _ in 0..100 {
+            // Find a free 128 KiB range by reserving it and letting it go again.
+            // SAFETY: a fresh anonymous reservation, freed right away.
+            let probe = unsafe { VirtualAlloc(null(), 2 * SPAN, MEM_RESERVE, PAGE_NOACCESS) };
+            if probe.is_null() {
+                continue;
+            }
+            // SAFETY: `probe` is the base the reservation returned.
+            unsafe { VirtualFree(probe, 0, MEM_RELEASE) };
+            let start = probe as usize;
+            // Another thread may take the range in between; then try a new one.
+            if let (Some(first), Some(second)) =
+                (Pages::at(start, SPAN), Pages::at(start + SPAN, SPAN))
+            {
+                return (first, second);
+            }
+        }
+        panic!("could not place two adjacent allocations");
+    }
+
+    #[test]
+    fn a_section_cannot_run_into_the_next_allocation() {
+        let (first, second) = adjacent_allocations();
+        let (a, b) = (first.addr(), second.addr());
+        assert_eq!(b, a + 0x10000);
+        // Both are plain readable memory, and the second starts where the first ends...
+        assert_eq!(readable_run(a, a), 0x10000, "stops at the allocation's end");
+        assert_eq!(readable_run(b, b), 0x10000);
+        // ...but a walk anchored at the first allocation does not cross into the second.
+        let run = |at: usize| readable_run(at, a);
+        assert!(walk_readable(a, 0x10000, run));
+        assert!(
+            !walk_readable(a + 0xf000, 0x2000, run),
+            "straddles the boundary"
+        );
+        assert!(!walk_readable(b, 0x1000, run), "wholly in the neighbour");
+
+        // The same through find_in_sections: an image in the first allocation whose sections
+        // are at 0xf800 (straddles) and 0x10000 (wholly in the neighbour).
+        let hdr = synth_pe(
+            &[
+                (".text", 0x1000, 0x1000, 0x1000, 0x400),
+                (".strad", 0x1000, 0xf800, 0x1000, 0),
+                (".next", 0x800, 0x10000, 0x800, 0),
+            ],
+            0x20000,
+        );
+        poke(&first, 0, &hdr);
+        let needle = [0xc3, 0x9a, 0x17, 0x6e, 0xb2, 0x40];
+        poke(&first, 0x1100, &needle);
+        poke(&second, 0x10, &needle);
+        let m = Module {
+            base: a,
+            size: 0x20000,
+        };
+        let p = pat("c3 9a 17 6e b2 40");
+        assert_eq!(find_in_sections(&m, &[".text"], &p), Ok(a + 0x1100));
+        assert_eq!(
+            find_in_sections(&m, &[".strad"], &p),
+            Err(ScanError::NotFound)
+        );
+        assert_eq!(
+            find_in_sections(&m, &[".next"], &p),
+            Err(ScanError::NotFound),
+            "the needle at b + 0x10 is in another allocation"
+        );
+        assert_eq!(
+            find_in_sections(&m, &[".text", ".next"], &p),
+            Err(ScanError::NotFound)
+        );
     }
 
     // ---- module and section search: the test binary itself ---------------------------------
@@ -1296,10 +1430,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_empty_section_is_skipped_but_an_outside_one_fails() {
+        let needle = [0xc3, 0x9a, 0x17, 0x6e, 0xb2, 0x40];
+        let p = pat("c3 9a 17 6e b2 40");
+        let pages = Pages::new(4);
+        let hdr = synth_pe(
+            &[
+                (".text", 0x1000, 0x1000, 0x1000, 0x400),
+                // VirtualSize 0 and SizeOfRawData 0: nothing to search, not an error.
+                (".empty", 0, 0x2000, 0, 0),
+                // Past SizeOfImage: outside the module.
+                (".gone", 0x800, 0x9000, 0x800, 0),
+            ],
+            0x4000,
+        );
+        poke(&pages, 0, &hdr);
+        poke(&pages, 0x1100, &needle);
+        let m = Module {
+            base: pages.addr(),
+            size: 0x4000,
+        };
+        assert_eq!(
+            find_in_sections(&m, &[".text", ".empty"], &p),
+            Ok(m.base + 0x1100)
+        );
+        assert_eq!(
+            find_in_sections(&m, &[".empty", ".text"], &p),
+            Ok(m.base + 0x1100)
+        );
+        // Only the empty section named: nothing to find.
+        assert_eq!(
+            find_in_sections(&m, &[".empty"], &p),
+            Err(ScanError::NotFound)
+        );
+        // A section outside the module still fails the whole search, even next to a good one.
+        assert_eq!(
+            find_in_sections(&m, &[".gone"], &p),
+            Err(ScanError::NotFound)
+        );
+        assert_eq!(
+            find_in_sections(&m, &[".text", ".gone"], &p),
+            Err(ScanError::NotFound)
+        );
+    }
+
     // ---- the real game exe (ignored: reads C:\Games\Enshrouded\enshrouded.exe) --------------
 
-    /// The anchors from the RE notes. The test prints each match next to its anchor and does not
-    /// assert on them: a drift is reported, not "fixed".
+    /// The anchors from the RE notes: the virtual address each pattern matches at in build
+    /// f68140a3 (sha256 b28b448a...). The game-exe test asserts on them, so a pattern that drifts
+    /// to a different place fails the test; it is a build-specific check.
     const ANCHORS: [(&str, u64); 10] = [
         ("SCENE_SETTINGS_FN", 0x1_400f_72b0),
         ("SCATTER_BRICK_LOAD", 0x1_4007_9502),
@@ -1319,6 +1499,7 @@ mod tests {
         let file = std::fs::read(r"C:\Games\Enshrouded\enshrouded.exe").expect("read the game exe");
         let info = parse_pe(&file).expect("PE headers of the game exe");
         let mut failures = Vec::new();
+        let mut drift = Vec::new();
         for sig in sigs::ALL {
             let p = Pattern::parse(sig.pattern).unwrap();
             // Map each named section by file offset: the part of it that is both in the file and
@@ -1353,23 +1534,28 @@ mod tests {
                         .iter()
                         .map(|o| format!("{:#x}", va + o))
                         .collect();
-                    let note = if va as u64 == anchor {
+                    let delta = va as i64 - anchor as i64;
+                    let note = if delta == 0 {
                         "= anchor".to_string()
                     } else {
-                        format!(
-                            "anchor {anchor:#x}, delta {:+#x}",
-                            va as i64 - anchor as i64
-                        )
+                        format!("anchor {anchor:#x}, delta {delta:+} bytes")
                     };
                     println!(
                         "{:<24} match {va:#x}  patch sites [{}]  ({note})",
                         sig.name,
                         sites.join(", ")
                     );
+                    if delta != 0 {
+                        drift.push(format!(
+                            "{}: matched {va:#x}, anchor {anchor:#x}, delta {delta:+} bytes",
+                            sig.name
+                        ));
+                    }
                 }
                 Err(e) => failures.push(format!("{}: {e:?}", sig.name)),
             }
         }
         assert!(failures.is_empty(), "not exactly once: {failures:?}");
+        assert!(drift.is_empty(), "match differs from its anchor: {drift:?}");
     }
 }
