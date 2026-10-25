@@ -1,0 +1,1160 @@
+//! The settings file, `enshrouded-headroom.ini`.
+//!
+//! `parse` never fails and never panics. A value that is missing, not valid or out of range falls
+//! back to its default or is clamped, and each such case adds one line to the returned warnings.
+//! The caller logs the warnings. Section and key names are not case sensitive.
+
+use std::collections::HashSet;
+use std::fs::OpenOptions;
+use std::io::{self, Write};
+use std::path::Path;
+
+use configparser::ini::Ini;
+
+/// Name of the settings file, next to the `.asi`.
+pub const INI_FILE_NAME: &str = "enshrouded-headroom.ini";
+
+/// The settings file that `load_or_create` writes when there is none. It parses without warnings
+/// and gives the same `Config` as `Config::default()`.
+pub const DEFAULT_INI: &str = include_str!("../enshrouded-headroom.default.ini");
+
+/// `[General] LogLevel`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+}
+
+impl From<LogLevel> for log::LevelFilter {
+    fn from(level: LogLevel) -> Self {
+        match level {
+            LogLevel::Error => log::LevelFilter::Error,
+            LogLevel::Warn => log::LevelFilter::Warn,
+            LogLevel::Info => log::LevelFilter::Info,
+            LogLevel::Debug => log::LevelFilter::Debug,
+        }
+    }
+}
+
+/// `[General] TextureBudget`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TextureBudget {
+    /// Raise the budget to suit the GPU.
+    Auto,
+    /// Leave the game's budget alone.
+    Off,
+    /// A fixed budget in GiB (2 to 8).
+    Gib(f64),
+}
+
+/// `[General] AsyncCompute`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsyncCompute {
+    On,
+    Game,
+}
+
+/// `[General] Reflex`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReflexMode {
+    Game,
+    Off,
+    On,
+    Boost,
+}
+
+/// The `[General]` section.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct General {
+    pub enabled: bool,
+    pub texture_budget: TextureBudget,
+    pub texture_reserve_gib: f64,
+    pub async_compute: AsyncCompute,
+    pub reflex: ReflexMode,
+    pub allow_unknown_build: bool,
+    pub log_level: LogLevel,
+}
+
+/// The `[Governor]` section: the keys in spec section 6.4.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GovernorCfg {
+    /// `0` turns the governor off; otherwise 30 to 360.
+    pub target_fps: u32,
+    pub window_seconds: f64,
+    pub raise_below: f64,
+    pub raise_hold_seconds: f64,
+    pub settle_seconds: f64,
+    /// Always above `raise_below`.
+    pub lower_above: f64,
+    pub lower_hold_seconds: f64,
+    pub hitch_factor: f64,
+    pub block_seconds: f64,
+    pub min_vram_free_mib: u32,
+}
+
+/// The `[Knobs]` section. Each `max_*` is 0 to 4.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KnobsCfg {
+    pub enable_object_distance: bool,
+    pub max_object_distance: u8,
+    pub enable_scatter_distance: bool,
+    pub max_scatter_distance: u8,
+    pub enable_terrain_distance: bool,
+    pub max_terrain_distance: u8,
+    pub deco_distance_scale: f64,
+    pub distant_objects_scale: f64,
+    pub terrain_ring_scale: f64,
+}
+
+/// All settings.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Config {
+    pub general: General,
+    pub governor: GovernorCfg,
+    pub knobs: KnobsCfg,
+}
+
+/// The default settings. `parse` falls back to these values, and `DEFAULT_INI` repeats them (a test
+/// checks that the two agree).
+const BUILTIN: Config = Config {
+    general: General {
+        enabled: true,
+        texture_budget: TextureBudget::Auto,
+        texture_reserve_gib: 11.0,
+        async_compute: AsyncCompute::On,
+        reflex: ReflexMode::Game,
+        allow_unknown_build: false,
+        log_level: LogLevel::Info,
+    },
+    governor: GovernorCfg {
+        target_fps: 75,
+        window_seconds: 2.0,
+        raise_below: 0.90,
+        raise_hold_seconds: 1.0,
+        settle_seconds: 1.0,
+        lower_above: 0.97,
+        lower_hold_seconds: 0.3,
+        hitch_factor: 2.0,
+        block_seconds: 20.0,
+        min_vram_free_mib: 1024,
+    },
+    knobs: KnobsCfg {
+        enable_object_distance: true,
+        max_object_distance: 4,
+        enable_scatter_distance: true,
+        max_scatter_distance: 4,
+        enable_terrain_distance: true,
+        max_terrain_distance: 4,
+        deco_distance_scale: 1.0,
+        distant_objects_scale: 1.0,
+        terrain_ring_scale: 1.0,
+    },
+};
+
+impl Default for Config {
+    fn default() -> Self {
+        BUILTIN
+    }
+}
+
+/// The sections this version knows, spelled as the spec spells them. A section that is not here is
+/// unknown. Task 15 adds `Debug`.
+const SECTIONS: [&str; 3] = ["General", "Governor", "Knobs"];
+
+/// Parse the text of a settings file. The `Vec` holds one warning per problem found.
+pub fn parse(text: &str) -> (Config, Vec<String>) {
+    // Notepad can save UTF-8 with a byte order mark. It would hide the first `[`.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut ini = Ini::new();
+    if let Err(error) = ini.read(text.to_owned()) {
+        let warning = format!("the settings file cannot be read ({error}), using all defaults");
+        return (BUILTIN, vec![warning]);
+    }
+    let mut r = Reader {
+        ini,
+        used: HashSet::new(),
+        warnings: Vec::new(),
+    };
+    let d = BUILTIN;
+
+    // Struct fields are evaluated in order, so warnings come out in file order of the spec.
+    let general = General {
+        enabled: r.boolean("General", "Enabled", d.general.enabled),
+        texture_budget: r.texture_budget(d.general.texture_budget),
+        texture_reserve_gib: r.float(
+            "General",
+            "TextureReserveGiB",
+            d.general.texture_reserve_gib,
+            4.0,
+            16.0,
+        ),
+        async_compute: r.choice(
+            "General",
+            "AsyncCompute",
+            d.general.async_compute,
+            &[("on", AsyncCompute::On), ("game", AsyncCompute::Game)],
+        ),
+        reflex: r.choice(
+            "General",
+            "Reflex",
+            d.general.reflex,
+            &[
+                ("game", ReflexMode::Game),
+                ("off", ReflexMode::Off),
+                ("on", ReflexMode::On),
+                ("boost", ReflexMode::Boost),
+            ],
+        ),
+        allow_unknown_build: r.boolean(
+            "General",
+            "AllowUnknownBuild",
+            d.general.allow_unknown_build,
+        ),
+        log_level: r.choice(
+            "General",
+            "LogLevel",
+            d.general.log_level,
+            &[
+                ("error", LogLevel::Error),
+                ("warn", LogLevel::Warn),
+                ("info", LogLevel::Info),
+                ("debug", LogLevel::Debug),
+            ],
+        ),
+    };
+
+    let g = d.governor;
+    let mut governor = GovernorCfg {
+        target_fps: r.int("Governor", "TargetFps", g.target_fps, 30, 360, true),
+        window_seconds: r.float("Governor", "WindowSeconds", g.window_seconds, 0.5, 10.0),
+        raise_below: r.float("Governor", "RaiseBelow", g.raise_below, 0.5, 0.99),
+        raise_hold_seconds: r.float(
+            "Governor",
+            "RaiseHoldSeconds",
+            g.raise_hold_seconds,
+            0.1,
+            10.0,
+        ),
+        settle_seconds: r.float("Governor", "SettleSeconds", g.settle_seconds, 0.1, 10.0),
+        lower_above: r.float("Governor", "LowerAbove", g.lower_above, 0.8, 1.0),
+        lower_hold_seconds: r.float(
+            "Governor",
+            "LowerHoldSeconds",
+            g.lower_hold_seconds,
+            0.1,
+            10.0,
+        ),
+        hitch_factor: r.float("Governor", "HitchFactor", g.hitch_factor, 1.2, 5.0),
+        block_seconds: r.float("Governor", "BlockSeconds", g.block_seconds, 1.0, 300.0),
+        min_vram_free_mib: r.int(
+            "Governor",
+            "MinVramFreeMiB",
+            g.min_vram_free_mib,
+            0,
+            8192,
+            false,
+        ),
+    };
+    if governor.lower_above <= governor.raise_below {
+        r.warnings.push(format!(
+            "[Governor] LowerAbove ({}) must be above RaiseBelow ({}), using the defaults {} and {}",
+            governor.lower_above, governor.raise_below, g.lower_above, g.raise_below
+        ));
+        governor.raise_below = g.raise_below;
+        governor.lower_above = g.lower_above;
+    }
+
+    let k = d.knobs;
+    let knobs = KnobsCfg {
+        enable_object_distance: r.boolean(
+            "Knobs",
+            "EnableObjectDistance",
+            k.enable_object_distance,
+        ),
+        max_object_distance: r.max_step("MaxObjectDistance", k.max_object_distance),
+        enable_scatter_distance: r.boolean(
+            "Knobs",
+            "EnableScatterDistance",
+            k.enable_scatter_distance,
+        ),
+        max_scatter_distance: r.max_step("MaxScatterDistance", k.max_scatter_distance),
+        enable_terrain_distance: r.boolean(
+            "Knobs",
+            "EnableTerrainDistance",
+            k.enable_terrain_distance,
+        ),
+        max_terrain_distance: r.max_step("MaxTerrainDistance", k.max_terrain_distance),
+        deco_distance_scale: r.float(
+            "Knobs",
+            "DecoDistanceScale",
+            k.deco_distance_scale,
+            0.5,
+            1.0,
+        ),
+        distant_objects_scale: r.float(
+            "Knobs",
+            "DistantObjectsScale",
+            k.distant_objects_scale,
+            0.5,
+            1.0,
+        ),
+        terrain_ring_scale: r.float("Knobs", "TerrainRingScale", k.terrain_ring_scale, 1.0, 1.6),
+    };
+
+    r.report_unknown();
+    (
+        Config {
+            general,
+            governor,
+            knobs,
+        },
+        r.warnings,
+    )
+}
+
+/// Read `<dir>\enshrouded-headroom.ini`. If the file is missing, write `DEFAULT_INI` there and use
+/// the defaults. An existing file is never overwritten.
+pub fn load_or_create(dir: &Path) -> (Config, Vec<String>) {
+    let path = dir.join(INI_FILE_NAME);
+    match std::fs::read(&path) {
+        // Bytes that are not UTF-8 become U+FFFD instead of an error. A hand-edited file with one
+        // odd character in a comment must not cost the player their settings.
+        Ok(bytes) => parse(&String::from_utf8_lossy(&bytes)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let warnings = match write_default(dir, &path) {
+                Ok(()) => Vec::new(),
+                Err(error) => vec![format!(
+                    "cannot create {} ({error}), using the defaults",
+                    path.display()
+                )],
+            };
+            (Config::default(), warnings)
+        }
+        Err(error) => (
+            Config::default(),
+            vec![format!(
+                "cannot read {} ({error}), using the defaults",
+                path.display()
+            )],
+        ),
+    }
+}
+
+/// Write `DEFAULT_INI` to `path`, creating `dir` first. `create_new` makes sure a file that
+/// appeared in the meantime is never overwritten.
+fn write_default(dir: &Path, path: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    file.write_all(DEFAULT_INI.as_bytes())
+}
+
+/// A number as a person types it. A decimal comma (`0,9`) counts. `nan` and `inf` do not.
+fn parse_number(text: &str) -> Option<f64> {
+    let value: f64 = text.trim().replace(',', ".").parse().ok()?;
+    value.is_finite().then_some(value)
+}
+
+/// The parsed file plus the warnings so far. The typed getters mark each key they ask for, so the
+/// keys left over at the end are the unknown ones.
+struct Reader {
+    ini: Ini,
+    /// Lower-case `(section, key)` pairs that a getter has asked for.
+    used: HashSet<(String, String)>,
+    warnings: Vec<String>,
+}
+
+impl Reader {
+    /// The text of `[section] key`, or `None` if the file does not have it. A key written without
+    /// `=` has no text, which reads as an empty value.
+    fn raw(&mut self, section: &str, key: &str) -> Option<String> {
+        // configparser stores section and key names in lower case.
+        let (section, key) = (section.to_lowercase(), key.to_lowercase());
+        let text = self
+            .ini
+            .get_map_ref()
+            .get(&section)?
+            .get(&key)?
+            .clone()
+            .unwrap_or_default();
+        self.used.insert((section, key));
+        Some(text)
+    }
+
+    /// Warn that `text` is not a valid value for `[section] key`.
+    fn not_valid(&mut self, section: &str, key: &str, text: &str, expected: &str, default: &str) {
+        self.warnings.push(format!(
+            "[{section}] {key}: \"{text}\" is not {expected}, using the default {default}"
+        ));
+    }
+
+    /// Clamp into `lo..=hi`, with a warning if that changed the value.
+    fn clamp(&mut self, section: &str, key: &str, value: f64, lo: f64, hi: f64) -> f64 {
+        let kept = value.clamp(lo, hi);
+        if !(lo..=hi).contains(&value) {
+            self.warnings.push(format!(
+                "[{section}] {key}: {value} is outside {lo}..={hi}, using {kept}"
+            ));
+        }
+        kept
+    }
+
+    fn float(&mut self, section: &str, key: &str, default: f64, lo: f64, hi: f64) -> f64 {
+        let Some(text) = self.raw(section, key) else {
+            return default;
+        };
+        match parse_number(&text) {
+            Some(value) => self.clamp(section, key, value, lo, hi),
+            None => {
+                self.not_valid(section, key, &text, "a number", &default.to_string());
+                default
+            }
+        }
+    }
+
+    /// A whole number in `lo..=hi`. With `zero_ok`, `0` is allowed as well.
+    fn int(
+        &mut self,
+        section: &str,
+        key: &str,
+        default: u32,
+        lo: u32,
+        hi: u32,
+        zero_ok: bool,
+    ) -> u32 {
+        let Some(text) = self.raw(section, key) else {
+            return default;
+        };
+        let Ok(value) = text.parse::<i64>() else {
+            self.not_valid(section, key, &text, "a whole number", &default.to_string());
+            return default;
+        };
+        let kept = if zero_ok && value == 0 {
+            0
+        } else {
+            value.clamp(i64::from(lo), i64::from(hi))
+        };
+        if kept != value {
+            let range = if zero_ok {
+                format!("0 or {lo}..={hi}")
+            } else {
+                format!("{lo}..={hi}")
+            };
+            self.warnings.push(format!(
+                "[{section}] {key}: {value} is outside {range}, using {kept}"
+            ));
+        }
+        // `kept` is between 0 and `hi`, so this cannot fail.
+        u32::try_from(kept).unwrap_or(default)
+    }
+
+    /// A `[Knobs] Max*` key: a step from 0 to 4.
+    fn max_step(&mut self, key: &str, default: u8) -> u8 {
+        let step = self.int("Knobs", key, u32::from(default), 0, 4, false);
+        u8::try_from(step).unwrap_or(default)
+    }
+
+    fn boolean(&mut self, section: &str, key: &str, default: bool) -> bool {
+        let Some(text) = self.raw(section, key) else {
+            return default;
+        };
+        match text.to_ascii_lowercase().as_str() {
+            "1" | "true" => true,
+            "0" | "false" => false,
+            _ => {
+                let default_text = if default { "1" } else { "0" };
+                self.not_valid(section, key, &text, "0, 1, true or false", default_text);
+                default
+            }
+        }
+    }
+
+    /// One of the words in `options`, not case sensitive.
+    fn choice<T: Copy + PartialEq>(
+        &mut self,
+        section: &str,
+        key: &str,
+        default: T,
+        options: &[(&str, T)],
+    ) -> T {
+        let Some(text) = self.raw(section, key) else {
+            return default;
+        };
+        let word = text.to_ascii_lowercase();
+        if let Some(&(_, value)) = options.iter().find(|(name, _)| *name == word) {
+            return value;
+        }
+        let names: Vec<&str> = options.iter().map(|(name, _)| *name).collect();
+        let default_name = options
+            .iter()
+            .find(|(_, value)| *value == default)
+            .map_or("?", |(name, _)| *name);
+        let expected = format!("one of {}", names.join(", "));
+        self.not_valid(section, key, &text, &expected, default_name);
+        default
+    }
+
+    /// `auto`, `off` or a number of GiB from 2 to 8.
+    fn texture_budget(&mut self, default: TextureBudget) -> TextureBudget {
+        let Some(text) = self.raw("General", "TextureBudget") else {
+            return default;
+        };
+        match text.to_ascii_lowercase().as_str() {
+            "auto" => TextureBudget::Auto,
+            "off" => TextureBudget::Off,
+            _ => match parse_number(&text) {
+                Some(gib) => {
+                    TextureBudget::Gib(self.clamp("General", "TextureBudget", gib, 2.0, 8.0))
+                }
+                None => {
+                    self.not_valid(
+                        "General",
+                        "TextureBudget",
+                        &text,
+                        "auto, off or a number of GiB",
+                        "auto",
+                    );
+                    default
+                }
+            },
+        }
+    }
+
+    /// Warn about each section and key that no getter asked for.
+    fn report_unknown(&mut self) {
+        let mut unknown = Vec::new();
+        for (section, keys) in self.ini.get_map_ref() {
+            let Some(known) = SECTIONS.iter().find(|s| s.to_lowercase() == *section) else {
+                unknown.push(if section == "default" {
+                    // configparser files keys that come before any header under this name.
+                    "[default]: keys before the first section header, or a section called \
+                     default, are ignored"
+                        .to_owned()
+                } else {
+                    format!("[{section}]: unknown section, ignored")
+                });
+                continue;
+            };
+            for key in keys.keys() {
+                if !self.used.contains(&(section.clone(), key.clone())) {
+                    unknown.push(format!("[{known}] {key}: unknown key, ignored"));
+                }
+            }
+        }
+        // The map's order is not the file's order; sort so the log is the same every time.
+        unknown.sort();
+        self.warnings.extend(unknown);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// `target/test-tmp/<name>`, emptied first.
+    fn tempdir_in_target(name: &str) -> PathBuf {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-tmp")
+            .join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Parse a file that holds one key.
+    fn one(section: &str, key: &str, value: &str) -> (Config, Vec<String>) {
+        parse(&format!("[{section}]\n{key}={value}\n"))
+    }
+
+    /// Every value is inside its range, whatever the input was.
+    fn assert_in_range(c: &Config) {
+        let (g, v, k) = (&c.general, &c.governor, &c.knobs);
+        assert!(v.target_fps == 0 || (30..=360).contains(&v.target_fps));
+        assert!((4.0..=16.0).contains(&g.texture_reserve_gib));
+        if let TextureBudget::Gib(x) = g.texture_budget {
+            assert!((2.0..=8.0).contains(&x));
+        }
+        assert!((0.5..=10.0).contains(&v.window_seconds));
+        assert!((0.5..=0.99).contains(&v.raise_below));
+        assert!((0.8..=1.0).contains(&v.lower_above));
+        assert!(v.lower_above > v.raise_below);
+        for s in [v.raise_hold_seconds, v.settle_seconds, v.lower_hold_seconds] {
+            assert!((0.1..=10.0).contains(&s));
+        }
+        assert!((1.2..=5.0).contains(&v.hitch_factor));
+        assert!((1.0..=300.0).contains(&v.block_seconds));
+        assert!(v.min_vram_free_mib <= 8192);
+        for m in [
+            k.max_object_distance,
+            k.max_scatter_distance,
+            k.max_terrain_distance,
+        ] {
+            assert!(m <= 4);
+        }
+        assert!((0.5..=1.0).contains(&k.deco_distance_scale));
+        assert!((0.5..=1.0).contains(&k.distant_objects_scale));
+        assert!((1.0..=1.6).contains(&k.terrain_ring_scale));
+    }
+
+    /// The numeric value of a key, by its `.ini` name, for the range tables.
+    fn number(c: &Config, key: &str) -> f64 {
+        match key {
+            "TargetFps" => f64::from(c.governor.target_fps),
+            "TextureReserveGiB" => c.general.texture_reserve_gib,
+            "WindowSeconds" => c.governor.window_seconds,
+            "RaiseBelow" => c.governor.raise_below,
+            "RaiseHoldSeconds" => c.governor.raise_hold_seconds,
+            "SettleSeconds" => c.governor.settle_seconds,
+            "LowerAbove" => c.governor.lower_above,
+            "LowerHoldSeconds" => c.governor.lower_hold_seconds,
+            "HitchFactor" => c.governor.hitch_factor,
+            "BlockSeconds" => c.governor.block_seconds,
+            "MinVramFreeMiB" => f64::from(c.governor.min_vram_free_mib),
+            "MaxObjectDistance" => f64::from(c.knobs.max_object_distance),
+            "MaxScatterDistance" => f64::from(c.knobs.max_scatter_distance),
+            "MaxTerrainDistance" => f64::from(c.knobs.max_terrain_distance),
+            "DecoDistanceScale" => c.knobs.deco_distance_scale,
+            "DistantObjectsScale" => c.knobs.distant_objects_scale,
+            "TerrainRingScale" => c.knobs.terrain_ring_scale,
+            _ => panic!("no such numeric key {key}"),
+        }
+    }
+
+    // ---- The four tests from the task brief ----
+
+    #[test]
+    fn defaults_match_spec() {
+        let (c, w) = parse(DEFAULT_INI);
+        assert!(w.is_empty());
+        assert_eq!(c.governor.target_fps, 75);
+        assert!(matches!(c.general.async_compute, AsyncCompute::On));
+        assert!(matches!(c.general.reflex, ReflexMode::Game));
+        assert_eq!(c.governor.raise_below, 0.90);
+        assert_eq!(c.governor.lower_hold_seconds, 0.3);
+        assert_eq!(c.governor.min_vram_free_mib, 1024);
+        assert_eq!(c.knobs.max_scatter_distance, 4);
+    }
+
+    #[test]
+    fn bad_values_fall_back_and_warn() {
+        let (c, w) =
+            parse("[Governor]\nRaiseBelow=0,85\nLowerAbove=banana\nTargetFps=9999\n[Nope]\nX=1\n");
+        assert_eq!(c.governor.raise_below, 0.85); // decimal comma accepted
+        assert_eq!(c.governor.lower_above, 0.97); // garbage -> default
+        assert_eq!(c.governor.target_fps, 360); // clamped
+        assert!(w.len() >= 3); // garbage, clamp, unknown section
+    }
+
+    #[test]
+    fn inverted_thresholds_reset_both() {
+        let (c, w) = parse("[Governor]\nRaiseBelow=0.98\nLowerAbove=0.9\n");
+        assert_eq!(
+            (c.governor.raise_below, c.governor.lower_above),
+            (0.90, 0.97)
+        );
+        assert!(!w.is_empty());
+    }
+
+    #[test]
+    fn missing_file_writes_default() {
+        let d = tempdir_in_target("cfg_missing");
+        let (_, w) = load_or_create(&d);
+        assert!(w.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(d.join("enshrouded-headroom.ini")).unwrap(),
+            DEFAULT_INI
+        );
+    }
+
+    // ---- Defaults ----
+
+    #[test]
+    fn default_ini_agrees_with_builtin_defaults() {
+        let (parsed, w) = parse(DEFAULT_INI);
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(parsed, Config::default());
+    }
+
+    #[test]
+    fn every_default_matches_the_spec_table() {
+        let c = Config::default();
+        let g = c.general;
+        assert!(g.enabled);
+        assert_eq!(g.texture_budget, TextureBudget::Auto);
+        assert_eq!(g.texture_reserve_gib, 11.0);
+        assert_eq!(g.async_compute, AsyncCompute::On);
+        assert_eq!(g.reflex, ReflexMode::Game);
+        assert!(!g.allow_unknown_build);
+        assert_eq!(g.log_level, LogLevel::Info);
+        let v = c.governor;
+        assert_eq!(v.target_fps, 75);
+        assert_eq!(v.window_seconds, 2.0);
+        assert_eq!(v.raise_below, 0.90);
+        assert_eq!(v.raise_hold_seconds, 1.0);
+        assert_eq!(v.settle_seconds, 1.0);
+        assert_eq!(v.lower_above, 0.97);
+        assert_eq!(v.lower_hold_seconds, 0.3);
+        assert_eq!(v.hitch_factor, 2.0);
+        assert_eq!(v.block_seconds, 20.0);
+        assert_eq!(v.min_vram_free_mib, 1024);
+        let k = c.knobs;
+        assert!(k.enable_object_distance && k.enable_scatter_distance && k.enable_terrain_distance);
+        assert_eq!(
+            (
+                k.max_object_distance,
+                k.max_scatter_distance,
+                k.max_terrain_distance
+            ),
+            (4, 4, 4)
+        );
+        assert_eq!(
+            (
+                k.deco_distance_scale,
+                k.distant_objects_scale,
+                k.terrain_ring_scale
+            ),
+            (1.0, 1.0, 1.0)
+        );
+    }
+
+    #[test]
+    fn empty_file_gives_defaults_without_warnings() {
+        let (c, w) = parse("");
+        assert_eq!(c, Config::default());
+        assert!(w.is_empty());
+    }
+
+    #[test]
+    fn default_ini_starts_with_why_not_rust_line() {
+        assert!(DEFAULT_INI.starts_with("; WHY NOT RUST:"));
+    }
+
+    // ---- Ranges ----
+
+    /// (section, key, lowest allowed, highest allowed)
+    const RANGES: &[(&str, &str, f64, f64)] = &[
+        ("General", "TextureReserveGiB", 4.0, 16.0),
+        ("Governor", "WindowSeconds", 0.5, 10.0),
+        ("Governor", "RaiseHoldSeconds", 0.1, 10.0),
+        ("Governor", "SettleSeconds", 0.1, 10.0),
+        ("Governor", "LowerHoldSeconds", 0.1, 10.0),
+        ("Governor", "HitchFactor", 1.2, 5.0),
+        ("Governor", "BlockSeconds", 1.0, 300.0),
+        ("Governor", "MinVramFreeMiB", 0.0, 8192.0),
+        ("Knobs", "MaxObjectDistance", 0.0, 4.0),
+        ("Knobs", "MaxScatterDistance", 0.0, 4.0),
+        ("Knobs", "MaxTerrainDistance", 0.0, 4.0),
+        ("Knobs", "DecoDistanceScale", 0.5, 1.0),
+        ("Knobs", "DistantObjectsScale", 0.5, 1.0),
+        ("Knobs", "TerrainRingScale", 1.0, 1.6),
+    ];
+
+    #[test]
+    fn values_on_the_range_edges_are_kept_without_warnings() {
+        for &(section, key, lo, hi) in RANGES {
+            for edge in [lo, hi] {
+                let (c, w) = one(section, key, &edge.to_string());
+                assert!(w.is_empty(), "{key}={edge}: {w:?}");
+                assert_eq!(number(&c, key), edge, "{key}");
+            }
+        }
+    }
+
+    #[test]
+    fn values_outside_the_range_are_clamped_with_one_warning() {
+        for &(section, key, lo, hi) in RANGES {
+            for (given, expected) in [(lo - 1.0, lo), (hi + 1.0, hi)] {
+                let (c, w) = one(section, key, &given.to_string());
+                assert_eq!(number(&c, key), expected, "{key}={given}");
+                assert_eq!(w.len(), 1, "{key}={given}: {w:?}");
+                assert!(w[0].contains(key), "warning names the key: {}", w[0]);
+            }
+        }
+    }
+
+    #[test]
+    fn target_fps_is_zero_or_30_to_360() {
+        for (given, expected, warns) in [
+            ("0", 0, false),
+            ("30", 30, false),
+            ("75", 75, false),
+            ("360", 360, false),
+            ("1", 30, true),
+            ("29", 30, true),
+            ("-5", 30, true),
+            ("361", 360, true),
+            ("9999", 360, true),
+        ] {
+            let (c, w) = one("Governor", "TargetFps", given);
+            assert_eq!(c.governor.target_fps, expected, "TargetFps={given}");
+            assert_eq!(!w.is_empty(), warns, "TargetFps={given}: {w:?}");
+        }
+    }
+
+    #[test]
+    fn target_fps_is_a_governor_key_only() {
+        // Spec 6.4 and 8: TargetFps lives in [Governor].
+        let (c, w) = one("Governor", "TargetFps", "144");
+        assert_eq!(c.governor.target_fps, 144);
+        assert!(w.is_empty(), "{w:?}");
+        // In [General] it is an unknown key: ignored, with a warning.
+        let (c, w) = one("General", "TargetFps", "144");
+        assert_eq!(c.governor.target_fps, 75);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].to_lowercase().contains("targetfps"), "{}", w[0]);
+    }
+
+    #[test]
+    fn threshold_ranges() {
+        // RaiseBelow 0.5..=0.99 and LowerAbove 0.8..=1.0, with LowerAbove above RaiseBelow.
+        let (c, w) = parse("[Governor]\nRaiseBelow=0.5\nLowerAbove=0.8\n");
+        assert_eq!((c.governor.raise_below, c.governor.lower_above), (0.5, 0.8));
+        assert!(w.is_empty(), "{w:?}");
+        let (c, w) = parse("[Governor]\nRaiseBelow=0.99\nLowerAbove=1.0\n");
+        assert_eq!(
+            (c.governor.raise_below, c.governor.lower_above),
+            (0.99, 1.0)
+        );
+        assert!(w.is_empty(), "{w:?}");
+        // Too low: clamped.
+        let (c, w) = parse("[Governor]\nRaiseBelow=0.1\nLowerAbove=0.1\n");
+        assert_eq!((c.governor.raise_below, c.governor.lower_above), (0.5, 0.8));
+        assert_eq!(w.len(), 2, "{w:?}");
+        // Too high: clamped.
+        let (c, w) = parse("[Governor]\nRaiseBelow=5\nLowerAbove=5\n");
+        assert_eq!(
+            (c.governor.raise_below, c.governor.lower_above),
+            (0.99, 1.0)
+        );
+        assert_eq!(w.len(), 2, "{w:?}");
+    }
+
+    #[test]
+    fn lower_above_must_be_strictly_above_raise_below() {
+        let (c, w) = parse("[Governor]\nRaiseBelow=0.9\nLowerAbove=0.9\n");
+        assert_eq!(
+            (c.governor.raise_below, c.governor.lower_above),
+            (0.90, 0.97)
+        );
+        assert_eq!(w.len(), 1, "{w:?}");
+        // A lone RaiseBelow above the default LowerAbove is the same case.
+        let (c, w) = parse("[Governor]\nRaiseBelow=0.99\n");
+        assert_eq!(
+            (c.governor.raise_below, c.governor.lower_above),
+            (0.90, 0.97)
+        );
+        assert_eq!(w.len(), 1, "{w:?}");
+        // A clamp can create the inversion: LowerAbove 0.1 becomes 0.8, which is not above 0.9.
+        let (c, w) = parse("[Governor]\nLowerAbove=0.1\n");
+        assert_eq!(
+            (c.governor.raise_below, c.governor.lower_above),
+            (0.90, 0.97)
+        );
+        assert_eq!(w.len(), 2, "{w:?}");
+    }
+
+    // ---- Value forms ----
+
+    #[test]
+    fn texture_budget_forms() {
+        for (given, expected) in [
+            ("auto", TextureBudget::Auto),
+            ("AUTO", TextureBudget::Auto),
+            ("off", TextureBudget::Off),
+            (" Off ", TextureBudget::Off),
+            ("6", TextureBudget::Gib(6.0)),
+            ("6.5", TextureBudget::Gib(6.5)),
+            ("6,5", TextureBudget::Gib(6.5)),
+            ("2", TextureBudget::Gib(2.0)),
+            ("8", TextureBudget::Gib(8.0)),
+        ] {
+            let (c, w) = one("General", "TextureBudget", given);
+            assert_eq!(c.general.texture_budget, expected, "TextureBudget={given}");
+            assert!(w.is_empty(), "TextureBudget={given}: {w:?}");
+        }
+        for (given, expected) in [("1", 2.0), ("0", 2.0), ("9", 8.0), ("100", 8.0)] {
+            let (c, w) = one("General", "TextureBudget", given);
+            assert_eq!(c.general.texture_budget, TextureBudget::Gib(expected));
+            assert_eq!(w.len(), 1, "TextureBudget={given}: {w:?}");
+        }
+        let (c, w) = one("General", "TextureBudget", "lots");
+        assert_eq!(c.general.texture_budget, TextureBudget::Auto);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("auto"), "warning names the default: {}", w[0]);
+    }
+
+    #[test]
+    fn enum_values_are_read_without_regard_to_case() {
+        let (c, w) = parse(
+            "[General]\nAsyncCompute=Game\nReflex=BOOST\nLogLevel=debug\n\
+             [Knobs]\nEnableObjectDistance=0\n",
+        );
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(c.general.async_compute, AsyncCompute::Game);
+        assert_eq!(c.general.reflex, ReflexMode::Boost);
+        assert_eq!(c.general.log_level, LogLevel::Debug);
+        assert!(!c.knobs.enable_object_distance);
+        for (given, expected) in [
+            ("game", ReflexMode::Game),
+            ("off", ReflexMode::Off),
+            ("on", ReflexMode::On),
+            ("boost", ReflexMode::Boost),
+        ] {
+            assert_eq!(one("General", "Reflex", given).0.general.reflex, expected);
+        }
+        for (given, expected) in [
+            ("error", LogLevel::Error),
+            ("warn", LogLevel::Warn),
+            ("info", LogLevel::Info),
+            ("debug", LogLevel::Debug),
+        ] {
+            assert_eq!(
+                one("General", "LogLevel", given).0.general.log_level,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn booleans_accept_0_1_true_false() {
+        for (given, expected) in [
+            ("1", true),
+            ("0", false),
+            ("true", true),
+            ("false", false),
+            ("TRUE", true),
+            ("False", false),
+        ] {
+            let (c, w) = one("General", "Enabled", given);
+            assert_eq!(c.general.enabled, expected, "Enabled={given}");
+            assert!(w.is_empty(), "Enabled={given}: {w:?}");
+        }
+        let (c, w) = one("General", "AllowUnknownBuild", "1");
+        assert!(c.general.allow_unknown_build);
+        assert!(w.is_empty(), "{w:?}");
+    }
+
+    #[test]
+    fn log_level_maps_to_level_filter() {
+        assert_eq!(
+            log::LevelFilter::from(LogLevel::Error),
+            log::LevelFilter::Error
+        );
+        assert_eq!(
+            log::LevelFilter::from(LogLevel::Warn),
+            log::LevelFilter::Warn
+        );
+        assert_eq!(
+            log::LevelFilter::from(LogLevel::Info),
+            log::LevelFilter::Info
+        );
+        assert_eq!(
+            log::LevelFilter::from(LogLevel::Debug),
+            log::LevelFilter::Debug
+        );
+    }
+
+    #[test]
+    fn not_valid_values_use_the_default_with_one_warning_that_names_the_key() {
+        for (section, key, given) in [
+            ("General", "Enabled", "maybe"),
+            ("General", "AllowUnknownBuild", "2"),
+            ("General", "AsyncCompute", "off"),
+            ("General", "Reflex", "turbo"),
+            ("General", "LogLevel", "verbose"),
+            ("General", "TextureReserveGiB", "lots"),
+            ("Governor", "TargetFps", "fast"),
+            ("Governor", "TargetFps", "75.5"),
+            ("Governor", "WindowSeconds", "nan"),
+            ("Governor", "HitchFactor", "inf"),
+            ("Governor", "BlockSeconds", "-inf"),
+            ("Governor", "MinVramFreeMiB", "1e3"),
+            ("Governor", "MinVramFreeMiB", "99999999999999999999"),
+            ("Knobs", "MaxObjectDistance", "many"),
+            ("Knobs", "EnableScatterDistance", "yes"),
+            ("Knobs", "TerrainRingScale", "1.0.0"),
+            ("Governor", "SettleSeconds", ""),
+        ] {
+            let (c, w) = one(section, key, given);
+            assert_eq!(c, Config::default(), "{key}={given}");
+            assert_eq!(w.len(), 1, "{key}={given}: {w:?}");
+            assert!(w[0].contains(key), "warning names the key: {}", w[0]);
+        }
+        // A key with no `=` at all is an empty value.
+        let (c, w) = parse("[Governor]\nHitchFactor\n");
+        assert_eq!(c, Config::default());
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("HitchFactor"));
+    }
+
+    // ---- File structure ----
+
+    #[test]
+    fn unknown_sections_and_keys_warn_once_each() {
+        let (c, w) = parse(
+            "[General]\nColour=blue\nEnabled=1\n[Nope]\nX=1\nY=2\n[Knobs]\nMaxObjectDistance=3\nZed=1\n",
+        );
+        assert_eq!(c.knobs.max_object_distance, 3);
+        assert_eq!(w.len(), 3, "{w:?}"); // Colour, [Nope] once (not X and Y), Zed
+                                         // configparser lower-cases names it does not know, so match without regard to case.
+        assert!(w.iter().any(|m| m.to_lowercase().contains("nope")));
+        assert!(w.iter().any(|m| m.to_lowercase().contains("colour")));
+        assert!(w.iter().any(|m| m.to_lowercase().contains("zed")));
+        assert!(!w.iter().any(|m| m.contains("MaxObjectDistance")));
+    }
+
+    #[test]
+    fn keys_before_any_section_are_unknown() {
+        let (c, w) = parse("TargetFps=100\n[General]\nEnabled=0\n");
+        assert_eq!(c.governor.target_fps, 75);
+        assert!(!c.general.enabled);
+        assert_eq!(w.len(), 1, "{w:?}");
+    }
+
+    #[test]
+    fn section_and_key_names_are_not_case_sensitive() {
+        let (c, w) = parse("[GOVERNOR]\nraisebelow=0.8\n[knobs]\nMAXOBJECTDISTANCE=2\n");
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(c.governor.raise_below, 0.8);
+        assert_eq!(c.knobs.max_object_distance, 2);
+    }
+
+    #[test]
+    fn comments_blank_lines_and_spaces_are_ignored() {
+        let (c, w) = parse(
+            "; a comment\n# another\n\n  [Governor]  \n  RaiseBelow = 0.85   ; note\n\
+             \tHitchFactor:3\r\nBlockSeconds=30 # note\r\n",
+        );
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(c.governor.raise_below, 0.85);
+        assert_eq!(c.governor.hitch_factor, 3.0);
+        assert_eq!(c.governor.block_seconds, 30.0);
+    }
+
+    #[test]
+    fn a_leading_byte_order_mark_is_ignored() {
+        let (c, w) = parse("\u{feff}[General]\nEnabled=0\n");
+        assert!(w.is_empty(), "{w:?}");
+        assert!(!c.general.enabled);
+        // Also for the shipped default file saved by an editor that adds one.
+        let with_bom = format!("\u{feff}{DEFAULT_INI}");
+        assert_eq!(parse(&with_bom), parse(DEFAULT_INI));
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_parsed_gives_the_defaults_and_a_warning() {
+        for text in ["[General\nEnabled=0\n", "[Governor]\n=5\n"] {
+            let (c, w) = parse(text);
+            assert_eq!(c, Config::default(), "{text:?}");
+            assert_eq!(w.len(), 1, "{text:?}: {w:?}");
+        }
+    }
+
+    #[test]
+    fn hostile_input_never_panics_and_always_gives_a_valid_config() {
+        let long_key = format!("[Governor]\n{}=1\n", "k".repeat(100_000));
+        let long_value = format!("[Governor]\nRaiseBelow={}\n", "9".repeat(100_000));
+        let many_sections = "[a]\n".repeat(10_000);
+        let inputs = [
+            "",
+            "[",
+            "]",
+            "[]",
+            "[[[",
+            "]]][[[",
+            "=",
+            "==",
+            ":",
+            "[General]\n=1",
+            "[General",
+            "\u{0}",
+            "\u{feff}",
+            "\u{feff}\u{feff}[General]",
+            ";",
+            "#",
+            "[General]\nLogLevel=\u{ff}\u{fffd}\n",
+            "[General]\nTargetFps=\u{0}\n",
+            "[General]\nTargetFps=99999999999999999999999\n",
+            "[Governor]\nRaiseBelow=1e400\n",
+            "[Governor]\nRaiseBelow=-1e400\n",
+            "[Governor]\nRaiseBelow=1,2,3\n",
+            "[Governor]\nRaiseBelow=0,\n",
+            "[Governor]\nRaiseBelow=,\n",
+            "[Governor]\nLowerAbove=nan\nRaiseBelow=nan\n",
+            "[Knobs]\nMaxObjectDistance=-9223372036854775808\n",
+            "[Knobs]\nMaxObjectDistance=9223372036854775807\n",
+            "[\u{1F600}]\n\u{1F600}=\u{1F600}\n",
+            "[General]\r\r\nEnabled=1\r\n\r",
+            &long_key,
+            &long_value,
+            &many_sections,
+        ];
+        for text in inputs {
+            let (c, _w) = parse(text);
+            assert_in_range(&c);
+        }
+    }
+
+    // ---- load_or_create ----
+
+    #[test]
+    fn existing_file_is_read_and_left_alone() {
+        let d = tempdir_in_target("cfg_existing");
+        let path = d.join(INI_FILE_NAME);
+        let text = "[Governor]\nTargetFps=100\n[Knobs]\nMaxTerrainDistance=1\n";
+        std::fs::write(&path, text).unwrap();
+        let (c, w) = load_or_create(&d);
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(c.governor.target_fps, 100);
+        assert_eq!(c.knobs.max_terrain_distance, 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    }
+
+    #[test]
+    fn file_that_is_not_utf8_does_not_panic() {
+        let d = tempdir_in_target("cfg_not_utf8");
+        std::fs::write(
+            d.join(INI_FILE_NAME),
+            b"[Governor]\nTargetFps=60\n; caf\xe9 \xff\xfe\n",
+        )
+        .unwrap();
+        let (c, w) = load_or_create(&d);
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(c.governor.target_fps, 60);
+    }
+
+    #[test]
+    fn missing_folder_is_created_for_the_default_file() {
+        let d = tempdir_in_target("cfg_missing_folder").join("a").join("b");
+        let (c, w) = load_or_create(&d);
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(c, Config::default());
+        assert_eq!(
+            std::fs::read_to_string(d.join(INI_FILE_NAME)).unwrap(),
+            DEFAULT_INI
+        );
+    }
+
+    #[test]
+    fn unwritable_folder_gives_defaults_and_a_warning() {
+        let d = tempdir_in_target("cfg_unwritable");
+        std::fs::write(d.join("blocker"), "a file, not a folder").unwrap();
+        let (c, w) = load_or_create(&d.join("blocker").join("sub"));
+        assert_eq!(c, Config::default());
+        assert_eq!(w.len(), 1, "{w:?}");
+    }
+
+    #[test]
+    fn unreadable_settings_path_gives_defaults_and_a_warning_and_is_not_replaced() {
+        let d = tempdir_in_target("cfg_unreadable");
+        let path = d.join(INI_FILE_NAME);
+        std::fs::create_dir(&path).unwrap(); // a folder where the file should be
+        let (c, w) = load_or_create(&d);
+        assert_eq!(c, Config::default());
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(path.is_dir());
+    }
+}

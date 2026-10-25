@@ -2,6 +2,8 @@
 //!
 //! Task 1 scaffold: the plugin loads, writes one line to its log, and does nothing else.
 
+pub mod config;
+
 use std::ffi::OsString;
 use std::io::Write;
 use std::os::windows::ffi::OsStringExt;
