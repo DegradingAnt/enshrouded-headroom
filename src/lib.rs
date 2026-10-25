@@ -5,7 +5,9 @@
 
 pub mod config;
 pub mod guard;
+pub mod iat;
 pub mod log;
+pub mod patch;
 pub mod scan;
 pub mod sigs;
 

@@ -239,17 +239,17 @@ struct PeInfo {
     sections: Vec<SectionHeader>,
 }
 
-fn u16_at(b: &[u8], off: usize) -> Option<u16> {
+pub(crate) fn u16_at(b: &[u8], off: usize) -> Option<u16> {
     let end = off.checked_add(2)?;
     Some(u16::from_le_bytes(b.get(off..end)?.try_into().ok()?))
 }
 
-fn u32_at(b: &[u8], off: usize) -> Option<u32> {
+pub(crate) fn u32_at(b: &[u8], off: usize) -> Option<u32> {
     let end = off.checked_add(4)?;
     Some(u32::from_le_bytes(b.get(off..end)?.try_into().ok()?))
 }
 
-fn u64_at(b: &[u8], off: usize) -> Option<u64> {
+pub(crate) fn u64_at(b: &[u8], off: usize) -> Option<u64> {
     let end = off.checked_add(8)?;
     Some(u64::from_le_bytes(b.get(off..end)?.try_into().ok()?))
 }
@@ -305,7 +305,7 @@ fn parse_pe(b: &[u8]) -> Option<PeInfo> {
 /// True if a page with this protection can be read: one of the six readable protections, and
 /// not a guard page (a read of a guard page raises an exception). Modifier bits such as
 /// `PAGE_NOCACHE` do not matter.
-fn protect_is_readable(protect: u32) -> bool {
+pub(crate) fn protect_is_readable(protect: u32) -> bool {
     if protect & PAGE_GUARD != 0 {
         return false;
     }
@@ -324,7 +324,7 @@ fn protect_is_readable(protect: u32) -> bool {
 /// readable. Zero if `addr` is unmapped, reserved only, no-access or a guard page, or if its
 /// region belongs to a different allocation than the one starting at `alloc_base`. (A loaded
 /// image is one allocation, so a section slice can never run into an unrelated neighbour.)
-fn readable_run(addr: usize, alloc_base: usize) -> usize {
+pub(crate) fn readable_run(addr: usize, alloc_base: usize) -> usize {
     let mut info = MEMORY_BASIC_INFORMATION::default();
     // SAFETY: `info` is a valid buffer of exactly the size passed. VirtualQuery accepts any
     // address, reads no memory at it, and reports failure by returning 0.
@@ -349,7 +349,7 @@ fn readable_run(addr: usize, alloc_base: usize) -> usize {
 
 /// True if every byte of `[addr, addr + len)` is readable, walking region by region with `run`
 /// (see [`readable_run`]). An overflowing range, or a gap anywhere, gives false.
-fn walk_readable(addr: usize, len: usize, run: impl Fn(usize) -> usize) -> bool {
+pub(crate) fn walk_readable(addr: usize, len: usize, run: impl Fn(usize) -> usize) -> bool {
     let Some(end) = addr.checked_add(len) else {
         return false;
     };
