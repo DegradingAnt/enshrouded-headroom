@@ -80,6 +80,38 @@ Enum types: `keen::pc::RenderDistantObjectsSetting` and similar; member tables a
 
 Several signatures include the original constant, so a match also proves the expected original bytes are present.
 
+**Extended patterns (controller, 2026-10-25, for plan Task 4).** Two rows above stop before their patch sites, so a match proved nothing about the bytes to be patched. Both were extended to cover every patch byte, and each was re-checked against `enshrouded.exe` (sha256 b28b448a…): exactly 1 match each.
+- voxel High imms (0x1400f7f1f, 33 bytes; imms 32.0 / 128.0 / 160.0 at +15 / +22 / +29): `8b 4f 40 85 c9 74 ?? 83 f9 01 75 ?? c7 43 60 00 00 00 42 c7 43 64 00 00 00 43 c7 43 68 00 00 20 43`
+- async compute override (0x1408490d2, 19 bytes; the 16-byte patch at +3 ends at +19): `88 4d 3e 44 38 b6 89 52 03 00 74 ?? 0f b6 86 88 52 03 00`. Bytes +3..+19 on disk equal Task 8's `ORIGINAL`.
+
+
+## Scatter capacity audit: first pass (controller, 2026-10-25 22:2x; pre-research for plan Task 13)
+
+Probe: scratchpad `capaudit.py`. It scanned 13 functions: the seeds FUN_140074b50 / FUN_1400744e0 / FUN_1400767a0 / 0x14007521d, plus their direct callees under 0x4000 bytes.
+Hits, all in `FUN_1400744e0` (the allocation function):
+- `0x1400745e0` `mov [rsp+0x30], 0x14000` and `0x1400745ff` `mov [rsp+0x30], 0x14000`: the capacity argument for TWO scatter sets.
+- `0x1400745eb` / `0x14007460a` `mov [rsp+0x28], 0xf000`: a second size argument (61,440 = 0.75 × 0x14000), role unknown.
+- `0x14007468b` `mov r8d, 0xa0000` (= 0x14000 × 8) and `0x1400746a8` / `0x1400746c4` `mov r8d, 0x280000` (= 0x14000 × 32): buffer BYTE sizes derived from the capacity.
+
+**COVERAGE GAP:** the known shader constant `0x140074d52` (`scatteredObjectCapacity = 0x14000`) was NOT reported, although its function was a seed. The scan works per `.pdata` entry, and chunked functions are missed, so this audit is NOT exhaustive.
+**Second pass, chunk-aware (`capaudit2.py`, 2026-10-25 22:35):** it groups chained `.pdata` chunks (UNW_FLAG_CHAININFO) with their primary entry. FUN_140074b50 = 3 chunks, FUN_1400744e0 = 1, FUN_1400767a0 = 7; 26 functions scanned (the seeds and their direct callees). It now FINDS the known positive `0x140074d52`, which proves the fix. Full list in that scope: 8 sites:
+- `0x1400745e0`, `0x1400745ff`: capacity args 0x14000 (two scatter sets);
+- `0x1400745eb`, `0x14007460a`: args 0xf000, role UNKNOWN;
+- `0x14007468b`: 0xa0000 (= cap × 8);
+- `0x1400746a8`, `0x1400746c4`: 0x280000 (= cap × 32);
+- `0x140074d52`: shader constant.
+Scope limit: GPU shader code is not in the exe and was not audited.
+**Ruling for Task 13:** `cap_ok` stays false until the role of 0xf000 is known AND the shaders are confirmed to read the capacity only from the constant. Otherwise the grass knob tops out at 90 m.
+**Implication for Task 13:** doubling capacity needs at least 7 sites changed together (2× 0x14000 args, 0xa0000, 2× 0x280000, the shader constant, and the 0xf000 args to be understood). Unless a chunk-aware audit maps every use, `cap_ok` must be false: the grass knob stays at 90 m.
+
+
+## Reflex menu option location (controller, 2026-10-25; pre-research for plan Task 16)
+
+The machine graphics settings struct (reflection descriptors at `0x14177a370`.., VERIFIED by descriptor dump) has these fields:
+windowMode +0x0, windowPosition +0x4, windowSize +0xc, forceWindowClientSizeResolution +0x14, forceFullscreenResolution +0x1c, renderScale +0x24, automaticRenderScale +0x28, vsync +0x29 (bool), hdrSettings +0x2a, **nvidiaReflex +0x2c** (`NvidiaReflexModeSettings`), nvidiaReflexDefaultOff +0x30, **render +0x34** (the render-settings struct), renderPreferences +0x88, useDefaultRenderSettings +0x94.
+- The live render settings are at options+0x9f8 (getter `0x140e28400`, menu agent), so the machine struct is at options+0x9c4 and nvidiaReflex is at options+0x9f0.
+- `FUN_1400f72b0(scene, renderSettings, …)` receives the render-settings pointer as its 2nd argument, so **nvidiaReflex = `*(u32*)(renderSettings − 0x8)`** and vsync = `*(u8*)(renderSettings − 0xb)`. The Task 12 post-hook can publish both. HYPOTHESIS until it is read at run time; `NvidiaReflexModeSettings` members (VERIFIED, member table 0x141779b80, stride 0x28): **Off = 0, On = 1, Boost = 2**. The author's log shows "On" (= 1). There is also an `nvidiaReflexDefaultOff` field at +0x30.
+
 ## Dead ends
 
 - Ranking functions that read the settings offsets 0x2c–0x40 (`scan_fields.py`): 776 matches. Not selective.
@@ -117,3 +149,23 @@ Floor = the menu setting (step 0); never below it. A menu change re-reads the ba
 ## Mod direction (the author, 2026-10-25)
 
 Public Nexus mod. A Rust `.asi` plugin for Ultimate ASI Loader (latest is v10.0.0, 2026-10-21). An fps-target governor that only ADDS above the menu settings, never below them. Brainstorming: Section 1 structure has been proposed and is waiting for the author's answer.
+
+## Research results, 2026-10-25 (workflow wf_abc7d5af-ccd, 2 researchers + 2 refuters; both PARTLY, conclusions survive)
+Full write-ups: `research-2026-10-25-reflex.md` and `research-2026-10-25-scatter-capacity.md` in this folder.
+- **Reflex (T1 + T3):**
+  - No low-latency or Reflex API name appears in the exe or its five top-level DLLs.
+  - The game log shows that the driver offers `VK_NV_low_latency2` and that the game never enables it. The game enables `VK_KHR_present_id2` and `VK_KHR_present_wait2`, but only on non-AMD GPUs and NVIDIA drivers >= 0x9a438000.
+  - The game chains its own `VkPresentId2KHR` on its single present call (0x140fd529a). With vsync on, its limiter at 0x140fb0d35 keeps at most one present queued (`vkWaitForPresent2KHR`, 500 ms timeout).
+  - The settings hold TWO fields of the same Reflex enum: `nvidiaReflex` (+0x9f0, default On) and `nvidiaReflexDefaultOff` (+0x9f4, default Off). No `.text` code reads either field.
+- **Scatter capacity, CORRECTION to the audit above:**
+  - The 0xf000 values are GPU-counter WARN levels (75 %), and the 0x14000 at 0x1400745e0/0x1400745ff are counter CAP metadata. Neither is a buffer size.
+  - The buffers are fixed per scene view: `ScatteredObjectData[0x14000]` (0xa0000 B) and two `DetailScatteringInstanceData[0x14000]` (0x280000 B each).
+  - Both `FUN_140074b50` calls share counter A, so there is ONE 0x14000 budget, not two. Counter B is the per-model instance-offset counter.
+  - The exe has no CPU-side clamp. The cbuffer `scatteredObjectCapacity` (0x140074d52) is the only scattered-object bound. The brick gate has its own `maxCullElements` (`BrickCullingShaderParameters` +0xec8).
+  - Patching the "capacity alloc" signature would CAUSE the overflow, so that patch was removed from plan Task 13.
+  - Measurement path: the game reads the counters back on the CPU (last value at entry+0x14, peak at +0x1c, warn at +0x20, cap at +0x24).
+
+## Decisions (the author, 2026-10-25, second questionnaire)
+- The Reflex row is NOT shown in the in-game menu on Vulkan.
+- Reflex default: "On for NVIDIA". The `.ini` value `game` becomes `auto` (on for NVIDIA GPUs whose driver lists `VK_NV_low_latency2`).
+- The grass measurement tool goes into v1: a debug-only read of the game's scatter GPU-counter peak in dense grass, to compute a safe maximum distance.

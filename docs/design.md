@@ -66,7 +66,7 @@ The `_perf\Launch-Enshrouded.ps1` launcher from 2026-10-23 is replaced by this m
 | `build_id` | Hashes the game exe and compares it with the list of known builds (section 9). |
 | `scan` | Finds byte signatures (pattern + mask) in the game module. A signature counts only if it matches exactly once. |
 | `patch` | Checks the expected original bytes, then `VirtualProtect`, write, read back, `FlushInstructionCache`. Keeps the original bytes. |
-| `vk_wrap` | Wraps `GetProcAddress` → `vkGetInstanceProcAddr` → `vkGetDeviceProcAddr`, and from that chain `vkCreateDevice`, `vkCreateSwapchainKHR`, `vkQueuePresentKHR` (and, for Reflex, `vkQueueSubmit`/`vkQueueSubmit2`). |
+| `vk_wrap` | Wraps `GetProcAddress` → `vkGetInstanceProcAddr` → `vkGetDeviceProcAddr`, and from that chain `vkCreateDevice`, `vkCreateSwapchainKHR`, `vkQueuePresentKHR`. There is no submit wrapper (6.5). |
 | `texture_budget` | Raises the top row of the VRAM-tier texture table (6.1). |
 | `async_compute` | Reproduces the game's own `--enable-async-compute` override (6.2). |
 | `frame_timer` | Records present-to-present times (6.3). |
@@ -134,7 +134,7 @@ Method:
    - If `lpProcName` is an ordinal (value ≤ 0xFFFF), it passes the call through.
    - It compares names only when `hModule` is `vulkan-1.dll`, checked with `GetModuleHandleW`.
    - For `"vkGetInstanceProcAddr"` it returns `wrap_gipa`. NGX gets the same wrapper, which is harmless.
-3. `wrap_gipa` returns `wrap_create_device` for `"vkCreateDevice"` and `wrap_gdpa` for `"vkGetDeviceProcAddr"`. `wrap_gdpa` returns `wrap_present` for `"vkQueuePresentKHR"`, `wrap_create_swapchain` for `"vkCreateSwapchainKHR"`, and, only when Reflex is active, `wrap_submit` for `"vkQueueSubmit"` and `"vkQueueSubmit2"`. Every other name passes through.
+3. `wrap_gipa` returns `wrap_create_device` for `"vkCreateDevice"` and `wrap_gdpa` for `"vkGetDeviceProcAddr"`. `wrap_gdpa` returns `wrap_present` for `"vkQueuePresentKHR"` and `wrap_create_swapchain` for `"vkCreateSwapchainKHR"`. Every other name passes through.
 4. `wrap_present` stores a `QueryPerformanceCounter` stamp in a lock-free ring (the main swapchain only), runs the Reflex steps if Reflex is active (6.5), and calls the real present.
 
 No mid-function fallback in version 1. If the wrapper chain is not used (the log shows no `wrap_gipa` hand-out by the first present), the frame timer, the governor, Reflex and the texture budget are off for that session. The static patches still apply.
@@ -178,6 +178,12 @@ The governor is a pure state machine with unit tests (section 10).
 
 Fact: the exe contains none of `vkLatencySleepNV`, `vkSetLatencySleepModeNV`, `vkSetLatencyMarkerNV`, `VK_NV_low_latency`, `low_latency2`, `NvAPI` or `nvapi64` (whole-file ASCII and UTF-16 search, 2026-10-25). The menu has a Reflex option (`nvidiaReflex`), but the Vulkan path cannot call Reflex, so the option is very likely inert.
 
+Research, 2026-10-25 (`research-2026-10-25-reflex.md` in the author's notes, with a refuter check):
+- The game's DLLs contain no low-latency API either.
+- On Vulkan the Reflex row is not shown in the menu (the author, 2026-10-25), and no game code reads either Reflex settings field.
+- The game chains its own `VkPresentId2KHR` on every present. With vsync on, it runs its own present-wait limiter (`vkWaitForPresent2KHR`, at most one queued present, 500 ms timeout).
+- The mod never modifies `VkPresentInfoKHR` or its chain.
+
 On the author's machine (game log, 2026-10-25):
 - line 595: the driver offers `VK_NV_low_latency2`;
 - line 892: `timelineSemaphore=VK_TRUE` in the feature listing;
@@ -189,22 +195,23 @@ Method (NVIDIA only, and only if the driver lists `VK_NV_low_latency2`):
    - Otherwise, if a `VkPhysicalDeviceTimelineSemaphoreFeatures` struct is there, it sets it there.
    - Otherwise it chains a new `VkPhysicalDeviceTimelineSemaphoreFeatures`.
    - If the instance API version is below 1.2, it also adds `VK_KHR_timeline_semaphore`.
+   - If neither `VK_KHR_present_id` nor `VK_KHR_present_id2` is in the game's list, it adds `VK_KHR_present_id` (`VUID-vkCreateDevice-ppEnabledExtensionNames-01387`). The game drops `present_id2` on AMD, on NVIDIA drivers below 0x9a438000, and when the driver lacks it. If the driver lists neither, Reflex is off.
    - **If the modified call fails, it calls again with the game's original create info and turns Reflex off for the session** (review finding 1).
 2. **Swapchain.** `wrap_create_swapchain` chains `VkSwapchainLatencyCreateInfoNV { latencyModeEnable = TRUE }`. **If that call fails, it calls again without it** and Reflex stays off. On success it calls `vkSetLatencySleepModeNV(lowLatencyMode = TRUE, lowLatencyBoost per .ini, minimumIntervalUs = 0)`. It does this again on every swapchain re-creation.
-3. **Frame IDs.** The mod keeps its own frame counter, starting at 1. `VK_NV_low_latency2` present IDs are not the `VkPresentId2KHR` IDs (review finding 3, Vulkan refpage `VkSetLatencyMarkerInfoNV`). `wrap_submit` chains `VkLatencySubmissionPresentIdNV { presentID = current frame }` on each queue submit, so the driver can tie the GPU work to a frame.
+3. **Frame IDs.** The mod keeps its own frame counter, starting at 1. `VK_NV_low_latency2` present IDs are not the `VkPresentId2KHR` IDs (review finding 3, Vulkan refpage `VkSetLatencyMarkerInfoNV`). There is no submit wrapper. Implicit attribution ties pending submits to the frame at the next `vkQueuePresentKHR`, and the game presents from a single call site (0x140fd529a). `VkLatencySubmissionPresentIdNV` is optional and is ignored below specVersion 3 (ruling 2026-10-25, research item G10).
 4. **Per frame,** in `wrap_present`:
-   - set `PRESENT_START`, call the real present, set `PRESENT_END`;
-   - call `vkLatencySleepNV` with the mod's timeline semaphore and target value;
-   - wait with `vkWaitSemaphores` and a **10 ms timeout**. On a timeout, a lost device or an out-of-date swapchain, turn Reflex off for the session and log it (review finding 2);
-   - increment the frame counter and set `SIMULATION_START` and `RENDERSUBMIT_START` for the new frame.
+   - set `PRESENT_START`, call the real present, set `PRESENT_END`, and increment the frame counter;
+   - call `vkLatencySleepNV` with the mod's timeline semaphore and the next target value;
+   - wait with `vkWaitSemaphores` and a **100 ms hang-guard timeout**. Three timeouts in a row turn Reflex off for the session; a success resets the count; a lost device turns it off at once. If the real present returned `VK_ERROR_OUT_OF_DATE_KHR` or `VK_SUBOPTIMAL_KHR`, that frame's sleep is skipped and Reflex stays on (the new swapchain is re-armed when it is created). Each turn-off is logged (review finding 2; research items G7 and G8);
+   - set `SIMULATION_START` for the new frame. There is no `RENDERSUBMIT_START`.
    - The sleep runs on the thread that presents, before it starts the next frame's work. Whether that also delays the game's input sampling depends on the game's threading, which is not known. That is why Reflex is experimental and must be measured.
-5. **Measurement.** Every 5 s, the mod reads `vkGetLatencyTimingsNV` and logs the average latency from simulation start to GPU render end, and present to display.
+5. **Measurement.** Every 5 s, on the present thread (inside `wrap_present`, on that frame's swapchain, which is valid there), the mod reads `vkGetLatencyTimingsNV` and logs the average latency from simulation start to GPU render end, and present to display.
 
-`.ini`: `Reflex = game | off | on | boost`.
-- `game` follows the game's own `nvidiaReflex` menu option: On → on, Off → off, and the boost value if the menu has one. The option's memory location is found in the build from the machine-settings reflection descriptors (`NvidiaReflexModeSettings`), the same method used for the render settings. If it is not found, `game` acts as `off`.
-- Default: `game` (the author, 2026-10-25).
+`.ini`: `Reflex = auto | off | on | boost`.
+- `auto`: on for NVIDIA GPUs whose driver lists `VK_NV_low_latency2`, and off otherwise. The game's own `nvidiaReflex` option is not read: it is not shown on Vulkan, and no game code reads it.
+- Default: `auto` (the author, 2026-10-25: "On for NVIDIA"). This replaces the earlier `game` value, which followed a menu option that does not exist on Vulkan.
 
-Proof: the mod log shows the extension and latency mode enabled, and the logged latency is lower with Reflex on than off, at the same spot and the same fps. If it is not lower, the feature stays off by default.
+Proof: the mod log shows the extension and latency mode enabled, and the logged latency is lower with Reflex on than off, at the same spot and the same fps. If it is not lower, that result goes to the author, who decides the default.
 
 Types: `ash` 0.38.0 has `SwapchainLatencyCreateInfoNV` but not every newer struct. Missing structs are defined in the mod as `#[repr(C)]` from the Vulkan headers.
 
@@ -291,7 +298,7 @@ The governor raises 7.1, then 7.2, then 7.3. The order is re-checked after the i
 - `Enabled = 1 | 0`
 - `TextureBudget = auto | off | <GiB>` (reserve key `TextureReserveGiB = 11`)
 - `AsyncCompute = on | game`
-- `Reflex = game | off | on | boost`
+- `Reflex = auto | off | on | boost`
 - `AllowUnknownBuild = 0 | 1`
 - `LogLevel = error | warn | info | debug`
 
@@ -314,7 +321,7 @@ Unknown keys and out-of-range values are logged. Out-of-range values are clamped
   - On an unknown build, only API-level features apply: the frame timer, the governor's timing, Reflex, and the texture budget, which needs a full 80-byte table match. Code patches and code hooks stay off, unless `AllowUnknownBuild = 1` (review finding 10). The log says which applied.
   - A game update therefore turns the knobs off until the mod is updated, instead of risking a crash.
 - **Driver refusals.** Changed `vkCreateDevice` and `vkCreateSwapchainKHR` calls are retried with the game's original arguments if they fail. The feature then stays off.
-- **No waits without timeouts** on game threads. The Reflex wait is 10 ms.
+- **No waits without timeouts** on game threads. The Reflex wait has a 100 ms hang-guard timeout (6.5).
 - **Panics.** Every extern function catches unwinds and falls back to the original.
 - **Memory access.** Hooks read only the arguments the game passes in, at that moment. The governor never reads game memory. Access violations cannot be caught by `catch_unwind`, so the design avoids the stale pointers that would cause them (review finding 11).
 - **Original bytes** are kept for every patch. They are not restored at process exit.
@@ -385,7 +392,7 @@ In-game checks on the author's machine:
 
 1. Async compute default: `on` for everyone.
 2. Byte signatures: published in the public repo (an exception to the private rule).
-3. Reflex default: `game`, which follows the in-game Reflex option.
+3. Reflex default: `auto`, meaning on for NVIDIA (the author, 2026-10-25). It replaces `game`: the in-game option is not shown on Vulkan.
 4. Licence: MIT.
 5. Name: `enshrouded-headroom` for now; rename before the Nexus release.
 6. Spec v2: approved.
