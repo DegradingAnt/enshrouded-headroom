@@ -6,6 +6,8 @@
 pub mod config;
 pub mod guard;
 pub mod log;
+pub mod scan;
+pub mod sigs;
 
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
