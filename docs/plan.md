@@ -35,11 +35,12 @@
 - Every extern function wraps its body in `guard(...)` (Task 3), which runs the original on a panic.
 
 **Defaults** (spec sections 6.4 and 8)
-- `[General]`: `TargetFps=75`, `TextureBudget=auto`, `TextureReserveGiB=11`, `AsyncCompute=on`, `Reflex=game`, `AllowUnknownBuild=0`.
+- `[General]`: `TextureBudget=auto`, `TextureReserveGiB=11`, `AsyncCompute=on`, `Reflex=game`, `AllowUnknownBuild=0`. (`TargetFps` is a `[Governor]` key, per spec 6.4 and 8; ruling 2026-10-25.)
 - `[Governor]`:
 
   | Key | Default |
   |---|---|
+  | `TargetFps` | 75 |
   | `WindowSeconds` | 2 |
   | `RaiseBelow` | 0.90 |
   | `RaiseHoldSeconds` | 1.0 |
@@ -179,7 +180,7 @@ C:\Modding\Enshrouded\
 #[test] fn defaults_match_spec() {
     let (c, w) = parse(DEFAULT_INI);
     assert!(w.is_empty());
-    assert_eq!(c.general.target_fps, 75);
+    assert_eq!(c.governor.target_fps, 75);
     assert!(matches!(c.general.async_compute, AsyncCompute::On));
     assert!(matches!(c.general.reflex, ReflexMode::Game));
     assert_eq!(c.governor.raise_below, 0.90);
@@ -191,7 +192,7 @@ C:\Modding\Enshrouded\
     let (c, w) = parse("[Governor]\nRaiseBelow=0,85\nLowerAbove=banana\nTargetFps=9999\n[Nope]\nX=1\n");
     assert_eq!(c.governor.raise_below, 0.85);      // decimal comma accepted
     assert_eq!(c.governor.lower_above, 0.97);      // garbage -> default
-    assert_eq!(c.general.target_fps, 360);         // clamped
+    assert_eq!(c.governor.target_fps, 360);        // clamped
     assert!(w.len() >= 3);                         // garbage, clamp, unknown section
 }
 #[test] fn inverted_thresholds_reset_both() {
