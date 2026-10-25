@@ -1,11 +1,13 @@
 //! enshrouded-headroom: an ASI plugin for Enshrouded.
 //!
-//! Task 1 scaffold: the plugin loads, writes one line to its log, and does nothing else.
+//! For now the plugin loads, starts its log, writes one line to it, and does nothing else. The
+//! panic guard in [`guard`] is ready for the hooks that later tasks add.
 
 pub mod config;
+pub mod guard;
+pub mod log;
 
 use std::ffi::OsString;
-use std::io::Write;
 use std::os::windows::ffi::OsStringExt;
 use std::path::PathBuf;
 
@@ -16,8 +18,6 @@ use windows_sys::Win32::System::LibraryLoader::{
     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
 };
 use windows_sys::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
-
-const LOG_FILE_NAME: &str = "enshrouded-headroom.log";
 
 /// Directory that holds this module (the `.asi`), or `None` if Windows cannot tell us.
 fn module_dir() -> Option<PathBuf> {
@@ -45,23 +45,21 @@ fn module_dir() -> Option<PathBuf> {
     path.parent().map(PathBuf::from)
 }
 
-/// Create (or truncate) the log next to the module and write the "loaded" line.
-/// Task 3 replaces this with the fern logger; failures are ignored on purpose.
-fn write_loaded_line() {
-    let Some(dir) = module_dir() else { return };
-    if let Ok(mut file) = std::fs::File::create(dir.join(LOG_FILE_NAME)) {
-        let _ = writeln!(
-            file,
-            "enshrouded-headroom {} loaded",
-            env!("CARGO_PKG_VERSION")
-        );
-    }
+/// Start the log (next to the module, or in `%LOCALAPPDATA%` as a fallback) and write the
+/// "loaded" line through it.
+///
+/// `self::log` is this crate's logging module; the `log` crate is `::log` at the crate root.
+fn start() {
+    // No module folder (Windows could not tell us): an empty path sends `init` to the fallback.
+    let dir = module_dir().unwrap_or_default();
+    self::log::init(&dir, ::log::LevelFilter::Info);
+    ::log::info!("enshrouded-headroom {} loaded", env!("CARGO_PKG_VERSION"));
 }
 
 /// Called by Ultimate ASI Loader once the game process is up. Must never unwind into the loader.
 #[no_mangle]
 pub extern "C" fn InitializeASI() {
-    let _ = std::panic::catch_unwind(write_loaded_line);
+    let _ = std::panic::catch_unwind(start);
 }
 
 /// `DllMain` only turns off thread notifications; all real work waits for `InitializeASI`.
