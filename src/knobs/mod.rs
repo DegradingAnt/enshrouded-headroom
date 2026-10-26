@@ -9,7 +9,7 @@
 //! Everything is an atomic, so a hook never blocks, allocates or takes a lock. An `f32` is kept as
 //! its bits (`to_bits` / `from_bits`) in an `AtomicU32`.
 //!
-//! This module also holds the MinHook helpers: [`create_and_queue`] creates a hook and queues it,
+//! This module also holds the MinHook helpers: `create_and_queue` creates a hook and queues it,
 //! and [`enable_queued_hooks`] enables every queued hook at once. `entry::start` calls that once,
 //! as its last step, so every code hook goes live in one batch.
 
@@ -134,7 +134,7 @@ pub const TERRAIN_STEPS: [f32; 5] = [1.0, 1.25, 1.5, 1.75, 2.0];
 
 // ---- MinHook --------------------------------------------------------------------------------
 
-/// Hooks that [`create_and_queue`] queued and [`apply_queued`] has not applied yet.
+/// Hooks that `create_and_queue` queued and [`apply_queued`] has not applied yet.
 static QUEUED: AtomicU32 = AtomicU32::new(0);
 
 /// Create a MinHook hook from `target` to `detour` and queue it to be enabled. Returns the

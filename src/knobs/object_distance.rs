@@ -11,7 +11,7 @@
 //!    which the governor uses as its world-rendering signal;
 //! 2. publishes the game's object multiplier (`+0x33c`) as `OBJECT`'s baseline, but only when it
 //!    is exactly a value the game writes (3.0, 2.0 or 1.0); any other value is counted in
-//!    `OBJECT_UNKNOWN_BASELINE` and both fields are left alone (the rule in [`post_work`]);
+//!    `OBJECT_UNKNOWN_BASELINE` and both fields are left alone (the rule in `post_work`);
 //! 3. for a game value, and with `EnableObjectDistance = 1` only, multiplies the two pixel-size
 //!    multipliers (`+0x33c`, `+0x340`) by `OBJECT`'s factor, clamped to `[0.5, 1.0]`. A smaller
 //!    multiplier culls less, so a factor below 1.0 draws farther and is never below the menu
@@ -66,7 +66,7 @@ fn is_game_value(v: f32) -> bool {
     GAME_MAIN_VALUES.contains(&v.to_bits())
 }
 
-/// Test only: makes [`post_work`] panic at its top, so a test can drive the real detour's panic
+/// Test only: makes `post_work` panic at its top, so a test can drive the real detour's panic
 /// path. Not in a non-test build.
 #[cfg(test)]
 static PANIC_IN_POST: AtomicBool = AtomicBool::new(false);
@@ -101,7 +101,7 @@ pub unsafe fn apply_to_scene(scene: *mut u8, factor: f32) {
     }
 }
 
-/// Publish what the game wrote. Reads only. See [`publish_checked`], which this is.
+/// Publish what the game wrote. Reads only. See `publish_checked`, which this is.
 ///
 /// # Safety
 ///
