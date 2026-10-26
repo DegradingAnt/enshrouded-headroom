@@ -16,11 +16,12 @@
 pub mod object_distance;
 
 use std::ffi::c_void;
-use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use log::Level;
-use minhook::MinHook;
+use minhook::{MinHook, MH_STATUS};
+
+use crate::guard::catch;
 
 /// One knob's shared state.
 ///
@@ -79,6 +80,13 @@ impl KnobShared {
         self.last_seen_qpc.store(now_qpc, Ordering::Release);
     }
 
+    /// Record the time only, without a baseline: the hook ran, but what it read was not a value
+    /// the game writes (see `object_distance`). Game thread, from a hook. `Release`, like
+    /// [`publish`](KnobShared::publish).
+    pub fn seen(&self, now_qpc: u64) {
+        self.last_seen_qpc.store(now_qpc, Ordering::Release);
+    }
+
     /// The last published baseline and the change counter. Governor thread.
     pub fn baseline(&self) -> (f32, u32) {
         let seq = self.baseline_seq.load(Ordering::Acquire);
@@ -109,6 +117,12 @@ pub static TERRAIN: KnobShared = KnobShared::new(1.0);
 /// `OBJECT.last_seen()`). 0 before the first publish, which keeps the scatter knob off.
 pub static SCATTER_LEVEL: AtomicU32 = AtomicU32::new(0);
 
+/// How many calls of the scene-settings hook found a value at `scene+0x33c` that the game never
+/// writes, so they published no baseline and scaled nothing (`object_distance`, rule in
+/// `post_work`). Task 15 reports it. `Relaxed`, and it wraps; it is stored before the call's
+/// `OBJECT.seen()`, so a reader that sees that time also sees the count.
+pub static OBJECT_UNKNOWN_BASELINE: AtomicU32 = AtomicU32::new(0);
+
 /// Object factor for each step. Step 0 is the player's menu value.
 pub const OBJECT_STEPS: [f32; 5] = [1.0, 0.85, 0.72, 0.61, 0.52];
 
@@ -122,16 +136,6 @@ pub const TERRAIN_STEPS: [f32; 5] = [1.0, 1.25, 1.5, 1.75, 2.0];
 
 /// Hooks that [`create_and_queue`] queued and [`apply_queued`] has not applied yet.
 static QUEUED: AtomicU32 = AtomicU32::new(0);
-
-/// Run `f` and turn a panic into `Err`. The `minhook` crate panics when `MH_Initialize` fails,
-/// and that must not stop the rest of `entry::start`. The panic text is already in the log (the
-/// panic hook); the payload is forgotten, not dropped, for the reason given in `guard`.
-fn catch<T>(what: &str, f: impl FnOnce() -> T) -> Result<T, String> {
-    catch_unwind(AssertUnwindSafe(f)).map_err(|payload| {
-        std::mem::forget(payload);
-        format!("{what}: MinHook panicked")
-    })
-}
 
 /// Create a MinHook hook from `target` to `detour` and queue it to be enabled. Returns the
 /// trampoline, the address that runs the original `target`.
@@ -191,11 +195,18 @@ pub fn apply_queued() -> Result<u32, String> {
         MinHook::apply_queued()
     })? {
         Ok(()) => Ok(queued),
-        Err(status) => Err(format!(
-            "MinHook could not enable the {queued} queued hook(s): {status:?}; a hook that is not \
-             enabled does nothing"
-        )),
+        Err(status) => Err(not_all_enabled_text(queued, status)),
     }
+}
+
+/// The text for a failed `MH_ApplyQueued`. It enables the hooks in the order they were created and
+/// stops at the first failure (MinHook `hook.c`), so the hooks before the failing one are live and
+/// the rest are not.
+fn not_all_enabled_text(queued: u32, status: MH_STATUS) -> String {
+    format!(
+        "MinHook could not enable all {queued} queued hook(s) ({status:?}); hooks queued before \
+         the failing one are live"
+    )
 }
 
 /// The log line for [`apply_queued`]'s result; `None` when nothing was queued.
@@ -308,12 +319,22 @@ mod tests {
     }
 
     #[test]
-    fn a_panic_inside_minhook_comes_back_as_an_error() {
-        let why = catch("create the hook", || -> u32 {
-            panic!("MH_Initialize failed")
-        })
-        .unwrap_err();
-        assert!(why.contains("create the hook"), "{why}");
-        assert_eq!(catch("x", || 7), Ok(7));
+    fn a_failed_apply_says_that_hooks_before_the_failing_one_are_live() {
+        // MH_ApplyQueued enables in order and stops at the first failure (hook.c).
+        assert_eq!(
+            not_all_enabled_text(2, MH_STATUS::MH_ERROR_MEMORY_PROTECT),
+            "MinHook could not enable all 2 queued hook(s) (MH_ERROR_MEMORY_PROTECT); hooks \
+             queued before the failing one are live"
+        );
+    }
+
+    #[test]
+    fn seen_records_the_time_only() {
+        let k = KnobShared::new(1.0);
+        k.publish(2.0, 5);
+        k.seen(9);
+        assert_eq!(k.last_seen(), 9);
+        assert_eq!(k.baseline(), (2.0, 1), "no baseline, no change counted");
+        assert_eq!(k.value(), 1.0);
     }
 }

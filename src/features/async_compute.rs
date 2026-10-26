@@ -55,7 +55,7 @@ use windows_sys::Win32::System::Environment::GetCommandLineW;
 use crate::config::AsyncCompute;
 use crate::entry;
 use crate::patch::{write_checked, PatchError};
-use crate::scan::{find_in_sections, main_module, Module, Pattern, ScanError};
+use crate::scan::{find_in_sections, main_module, Module, Pattern};
 use crate::sigs::ASYNC_OVERRIDE;
 
 /// The 16 bytes at +3 of the signature's match, as the game has them: `cmp [rsi+0x35289], r14b`,
@@ -217,7 +217,7 @@ pub unsafe fn apply(m: &Module) -> Result<(), String> {
         Pattern::parse(ASYNC_OVERRIDE.pattern).map_err(|error| format!("off: {name}: {error}"))?;
     let found = find_in_sections(m, ASYNC_OVERRIDE.sections, &pattern).map_err(|error| {
         log::debug!("async compute: {name}: {error}");
-        scan_failure_text(&error)
+        format!("off: {}", error.player_text())
     })?;
     let site = found
         .checked_add(ASYNC_OVERRIDE.patch_offset())
@@ -227,22 +227,6 @@ pub unsafe fn apply(m: &Module) -> Result<(), String> {
     // `site`. The 16 bytes at `site` end at the end of the 19-byte match `find_in_sections` just
     // found in `.text`, in the mapped, readable memory of `m`.
     unsafe { write_site(site) }.map_err(|error| failure_text(site, error))
-}
-
-/// The log text for a signature that did not match exactly once, starting with what became of
-/// the feature.
-fn scan_failure_text(error: &ScanError) -> String {
-    match error {
-        ScanError::Multiple(count) => format!(
-            "off: the game code matched {count} times, not once (another tool or a different \
-             build may have changed it)"
-        ),
-        ScanError::NotFound | ScanError::BadPattern(_) => {
-            "off: the game code was not found (another tool or a different build may have \
-             changed it)"
-                .to_owned()
-        }
-    }
 }
 
 /// The body of [`init`], with the command line, the code-patch answer and the patching passed in.

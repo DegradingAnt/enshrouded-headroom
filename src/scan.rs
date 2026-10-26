@@ -55,6 +55,24 @@ impl fmt::Display for ScanError {
 
 impl std::error::Error for ScanError {}
 
+impl ScanError {
+    /// The log text for a player: what happened to the game code, not the scan's details (those
+    /// go to the debug log). It does not blame one cause. The caller adds its own prefix.
+    pub fn player_text(&self) -> String {
+        match self {
+            ScanError::Multiple(count) => format!(
+                "the game code matched {count} times, not once (another tool or a different \
+                 build may have changed it)"
+            ),
+            ScanError::NotFound | ScanError::BadPattern(_) => {
+                "the game code was not found (another tool or a different build may have \
+                 changed it)"
+                    .to_owned()
+            }
+        }
+    }
+}
+
 impl Pattern {
     /// Parse space-separated tokens: two hex digits for a byte, `??` for a wildcard.
     ///
@@ -668,6 +686,22 @@ mod tests {
             Pattern::parse("zz"),
             Err(ScanError::BadPattern(_))
         ));
+    }
+
+    #[test]
+    fn player_text_says_what_happened_and_not_the_scan_details() {
+        let not_found = "the game code was not found (another tool or a different build may \
+                         have changed it)";
+        assert_eq!(ScanError::NotFound.player_text(), not_found);
+        assert_eq!(
+            ScanError::BadPattern("bad token".into()).player_text(),
+            not_found
+        );
+        assert_eq!(
+            ScanError::Multiple(3).player_text(),
+            "the game code matched 3 times, not once (another tool or a different build may \
+             have changed it)"
+        );
     }
 
     #[test]

@@ -119,22 +119,41 @@ pub fn guard<T>(f: Feature, fallback: impl FnOnce() -> T, body: impl FnOnce() ->
     if is_disabled(f) {
         return fallback();
     }
-    // AssertUnwindSafe: once `disable` has run, no call that starts later runs `body`, so those
+    // Unwind safety: once `disable` has run, no call that starts later runs `body`, so those
     // calls never see state this panic left half-written. A call already in flight on another
     // thread still can. Hook bodies must therefore keep their atomics consistent at every point
     // where they can panic.
-    match catch_unwind(AssertUnwindSafe(body)) {
+    match catch_panic(body) {
         Ok(value) => value,
-        Err(payload) => {
-            let why = format!("panic: {}", payload_message(payload.as_ref()));
-            // Never drop the payload: `panic_any` can carry a value whose destructor panics, and
-            // that panic would unwind out of this function. Forgetting leaks a few bytes, once
-            // per disabled feature.
-            std::mem::forget(payload);
-            disable(f, &why);
+        Err(message) => {
+            disable(f, &format!("panic: {message}"));
             fallback()
         }
     }
+}
+
+/// Run `f` and turn a panic into `Err("<what>: panic: <message>")`. For code that has no
+/// [`Feature`] to switch off, such as a start-up call into a crate that can panic (the `minhook`
+/// crate panics when `MH_Initialize` fails). Nothing is disabled and nothing is logged here; the
+/// panic hook logs the panic itself.
+///
+/// Unwind safety is the caller's: after an `Err`, the caller must not rely on state that `f` was
+/// changing.
+pub fn catch<T>(what: &str, f: impl FnOnce() -> T) -> Result<T, String> {
+    catch_panic(f).map_err(|message| format!("{what}: panic: {message}"))
+}
+
+/// `f()`, or the text of its panic. The one place this module handles a panic payload; the
+/// callers ([`guard`], [`catch`]) give the unwind-safety argument for their own `f`.
+fn catch_panic<T>(f: impl FnOnce() -> T) -> Result<T, String> {
+    catch_unwind(AssertUnwindSafe(f)).map_err(|payload| {
+        let message = payload_message(payload.as_ref()).to_owned();
+        // Never drop the payload: `panic_any` can carry a value whose destructor panics, and that
+        // panic would unwind out of this function. Forgetting leaks a few bytes, once per caught
+        // panic.
+        std::mem::forget(payload);
+        message
+    })
 }
 
 /// The text of a panic payload: `panic!("literal")` and `panic!("{x}")` give a `&str` or a
@@ -265,6 +284,22 @@ mod tests {
         );
         assert_eq!(value, 1);
         assert!(is_disabled(Feature::StartupScales));
+    }
+
+    #[test]
+    fn catch_returns_the_value_or_the_panic_text() {
+        assert_eq!(catch("x", || 7), Ok(7));
+        let why = catch("create the hook", || -> u32 {
+            panic!("MH_Initialize failed")
+        })
+        .unwrap_err();
+        assert_eq!(why, "create the hook: panic: MH_Initialize failed");
+    }
+
+    #[test]
+    fn catch_survives_a_payload_whose_drop_panics() {
+        let why = catch("apply", || -> u32 { std::panic::panic_any(DropBomb) }).unwrap_err();
+        assert_eq!(why, "apply: panic: <non-string panic payload>");
     }
 
     #[test]

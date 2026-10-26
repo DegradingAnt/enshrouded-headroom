@@ -7,12 +7,15 @@
 //! (RCX scene, RDX render settings, R8 three dwords), no return value, a leaf function.
 //!
 //! After the original returns, the hook ([`scene_settings_detour`]):
-//! 1. always publishes the game's object multiplier (`+0x33c`) as `OBJECT`'s baseline, the
-//!    detail-scattering level (`+0x290`) to `SCATTER_LEVEL`, and the time, which the governor
-//!    uses as its world-rendering signal;
-//! 2. with `EnableObjectDistance = 1` only, multiplies the two pixel-size multipliers (`+0x33c`,
-//!    `+0x340`) by `OBJECT`'s factor, clamped to `[0.5, 1.0]`. A smaller multiplier culls less,
-//!    so a factor below 1.0 draws farther and is never below the menu value.
+//! 1. always publishes the detail-scattering level (`+0x290`) to `SCATTER_LEVEL` and the time,
+//!    which the governor uses as its world-rendering signal;
+//! 2. publishes the game's object multiplier (`+0x33c`) as `OBJECT`'s baseline, but only when it
+//!    is exactly a value the game writes (3.0, 2.0 or 1.0); any other value is counted in
+//!    `OBJECT_UNKNOWN_BASELINE` and both fields are left alone (the rule in [`post_work`]);
+//! 3. for a game value, and with `EnableObjectDistance = 1` only, multiplies the two pixel-size
+//!    multipliers (`+0x33c`, `+0x340`) by `OBJECT`'s factor, clamped to `[0.5, 1.0]`. A smaller
+//!    multiplier culls less, so a factor below 1.0 draws farther and is never below the menu
+//!    value.
 //!
 //! The hook is created and queued by [`install`] and enabled with every other queued hook at the
 //! end of `entry::start` (`knobs::enable_queued_hooks`).
@@ -21,12 +24,12 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use log::Level;
 
-use super::{create_and_queue, OBJECT, SCATTER_LEVEL};
+use super::{create_and_queue, OBJECT, OBJECT_UNKNOWN_BASELINE, SCATTER_LEVEL};
 use crate::config::KnobsCfg;
 use crate::entry;
 use crate::frame_timer::qpc_now;
 use crate::guard::{guard, Feature};
-use crate::scan::{find_in_sections, main_module, Module, Pattern, ScanError};
+use crate::scan::{find_in_sections, main_module, Module, Pattern};
 use crate::sigs::SCENE_SETTINGS_FN;
 
 /// `scene+0x33c` (f32): the pixel-size multiplier of the main GPU culling pass. The game writes
@@ -52,6 +55,21 @@ static TRAMPOLINE: AtomicUsize = AtomicUsize::new(0);
 
 /// `EnableObjectDistance`. Set by [`init`] before the hook is enabled; read by the detour.
 static APPLY_FACTOR: AtomicBool = AtomicBool::new(false);
+
+/// The bits of the only values the game function writes to `scene+0x33c`: 3.0, 2.0 and 1.0
+/// (models Performance / Balance / Quality; the stores at 0x1400f76e8, 0x1400f76bf and
+/// 0x1400f7696, REA ev_7ac38aaf).
+const GAME_MAIN_VALUES: [u32; 3] = [3.0f32.to_bits(), 2.0f32.to_bits(), 1.0f32.to_bits()];
+
+/// Is `v`, bit for bit, one of the values the game writes to `scene+0x33c`?
+fn is_game_value(v: f32) -> bool {
+    GAME_MAIN_VALUES.contains(&v.to_bits())
+}
+
+/// Test only: makes [`post_work`] panic at its top, so a test can drive the real detour's panic
+/// path. Not in a non-test build.
+#[cfg(test)]
+static PANIC_IN_POST: AtomicBool = AtomicBool::new(false);
 
 /// `factor` clamped to `[MIN_FACTOR, MAX_FACTOR]`; NaN counts as 1.0 (no change).
 fn clamp_factor(factor: f32) -> f32 {
@@ -83,18 +101,34 @@ pub unsafe fn apply_to_scene(scene: *mut u8, factor: f32) {
     }
 }
 
-/// Publish what the game wrote: `scene + PIXEL_SIZE_MAIN` as `OBJECT`'s baseline, the u32 at
-/// `scene + DETAIL_SCATTERING` to `SCATTER_LEVEL`, and `now` as `OBJECT`'s last-seen time (stored
-/// last, so a reader that sees it sees the rest). Reads only.
+/// Publish what the game wrote. Reads only. See [`publish_checked`], which this is.
 ///
 /// # Safety
 ///
 /// `scene` points to a scene-settings struct, at least `0x344` bytes, that no other thread writes
 /// meanwhile. No alignment is needed.
 pub unsafe fn publish_from_scene(scene: *const u8, now: u64) {
+    // SAFETY: this function's contract is `publish_checked`'s.
+    unsafe { publish_checked(scene, now) };
+}
+
+/// Publish what the game wrote, and say whether `scene + PIXEL_SIZE_MAIN` holds a game value.
+///
+/// - Always: the u32 at `scene + DETAIL_SCATTERING` to `SCATTER_LEVEL`, and `now` as `OBJECT`'s
+///   last-seen time, stored last so a reader that sees it sees the rest.
+/// - A game value ([`is_game_value`]): it is published as `OBJECT`'s baseline; returns `true`.
+/// - Any other value: no baseline is published, `OBJECT_UNKNOWN_BASELINE` goes up by one (it
+///   wraps); returns `false`.
+///
+/// Reads only. No allocation, lock or log.
+///
+/// # Safety
+///
+/// As [`publish_from_scene`].
+unsafe fn publish_checked(scene: *const u8, now: u64) -> bool {
     // SAFETY: both fields are inside the struct at `scene` (this function's contract), which
     // nothing writes meanwhile; unaligned reads need no alignment.
-    let (baseline, level) = unsafe {
+    let (main, level) = unsafe {
         (
             scene
                 .wrapping_add(PIXEL_SIZE_MAIN)
@@ -107,23 +141,45 @@ pub unsafe fn publish_from_scene(scene: *const u8, now: u64) {
         )
     };
     SCATTER_LEVEL.store(level, Ordering::Relaxed);
-    OBJECT.publish(baseline, now);
+    if is_game_value(main) {
+        OBJECT.publish(main, now);
+        true
+    } else {
+        OBJECT_UNKNOWN_BASELINE.fetch_add(1, Ordering::Relaxed);
+        OBJECT.seen(now);
+        false
+    }
 }
 
-/// The detour's work after the original returned: always publish (the baseline first, before
-/// anything is scaled), then scale by `factor` only when `apply`. A null `scene` does nothing.
+/// The detour's work after the original returned. A null `scene` does nothing.
+///
+/// **The rule: compounding is impossible.** The game function writes only 3.0, 2.0 or 1.0 to
+/// `+0x33c` (REA ev_7ac38aaf). For a models value of 3 or more it returns without writing
+/// `+0x33c`/`+0x340` at all (the `JNZ` at 0x1400f7694). So:
+/// - `+0x33c` holds exactly 3.0, 2.0 or 1.0: it is the game's value for this call. It is
+///   published as the baseline, and with `apply` both fields are scaled by `factor`.
+/// - Any other value (one this hook scaled earlier, or one the game did not write): both fields
+///   are left alone and no baseline is published. The scatter level and the time are still
+///   published (the world is rendering), and `OBJECT_UNKNOWN_BASELINE` counts the call.
+///
+/// No step product is a game value (test `a_scaled_field_is_never_taken_for_a_game_value`), so a
+/// field the hook already scaled is never scaled again.
 ///
 /// # Safety
 ///
 /// `scene` is null, or points to a scene-settings struct, at least `0x344` bytes, that the
 /// original has just written and that no other thread accesses meanwhile.
 unsafe fn post_work(scene: *mut u8, apply: bool, factor: f32, now: u64) {
+    #[cfg(test)]
+    if PANIC_IN_POST.load(Ordering::Relaxed) {
+        panic!("PANIC_IN_POST is set");
+    }
     if scene.is_null() {
         return;
     }
     // SAFETY: this function's contract.
-    unsafe { publish_from_scene(scene, now) };
-    if apply {
+    let game_value = unsafe { publish_checked(scene, now) };
+    if game_value && apply {
         // SAFETY: this function's contract.
         unsafe { apply_to_scene(scene, factor) };
     }
@@ -207,20 +263,6 @@ unsafe fn hook_at(target: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// The log text for a signature that did not match exactly once.
-fn scan_failure_text(error: &ScanError) -> String {
-    match error {
-        ScanError::Multiple(count) => format!(
-            "the game code matched {count} times, not once (another tool or a different build \
-             may have changed it)"
-        ),
-        ScanError::NotFound | ScanError::BadPattern(_) => {
-            "the game code was not found (another tool or a different build may have changed it)"
-                .to_owned()
-        }
-    }
-}
-
 /// Find `SCENE_SETTINGS_FN` in `m` and create the hook on it, queued; [`enable_queued_hooks`]
 /// enables it. `Err` is the reason for the log.
 ///
@@ -236,7 +278,7 @@ pub fn install(m: &Module) -> Result<(), String> {
         Pattern::parse(SCENE_SETTINGS_FN.pattern).map_err(|error| format!("{name}: {error}"))?;
     let found = find_in_sections(m, SCENE_SETTINGS_FN.sections, &pattern).map_err(|error| {
         log::debug!("object distance: {name}: {error}");
-        scan_failure_text(&error)
+        error.player_text()
     })?;
     let target = found
         .checked_add(SCENE_SETTINGS_FN.patch_offset())
@@ -312,7 +354,9 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::guard::is_disabled;
-    use crate::knobs::{apply_queued, OBJECT, OBJECT_STEPS, SCATTER_LEVEL};
+    use crate::knobs::{
+        apply_queued, OBJECT, OBJECT_STEPS, OBJECT_UNKNOWN_BASELINE, SCATTER_LEVEL,
+    };
     use crate::scan::{find_unique, main_module};
     use log::Level;
     use minhook::MinHook;
@@ -413,12 +457,12 @@ mod tests {
         put_f32(&mut s, 1 + 0x33c, 2.0);
         put_f32(&mut s, 1 + 0x340, 1.0);
         put_u32(&mut s, 1 + 0x290, 3);
-        unsafe { apply_to_scene(s.as_mut_ptr().wrapping_add(1), 0.5) };
-        assert_eq!((get_f32(&s, 1 + 0x33c), get_f32(&s, 1 + 0x340)), (1.0, 0.5));
         let _g = globals();
         unsafe { publish_from_scene(s.as_ptr().wrapping_add(1), 0x55) };
         assert_eq!(SCATTER_LEVEL.load(Relaxed), 3);
-        assert_eq!(OBJECT.baseline().0, 1.0);
+        assert_eq!(OBJECT.baseline().0, 2.0);
+        unsafe { apply_to_scene(s.as_mut_ptr().wrapping_add(1), 0.5) };
+        assert_eq!((get_f32(&s, 1 + 0x33c), get_f32(&s, 1 + 0x340)), (1.0, 0.5));
     }
 
     // ---- publish_from_scene and the detour's work -------------------------------------------
@@ -489,6 +533,84 @@ mod tests {
         let seen = OBJECT.last_seen();
         unsafe { post_work(std::ptr::null_mut(), true, 0.5, seen.wrapping_add(1)) };
         assert_eq!(OBJECT.last_seen(), seen);
+    }
+
+    /// A scene as the game function may leave it: `main` at +0x33c, 1.0 at +0x340, `level` at
+    /// +0x290.
+    fn scene_with(main: f32, level: u32) -> Vec<u8> {
+        let mut s = vec![0u8; 0x400];
+        put_f32(&mut s, 0x33c, main);
+        put_f32(&mut s, 0x340, 1.0);
+        put_u32(&mut s, 0x290, level);
+        s
+    }
+
+    #[test]
+    fn a_value_the_game_never_writes_is_left_alone_and_not_published() {
+        let _g = globals();
+        // 0.72 is a value the hook itself could have written; 5.0, NaN and 0.0 are not models
+        // values at all.
+        for main in [0.72f32, 5.0, f32::NAN, 0.0] {
+            // A known game baseline first, so publishing `main` would change the bits.
+            OBJECT.publish(3.0, 1);
+            let (_, seq) = OBJECT.baseline();
+            let unknown = OBJECT_UNKNOWN_BASELINE.load(Relaxed);
+            SCATTER_LEVEL.store(0, Relaxed);
+            let mut s = scene_with(main, 3);
+            let before = s.clone();
+            unsafe { post_work(s.as_mut_ptr(), true, 0.52, 0x4444) };
+            assert_eq!(
+                (get_u32(&s, 0x33c), get_u32(&s, 0x340)),
+                (main.to_bits(), 1.0f32.to_bits()),
+                "{main}: both fields untouched"
+            );
+            assert!(s == before, "{main}: nothing else written either");
+            assert_eq!(
+                OBJECT.baseline(),
+                (3.0, seq),
+                "{main}: no baseline published"
+            );
+            assert_eq!(OBJECT.last_seen(), 0x4444, "{main}: the world is rendering");
+            assert_eq!(SCATTER_LEVEL.load(Relaxed), 3, "{main}");
+            assert_eq!(
+                OBJECT_UNKNOWN_BASELINE.load(Relaxed),
+                unknown.wrapping_add(1),
+                "{main}: counted"
+            );
+        }
+    }
+
+    #[test]
+    fn the_three_game_values_are_published_and_scaled() {
+        let _g = globals();
+        for main in [3.0f32, 2.0, 1.0] {
+            let unknown = OBJECT_UNKNOWN_BASELINE.load(Relaxed);
+            let mut s = scene_with(main, 2);
+            unsafe { post_work(s.as_mut_ptr(), true, 0.72, 0x3333) };
+            assert_eq!(OBJECT.baseline().0, main);
+            assert_eq!(
+                (get_f32(&s, 0x33c), get_f32(&s, 0x340)),
+                (main * 0.72, 0.72),
+                "{main}"
+            );
+            assert_eq!(OBJECT.last_seen(), 0x3333);
+            assert_eq!(SCATTER_LEVEL.load(Relaxed), 2);
+            assert_eq!(OBJECT_UNKNOWN_BASELINE.load(Relaxed), unknown, "{main}");
+        }
+    }
+
+    #[test]
+    fn a_scaled_field_is_never_taken_for_a_game_value() {
+        // So a field the hook already scaled is never scaled again, whatever the caller does
+        // with the struct between two calls.
+        for game in [3.0f32, 2.0, 1.0] {
+            for step in OBJECT_STEPS.into_iter().skip(1) {
+                let scaled = game * step;
+                assert!(!is_game_value(scaled), "{game} x {step} = {scaled}");
+            }
+        }
+        assert!(is_game_value(3.0) && is_game_value(2.0) && is_game_value(1.0));
+        assert!(!is_game_value(-1.0) && !is_game_value(f32::NAN) && !is_game_value(-0.0));
     }
 
     // ---- start-up decision and install --------------------------------------------------------
@@ -774,6 +896,45 @@ mod tests {
                 assert_eq!(FAKE_CALLS.load(Relaxed), 1);
                 assert_eq!(get_f32(&scene, 0x33c), 2.0, "unscaled");
                 assert_eq!(OBJECT.last_seen(), 0, "nothing published");
+                // SAFETY: as in the real-hook test.
+                unsafe { MinHook::remove_hook(target as *mut c_void) }.unwrap();
+            },
+        );
+    }
+
+    #[test]
+    fn the_real_detour_runs_the_original_once_when_its_post_work_panics() {
+        in_child(
+            "the_real_detour_runs_the_original_once_when_its_post_work_panics",
+            || {
+                assert!(!is_disabled(Feature::ObjectDistance), "a fresh process");
+                let target = fake_scene_settings as *const () as usize;
+                APPLY_FACTOR.store(true, Relaxed);
+                OBJECT.set(0.5);
+                // SAFETY: as in the real-hook test.
+                unsafe { hook_at(target) }.unwrap();
+                assert_eq!(apply_queued(), Ok(1));
+
+                // The feature is on, so the real detour runs its post-work, which panics.
+                PANIC_IN_POST.store(true, Relaxed);
+                let mut scene = vec![0u8; 0x400];
+                call_fake(&mut scene, &settings_with_level(3), &[1, 0, 0]);
+                assert_eq!(FAKE_CALLS.load(Relaxed), 1, "the original ran exactly once");
+                assert!(
+                    is_disabled(Feature::ObjectDistance),
+                    "the panic switched the feature off"
+                );
+                assert_eq!(get_f32(&scene, 0x33c), 2.0, "unscaled");
+                assert_eq!(OBJECT.last_seen(), 0, "nothing published");
+                assert_eq!(OBJECT.baseline(), (0.0, 0), "no baseline");
+                assert_eq!(SCATTER_LEVEL.load(Relaxed), 0, "no scatter level");
+                assert_eq!(OBJECT_UNKNOWN_BASELINE.load(Relaxed), 0);
+
+                // From now on the detour only runs the original, once a call.
+                PANIC_IN_POST.store(false, Relaxed);
+                call_fake(&mut scene, &settings_with_level(3), &[1, 0, 0]);
+                assert_eq!(FAKE_CALLS.load(Relaxed), 2);
+                assert_eq!(OBJECT.last_seen(), 0, "still nothing published");
                 // SAFETY: as in the real-hook test.
                 unsafe { MinHook::remove_hook(target as *mut c_void) }.unwrap();
             },

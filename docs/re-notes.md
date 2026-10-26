@@ -49,6 +49,13 @@ Enum types: `keen::pc::RenderDistantObjectsSetting` and similar; member tables a
 - decoObjects (+0x38) → scene+0x294 (byte 0..3). distantObjects (+0x34) → scene+0x295 (byte 0..3). detailScattering (+0x3c) → scene+0x290 (dword 0..3; probably the source of renderView+0x3f8, HYPOTHESIS).
 - fog (+0x2c) → scene+0x328/+0x32c (0.45 / 0.4 / 0.3 / 0.2) and +0x334. tessellation (+0x44) → +0x2ec..+0x304. textureAnisotropy (+0x4c) → +0x420 (1/2/4/8/16).
 - **Knob design that follows:** a minhook post-hook on `FUN_1400f72b0` calls the original, keeps the `scene` pointer, and then overwrites only the raised fields. A value below 1.0 at +0x33c goes past Quality; the game's own values stay as the floor. Call frequency: callers.py finds ONE call site, `0x1408576af`, with `lea rcx,[rbp-0x10]`. The scene-settings struct is a STACK LOCAL of the caller, rebuilt on every call, so a direct write between calls cannot hold. The caller then calls the scene renderer `0x1400f4ae0` (agent knob-culling F5), so this probably runs once per rendered frame (HYPOTHESIS-strong). Conclusion: the post-hook is the right method, and a governor change applies on the next frame.
+- **Hook site (VERIFIED, REA/Ghidra ev_7ac38aaf, exe sha256 b28b448a…; the Steam exe has the same code):**
+  - The function is a leaf. It makes no calls.
+  - The first two instructions are `MOV EAX,[R8]` (3 bytes, at 0x1400f72b0) and the RIP-relative `MOVSS XMM1,[rip+disp32]` (8 bytes, at 0x1400f72b3). Together they are 11 bytes and end at 0x1400f72bb. MinHook copies them into its trampoline and relocates the RIP-relative one.
+  - The lowest branch target in the body is 0x1400f72e7 (entry+0x37). So no branch jumps into the bytes that MinHook replaces.
+  - The function writes only 3.0, 2.0 or 1.0 to +0x33c (models 0, 1 and 2).
+  - For a models value of 3 or more, the `JNZ` at 0x1400f7694 goes to the `RET` at 0x1400f7710. +0x33c and +0x340 are then not written.
+  - So the Task 12 hook publishes and scales +0x33c only when it holds exactly 3.0, 2.0 or 1.0. It leaves any other value alone and counts it.
 
 
 ## Menu enums and the two apply paths (agent knob-menu, VERIFIED)
