@@ -131,6 +131,8 @@ unsafe extern "system" fn fake_gpa(module: HMODULE, name: PCSTR) -> FARPROC {
         note(format!("gpa({:#x}, {n})", module as usize));
         let out = if n == "vkGetInstanceProcAddr" {
             addr(fake_gipa as *const ())
+        } else if n == "vkCreateInstance" {
+            addr(fake_create_instance as *const ())
         } else {
             addr(other_farproc as *const ())
         };
@@ -162,13 +164,33 @@ unsafe extern "system" fn fake_gipa(
     let n = unsafe { name_of(name) };
     note(format!("gipa({:#x}, {n})", instance.as_raw()));
     to_void(match n.as_str() {
+        "vkCreateInstance" => addr(fake_create_instance as *const ()),
         "vkGetDeviceProcAddr" => addr(fake_gdpa as *const ()),
         "vkCreateDevice" => addr(fake_create_device as *const ()),
+        "vkQueuePresentKHR" => addr(fake_present as *const ()),
+        "vkCreateSwapchainKHR" => addr(fake_create_swapchain as *const ()),
         "vkEnumeratePhysicalDevices" => addr(fake_enumerate_physical as *const ()),
         "vkGetPhysicalDeviceMemoryProperties" => addr(fake_memory_properties as *const ()),
         "vkGetPhysicalDeviceProperties" => addr(fake_properties as *const ()),
         _ => addr(other_vk as *const ()),
     })
+}
+
+/// Create the fake instance through the unchanged native observer.
+/// # Safety
+/// The caller supplies writable instance output; remaining inputs stay borrowed by the wrapper.
+unsafe extern "system" fn fake_create_instance(
+    _: *const vk::InstanceCreateInfo<'_>,
+    _: *const vk::AllocationCallbacks<'_>,
+    out: *mut vk::Instance,
+) -> vk::Result {
+    let body = || {
+        note("create_instance".into());
+        // SAFETY: the caller supplies one live output slot.
+        unsafe { out.write(vk::Instance::from_raw(INSTANCE)) };
+        vk::Result::SUCCESS
+    };
+    enshrouded_headroom::guard::guard(enshrouded_headroom::guard::Feature::VkWrap, body, body)
 }
 
 /// Actual enumeration output establishes the fake device's native parent.
@@ -289,6 +311,7 @@ unsafe extern "system" fn fake_properties(
     // SAFETY: the chain passes a valid struct to fill.
     let out = unsafe { &mut *out };
     out.device_type = vk::PhysicalDeviceType::DISCRETE_GPU;
+    out.api_version = vk::API_VERSION_1_2;
     for (dst, &src) in out.device_name.iter_mut().zip(b"Fake GPU\0") {
         *dst = src as c_char;
     }
@@ -525,7 +548,7 @@ fn scenario(dir: &Path) {
     );
     // Another vulkan-1 name passes through.
     // SAFETY: as above.
-    let got = unsafe { gpa_via_slot(slot, vulkan, c"vkCreateInstance") };
+    let got = unsafe { gpa_via_slot(slot, vulkan, c"vkEnumerateInstanceVersion") };
     assert_eq!(got, other_farproc as *const () as usize);
     take_calls();
     // An ordinal on vulkan-1 itself, which the fake finds: the module matches, so only the
@@ -544,9 +567,24 @@ fn scenario(dir: &Path) {
     let instance = vk::Instance::from_raw(INSTANCE);
     // SAFETY (the calls below): made-up handles the fakes never dereference, and literal names.
     unsafe {
-        // A global command with no instance: passed through, no instance recorded.
+        // Global creation is observed, while the ordinary instance lookup slot stays unset.
         let got = gipa(vk::Instance::null(), c"vkCreateInstance".as_ptr());
-        assert_eq!(void_addr(got), other_vk as *const () as usize);
+        assert_eq!(
+            void_addr(got),
+            enshrouded_headroom::vk::wrap_create_instance as *const () as usize
+        );
+        let create = std::mem::transmute::<vk::PFN_vkVoidFunction, vk::PFN_vkCreateInstance>(got);
+        let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_2);
+        let mut created = vk::Instance::null();
+        assert_eq!(
+            create(
+                &vk::InstanceCreateInfo::default().application_info(&app),
+                std::ptr::null(),
+                &mut created
+            ),
+            vk::Result::SUCCESS
+        );
+        assert_eq!(created.as_raw(), instance.as_raw());
         assert_eq!(load(&GAME_INSTANCE), 0);
 
         let gdpa = gipa(instance, c"vkGetDeviceProcAddr".as_ptr());
@@ -590,6 +628,7 @@ fn scenario(dir: &Path) {
             take_calls(),
             [
                 "gipa(0x0, vkCreateInstance)",
+                "create_instance",
                 "gipa(0x11110000, vkGetDeviceProcAddr)",
                 "gipa(0x11110000, vkCreateDevice)",
                 "gipa(0x11110000, vkGetPhysicalDeviceMemoryProperties)",
@@ -713,9 +752,13 @@ fn scenario(dir: &Path) {
                 "gdpa(0x33330000, vkQueueSubmit)",
                 "gdpa(0x33330000, vkQueueSubmit2)",
                 "gdpa(0x33330000, vkGetDeviceProcAddr)",
+                "gipa(0x11110000, vkGetDeviceProcAddr)",
                 "gdpa(0x33331000, vkQueuePresentKHR)",
+                "gipa(0x11110000, vkQueuePresentKHR)",
                 "gdpa(0x33331000, vkQueuePresentKHR)",
+                "gipa(0x11110000, vkQueuePresentKHR)",
                 "gdpa(0x33331000, vkGetDeviceProcAddr)",
+                "gipa(0x11110000, vkGetDeviceProcAddr)",
                 "gdpa(0x33330000, vkLatencySleepNV)",
             ]
         );
@@ -900,6 +943,104 @@ mod reflex_driver {
     static VENDOR: AtomicUsize = AtomicUsize::new(0x10de);
     static REFUSE: AtomicUsize = AtomicUsize::new(0);
 
+    /// Physical API and instance creation facts are independent inputs to route selection.
+    static PHYSICAL_API: AtomicUsize = AtomicUsize::new(vk::API_VERSION_1_2 as usize);
+    /// Route cases start without newer core feature nodes; other cases retain their chain checks.
+    static CAPS_CASE: AtomicUsize = AtomicUsize::new(0);
+    static INSTANCE_FAILURE: AtomicUsize = AtomicUsize::new(0);
+    static CORE_LOOKUPS: AtomicUsize = AtomicUsize::new(0);
+    static KHR_LOOKUPS: AtomicUsize = AtomicUsize::new(0);
+    static CORE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static KHR_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static MISSING_CORE: AtomicUsize = AtomicUsize::new(0);
+    static MISSING_KHR: AtomicUsize = AtomicUsize::new(0);
+    /// # Safety
+    /// Inputs/output obey vkCreateInstance; successful output is the fake B instance.
+    unsafe extern "system" fn create_instance(
+        _: *const vk::InstanceCreateInfo<'_>,
+        _: *const vk::AllocationCallbacks<'_>,
+        out: *mut vk::Instance,
+    ) -> vk::Result {
+        guard(
+            Feature::VkWrap,
+            || vk::Result::ERROR_UNKNOWN,
+            || {
+                if INSTANCE_FAILURE.load(Ordering::Relaxed) != 0 {
+                    return vk::Result::ERROR_INITIALIZATION_FAILED;
+                }
+                // SAFETY: caller supplies writable output; no real Vulkan objects are used.
+                unsafe { out.write(vk::Instance::from_raw(INSTANCE + 1)) };
+                vk::Result::SUCCESS
+            },
+        )
+    }
+    /// Create through the real lookup observer, never inject capability metadata.
+    fn observe_instance(case: &str) {
+        if case == "caps-unknown" {
+            return;
+        }
+        let requested = if matches!(case, "caps-khr" | "caps-no-route" | "caps-khr-missing") {
+            vk::API_VERSION_1_0
+        } else if case == "caps-core" {
+            vk::API_VERSION_1_1
+        } else {
+            vk::API_VERSION_1_2
+        };
+        let khr = matches!(
+            case,
+            "caps-khr" | "caps-khr-missing" | "caps-low-physical-khr" | "caps-core-missing"
+        );
+        let app = vk::ApplicationInfo::default().api_version(requested);
+        let names = [c"VK_KHR_get_physical_device_properties2".as_ptr()];
+        let info = vk::InstanceCreateInfo::default()
+            .application_info(&app)
+            .enabled_extension_names(if khr { &names } else { &[] });
+        if case == "caps-failed-create" {
+            INSTANCE_FAILURE.store(1, Ordering::Relaxed);
+        }
+        let mut instance = vk::Instance::null();
+        // SAFETY: exact fake global entry point, initialized inputs and live output.
+        let result = unsafe {
+            let raw = wrap_gipa(vk::Instance::null(), c"vkCreateInstance".as_ptr()).unwrap();
+            let create =
+                std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkCreateInstance>(raw);
+            create(&info, std::ptr::null(), &mut instance)
+        };
+        if case == "caps-failed-create" {
+            assert_eq!(result, vk::Result::ERROR_INITIALIZATION_FAILED);
+            assert!(instance.is_null());
+            // Subsequent enumeration represents a separate pre-existing, unobserved B instance.
+        } else {
+            assert_eq!(result, vk::Result::SUCCESS);
+            assert_eq!(instance.as_raw(), INSTANCE + 1);
+        }
+    }
+    /// # Safety
+    /// Exact core alias; counter distinguishes it from the independently returned KHR pointer.
+    unsafe extern "system" fn features_core(
+        phys: vk::PhysicalDevice,
+        out: *mut vk::PhysicalDeviceFeatures2<'_>,
+    ) {
+        let body = || {
+            CORE_CALLS.fetch_add(1, Ordering::Relaxed);
+            // SAFETY: this wrapper forwards its exact live input to the shared fake implementation.
+            unsafe { features(phys, out) };
+        };
+        guard(Feature::VkWrap, body, body)
+    }
+    /// # Safety
+    /// Exact KHR alias; its pointer is distinct even though its Vulkan layout matches core.
+    unsafe extern "system" fn features_khr(
+        phys: vk::PhysicalDevice,
+        out: *mut vk::PhysicalDeviceFeatures2<'_>,
+    ) {
+        let body = || {
+            KHR_CALLS.fetch_add(1, Ordering::Relaxed);
+            // SAFETY: this wrapper forwards its exact live input to the shared fake implementation.
+            unsafe { features(phys, out) };
+        };
+        guard(Feature::VkWrap, body, body)
+    }
     /// # Safety
     /// The test passes a writable physical-properties output.
     unsafe extern "system" fn properties(
@@ -913,6 +1054,7 @@ mod reflex_driver {
                 // SAFETY: the query supplies this live output object.
                 unsafe {
                     (*out).vendor_id = VENDOR.load(Ordering::Relaxed) as u32;
+                    (*out).api_version = PHYSICAL_API.load(Ordering::Relaxed) as u32;
                 }
             },
         );
@@ -1162,7 +1304,23 @@ mod reflex_driver {
                 b"vkGetPhysicalDeviceMemoryProperties" => memory as *const () as usize,
                 b"vkGetPhysicalDeviceProperties" => properties as *const () as usize,
                 b"vkEnumerateDeviceExtensionProperties" => extensions as *const () as usize,
-                b"vkGetPhysicalDeviceFeatures2" => features as *const () as usize,
+                b"vkCreateInstance" => create_instance as *const () as usize,
+                b"vkGetPhysicalDeviceFeatures2" => {
+                    CORE_LOOKUPS.fetch_add(1, Ordering::Relaxed);
+                    if MISSING_CORE.load(Ordering::Relaxed) != 0 {
+                        0
+                    } else {
+                        features_core as *const () as usize
+                    }
+                }
+                b"vkGetPhysicalDeviceFeatures2KHR" => {
+                    KHR_LOOKUPS.fetch_add(1, Ordering::Relaxed);
+                    if MISSING_KHR.load(Ordering::Relaxed) != 0 {
+                        0
+                    } else {
+                        features_khr as *const () as usize
+                    }
+                }
                 _ => 0,
             })
         };
@@ -1207,6 +1365,14 @@ mod reflex_driver {
                                 address_preserved = f.buffer_device_address == vk::TRUE;
                             }
                             if (*node).s_type
+                                == vk::StructureType::PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES
+                            {
+                                timeline = (*node
+                                    .cast::<vk::PhysicalDeviceTimelineSemaphoreFeatures<'_>>())
+                                .timeline_semaphore
+                                    == vk::TRUE;
+                            }
+                            if (*node).s_type
                                 == vk::StructureType::PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR
                             {
                                 present = (*node
@@ -1216,7 +1382,11 @@ mod reflex_driver {
                             }
                             node = (*node).p_next;
                         }
-                        if low && timeline && present && address_preserved {
+                        if low
+                            && timeline
+                            && present
+                            && (address_preserved || CAPS_CASE.load(Ordering::Relaxed) != 0)
+                        {
                             CHANGED_OK.fetch_add(1, Ordering::Relaxed);
                         }
                     }
@@ -1595,6 +1765,39 @@ mod reflex_driver {
             );
         }
     }
+
+    /// Non-null pointers cannot authorize an alias; successful instance observation is required.
+    #[test]
+    fn feature_query_requires_proven_core_or_khr_route() {
+        const NAME: &str = "reflex_driver::feature_query_requires_proven_core_or_khr_route";
+        if let Ok(case) = std::env::var("W23_CAPS_CHILD") {
+            child(&case);
+            return;
+        }
+        for case in [
+            "caps-khr",
+            "caps-core",
+            "caps-unknown",
+            "caps-failed-create",
+            "caps-no-route",
+            "caps-low-physical",
+            "caps-low-physical-khr",
+            "caps-core-missing",
+            "caps-khr-missing",
+        ] {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture"])
+                .env("W23_CAPS_CHILD", case)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{case}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
     fn child(case: &str) {
         let (config, warnings) = enshrouded_headroom::config::parse(if case == "present-off" {
             "[General]\nReflex = off\n"
@@ -1603,8 +1806,18 @@ mod reflex_driver {
         });
         assert!(warnings.is_empty());
         reflex::init(config.general.reflex);
+        CAPS_CASE.store(usize::from(case.starts_with("caps-")), Ordering::Relaxed);
         PRESENT_CASE.store(usize::from(case.starts_with("present-")), Ordering::Relaxed);
         REAL_GIPA.store(gipa as *const () as usize, Ordering::Release);
+        observe_instance(case);
+        if matches!(case, "caps-low-physical" | "caps-low-physical-khr") {
+            PHYSICAL_API.store(vk::API_VERSION_1_0 as usize, Ordering::Relaxed);
+        }
+        if case == "caps-core" {
+            PHYSICAL_API.store(vk::API_VERSION_1_1 as usize, Ordering::Relaxed);
+        }
+        MISSING_CORE.store(usize::from(case == "caps-core-missing"), Ordering::Relaxed);
+        MISSING_KHR.store(usize::from(case == "caps-khr-missing"), Ordering::Relaxed);
         GAME_INSTANCE.store(INSTANCE as usize, Ordering::Release);
         REAL_CREATE_DEVICE.store(create as *const () as usize, Ordering::Release);
         if case.starts_with("dispatch-conflict") {
@@ -1706,7 +1919,12 @@ mod reflex_driver {
         let original_next = v12.p_next;
         let names = [c"VK_KHR_swapchain".as_ptr()];
         let mut info = vk::DeviceCreateInfo::default().enabled_extension_names(&names);
-        info.p_next = (&v12 as *const vk::PhysicalDeviceVulkan12Features<'_>).cast();
+        info.p_next = if case.starts_with("caps-") {
+            // The 1.0 route cases must not request newer core feature structs themselves.
+            std::ptr::null()
+        } else {
+            (&v12 as *const vk::PhysicalDeviceVulkan12Features<'_>).cast()
+        };
         let original_chain = info.p_next;
         ORIGINAL.store(&info as *const _ as usize, Ordering::Relaxed);
         let mut device = vk::Device::null();
@@ -1724,6 +1942,38 @@ mod reflex_driver {
         assert_eq!(v12.p_next, original_next);
         assert_eq!(v12.timeline_semaphore, vk::FALSE);
         assert_eq!(v12.buffer_device_address, vk::TRUE);
+        if case.starts_with("caps-") {
+            let (core, khr) = match case {
+                "caps-core" => (1, 0),
+                "caps-khr" | "caps-low-physical-khr" => (0, 1),
+                _ => (0, 0),
+            };
+            assert_eq!(
+                CORE_CALLS.load(Ordering::Relaxed),
+                core,
+                "forbidden core feature call"
+            );
+            assert_eq!(KHR_CALLS.load(Ordering::Relaxed), khr, "KHR feature call");
+            assert_eq!(
+                CORE_LOOKUPS.load(Ordering::Relaxed),
+                core + usize::from(case == "caps-core-missing"),
+                "only resolve a permitted core route"
+            );
+            assert_eq!(
+                KHR_LOOKUPS.load(Ordering::Relaxed),
+                khr + usize::from(case == "caps-khr-missing"),
+                "only resolve a permitted KHR route"
+            );
+            let modified = usize::from(core + khr != 0);
+            assert_eq!(CHANGED_OK.load(Ordering::Relaxed), modified);
+            assert_eq!(
+                RETRY_OK.load(Ordering::Relaxed),
+                1 - modified,
+                "unknown/missing route forwards the original pointer unchanged"
+            );
+            assert_eq!(ATTEMPTS.load(Ordering::Relaxed), 1);
+            return;
+        }
         if case.starts_with("present-") {
             present_child(case, device);
             return;

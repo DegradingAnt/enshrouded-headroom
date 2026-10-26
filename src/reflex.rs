@@ -575,9 +575,10 @@ unsafe fn capabilities(
     phys: vk::PhysicalDevice,
     gipa: usize,
     instance: usize,
+    api: Option<crate::vk::InstanceApi>,
 ) -> Option<Capabilities> {
-    // SAFETY: each entry is resolved by its precise Vulkan function name.
-    let (properties, enumerate, features) = unsafe {
+    // SAFETY: these commands are available in Vulkan 1.0 and use the leased parent.
+    let (properties, enumerate) = unsafe {
         (
             std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkGetPhysicalDeviceProperties>(
                 instance_proc(gipa, instance, c"vkGetPhysicalDeviceProperties")?,
@@ -590,9 +591,6 @@ unsafe fn capabilities(
                 instance,
                 c"vkEnumerateDeviceExtensionProperties",
             )?),
-            std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkGetPhysicalDeviceFeatures2>(
-                instance_proc(gipa, instance, c"vkGetPhysicalDeviceFeatures2")?,
-            ),
         )
     };
     let mut properties_out = vk::PhysicalDeviceProperties::default();
@@ -601,6 +599,25 @@ unsafe fn capabilities(
     if properties_out.vendor_id != 0x10de {
         return None;
     }
+    // Core physical-device functionality requires both application and physical-device API
+    // support. A non-null pointer never establishes permission to use that command alias.
+    let api = api?;
+    let features_name = if api.requested_api_version >= vk::API_VERSION_1_1
+        && properties_out.api_version >= vk::API_VERSION_1_1
+    {
+        c"vkGetPhysicalDeviceFeatures2"
+    } else if api.properties2_enabled {
+        c"vkGetPhysicalDeviceFeatures2KHR"
+    } else {
+        return None;
+    };
+    // SAFETY: successful instance creation and the physical properties prove the selected route.
+    // Both aliases have this exact signature. A missing selected pointer has no alias fallback.
+    let features = unsafe {
+        std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkGetPhysicalDeviceFeatures2>(
+            instance_proc(gipa, instance, features_name)?,
+        )
+    };
     let mut count = 0;
     // SAFETY: null layer selects device extensions and null output queries the count.
     if unsafe { enumerate(phys, std::ptr::null(), &mut count, std::ptr::null_mut()) }
@@ -736,10 +753,12 @@ pub unsafe fn create_device(
             return original();
         }
         // SAFETY: the original Vulkan arguments and live physical device.
-        let Some(caps) = crate::vk::with_physical_device(phys, |gipa, instance| unsafe {
-            capabilities(phys, gipa, instance)
-        })
-        .flatten() else {
+        let Some(caps) =
+            crate::vk::with_physical_device_capabilities(phys, |gipa, instance, api| unsafe {
+                capabilities(phys, gipa, instance, api)
+            })
+            .flatten()
+        else {
             return original();
         };
         // SAFETY: info and its chain live until this call returns.

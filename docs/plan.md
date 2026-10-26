@@ -847,11 +847,14 @@ Task 15 consumes this module. The governor's knob 1 is enabled only while `SCATT
 Issue #27 authorizes this wiring and the Reflex present-path exception to AGENTS rule 5.
 The maintainer also approved `guard::disable_silent` in `src/guard.rs` and the parsed-mode
 initialization step in `src/entry.rs` before Vulkan interception.
+The author approved unchanged instance-creation observation to establish API/extension facts
+for safe core/KHR capability queries.
 
 **Interfaces and maintained rulings:**
 - Preserve W19's `TimelineFix` and pure `plan_device` API.
 - `decide_mode(cfg: &ReflexMode, game_menu: Option<u32>, vendor_nvidia: bool, ext_listed: bool) -> Option<bool>` uses 0/1/2 for saved off/on/boost. `Auto` is the default. Unknown saved values use auto.
 - At device creation, query prerequisites and add the extension whenever NVIDIA support exists and the configured mode is not `Off`. The saved menu is not required yet. Copy all changed chain nodes; unknown layouts fail closed.
+- Bind successful instance creation's requested API and enabled properties2 extension to its observed generation. After the Vulkan 1.0 physical-properties query, choose core Features2 only when both APIs are at least 1.1; otherwise choose KHR only when explicitly enabled. Unknown facts or a missing selected function preserve the original device without alias fallback.
 - On a rejected modified device or swapchain create call, retry the exact original create-info pointer once and disable Reflex with `driver refused`.
 - On each successful new swapchain, set sleep mode from the current decision. Once the menu first becomes known, update the mode once if that changes the decision.
 - Read the verified menu fields in the existing scene-settings post-hook (`docs/re-notes.md`, "Reflex and vsync menu values seen from the scene-settings hook"). Check `R8 == RDX + 0x54` without overflow before reading Reflex at `RDX-8` and vsync at `RDX-11`; invalid ranges publish unknown through Relaxed atomics. Preserve the original-once hook structure.
