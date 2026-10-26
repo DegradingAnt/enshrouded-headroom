@@ -262,8 +262,9 @@ pub fn start() {
     // Peak correction reads the published effective paper white and runs on the scene hook.
     features::hdr_peak::init(&cfg.hdr, &cfg.knobs);
 
-    // 10. Publish the parsed Reflex mode before Vulkan wrappers can create a device or swapchain.
+    // 10. Publish both parsed latency modes before Vulkan wrappers can create a device or swapchain.
     crate::reflex::init(cfg.general.reflex);
+    crate::antilag::init(cfg.general.anti_lag);
 
     // 11. The Vulkan wrapper chain (present timer, device hook). It swaps the exe's
     // `GetProcAddress` import slot, not code, so it does not wait for `code_patches_allowed` and

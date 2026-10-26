@@ -39,6 +39,47 @@ use windows_sys::core::PCSTR;
 use windows_sys::Win32::Foundation::{FreeLibrary, FARPROC, HMODULE};
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 
+/// Allocation tracking is thread local, so unrelated test workers retain their own counters.
+struct NativeTestAllocator;
+thread_local! {
+    static TRACK_ALLOCATIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static ALLOCATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+/// Count only the explicit native present exercise; allocator callbacks never panic or allocate.
+fn count_allocation() {
+    if TRACK_ALLOCATIONS
+        .try_with(|flag| flag.get())
+        .unwrap_or(false)
+    {
+        let _ = ALLOCATIONS.try_with(|count| count.set(count.get().saturating_add(1)));
+    }
+}
+// SAFETY: every operation forwards the exact original layout/pointer to System. Counting uses
+// initialized thread-local Cells and never unwinds, allocates, or changes allocator semantics.
+unsafe impl std::alloc::GlobalAlloc for NativeTestAllocator {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        count_allocation();
+        // SAFETY: forward the caller's valid layout to the system allocator.
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        // SAFETY: forward the caller's live allocation and matching layout unchanged.
+        unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        count_allocation();
+        // SAFETY: forward the caller's valid layout unchanged.
+        unsafe { std::alloc::System.alloc_zeroed(layout) }
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        count_allocation();
+        // SAFETY: pointer/layout/new size obey the caller's original realloc contract.
+        unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
+    }
+}
+#[global_allocator]
+static NATIVE_TEST_ALLOCATOR: NativeTestAllocator = NativeTestAllocator;
+
 /// Names the folder the child works in. Unset in the parent.
 const CHILD_ENV: &str = "ENSHROUDED_HEADROOM_VK_CHAIN_DIR";
 const TEST_NAME: &str = "the_wrapper_chain_works_end_to_end";
@@ -1360,6 +1401,12 @@ mod reflex_driver {
                             info.pp_enabled_extension_names,
                             info.enabled_extension_count as usize,
                         );
+                        assert!(
+                            !names
+                                .iter()
+                                .any(|n| CStr::from_ptr(*n) == c"VK_AMD_anti_lag"),
+                            "Reflex creation never enables the competing AMD extension"
+                        );
                         let low = names
                             .iter()
                             .any(|n| CStr::from_ptr(*n) == c"VK_NV_low_latency2");
@@ -1777,6 +1824,38 @@ mod reflex_driver {
         }
     }
 
+    /// Forced Anti-Lag preserves the complete native NVIDIA Reflex path.
+    #[test]
+    fn reflex_precedes_antilag_native() {
+        const NAME: &str = "reflex_driver::reflex_precedes_antilag_native";
+        const ARGS: [&str; 4] = ["--exact", NAME, "--nocapture", "--test-threads=1"];
+        if std::env::var("W25_REFLEX_CHILD").ok().as_deref() == Some("1")
+            && std::env::args_os()
+                .skip(1)
+                .eq(ARGS.map(std::ffi::OsString::from))
+        {
+            enshrouded_headroom::antilag::init(enshrouded_headroom::config::AntiLagMode::On);
+            child("present-success");
+            assert_eq!(
+                CHANGED_OK.load(Ordering::Relaxed),
+                1,
+                "native Reflex device is enabled"
+            );
+            return;
+        }
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(ARGS)
+            .env("W25_REFLEX_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     /// Non-null pointers cannot authorize an alias; successful instance observation is required.
     #[test]
     fn feature_query_requires_proven_core_or_khr_route() {
@@ -2180,5 +2259,866 @@ mod reflex_driver {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
+    }
+}
+
+/// Native AMD calls, exercised through the installed wrappers in isolated one-worker children.
+mod antilag_driver {
+    use super::*;
+    use enshrouded_headroom::{
+        antilag,
+        config::AntiLagMode,
+        guard::{guard, Feature},
+    };
+    static ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+    static CHAIN: AtomicUsize = AtomicUsize::new(0);
+    static EDITS: AtomicUsize = AtomicUsize::new(0);
+    static ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+    static UPDATE_ENTERED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    static UPDATE_RELEASE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    static UPDATE_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static PRESENT_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static ORIGINAL_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static CORE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static KHR_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static DESTROYS: AtomicUsize = AtomicUsize::new(0);
+    static CASE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    fn case(name: &str) -> bool {
+        CASE.get().is_some_and(|value| value == name)
+    }
+    static LOGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    struct Capture;
+    impl log::Log for Capture {
+        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record<'_>) {
+            let line = record.args().to_string();
+            if (case("logger-device") || case("logger-swap")) && line.contains("Anti-Lag disabled:")
+            {
+                panic!("injected host logger failure");
+            }
+            LOGS.lock().unwrap().push(line);
+        }
+        fn flush(&self) {}
+    }
+    static CAPTURE: Capture = Capture;
+
+    /// # Safety
+    /// The native creation contract; the test supplies a writable instance output.
+    unsafe extern "system" fn create_instance(
+        _: *const vk::InstanceCreateInfo<'_>,
+        _: *const vk::AllocationCallbacks<'_>,
+        out: *mut vk::Instance,
+    ) -> vk::Result {
+        guard(
+            Feature::VkWrap,
+            || vk::Result::ERROR_UNKNOWN,
+            || {
+                // SAFETY: the fake instance is returned in caller-owned output.
+                unsafe { out.write(vk::Instance::from_raw(INSTANCE)) };
+                vk::Result::SUCCESS
+            },
+        )
+    }
+    /// # Safety
+    /// Writable one-element fake enumeration outputs or a null count query.
+    unsafe extern "system" fn enumerate(
+        _: vk::Instance,
+        count: *mut u32,
+        out: *mut vk::PhysicalDevice,
+    ) -> vk::Result {
+        guard(
+            Feature::VkWrap,
+            || vk::Result::ERROR_UNKNOWN,
+            || {
+                // SAFETY: the test supplies the advertised capacity.
+                unsafe {
+                    count.write(1);
+                    if !out.is_null() {
+                        out.write(vk::PhysicalDevice::from_raw(PHYS));
+                    }
+                }
+                vk::Result::SUCCESS
+            },
+        )
+    }
+    /// # Safety
+    /// Exact initialized physical properties output.
+    unsafe extern "system" fn properties(
+        _: vk::PhysicalDevice,
+        out: *mut vk::PhysicalDeviceProperties,
+    ) {
+        guard(
+            Feature::VkWrap,
+            || (),
+            || {
+                // SAFETY: this is the driver's writable properties output.
+                unsafe {
+                    (*out).vendor_id = if case("vendor") { 0x10de } else { 0x1002 };
+                    (*out).api_version = if case("low-physical") {
+                        vk::API_VERSION_1_0
+                    } else {
+                        vk::API_VERSION_1_2
+                    };
+                }
+            },
+        )
+    }
+    /// # Safety
+    /// Extension enumeration contract with capacity from the preceding count query.
+    unsafe extern "system" fn extensions(
+        _: vk::PhysicalDevice,
+        _: *const c_char,
+        count: *mut u32,
+        out: *mut vk::ExtensionProperties,
+    ) -> vk::Result {
+        guard(
+            Feature::VkWrap,
+            || vk::Result::ERROR_UNKNOWN,
+            || {
+                // SAFETY: initialized entry fits the one-element advertised capacity.
+                unsafe {
+                    count.write(if case("no-extension") { 0 } else { 1 });
+                    if !out.is_null() && !case("no-extension") {
+                        let mut entry = vk::ExtensionProperties {
+                            spec_version: 1,
+                            ..Default::default()
+                        };
+                        for (dst, src) in entry
+                            .extension_name
+                            .iter_mut()
+                            .zip(c"VK_AMD_anti_lag".to_bytes_with_nul())
+                        {
+                            *dst = *src as c_char;
+                        }
+                        out.write(entry);
+                    }
+                }
+                vk::Result::SUCCESS
+            },
+        )
+    }
+    /// # Safety
+    /// The wrapper queries the initialized AMD feature node, or another known Vulkan feature.
+    unsafe extern "system" fn features(
+        _: vk::PhysicalDevice,
+        out: *mut vk::PhysicalDeviceFeatures2<'_>,
+    ) {
+        guard(
+            Feature::VkWrap,
+            || (),
+            || {
+                // SAFETY: each common header and matching AMD node belongs to the query output.
+                unsafe {
+                    let mut node = (*out).p_next.cast::<vk::BaseOutStructure<'_>>();
+                    while !node.is_null() {
+                        if (*node).s_type == types::PHYSICAL_DEVICE_ANTI_LAG_FEATURES_AMD {
+                            (*node.cast::<types::PhysicalDeviceAntiLagFeaturesAMD>()).anti_lag =
+                                if case("feature-off") {
+                                    vk::FALSE
+                                } else {
+                                    vk::TRUE
+                                };
+                        }
+                        node = (*node).p_next;
+                    }
+                }
+            },
+        )
+    }
+    /// # Safety
+    /// Exact selected core route with an independently observed call count.
+    unsafe extern "system" fn core_features(
+        phys: vk::PhysicalDevice,
+        out: *mut vk::PhysicalDeviceFeatures2<'_>,
+    ) {
+        guard(
+            Feature::VkWrap,
+            || (),
+            || {
+                CORE_CALLS.fetch_add(1, Ordering::Relaxed);
+                // SAFETY: preserve the exact original native query arguments.
+                unsafe { features(phys, out) };
+            },
+        )
+    }
+    /// # Safety
+    /// Exact selected extension route; pointer presence never grants the permission.
+    unsafe extern "system" fn khr_features(
+        phys: vk::PhysicalDevice,
+        out: *mut vk::PhysicalDeviceFeatures2<'_>,
+    ) {
+        guard(
+            Feature::VkWrap,
+            || (),
+            || {
+                KHR_CALLS.fetch_add(1, Ordering::Relaxed);
+                // SAFETY: both aliases use the same initialized output layout.
+                unsafe { features(phys, out) };
+            },
+        )
+    }
+    /// # Safety
+    /// The initialized device input and its borrowed chain remain live for this call.
+    unsafe extern "system" fn create(
+        _: vk::PhysicalDevice,
+        info: *const vk::DeviceCreateInfo<'_>,
+        _: *const vk::AllocationCallbacks<'_>,
+        out: *mut vk::Device,
+    ) -> vk::Result {
+        guard(
+            Feature::VkWrap,
+            || vk::Result::ERROR_UNKNOWN,
+            || {
+                let attempt = ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+                if info as usize != ORIGINAL.load(Ordering::Relaxed) {
+                    // SAFETY: the wrapper supplies a live copied chain and extension pointer list.
+                    unsafe {
+                        let value = &*info;
+                        let first = &*value
+                            .p_next
+                            .cast::<types::PhysicalDeviceAntiLagFeaturesAMD>();
+                        assert_eq!(first.s_type.as_raw(), 1_000_476_000);
+                        assert_eq!(first.anti_lag, vk::TRUE);
+                        let names = std::slice::from_raw_parts(
+                            value.pp_enabled_extension_names,
+                            value.enabled_extension_count as usize,
+                        );
+                        assert_eq!(
+                            names
+                                .iter()
+                                .filter(|n| CStr::from_ptr(**n) == c"VK_AMD_anti_lag")
+                                .count(),
+                            1
+                        );
+                        let tail = &*first
+                            .p_next
+                            .cast::<vk::PhysicalDeviceVulkan12Features<'_>>();
+                        assert_eq!(tail.buffer_device_address, vk::TRUE);
+                        assert_ne!(
+                            first.p_next as usize,
+                            CHAIN.load(Ordering::Relaxed),
+                            "owned tail copy"
+                        );
+                    }
+                    EDITS.fetch_add(1, Ordering::Relaxed);
+                    if case("refusal") && attempt == 0 {
+                        return vk::Result::ERROR_EXTENSION_NOT_PRESENT;
+                    }
+                } else {
+                    ORIGINAL_CALLS.fetch_add(1, Ordering::Relaxed);
+                }
+                // SAFETY: successful creation writes a live fake handle into caller-owned output.
+                unsafe {
+                    out.write(vk::Device::from_raw(DEVICE));
+                }
+                vk::Result::SUCCESS
+            },
+        )
+    }
+    /// # Safety
+    /// Fake queue output for the device's one created queue.
+    unsafe extern "system" fn get_queue(_: vk::Device, _: u32, index: u32, out: *mut vk::Queue) {
+        guard(
+            Feature::VkWrap,
+            || (),
+            || {
+                // SAFETY: valid writable queue output.
+                unsafe {
+                    out.write(vk::Queue::from_raw(QUEUE + u64::from(index)));
+                }
+            },
+        )
+    }
+    /// # Safety
+    /// The live fake AMD update and its presentation-info child.
+    unsafe extern "system" fn update(_: vk::Device, data: *const types::AntiLagDataAMD) {
+        guard(
+            Feature::VkWrap,
+            || (),
+            || {
+                UPDATE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if case("noalloc") {
+                    return;
+                }
+                // SAFETY: initialized synchronous AMD data, filled by the runtime.
+                unsafe {
+                    if case("concurrent") {
+                        UPDATE_ENTERED.store(true, Ordering::Release);
+                        while !UPDATE_RELEASE.load(Ordering::Acquire) {
+                            std::thread::yield_now();
+                        }
+                    }
+                    if case("slow") {
+                        std::thread::sleep(std::time::Duration::from_millis(115));
+                    }
+                    note(format!(
+                        "amd:{}:{}",
+                        (*(*data).p_presentation_info).stage.as_raw(),
+                        (*(*data).p_presentation_info).frame_index
+                    ));
+                }
+            },
+        )
+    }
+    /// # Safety
+    /// The original create input is live and its initialized output belongs to this child.
+    unsafe extern "system" fn create_swap(
+        _: vk::Device,
+        _: *const vk::SwapchainCreateInfoKHR<'_>,
+        _: *const vk::AllocationCallbacks<'_>,
+        out: *mut vk::SwapchainKHR,
+    ) -> vk::Result {
+        guard(
+            Feature::VkWrap,
+            || vk::Result::ERROR_UNKNOWN,
+            || {
+                // SAFETY: native output is caller owned.
+                unsafe {
+                    out.write(vk::SwapchainKHR::from_raw(SWAPCHAIN));
+                }
+                vk::Result::SUCCESS
+            },
+        )
+    }
+    /// # Safety
+    /// Exact fake presentation call with the caller's unchanged chain.
+    unsafe extern "system" fn present(
+        _: vk::Queue,
+        info: *const vk::PresentInfoKHR<'_>,
+    ) -> vk::Result {
+        guard(
+            Feature::VkWrap,
+            || vk::Result::ERROR_UNKNOWN,
+            || {
+                if !case("concurrent") {
+                    assert_eq!(
+                        info as usize,
+                        PRESENT_INFO.load(Ordering::Relaxed),
+                        "original present pointer"
+                    );
+                }
+                PRESENT_COUNT.fetch_add(1, Ordering::Relaxed);
+                if !case("noalloc") {
+                    note("real present".to_owned());
+                }
+                if case("lost") || case("logger-device") || case("logger-swap") {
+                    vk::Result::ERROR_DEVICE_LOST
+                } else {
+                    vk::Result::SUCCESS
+                }
+            },
+        )
+    }
+    static PRESENT_INFO: AtomicUsize = AtomicUsize::new(0);
+    /// # Safety
+    /// Native destructor signature; the fake owns no native resources.
+    unsafe extern "system" fn destroy(_: vk::Device, _: *const vk::AllocationCallbacks<'_>) {
+        guard(
+            Feature::VkWrap,
+            || (),
+            || {
+                DESTROYS.fetch_add(1, Ordering::Relaxed);
+            },
+        );
+    }
+    /// # Safety
+    /// Native swapchain destructor signature; the fake owns no resources.
+    unsafe extern "system" fn destroy_swap(
+        _: vk::Device,
+        _: vk::SwapchainKHR,
+        _: *const vk::AllocationCallbacks<'_>,
+    ) {
+        guard(
+            Feature::VkWrap,
+            || (),
+            || {
+                DESTROYS.fetch_add(1, Ordering::Relaxed);
+            },
+        );
+    }
+    /// # Safety
+    /// Static native entry points matching the exact requested names.
+    unsafe extern "system" fn gdpa(_: vk::Device, name: *const c_char) -> vk::PFN_vkVoidFunction {
+        guard(
+            Feature::VkWrap,
+            || None,
+            || {
+                // SAFETY: the native caller passes a terminated name.
+                to_void(match unsafe { CStr::from_ptr(name) }.to_bytes() {
+                    b"vkAntiLagUpdateAMD" => update as *const () as usize,
+                    b"vkGetDeviceQueue" => get_queue as *const () as usize,
+                    b"vkDestroyDevice" => destroy as *const () as usize,
+                    b"vkDestroySwapchainKHR" => destroy_swap as *const () as usize,
+                    _ => 0,
+                })
+            },
+        )
+    }
+    /// # Safety
+    /// Static fake entry points match each requested instance signature.
+    unsafe extern "system" fn gipa(_: vk::Instance, name: *const c_char) -> vk::PFN_vkVoidFunction {
+        guard(
+            Feature::VkWrap,
+            || None,
+            || {
+                // SAFETY: the native caller passes a terminated name.
+                to_void(match unsafe { CStr::from_ptr(name) }.to_bytes() {
+                    b"vkCreateInstance" => create_instance as *const () as usize,
+                    b"vkEnumeratePhysicalDevices" => enumerate as *const () as usize,
+                    b"vkGetPhysicalDeviceProperties" => properties as *const () as usize,
+                    b"vkEnumerateDeviceExtensionProperties" => extensions as *const () as usize,
+                    b"vkGetPhysicalDeviceFeatures2" => {
+                        if case("missing-core") {
+                            0
+                        } else {
+                            core_features as *const () as usize
+                        }
+                    }
+                    b"vkGetPhysicalDeviceFeatures2KHR" => khr_features as *const () as usize,
+                    b"vkGetDeviceProcAddr" => gdpa as *const () as usize,
+                    b"vkDestroyDevice" => destroy as *const () as usize,
+                    b"vkDestroySwapchainKHR" => destroy_swap as *const () as usize,
+                    _ => 0,
+                })
+            },
+        )
+    }
+    /// The real create wrapper copies the AMD chain without touching the caller's inputs.
+    #[test]
+    fn amd_chain_and_present_are_native() {
+        const NAME: &str = "antilag_driver::amd_chain_and_present_are_native";
+        const ARGS: [&str; 4] = ["--exact", NAME, "--nocapture", "--test-threads=1"];
+        const CASES: [&str; 21] = [
+            "eligible",
+            "refusal",
+            "vendor",
+            "no-extension",
+            "feature-off",
+            "group",
+            "existing",
+            "unknown",
+            "khr",
+            "no-route",
+            "missing-core",
+            "low-physical",
+            "off",
+            "lost",
+            "slow",
+            "destroy",
+            "swap-destroy",
+            "logger-device",
+            "logger-swap",
+            "concurrent",
+            "noalloc",
+        ];
+        let exact = std::env::args_os()
+            .skip(1)
+            .eq(ARGS.map(std::ffi::OsString::from));
+        if let Some(name) = std::env::var("W25_AMD_CHILD")
+            .ok()
+            .filter(|name| exact && CASES.contains(&name.as_str()))
+        {
+            child(&name);
+            return;
+        }
+        for name in CASES {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(ARGS)
+                .env("W25_AMD_CHILD", name)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{name}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            println!("AMD case passed: {name}");
+        }
+    }
+    fn child(name: &str) {
+        CASE.set(name.to_owned()).unwrap();
+        log::set_logger(&CAPTURE).unwrap();
+        log::set_max_level(log::LevelFilter::Trace);
+        antilag::init(if case("off") {
+            AntiLagMode::Off
+        } else if case("vendor") {
+            AntiLagMode::On
+        } else {
+            AntiLagMode::Auto
+        });
+        REAL_GIPA.store(gipa as *const () as usize, Ordering::Release);
+        REAL_CREATE_DEVICE.store(create as *const () as usize, Ordering::Release);
+        let app = vk::ApplicationInfo::default().api_version(if case("khr") || case("no-route") {
+            vk::API_VERSION_1_0
+        } else {
+            vk::API_VERSION_1_2
+        });
+        let khr = [c"VK_KHR_get_physical_device_properties2".as_ptr()];
+        let info = vk::InstanceCreateInfo::default()
+            .application_info(&app)
+            .enabled_extension_names(if case("khr") { &khr } else { &[] });
+        let mut instance = vk::Instance::from_raw(INSTANCE);
+        // SAFETY: exact fake global native create/enumeration with initialized output/input.
+        unsafe {
+            if !case("unknown") {
+                let raw = wrap_gipa(vk::Instance::null(), c"vkCreateInstance".as_ptr()).unwrap();
+                let f = std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkCreateInstance>(
+                    raw,
+                );
+                assert_eq!(
+                    f(&info, std::ptr::null(), &mut instance),
+                    vk::Result::SUCCESS
+                );
+            }
+            let raw = wrap_gipa(instance, c"vkEnumeratePhysicalDevices".as_ptr()).unwrap();
+            let f = std::mem::transmute::<
+                unsafe extern "system" fn(),
+                vk::PFN_vkEnumeratePhysicalDevices,
+            >(raw);
+            let mut count = 1;
+            let mut phys = vk::PhysicalDevice::null();
+            assert_eq!(f(instance, &mut count, &mut phys), vk::Result::SUCCESS);
+        }
+        let tail = vk::PhysicalDeviceVulkan12Features::default().buffer_device_address(true);
+        let mut feature = types::PhysicalDeviceAntiLagFeaturesAMD {
+            s_type: types::PHYSICAL_DEVICE_ANTI_LAG_FEATURES_AMD,
+            p_next: std::ptr::from_ref(&tail).cast_mut().cast(),
+            anti_lag: vk::FALSE,
+        };
+        let physical_devices = [
+            vk::PhysicalDevice::from_raw(PHYS),
+            vk::PhysicalDevice::from_raw(PHYS_2),
+        ];
+        let mut group =
+            vk::DeviceGroupDeviceCreateInfo::default().physical_devices(&physical_devices);
+        group.p_next = std::ptr::from_ref(&tail).cast();
+        let names = [c"VK_KHR_swapchain".as_ptr(), c"VK_AMD_anti_lag".as_ptr()];
+        let priorities = [1.0, 1.0];
+        let queues = [vk::DeviceQueueCreateInfo::default()
+            .queue_family_index(0)
+            .queue_priorities(if case("concurrent") {
+                &priorities
+            } else {
+                &priorities[..1]
+            })];
+        let mut info = vk::DeviceCreateInfo::default()
+            .enabled_extension_names(if case("existing") {
+                &names
+            } else {
+                &names[..1]
+            })
+            .queue_create_infos(&queues);
+        info.p_next = if case("group") {
+            std::ptr::from_mut(&mut group).cast()
+        } else if case("existing") {
+            std::ptr::from_mut(&mut feature).cast()
+        } else {
+            std::ptr::from_ref(&tail).cast()
+        };
+        ORIGINAL.store(&info as *const _ as usize, Ordering::Relaxed);
+        CHAIN.store(info.p_next as usize, Ordering::Relaxed);
+        let mut out = vk::Device::null();
+        // SAFETY: wrappers run only against this child's complete fake dispatch table.
+        unsafe {
+            assert_eq!(
+                wrap_create_device(
+                    vk::PhysicalDevice::from_raw(PHYS),
+                    &info,
+                    std::ptr::null(),
+                    &mut out
+                ),
+                vk::Result::SUCCESS
+            );
+        }
+        assert_eq!(info.p_next as usize, CHAIN.load(Ordering::Relaxed));
+        assert_eq!(tail.buffer_device_address, vk::TRUE);
+        assert_eq!(tail.timeline_semaphore, vk::FALSE);
+        assert_eq!(
+            feature.anti_lag,
+            vk::FALSE,
+            "caller's feature remains untouched"
+        );
+        assert_eq!(feature.p_next, std::ptr::from_ref(&tail).cast_mut().cast());
+        let changed = matches!(
+            name,
+            "eligible"
+                | "refusal"
+                | "existing"
+                | "khr"
+                | "lost"
+                | "slow"
+                | "destroy"
+                | "swap-destroy"
+                | "logger-device"
+                | "logger-swap"
+                | "concurrent"
+                | "noalloc"
+        );
+        assert_eq!(
+            EDITS.load(Ordering::Relaxed),
+            usize::from(changed),
+            "AMD feature/extension reach native creation only when eligible"
+        );
+        assert_eq!(
+            ATTEMPTS.load(Ordering::Relaxed),
+            1 + usize::from(case("refusal"))
+        );
+        assert_eq!(
+            ORIGINAL_CALLS.load(Ordering::Relaxed),
+            usize::from(!changed || case("refusal")),
+            "refusal retries the exact original pointer"
+        );
+        if matches!(
+            name,
+            "unknown" | "no-route" | "missing-core" | "low-physical" | "off" | "vendor"
+        ) {
+            assert_eq!(CORE_CALLS.load(Ordering::Relaxed), 0);
+            assert_eq!(KHR_CALLS.load(Ordering::Relaxed), 0);
+        } else if case("khr") {
+            assert_eq!(CORE_CALLS.load(Ordering::Relaxed), 0);
+            assert_eq!(KHR_CALLS.load(Ordering::Relaxed), 1);
+        }
+        if case("vendor") {
+            assert!(LOGS
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|line| line.contains("not listed, off")));
+        }
+        if !changed || case("refusal") {
+            return;
+        }
+        REAL_CREATE_SWAPCHAIN.store(create_swap as *const () as usize, Ordering::Release);
+        REAL_PRESENT.store(present as *const () as usize, Ordering::Release);
+        let mut swap = vk::SwapchainKHR::null();
+        // SAFETY: one live fake device and writable swapchain output.
+        unsafe {
+            assert_eq!(
+                wrap_create_swapchain(
+                    out,
+                    &vk::SwapchainCreateInfoKHR::default(),
+                    std::ptr::null(),
+                    &mut swap
+                ),
+                vk::Result::SUCCESS
+            );
+        }
+        let swapchains = [swap];
+        let indices = [0];
+        let marker = types::PresentId2KHR {
+            s_type: types::STRUCTURE_TYPE_PRESENT_ID_2_KHR,
+            p_next: std::ptr::null(),
+            swapchain_count: 1,
+            p_present_ids: &1,
+        };
+        let mut info = vk::PresentInfoKHR::default()
+            .swapchains(&swapchains)
+            .image_indices(&indices);
+        info.p_next = std::ptr::from_ref(&marker).cast();
+        PRESENT_INFO.store(&info as *const _ as usize, Ordering::Relaxed);
+        if case("noalloc") {
+            ALLOCATIONS.with(|count| count.set(0));
+            TRACK_ALLOCATIONS.with(|flag| flag.set(true));
+            for _ in 0..1000 {
+                // SAFETY: one owned live fake queue/swapchain, valid immutable present input.
+                unsafe {
+                    assert_eq!(
+                        wrap_present(vk::Queue::from_raw(QUEUE), &info),
+                        vk::Result::SUCCESS
+                    );
+                }
+            }
+            TRACK_ALLOCATIONS.with(|flag| flag.set(false));
+            assert_eq!(
+                ALLOCATIONS.with(|count| count.get()),
+                0,
+                "1000 actual native AMD presents allocate nothing"
+            );
+            assert_eq!(
+                UPDATE_COUNT.load(Ordering::Relaxed),
+                2001,
+                "seed INPUT plus exactly one PRESENT/INPUT pair per real present"
+            );
+            assert_eq!(PRESENT_COUNT.load(Ordering::Relaxed), 1000);
+            ALLOCATIONS.with(|count| count.set(0));
+            TRACK_ALLOCATIONS.with(|flag| flag.set(true));
+            let positive = std::hint::black_box(Vec::<u8>::with_capacity(128));
+            TRACK_ALLOCATIONS.with(|flag| flag.set(false));
+            assert!(
+                ALLOCATIONS.with(|count| count.get()) > 0,
+                "the same allocator detects a real allocation"
+            );
+            drop(positive);
+            return;
+        }
+        if case("concurrent") {
+            let first = std::thread::spawn(|| {
+                let swaps = [vk::SwapchainKHR::from_raw(SWAPCHAIN)];
+                let indices = [0];
+                let info = vk::PresentInfoKHR::default()
+                    .swapchains(&swaps)
+                    .image_indices(&indices);
+                // SAFETY: thread-owned input and queue zero's exclusive call.
+                unsafe { wrap_present(vk::Queue::from_raw(QUEUE), &info) }
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !UPDATE_ENTERED.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            assert!(
+                UPDATE_ENTERED.load(Ordering::Acquire),
+                "first driver update is in flight"
+            );
+            // SAFETY: queue one is a distinct created queue, with independent Vulkan host synchronization.
+            unsafe {
+                assert_eq!(
+                    wrap_present(vk::Queue::from_raw(QUEUE + 1), &info),
+                    vk::Result::SUCCESS
+                );
+            }
+            assert!(
+                enshrouded_headroom::guard::is_disabled(Feature::AntiLag),
+                "concurrent admission fails closed without waiting"
+            );
+            UPDATE_RELEASE.store(true, Ordering::Release);
+            assert_eq!(first.join().unwrap(), vk::Result::SUCCESS);
+            let calls = take_calls();
+            assert_eq!(
+                calls.iter().filter(|line| line.starts_with("amd:")).count(),
+                1,
+                "only the already-admitted INPUT call ran"
+            );
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|line| line.as_str() == "real present")
+                    .count(),
+                2,
+                "each real present still runs once"
+            );
+            return;
+        }
+        // SAFETY: live fake queue, swapchain and fully initialized native input.
+        unsafe {
+            assert_eq!(
+                wrap_present(vk::Queue::from_raw(QUEUE), &info),
+                if case("lost") || case("logger-device") || case("logger-swap") {
+                    vk::Result::ERROR_DEVICE_LOST
+                } else {
+                    vk::Result::SUCCESS
+                }
+            );
+        }
+        assert_eq!(info.p_next, std::ptr::from_ref(&marker).cast());
+        assert_eq!(
+            take_calls(),
+            if case("lost") || case("logger-device") || case("logger-swap") {
+                vec!["amd:0:2", "amd:1:2", "real present"]
+            } else {
+                vec!["amd:0:2", "amd:1:2", "real present", "amd:0:3"]
+            }
+        );
+        if case("logger-device") || case("logger-swap") {
+            assert!(enshrouded_headroom::guard::is_disabled(Feature::AntiLag));
+            // SAFETY: mandatory wrapped teardown must survive a deferred host logger unwind.
+            unsafe {
+                if case("logger-device") {
+                    enshrouded_headroom::vk::wrap_destroy_device(out, std::ptr::null());
+                } else {
+                    enshrouded_headroom::vk::wrap_destroy_swapchain(out, swap, std::ptr::null());
+                }
+            }
+            assert_eq!(
+                DESTROYS.load(Ordering::Relaxed),
+                1,
+                "native destructor still runs once after reporter panic"
+            );
+            assert!(
+                !enshrouded_headroom::guard::is_disabled(Feature::VkWrap),
+                "optional reporting cannot trip the enclosing mandatory wrapper"
+            );
+            return;
+        }
+        if case("slow") || case("lost") {
+            assert!(enshrouded_headroom::guard::is_disabled(Feature::AntiLag));
+            assert!(
+                !LOGS
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|line| line.contains("Anti-Lag disabled:")),
+                "present stays silent"
+            );
+            antilag::report_pending();
+            antilag::report_pending();
+            assert_eq!(
+                LOGS.lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|line| line.contains("Anti-Lag disabled:"))
+                    .count(),
+                1,
+                "deferred reason appears once"
+            );
+            // SAFETY: the disabled runtime still returns the one native present result.
+            unsafe {
+                let _ = wrap_present(vk::Queue::from_raw(QUEUE), &info);
+            }
+            assert_eq!(take_calls(), ["real present"]);
+            return;
+        }
+        if case("destroy") || case("swap-destroy") {
+            // SAFETY: exact native destruction looked up through the real installed chain.
+            unsafe {
+                if case("destroy") {
+                    let raw = wrap_gdpa(out, c"vkDestroyDevice".as_ptr()).unwrap();
+                    let f = std::mem::transmute::<
+                        unsafe extern "system" fn(),
+                        vk::PFN_vkDestroyDevice,
+                    >(raw);
+                    assert_eq!(
+                        f as usize,
+                        enshrouded_headroom::vk::wrap_destroy_device as *const () as usize
+                    );
+                    f(out, std::ptr::null());
+                } else {
+                    let raw = wrap_gdpa(out, c"vkDestroySwapchainKHR".as_ptr()).unwrap();
+                    let f = std::mem::transmute::<
+                        unsafe extern "system" fn(),
+                        vk::PFN_vkDestroySwapchainKHR,
+                    >(raw);
+                    assert_eq!(
+                        f as usize,
+                        enshrouded_headroom::vk::wrap_destroy_swapchain as *const () as usize
+                    );
+                    f(out, swap, std::ptr::null());
+                }
+            }
+            assert_eq!(DESTROYS.load(Ordering::Relaxed), 1);
+            // Reuse of the exact raw queue/swapchain bits must never revive the retired record.
+            // SAFETY: the fake accepts these replacement handles; runtime admission must reject them.
+            unsafe {
+                assert_eq!(
+                    wrap_present(vk::Queue::from_raw(QUEUE), &info),
+                    vk::Result::SUCCESS
+                );
+            }
+            assert_eq!(take_calls(), ["real present"]);
+            return;
+        }
+        // A colliding swapchain number on another device's actual queue cannot pace this device.
+        // SAFETY: the fake accepts the other queue, while runtime association must reject it.
+        unsafe {
+            assert_eq!(
+                wrap_present(vk::Queue::from_raw(QUEUE + 1), &info),
+                vk::Result::SUCCESS
+            );
+        }
+        assert_eq!(take_calls(), ["real present"]);
     }
 }

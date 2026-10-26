@@ -236,29 +236,53 @@ Layouts use ash 0.38.0 (Vulkan 1.3.281) and the existing present-ID2 declaration
 [Vulkan-Headers v1.4.366, commit 73814d006638aa00bd553215b054f0f02e457e22](https://github.com/KhronosGroup/Vulkan-Headers/blob/73814d006638aa00bd553215b054f0f02e457e22/include/vulkan/vulkan_core.h).
 ### 6.6 AMD Anti-Lag 2 (experimental)
 
-Anti-Lag is not verified on AMD hardware. W19 adds only pure planning, mode decisions, AMD ABI
-types and an atomic call sequencer. It makes no driver calls. Task 16b owns the runtime wiring.
+Anti-Lag runtime wiring is implemented. It is **experimental, not verified on AMD hardware**.
+`.ini`: `AntiLag = auto | off | on`, default `auto`. Both `auto` and `on` require AMD
+(vendor ID `0x1002`), a driver-listed `VK_AMD_anti_lag` extension and the `antiLag` feature.
+`off` leaves creation and presentation unchanged. A bad setting warns and uses `auto`.
+A forced `on` on a non-AMD device logs "not listed, off" and changes nothing. Reflex has
+priority: an active Reflex device never receives this mod's Anti-Lag pacing.
 
-`.ini`: `AntiLag = auto | off | on`, default `auto`.
-- `auto` enables Anti-Lag for AMD GPUs (vendor ID `0x1002`) only when the driver lists
-  `VK_AMD_anti_lag` and reports the `antiLag` feature.
-- `on` still requires the extension and feature. `off` disables it.
-- A bad setting warns and falls back to `auto`.
-- Reflex and Anti-Lag are never enabled together. The GPU vendor decides the automatic path;
-  an active Reflex mode blocks Anti-Lag even with an explicit `on` setting.
-- The device planner skips groups with more than one device. It avoids duplicate extension and
-  feature-chain entries. Future wiring must query capabilities before applying it.
+Before device creation, the wrapper queries the physical device under the observed parent's
+lifetime lease. Core Features2 requires both the requested and physical API versions to be at
+least 1.1. The KHR alias requires the explicitly enabled properties2 instance extension.
+Unknown facts or a missing selected entry point leave Anti-Lag off, without alias fallback.
 
-For one serialized present stream, the counter starts at 1. The first present has no PRESENT marker.
-After it returns, the sequencer plans INPUT(2), then PRESENT(2) before the second present, then
-INPUT(3), and so on. The INPUT stage is an approximation, called after the previous present returns.
-Future wiring must execute every returned call in order. The sequencer itself sends nothing.
+The shared typed device copier owns the changed chain and extension list. It puts the enabled
+AMD feature first, adds the extension once and preserves the game's input values and pointers.
+Groups containing more than one physical device and unknown chain layouts remain unchanged.
+If the driver refuses the modified create call, the wrapper retries the exact original pointer
+once and disables Anti-Lag for the session.
 
-A lost device disables the sequencer at once. Three consecutive driver updates taking more than
-100 ms disable it for the session; an update at or below 100 ms resets the streak. The caller
-measures these durations and logs the single disable transition. Counter exhaustion also stops
-planning rather than wrapping a frame ID. The data helper sets ON with no frame-rate cap and
-clears both extension chains. Its presentation-info pointer must remain valid through the call.
+Only the first eligible AMD device is admitted. Its native destruction endpoints must be bound
+before creation. The runtime records that device's actual created queue handles with the core
+`vkGetDeviceQueue` command. Queues with nonzero creation flags, missing commands or unsupported
+queue counts leave pacing off. A common driver function pointer does not establish queue ownership.
+Each successful swapchain creation associates a fresh sequencer with that device and swapchain.
+Only a single-swapchain present on an associated queue is paced. Retirement drains readers before
+native device or swapchain destruction; reused raw handle bits cannot revive a retired record.
+
+The runtime seeds INPUT(2) immediately before the first paced present, then sends PRESENT(2),
+calls the real present once and sends INPUT(3). Later presents continue matching PRESENT and
+INPUT pairs. The INPUT stage is an approximation after the previous present; the initial seed
+has no preceding present. It does not observe the game's actual input processing. The original
+present info, its `pNext` pointer and the game's present IDs pass through unchanged.
+
+This is the issue W25 exception to the timestamp-only present rule. Present bookkeeping uses
+only atomics and stack values, with no allocation, waiting lock or ordinary logging. A second
+concurrent present stream disables Anti-Lag without waiting for the first. Each AMD driver call
+is timed with QPC. Three consecutive calls taking strictly more than 100 ms disable it for the
+session; a faster call resets the streak. This detects a returned slow call and cannot cancel
+a driver call that never returns. `VK_ERROR_DEVICE_LOST` stops pacing at once. The next device
+or swapchain lifecycle safe point reports the stop once, even when the feature is already off.
+A failing host logger cannot interrupt mandatory native teardown. Counter exhaustion also stops
+the sequencer instead of reusing an ID.
+
+The ABI and call contract follow the pinned Khronos registry from section 6.5 and the
+[`vkAntiLagUpdateAMD` reference](https://docs.vulkan.org/refpages/latest/refpages/source/vkAntiLagUpdateAMD.html).
+The author can check `AntiLag=on` on the RTX 5080: the log must say "not listed, off", no AMD
+extension is added, and normal behavior is preserved. Native fake-driver checks establish
+sequencing and safety rules; real AMD latency and game behavior still need a tester.
 
 ## 7. Knobs
 
