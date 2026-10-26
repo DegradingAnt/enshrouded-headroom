@@ -7,11 +7,21 @@ examine_globs = [
     "src/scan.rs",
     "src/frame_timer.rs",
     "src/governor/**",
+    "src/knobs/**",
 ]
 additional_cargo_args = ["--lib"]
-# No functions are excluded: the unit suite exercises these modules without the game.
-# src/knobs is absent at the W16 base; add it only after its implementation lands.
-exclude_re = []
+# Native wrapper exclusions were fixed before the knobs baseline: 7 generated mutants.
+# apply_queued (3) and enable_queued_hooks (1) invoke MinHook and native thread/code changes.
+# object install (1) locates the live game signature and queues a detour.
+# object/scatter init (1 each) combine entry globals/logging with native installation.
+# Synthetic callbacks, owned-page set_distance, shared state and planners stay included.
+exclude_re = [
+    'src/knobs/mod\.rs:.*\b(apply_queued|enable_queued_hooks)\b',
+    'src/knobs/object_distance\.rs:.*\b(install|init)\b',
+    'src/knobs/scatter_distance\.rs:.*\binit\b',
+]
+# cargo-mutants 27.1.0 skips unsafe functions, cfg(test) bodies, and new constructors.
+# The generated population is not exhaustive source coverage; no orderings are changed.
 # Keep the tool's default with_capacity call exclusion: capacity is not observable behavior.
 # Other crates/modules and cfg(test) bodies are outside the generated population.
 timeout_multiplier = 5.0

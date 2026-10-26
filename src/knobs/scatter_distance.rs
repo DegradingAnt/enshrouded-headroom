@@ -1225,4 +1225,24 @@ mod tests {
         println!("vanilla decision: {decision:x?}");
         assert_eq!(decision, Ok(DISTANCE_CONST_VA));
     }
+
+    #[test]
+    fn either_non_vanilla_snapshot_refuses_the_shared_target() {
+        let target = 0x1000;
+        for other in [
+            0u32,
+            100.0f32.to_bits(),
+            VANILLA_BITS + 1,
+            f32::NAN.to_bits(),
+        ] {
+            assert_eq!(
+                vanilla_target((target, VANILLA_BITS), (target, other)),
+                Err(NOT_90)
+            );
+            assert_eq!(
+                vanilla_target((target, other), (target, VANILLA_BITS)),
+                Err(NOT_90)
+            );
+        }
+    }
 }
