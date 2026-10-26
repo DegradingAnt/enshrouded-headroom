@@ -33,6 +33,32 @@ const START_TEST_NAME: &str = "start_up_logs_one_grass_distance_line_after_objec
 /// The file name of the plugin DLL that cargo builds (the crate is also a `cdylib`).
 const PLUGIN_DLL: &str = "enshrouded_headroom.dll";
 
+/// The plugin DLL that cargo built with this test.
+///
+/// `cargo test` builds the library, its `cdylib` included, into `deps`, the folder of this test
+/// binary, so that copy is the one from this build. Only `cargo build` also copies it one folder
+/// up, so that place is the fallback. Panics, naming both places, if neither has the DLL.
+fn built_plugin() -> PathBuf {
+    let exe = std::env::current_exe().unwrap();
+    let deps = exe.parent().unwrap();
+    let places = [
+        deps.join(PLUGIN_DLL),
+        deps.parent().unwrap().join(PLUGIN_DLL),
+    ];
+    places
+        .iter()
+        .find(|path| path.is_file())
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "the plugin DLL is in neither {} nor {}; cargo builds it with the tests because \
+                 the crate type list in Cargo.toml has \"cdylib\"",
+                places[0].display(),
+                places[1].display()
+            )
+        })
+}
+
 /// The work of the child process: log at two levels, then panic inside a guard.
 fn scenario(dir: &Path) {
     let used = enshrouded_headroom::log::init(dir, log::LevelFilter::Warn);
@@ -160,14 +186,9 @@ fn start_up_logs_one_grass_distance_line_after_object_distance() {
         return;
     }
 
-    // The DLL that cargo built with this test, next to the `deps` folder this binary is in. A copy
-    // in a scratch folder, so the plugin finds its ini there and writes its log there.
-    let exe = std::env::current_exe().unwrap();
-    let built = exe
-        .parent()
-        .and_then(Path::parent)
-        .unwrap()
-        .join(PLUGIN_DLL);
+    // A copy of the DLL in a scratch folder, so the plugin finds its ini there and writes its log
+    // there.
+    let built = built_plugin();
     let dir = scratch_dir("startup-steps");
     std::fs::copy(&built, dir.join(PLUGIN_DLL))
         .unwrap_or_else(|e| panic!("copy {}: {e}", built.display()));

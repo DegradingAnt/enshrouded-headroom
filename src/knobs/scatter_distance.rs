@@ -355,6 +355,23 @@ unsafe fn point_loads_at_page_with(
 /// loads yet, so their disp32s can be rewritten. A test may pass memory of its own process that no
 /// thread executes.
 pub unsafe fn install(m: &Module) -> Result<(), String> {
+    // SAFETY: this function's contract is `install_with`'s, and `alloc_near_all` gives a fresh,
+    // zero-filled, read-write block that nothing else knows.
+    unsafe { install_with(m, alloc_near_all) }
+}
+
+/// [`install`], with the page allocator passed in: `alloc(targets, size)` is `alloc_near_all`'s
+/// shape. It is asked once, with the ends of both load instructions, so a test can see that a
+/// page must be in reach of both.
+///
+/// # Safety
+///
+/// [`install`]'s contract. `alloc` returns `None`, or the start of a fresh, zero-filled,
+/// read-write block of at least `size` bytes that nothing else uses.
+unsafe fn install_with(
+    m: &Module,
+    alloc: impl FnOnce(&[usize], usize) -> Option<usize>,
+) -> Result<(), String> {
     // SAFETY: this function's start-up contract is the one `find_loads` and `check_vanilla` need.
     let loads = unsafe { find_loads(m) }?;
     // SAFETY: as above.
@@ -366,10 +383,10 @@ pub unsafe fn install(m: &Module) -> Result<(), String> {
         instance.insn_end().ok_or(NO_PAGE)?,
         brick.insn_end().ok_or(NO_PAGE)?,
     ];
-    let page = alloc_near_all(&ends, size_of::<u32>()).ok_or(NO_PAGE)?;
+    let page = alloc(&ends, size_of::<u32>()).ok_or(NO_PAGE)?;
     log::debug!("grass distance: page at {page:#x}");
-    // SAFETY: `page` is a fresh, zero-filled block from `alloc_near_all` that nothing else knows;
-    // the rest is this function's start-up contract.
+    // SAFETY: `page` is a fresh, zero-filled block that nothing else knows (this function's
+    // contract for `alloc`); the rest is this function's start-up contract.
     unsafe { point_loads_at_page(&loads, page) }
 }
 
@@ -774,6 +791,48 @@ mod tests {
         let why = install_here(&main_module()).unwrap_err();
         assert!(why.contains("not found"), "{why}");
         assert_eq!(SCATTER_FLOAT.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn install_asks_for_a_page_that_both_loads_reach() {
+        let _g = globals();
+        let (mem, module) = image();
+        let mut asked = Vec::new();
+        let alloc = |targets: &[usize], size: usize| {
+            asked.push((targets.to_vec(), size));
+            alloc_near_all(targets, size)
+        };
+        // SAFETY: as in `install_here`; `alloc` hands on the fresh block `alloc_near_all` gives.
+        assert_eq!(unsafe { install_with(&module, alloc) }, Ok(()));
+        assert_eq!(asked.len(), 1, "one page");
+        let (targets, size) = &asked[0];
+        // The ends of both load instructions (0x14007950f and 0x14007693e in the game).
+        let mut sorted = targets.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted,
+            [
+                module.base + BRICK_DISP + 4,
+                module.base + INSTANCE_DISP + 4
+            ]
+        );
+        assert_eq!(*size, 4, "one f32");
+        let page = SCATTER_FLOAT.load(Acquire);
+        assert_eq!(target_of(&mem, BRICK_DISP), page);
+        assert_eq!(target_of(&mem, INSTANCE_DISP), page);
+    }
+
+    #[test]
+    fn no_page_in_reach_refuses_and_changes_nothing() {
+        let _g = globals();
+        let (mem, module) = image();
+        let before = all(&mem);
+        let no_page = |_: &[usize], _: usize| None;
+        // SAFETY: as in `install_here`; the allocator gives no page, so nothing is written.
+        let result = unsafe { install_with(&module, no_page) };
+        assert_eq!(result, Err(NO_PAGE.to_owned()));
+        assert_eq!(all(&mem), before);
+        assert_eq!(SCATTER_FLOAT.load(Acquire), 0);
     }
 
     /// A page that both of the image's loads reach, as `install` gets one. The `Mem` frees it when
