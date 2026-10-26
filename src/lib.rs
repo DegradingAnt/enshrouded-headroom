@@ -7,6 +7,7 @@
 pub mod build_id;
 pub mod config;
 pub mod entry;
+pub mod features;
 pub mod guard;
 pub mod iat;
 pub mod log;

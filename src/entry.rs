@@ -13,6 +13,7 @@ use std::sync::OnceLock;
 
 use crate::build_id::{self, Build};
 use crate::config::{self, Config, INI_FILE_NAME};
+use crate::features;
 use crate::guard;
 
 /// Sub-folder of `%LOCALAPPDATA%` for the settings file when there is no module folder. It is the
@@ -202,6 +203,11 @@ pub fn start() {
     }
 
     // Later tasks add their start-up steps below this line, in the order the plan gives.
+
+    // 8. The texture budget. It patches data (a table in `.rdata`), not code, so it does not wait
+    // for `code_patches_allowed`: on any build it needs the whole 80-byte table to match. It logs
+    // its own line, including why it is off.
+    features::texture_budget::init(&cfg.general.texture_budget);
 }
 
 #[cfg(test)]
