@@ -33,7 +33,7 @@ The parser identifies keys by section and name. A bad value falls back or clamps
 
 | Message template | Meaning and action |
 |---|---|
-| `cannot read {} ({error})` | An existing INI could not be read; another candidate folder is tried. Check the path and permissions, then confirm the later settings line. |
+| `cannot read {} ({error})` | An existing INI could not be read; another candidate folder is tried. Check the path and permissions, then confirm the settings line. |
 | `cannot create {} ({error})` | Creating a default INI failed. Another folder is tried. Use a writable settings location and inspect the eventual settings line. |
 | `no folder for the settings file (no module folder, no %LOCALAPPDATA%); using the defaults` | Neither settings location was available. Defaults apply. Include the loader environment in a report if this repeats. |
 | `the settings file cannot be read ({error}), using all defaults` | INI syntax parsing failed. Back up the file, compare it with the default INI and correct the reported syntax. |
