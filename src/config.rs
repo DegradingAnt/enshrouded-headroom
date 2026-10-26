@@ -1554,7 +1554,8 @@ mod tests {
     fn invalid_choices_name_the_default_that_is_used_in_the_warning() {
         for (key, default) in [
             ("AsyncCompute", "on"),
-            ("Reflex", "game"),
+            ("Reflex", "auto"),
+            ("AntiLag", "auto"),
             ("LogLevel", "info"),
         ] {
             let (config, warnings) = one("General", key, "invalid");
