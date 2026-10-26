@@ -40,6 +40,7 @@ jobs:
           $testExitCode = $LASTEXITCODE
           $testSummary = @('```text') + @($testOutput | Where-Object { $_ -match '^test result:' }) + @('```')
           $testSummary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          Get-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
           exit $testExitCode
 
       - name: Build the .asi
