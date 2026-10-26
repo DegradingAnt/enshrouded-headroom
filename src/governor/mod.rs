@@ -140,6 +140,8 @@ struct Raise {
     id: u64,
     /// When it was made.
     t: f64,
+    /// It has stayed for BlockSeconds, and its knob's undo count was reset for it (R9).
+    held: bool,
 }
 
 /// One frame in the window.
@@ -374,7 +376,8 @@ impl Governor {
     }
 
     /// T5: the first tick starts the clock; a time that is not finite is the last tick's; a small
-    /// step back is clamped; a step back of more than REBASE_S is a re-base and a reset point.
+    /// step back is clamped; a step back of more than REBASE_S is a re-base and a reset point; a
+    /// step forward of more than REBASE_S is a reset point.
     fn clamp_time(&mut self, raw: f64) -> f64 {
         let now = match self.last_now {
             None => {
@@ -383,7 +386,14 @@ impl Governor {
                 now
             }
             Some(last) if !raw.is_finite() => last,
-            Some(last) if raw >= last => raw,
+            Some(last) if raw >= last => {
+                // A step forward of more than REBASE_S is a reset point too (review T11-2): one
+                // bad future time must not end the quiet period and the hold timers on its own.
+                if raw - last > REBASE_S + EPS {
+                    self.reset_point(raw);
+                }
+                raw
+            }
             Some(last) if last - raw <= REBASE_S + EPS => last,
             Some(last) => {
                 self.rebase(raw - last);
@@ -428,9 +438,14 @@ impl Governor {
     }
 
     /// R9: a raise that has stayed on the stack for BlockSeconds resets its knob's undo count.
+    /// That is an event, once per raise: a raise that goes on staying does not reset the count
+    /// again, so the back-off for a higher step of the same knob still engages. A raise that was
+    /// already on the stack when its knob was undone never resets it (`undo` marks it held),
+    /// because a lower step that was holding says nothing new about the step that failed.
     fn reset_held_backoff(&mut self, now: f64) {
-        for raise in &self.stack {
-            if now - raise.t + EPS >= self.cfg.block_seconds {
+        for raise in &mut self.stack {
+            if !raise.held && now - raise.t + EPS >= self.cfg.block_seconds {
+                raise.held = true;
                 if let Some(count) = self.undo_count.get_mut(raise.knob) {
                     *count = 0;
                 }
@@ -543,6 +558,10 @@ impl Governor {
     /// (T2) and the probation (R10). An empty stack gives `None`.
     fn undo(&mut self, now: f64) -> Option<Action> {
         while let Some(raise) = self.stack.pop() {
+            // The entry leaves the stack on every path below, the skips included (R7).
+            if self.last_raise.is_some_and(|(id, _)| id == raise.id) {
+                self.last_raise = None;
+            }
             let Some(step) = self.steps.get_mut(raise.knob) else {
                 continue;
             };
@@ -551,9 +570,6 @@ impl Governor {
             }
             *step = step.saturating_sub(1);
             let step = *step;
-            if self.last_raise.is_some_and(|(id, _)| id == raise.id) {
-                self.last_raise = None;
-            }
             let undos = match self.undo_count.get_mut(raise.knob) {
                 Some(count) => {
                     *count = count.saturating_add(1);
@@ -563,6 +579,12 @@ impl Governor {
             };
             if let Some(until) = self.blocked_until.get_mut(raise.knob) {
                 *until = now + self.cfg.block_seconds * backoff_factor(undos);
+            }
+            // R9: a raise of this knob that was already on the stack says nothing new about the
+            // step that failed, so it can never reset the count. Only a raise made after this
+            // undo that then holds, or a menu reset, resets it.
+            for lower in self.stack.iter_mut().filter(|r| r.knob == raise.knob) {
+                lower.held = true;
             }
             self.t_last_undo = Some(now);
             self.reset_point(now);
@@ -692,7 +714,12 @@ impl Governor {
         let step = *step;
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
-        self.stack.push(Raise { knob, id, t: now });
+        self.stack.push(Raise {
+            knob,
+            id,
+            t: now,
+            held: false,
+        });
         self.last_raise = Some((id, now));
         self.t_last_raise = Some(now);
         self.reset_point(now);
@@ -771,6 +798,13 @@ mod tests {
     }
 
     /// The next tick: returns (n, frame clock, period). `Some(period)` replaces the stored period.
+    ///
+    /// RULE: never mix the direct-time helpers (`at`, or a direct `g.tick`) with the harness
+    /// helpers (`run`, `run_pattern`, `run_core`, `feed`, `empty_tick`, `tick_with`) on one
+    /// governor. The harness keys its tick counter and frame clock by the governor's address and
+    /// starts them again only for a governor that has never ticked. After a direct tick it would
+    /// carry on from a counter that does not match the governor's clock, and its `now` could go
+    /// backwards.
     fn advance(g: &Governor, period: Option<f64>) -> (u64, f64, f64) {
         let fresh = g.last_now.is_none();
         SIMS.with(|sims| {
@@ -1310,6 +1344,27 @@ mod tests {
     }
 
     #[test]
+    fn backoff_doubles_for_a_higher_step_while_a_lower_step_holds() {
+        // R9 (review T11-1): step 1 of the knob holds and step 2 is the one that fails. The
+        // count resets once, when a raise has stayed for BlockSeconds; a raise that goes on
+        // staying does not keep resetting it, so the back-off for step 2 engages.
+        let mut g = gov_with(vec![knob(4)]);
+        let ev = run_core(&mut g, 470.0, true, P240, None, &mut |_, steps, _| {
+            if steps[0] >= 2 {
+                15.0
+            } else {
+                10.0
+            }
+        });
+        let waits: Vec<u64> = ev
+            .windows(2)
+            .filter(|w| !w[0].raise && w[1].raise)
+            .map(|w| w[1].n - w[0].n)
+            .collect();
+        assert_eq!(waits, vec![400, 800, 1600, 3200, 3200], "{ev:?}");
+    }
+
+    #[test]
     fn hitch_after_raise_already_undone_does_nothing() {
         // R7: a hitch only undoes its own raise.
         let mut g = gov_with(vec![knob(1), knob(4), knob(4)]);
@@ -1463,6 +1518,13 @@ mod tests {
             // 120 fps against a 144 target: overload, unless the bogus period raised the target.
             let a = run(&mut g, 3.0, P120, true, period);
             assert!(a.is_empty(), "period {period}: {a:?}");
+            // A short period would not change the target above (review T11-5), so check that it
+            // was not taken as a display period at all.
+            assert!(
+                g.last_valid_period.is_none(),
+                "period {period}: {:?}",
+                g.last_valid_period
+            );
         }
     }
 
@@ -1650,6 +1712,18 @@ mod tests {
     }
 
     #[test]
+    fn a_far_future_tick_is_a_reset_point() {
+        // T5 (review T11-2): a step forward of more than 1 s is a reset point, so one bogus
+        // future tick cannot end the quiet period and the hold timers on its own.
+        let mut g = gov();
+        for n in 1..=10 {
+            at(&mut g, f64::from(n) * TICK_S, &[10.0; 5]);
+        }
+        assert!(at(&mut g, 1e9, &[10.0; 5]).is_empty());
+        assert_eq!(g.reset_at, 1e9);
+    }
+
+    #[test]
     fn window_holds_at_most_4096_frames() {
         // T6.
         let mut g = gov();
@@ -1667,15 +1741,37 @@ mod tests {
             knob: 1,
             id: 1000,
             t: 1.05,
+            held: false,
         });
         g.stack.push(Raise {
             knob: 9,
             id: 1001,
             t: 1.05,
+            held: false,
         });
         assert_eq!(g.undo(1.10), Some(Action::Set { knob: 0, step: 0 }));
         assert!(g.stack.is_empty());
         assert_eq!(g.undo(1.15), None); // an empty stack: nothing to do
+    }
+
+    #[test]
+    fn an_entry_that_undo_skips_still_ends_its_post_raise_period() {
+        // R7 + R9 (review T11-4): an entry leaves the stack by any path, so a skipped entry
+        // that carries the most recent raise's id ends that raise's post-raise period.
+        for (knob, label) in [(9, "knob out of range"), (1, "knob at step 0")] {
+            let mut g = gov();
+            run(&mut g, 1.05, 10.0, true, P240);
+            assert_eq!(g.steps(), &[1, 0, 0]);
+            g.stack.push(Raise {
+                knob,
+                id: 1000,
+                t: 1.05,
+                held: false,
+            });
+            g.last_raise = Some((1000, 1.05));
+            assert_eq!(g.undo(1.10), Some(Action::Set { knob: 0, step: 0 }));
+            assert!(g.last_raise.is_none(), "{label}: {:?}", g.last_raise);
+        }
     }
 
     #[test]
