@@ -295,7 +295,7 @@ Each knob states:
 - **Capacity (research 2026-10-25, which replaces the doubling plan):**
   - The buffers are fixed per scene view: `ScatteredObjectData[0x14000]` and two `DetailScatteringInstanceData[0x14000]`. One GPU counter (A) fills the 0x14000 budget for both scatter passes each frame. The game reads that counter back to the CPU: last value at entry+0x14, peak at +0x1c, a warn level of 0xf000 (75 %) at +0x20, and the cap of 0x14000 at +0x24.
   - The exe has no CPU-side clamp. The only bound is the shader constant `scatteredObjectCapacity` (`0x140074d52`). The 0x14000 at `0x1400745e0` is counter METADATA, not a buffer size, so patching it would cause an overflow. **Capacity is never changed.**
-  - **Scatter counter probe (7.2a):** a pre-hook on `FUN_1400767a0` reads counter A at most once every 500 ms. It self-checks the pointer chain (warn must be 0xf000 and cap 0x14000; otherwise the probe stays off and the knob stays at 90 m) and publishes the last value.
+  - **Scatter counter probe (7.2a):** a pre-hook on `FUN_1400767a0` publishes only the pass pointer and a call counter. A sampler thread copies the GPU counter blocks every 500 ms while calls continue. It self-checks A.warn = 0xf000 and A.cap = 0x14000 before publishing a complete sample. A layout mismatch or ten consecutive misses leaves the probe off and the knob at 90 m.
   - **Live headroom rule:** the governor raises this knob from r to r_next only while `last × (r_next / r)² < 0xf000`, and steps down at once when `last ≥ 0xf000`. The readback is at least one frame late; the 25 % gap between warn and cap is the margin.
   - **Hard ceiling:** r_max = 90 × sqrt(0xf000 / peak₉₀), where peak₉₀ is measured once at vanilla 90 m in the densest grass (the author's measurement session, `[Debug] ScatterProbe = 1`). Until it is measured, the ceiling is 90 m and the knob is inactive.
   - Not covered: the brick gate's own `maxCullElements` (`BrickCullingShaderParameters` +0xec8). The measurement session also watches for missing bricks at the raised distance.
@@ -310,13 +310,14 @@ Each knob states:
   - obj = [pass+0x18];
   - pool = [[pass+0x8]+0x20];
   - entry(h) = [pool+0x48] + (h & 0xffff) × 0x40, for h = [obj+0x8] (counter A), [obj+0xc] (B) and [obj+0x10] (C).
-  - Each block that a sample reads is checked readable (VirtualQuery) once before it is read: `pass` +0x8..+0x20, owner +0x20..+0x28, pool +0x48..+0x50, obj +0x8..+0x14, and each entry +0x14..+0x3c. That is 7 checks per sample. The probe never reads outside a checked block.
-- **When it is installed:** only with `[Debug] ScatterProbe = 1` and `LogLevel = debug`, or with `EnableScatterDistance = 1` once the measured ceiling r_max allows a raise (`ceiling_step(SCATTER_STEPS, r_max) > 0`). Until r_max is measured, a default install has no probe hook. (The first version was on by default and sampled every 30th call with a check before each of 22 reads. In game it caused a stutter, 2026-10-26.)
+  - The sampler copies 7 blocks with `ReadProcessMemory(GetCurrentProcess(), ...)`: `pass` +0x8..+0x20, owner +0x20..+0x28, pool +0x48..+0x50, obj +0x8..+0x14, and each entry +0x14..+0x3c. A copy is accepted only if the API succeeds and reports the exact requested byte count. Checked field reads parse only these local buffers; Rust never dereferences a game address.
+- **When it is installed:** only with `[Debug] ScatterProbe = 1` and `LogLevel = debug`, or with `EnableScatterDistance = 1` once the measured ceiling r_max allows a raise (`ceiling_step(SCATTER_STEPS, r_max) > 0`). Until r_max is measured, a default install has no probe hook or sampler thread. An off log names both failed halves of this rule.
+- **Reason for the sampler:** the in-game pulse remained with the earlier 500 ms hook sampler and its 7 `VirtualQuery` checks. Contention on the process address-space lock is a HYPOTHESIS. All sampling work now runs off the game thread. Not verified in game; the maintainer boot-tests it with the probe on.
 - **Rules:**
-  - The hook samples at most once every 500 ms of `QueryPerformanceCounter` time, however often the grass pass runs; the first call samples. A call claims a due sample with a compare-exchange on the next due time, so two threads never take the same sample. A call with no sample due reads the clock and one atomic, nothing more.
-  - It publishes atomics only, never logs, and always calls the original exactly once.
-  - The self-check requires A.warn = 0xf000 and A.cap = 0x14000. On a failure, the probe turns off for the session (once, logged by the governor thread).
-  - It runs inside `guard(Feature::ScatterDistance, ...)`.
+  - The guarded hook stores the latest pass pointer with `Release`, increments a call counter with `Relaxed`, and calls the original exactly once with unchanged arguments. It does not read the clock or game memory, allocate, lock or log.
+  - Only after the wanted hook installs, start one detached thread named `scatter-probe`. It sleeps 500 ms without holding a lock. If the call counter is unchanged, it reads nothing. Otherwise it loads the pass pointer with `Acquire` and attempts one sample. Its body runs inside `guard(Feature::ScatterDistance, ...)`; a panic stops it and latches `FAILED`.
+  - A failed or short copy, zero handle or ownership mismatch skips that sample. Nine consecutive misses are tolerated; the tenth while calls continue sets `FAILED` and clears `PROBE_OK`. A good complete sample resets the miss count to zero. An unchanged call counter neither reads memory nor counts another miss.
+  - A correctly copied counter A must have warn = 0xf000 and cap = 0x14000. A mismatch fails at once. No partial sample is published. Failure stays latched for the session; the governor logs it once.
 - **Debug output:** with `[Debug] ScatterProbe = 1` and `LogLevel = debug`, the governor thread logs A, B and C (last and peak) every 2 s, and the session peak of A at exit.
 - **Measurement session (the author, once per build):** grass quality High, mod distance left at vanilla 90 m, stand in the densest grass for 60 s, then send the log. The controller computes r_max and records it in the RE notes. The release uses r_max as the knob's ceiling.
 
@@ -376,7 +377,7 @@ The governor raises 7.1, then 7.2, then 7.3. The order is re-checked after the i
 - `DecoDistanceScale = 1.0`, `DistantObjectsScale = 1.0`, `TerrainRingScale = 1.0`
 
 `[Debug]` (debug only, needs `LogLevel = debug`; not in the default file; at any other log level the mod ignores these keys):
-- `ScatterProbe = 0 | 1` (default 0): read and log the scatter counters (7.2a). Until r_max is measured, this key is the only reason to install the probe hook (7.2a).
+- `ScatterProbe = 0 | 1` (default 0): enable the publish-only hook and its 500 ms sampler thread, and log the scatter counters (7.2a). Until r_max is measured, this key with `LogLevel = debug` is the only reason to install them.
 - `ForceStepObjectDistance`, `ForceStepScatterDistance`, `ForceStepTerrainDistance = 0..=4` (default: absent, the knob is not held): hold that knob at a fixed step for testing (pre-flight ruling for Task 17). A whole number outside 0..=4 is clamped with a warning. Other text warns and counts as absent.
 
 Unknown keys and invalid values are logged. Invalid choices use their defaults.
