@@ -337,33 +337,6 @@ pub fn read_ini(dir: &Path) -> io::Result<Option<(Config, Vec<String>)>> {
     }
 }
 
-/// Read `<dir>\enshrouded-headroom.ini`. If the file is missing, write `DEFAULT_INI` there and use
-/// the defaults. An existing file is never overwritten. (One folder only: `entry` tries several
-/// with `read_ini` and `write_default`.)
-pub fn load_or_create(dir: &Path) -> (Config, Vec<String>) {
-    let path = dir.join(INI_FILE_NAME);
-    match read_ini(dir) {
-        Ok(Some(loaded)) => loaded,
-        Ok(None) => {
-            let warnings = match write_default(dir) {
-                Ok(()) => Vec::new(),
-                Err(error) => vec![format!(
-                    "cannot create {} ({error}), using the defaults",
-                    path.display()
-                )],
-            };
-            (Config::default(), warnings)
-        }
-        Err(error) => (
-            Config::default(),
-            vec![format!(
-                "cannot read {} ({error}), using the defaults",
-                path.display()
-            )],
-        ),
-    }
-}
-
 /// Write `DEFAULT_INI` as `<dir>\enshrouded-headroom.ini`, creating `dir` first. An existing file
 /// is an error, not overwritten.
 pub fn write_default(dir: &Path) -> io::Result<()> {
@@ -720,7 +693,10 @@ mod tests {
     #[test]
     fn missing_file_writes_default() {
         let d = tempdir_in_target("cfg_missing");
-        let (_, w) = load_or_create(&d);
+        assert_eq!(read_ini(&d).unwrap(), None);
+        write_default(&d).unwrap();
+        let (c, w) = read_ini(&d).unwrap().unwrap();
+        assert_eq!(c, Config::default());
         assert!(w.is_empty());
         assert_eq!(
             std::fs::read_to_string(d.join("enshrouded-headroom.ini")).unwrap(),
@@ -1347,7 +1323,7 @@ mod tests {
         }
     }
 
-    // ---- load_or_create ----
+    // ---- Settings file reads and writes ----
 
     #[test]
     fn existing_file_is_read_and_left_alone() {
@@ -1355,7 +1331,7 @@ mod tests {
         let path = d.join(INI_FILE_NAME);
         let text = "[Governor]\nTargetFps=100\n[Knobs]\nMaxTerrainDistance=1\n";
         std::fs::write(&path, text).unwrap();
-        let (c, w) = load_or_create(&d);
+        let (c, w) = read_ini(&d).unwrap().unwrap();
         assert!(w.is_empty(), "{w:?}");
         assert_eq!(c.governor.target_fps, 100);
         assert_eq!(c.knobs.max_terrain_distance, 1);
@@ -1370,7 +1346,7 @@ mod tests {
             b"[Governor]\nTargetFps=60\n; caf\xe9 \xff\xfe\n",
         )
         .unwrap();
-        let (c, w) = load_or_create(&d);
+        let (c, w) = read_ini(&d).unwrap().unwrap();
         assert!(w.is_empty(), "{w:?}");
         assert_eq!(c.governor.target_fps, 60);
     }
@@ -1378,22 +1354,14 @@ mod tests {
     #[test]
     fn missing_folder_is_created_for_the_default_file() {
         let d = tempdir_in_target("cfg_missing_folder").join("a").join("b");
-        let (c, w) = load_or_create(&d);
+        write_default(&d).unwrap();
+        let (c, w) = read_ini(&d).unwrap().unwrap();
         assert!(w.is_empty(), "{w:?}");
         assert_eq!(c, Config::default());
         assert_eq!(
             std::fs::read_to_string(d.join(INI_FILE_NAME)).unwrap(),
             DEFAULT_INI
         );
-    }
-
-    #[test]
-    fn unwritable_folder_gives_defaults_and_a_warning() {
-        let d = tempdir_in_target("cfg_unwritable");
-        std::fs::write(d.join("blocker"), "a file, not a folder").unwrap();
-        let (c, w) = load_or_create(&d.join("blocker").join("sub"));
-        assert_eq!(c, Config::default());
-        assert_eq!(w.len(), 1, "{w:?}");
     }
 
     #[test]
@@ -1409,7 +1377,9 @@ mod tests {
         assert_eq!(result.unwrap_err().to_string(), "disk full");
         assert!(!path.exists(), "the half-written file must be gone");
         // So the next start finds no file and writes a whole one.
-        let (c, w) = load_or_create(&d);
+        assert_eq!(read_ini(&d).unwrap(), None);
+        write_default(&d).unwrap();
+        let (c, w) = read_ini(&d).unwrap().unwrap();
         assert!(w.is_empty(), "{w:?}");
         assert_eq!(c, Config::default());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), DEFAULT_INI);
@@ -1431,16 +1401,5 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "[Governor]\nTargetFps=100\n"
         );
-    }
-
-    #[test]
-    fn unreadable_settings_path_gives_defaults_and_a_warning_and_is_not_replaced() {
-        let d = tempdir_in_target("cfg_unreadable");
-        let path = d.join(INI_FILE_NAME);
-        std::fs::create_dir(&path).unwrap(); // a folder where the file should be
-        let (c, w) = load_or_create(&d);
-        assert_eq!(c, Config::default());
-        assert_eq!(w.len(), 1, "{w:?}");
-        assert!(path.is_dir());
     }
 }
