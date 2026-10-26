@@ -1089,7 +1089,7 @@ mod tests {
             // SAFETY: this isolated process owns the documented fake function and hook.
             unsafe { hook_at(target) }.unwrap();
             assert_eq!(apply_queued(), Ok(1));
-            let mut scene = vec![0u8; 0x400];
+            let mut scene = vec![0u8; 0x420];
             let mut options = [0u64; 32];
             let base = options.as_mut_ptr().cast::<u8>();
             // SAFETY: the aligned fake options allocation contains all accesses made by the native fake
