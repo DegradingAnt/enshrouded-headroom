@@ -109,6 +109,50 @@ fn unknown_build_advice(build: &Result<Build, String>, allowed: bool) -> Option<
     }
 }
 
+/// What the build step concluded.
+#[derive(Debug, PartialEq, Eq)]
+enum Verdict {
+    /// `Enabled = 0`: the mod does nothing, and the exe is not even read.
+    Disabled,
+    /// The exe was identified (or could not be) and the code-patch decision made.
+    Checked {
+        build: Result<Build, String>,
+        allowed: bool,
+    },
+}
+
+/// Steps 6 and 7: with `Enabled = 0` stop at once; otherwise call `identify` (which reads the exe)
+/// and decide whether code patches are allowed. An exe that cannot be identified counts as unknown.
+fn judge(cfg: &Config, identify: impl FnOnce() -> Result<Build, String>) -> Verdict {
+    if !cfg.general.enabled {
+        return Verdict::Disabled;
+    }
+    let allow_unknown = cfg.general.allow_unknown_build;
+    let build = identify();
+    let allowed = build.as_ref().map_or(allow_unknown, |build| {
+        decide_code_patches(build, allow_unknown)
+    });
+    Verdict::Checked { build, allowed }
+}
+
+/// Store the verdict's code-patch answer in `cell`. A `Disabled` verdict stores nothing, so the
+/// cell stays unset and reads as "not allowed".
+fn record(verdict: &Verdict, cell: &OnceLock<bool>) {
+    if let Verdict::Checked { allowed, .. } = verdict {
+        // `start` runs once, so the cell is empty here; an `Err` could only mean "already set".
+        let _ = cell.set(*allowed);
+    }
+}
+
+/// The log level of the build line: `Info` for a known build, `Warn` for any other, so that an
+/// unknown build's hash is in the log at the default level and at `LogLevel = warn`.
+fn build_level(build: &Result<Build, String>) -> log::Level {
+    match build {
+        Ok(Build::Known(_)) => log::Level::Info,
+        Ok(Build::Unknown(_)) | Err(_) => log::Level::Warn,
+    }
+}
+
 /// Set once the first call to [`start`] has begun.
 static STARTED: AtomicBool = AtomicBool::new(false);
 
@@ -143,23 +187,19 @@ pub fn start() {
     for warning in &warnings {
         log::warn!("{warning}");
     }
-    if !cfg.general.enabled {
-        log::info!("Enabled = 0 in {INI_FILE_NAME}: the mod does nothing");
-        return;
-    }
 
-    // 6. Which build is this, and 7. may code be patched in it.
-    let allow_unknown = cfg.general.allow_unknown_build;
-    let build = identify(crate::exe_path().as_deref());
-    let allowed = build.as_ref().map_or(allow_unknown, |build| {
-        decide_code_patches(build, allow_unknown)
-    });
-    log::info!("{}", build_line(&build, allowed));
-    if let Some(advice) = unknown_build_advice(&build, allowed) {
+    // 6. Which build is this, and 7. may code be patched in it. (`Enabled = 0` stops here, before
+    // the exe is read.) Nothing reads the answer between `judge` and `record`.
+    let verdict = judge(&cfg, || identify(crate::exe_path().as_deref()));
+    record(&verdict, &CODE_PATCHES);
+    let Verdict::Checked { build, allowed } = &verdict else {
+        log::warn!("Enabled = 0 in {INI_FILE_NAME}: the mod does nothing");
+        return;
+    };
+    log::log!(build_level(build), "{}", build_line(build, *allowed));
+    if let Some(advice) = unknown_build_advice(build, *allowed) {
         log::warn!("{advice}");
     }
-    // `start` runs once, so the cell is empty here; the `Err` case could only mean "already set".
-    let _ = CODE_PATCHES.set(allowed);
 
     // Later tasks add their start-up steps below this line, in the order the plan gives.
 }
@@ -226,13 +266,12 @@ mod tests {
     }
 
     #[test]
-    fn no_settings_folder_gives_the_defaults_a_warning_and_no_file() {
+    fn no_settings_folder_gives_the_defaults_and_a_warning() {
+        // `load_settings(None)` has no path to read or write, so it cannot touch any file.
         let (cfg, warnings) = load_settings(None);
         assert_eq!(cfg, Config::default());
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("settings"), "{}", warnings[0]);
-        // A relative path would have put the file in the current folder.
-        assert!(!Path::new(INI_FILE_NAME).exists());
     }
 
     fn hash_of_abc() -> [u8; 32] {
@@ -313,6 +352,74 @@ mod tests {
         assert!(on.contains("AllowUnknownBuild"), "{on}");
         assert_ne!(on, off);
         assert!(unknown_build_advice(&Err(String::new()), false).is_some());
+    }
+
+    /// A `Config` with the two switches the build step looks at.
+    fn cfg_with(enabled: bool, allow_unknown_build: bool) -> Config {
+        let mut cfg = Config::default();
+        cfg.general.enabled = enabled;
+        cfg.general.allow_unknown_build = allow_unknown_build;
+        cfg
+    }
+
+    #[test]
+    fn enabled_0_stops_before_the_exe_is_read_and_leaves_the_flag_unset() {
+        // Even with AllowUnknownBuild = 1, so the stop is not just "patches are off anyway".
+        let cfg = cfg_with(false, true);
+        let exe_was_read = std::cell::Cell::new(false);
+        let verdict = judge(&cfg, || {
+            exe_was_read.set(true);
+            Ok(Build::Known("f68140a3"))
+        });
+        assert_eq!(verdict, Verdict::Disabled);
+        assert!(
+            !exe_was_read.get(),
+            "the exe must not be read when Enabled = 0"
+        );
+        let cell = OnceLock::new();
+        record(&verdict, &cell);
+        assert_eq!(cell.get(), None, "a stopped start-up must not set the flag");
+        assert!(!read_flag(&cell));
+    }
+
+    #[test]
+    fn enabled_1_identifies_the_build_and_decides_the_flag() {
+        let known = Ok(Build::Known("f68140a3"));
+        let unknown = Ok(Build::Unknown([7; 32]));
+        let unreadable: Result<Build, String> = Err("cannot read x".to_owned());
+        // (build, AllowUnknownBuild, expected answer)
+        let cases = [
+            (known, false, true),
+            (unknown.clone(), false, false),
+            (unknown, true, true),
+            (unreadable.clone(), false, false),
+            (unreadable, true, true),
+        ];
+        for (build, allow_unknown, want) in cases {
+            let verdict = judge(&cfg_with(true, allow_unknown), || build.clone());
+            assert_eq!(
+                verdict,
+                Verdict::Checked {
+                    build: build.clone(),
+                    allowed: want
+                }
+            );
+            let cell = OnceLock::new();
+            record(&verdict, &cell);
+            assert_eq!(
+                cell.get(),
+                Some(&want),
+                "{build:?}, AllowUnknownBuild={allow_unknown}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_known_build_is_logged_below_warn() {
+        use log::Level;
+        assert_eq!(build_level(&Ok(Build::Known("f68140a3"))), Level::Info);
+        assert_eq!(build_level(&Ok(Build::Unknown([7; 32]))), Level::Warn);
+        assert_eq!(build_level(&Err("cannot read x".to_owned())), Level::Warn);
     }
 
     #[test]

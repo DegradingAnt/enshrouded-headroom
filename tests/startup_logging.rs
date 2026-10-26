@@ -56,18 +56,24 @@ fn level_filter_and_panic_hook_write_the_log_not_stderr() {
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
+    // Once the panic hook is installed, a failure in the child is written to the log and not to
+    // stderr, so the log (if there is one) belongs in the message.
+    let log_text = std::fs::read_to_string(dir.join(enshrouded_headroom::log::LOG_FILE_NAME));
+    let log_shown = log_text
+        .as_deref()
+        .unwrap_or("<no log file, or it cannot be read>");
     assert!(
         output.status.success(),
-        "child failed: {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        "child failed: {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}\nlog:\n{log_shown}",
         output.status
     );
     assert!(
         stdout.contains("1 passed"),
-        "the child must have run the scenario\nstdout:\n{stdout}"
+        "the child must have run the scenario\nstdout:\n{stdout}\nlog:\n{log_shown}"
     );
 
     // (b) The level limit: `info!` is cut, `warn!` is kept.
-    let log = std::fs::read_to_string(dir.join(enshrouded_headroom::log::LOG_FILE_NAME)).unwrap();
+    let log = log_text.unwrap();
     assert!(
         !log.contains("info line below the limit"),
         "an info line got through a Warn limit:\n{log}"

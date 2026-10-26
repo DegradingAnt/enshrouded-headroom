@@ -93,8 +93,8 @@ impl Provider {
     fn open_sha256() -> io::Result<Provider> {
         let mut handle: BCRYPT_ALG_HANDLE = std::ptr::null_mut();
         // SAFETY: `handle` is a valid place for the result; `BCRYPT_SHA256_ALGORITHM` is a
-        // NUL-terminated UTF-16 string; a null implementation name selects Windows' own provider;
-        // 0 is "no flags".
+        // NUL-terminated UTF-16 string; a null implementation name selects the default provider
+        // for the algorithm; 0 is "no flags".
         let status = unsafe {
             BCryptOpenAlgorithmProvider(&mut handle, BCRYPT_SHA256_ALGORITHM, std::ptr::null(), 0)
         };
@@ -154,8 +154,10 @@ impl<'provider> Hash<'provider> {
         check("BCryptHashData", status)
     }
 
-    /// The digest of everything fed so far.
-    fn finish(&mut self) -> io::Result<[u8; 32]> {
+    /// The digest of everything fed so far. It takes the hash by value: BCrypt accepts no more
+    /// data after `BCryptFinishHash`, and this way the handle cannot be used again. `Drop` still
+    /// destroys it, on the error path as well.
+    fn finish(self) -> io::Result<[u8; 32]> {
         let mut digest = [0u8; 32];
         // SAFETY: `self.handle` is a live hash; `digest` is valid for `DIGEST_LEN` (32) bytes, the
         // size of a SHA-256 digest.
