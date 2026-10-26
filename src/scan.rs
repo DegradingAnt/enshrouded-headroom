@@ -197,9 +197,6 @@ const MIN_HEADER_COPY: usize = 0x40;
 pub(crate) struct SectionHeader {
     /// Zero-padded; a name of exactly 8 bytes has no NUL.
     name: [u8; 8],
-    /// The diagnostic name used by file comparison tests.
-    #[cfg(test)]
-    name_text: String,
     /// The section length in memory before alignment.
     pub(crate) virtual_size: u32,
     /// The section's relative virtual address.
@@ -212,7 +209,19 @@ pub(crate) struct SectionHeader {
 }
 
 impl SectionHeader {
-    /// Compare the entire raw name, without interpreting invalid UTF-8.
+    /// The diagnostic name used by file comparison tests, with invalid UTF-8 replaced.
+    #[cfg(test)]
+    fn name_text(&self) -> String {
+        let end = self
+            .name
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(self.name.len());
+        String::from_utf8_lossy(self.name.get(..end).unwrap_or_default()).into_owned()
+    }
+
+    /// Whole-name comparison. A request longer than 8 bytes never matches
+    /// (long section names that live in the COFF string table are not supported).
     fn is_named(&self, name: &str) -> bool {
         let len = self
             .name
@@ -222,8 +231,9 @@ impl SectionHeader {
         !name.is_empty() && self.name.get(..len) == Some(name.as_bytes())
     }
 
-    /// Return the mapped range, using raw size only when virtual size is zero.
-    /// An empty range is valid when its address is within `limit`.
+    /// `(rva, length)` of the section in memory, or `None` if it ends past `limit`.
+    /// An empty section (VirtualSize and SizeOfRawData both 0) is `Some((rva, 0))`,
+    /// not `None`, so the caller can tell "nothing to search" from "outside the module".
     fn mem_range(&self, limit: usize) -> Option<(usize, usize)> {
         let len = match self.virtual_size {
             0 => self.raw_size as usize,
@@ -244,13 +254,13 @@ pub(crate) struct PeInfo {
     /// The loader's declared image length.
     size_of_image: u32,
     /// The entry point RVA needed by the build comparison.
-    #[cfg(test)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) entry_rva: u32,
     /// Section alignment used by the build comparison.
-    #[cfg(test)]
+    #[cfg_attr(not(test), allow(dead_code))]
     section_alignment: u32,
     /// End of the complete section table, used by the file validation adapter.
-    #[cfg(test)]
+    #[cfg_attr(not(test), allow(dead_code))]
     section_table_end: usize,
     /// Section entries in their original table order.
     sections: Vec<SectionHeader>,
@@ -271,8 +281,22 @@ impl PeInfo {
     pub(crate) fn section(&self, name: &str) -> Result<&SectionHeader, String> {
         self.sections
             .iter()
-            .find(|s| s.name_text == name)
+            .find(|s| s.name_text() == name)
             .ok_or_else(|| format!("no {name} section"))
+    }
+
+    /// The virtual address (image base included) and file bytes of a named section.
+    pub(crate) fn section_va_bytes<'file>(
+        &self,
+        file: &'file [u8],
+        name: &str,
+    ) -> Result<(u64, &'file [u8]), String> {
+        let section = self.section(name)?;
+        let va = self
+            .image_base
+            .checked_add(u64::from(section.rva))
+            .ok_or("section address overflow")?;
+        Ok((va, self.raw_virtual(file, section)?))
     }
 
     /// Read the full raw section, including any file padding past its virtual size.
@@ -310,18 +334,18 @@ impl PeInfo {
         file.get(start..end).ok_or_else(|| {
             format!(
                 "{}: raw data {start:#x}..{end:#x} is past the end of the file ({} bytes)",
-                section.name_text,
+                section.name_text(),
                 file.len()
             )
         })
     }
 
     /// Name the section containing `rva`, using its unaligned virtual size.
-    pub(crate) fn section_of(&self, rva: u32) -> Option<&str> {
+    pub(crate) fn section_of(&self, rva: u32) -> Option<String> {
         self.sections
             .iter()
             .find(|s| (s.rva..s.rva.saturating_add(s.virtual_size)).contains(&rva))
-            .map(|s| s.name_text.as_str())
+            .map(|s| s.name_text())
     }
 }
 
@@ -399,11 +423,6 @@ pub(crate) fn parse_pe(b: &[u8]) -> Result<PeInfo, String> {
             .map_err(|_| "section name")?;
         sections.push(SectionHeader {
             name,
-            #[cfg(test)]
-            name_text: {
-                let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
-                String::from_utf8_lossy(name.get(..end).ok_or("section name")?).into_owned()
-            },
             virtual_size: u32_at(header, 8).ok_or("VirtualSize")?,
             rva: u32_at(header, 12).ok_or("VirtualAddress")?,
             raw_size: u32_at(header, 16).ok_or("SizeOfRawData")?,
@@ -413,11 +432,8 @@ pub(crate) fn parse_pe(b: &[u8]) -> Result<PeInfo, String> {
     Ok(PeInfo {
         image_base,
         size_of_image,
-        #[cfg(test)]
         entry_rva: u32_at(b, pe_offset(optional, 16)?).ok_or("no AddressOfEntryPoint")?,
-        #[cfg(test)]
         section_alignment: u32_at(b, pe_offset(optional, 32)?).ok_or("no SectionAlignment")?,
-        #[cfg(test)]
         section_table_end: table_end,
         sections,
     })
@@ -912,7 +928,6 @@ mod tests {
             name: [0; 8],
             virtual_size: vsize,
             rva: va,
-            name_text: String::new(),
             raw_size: rsize,
             raw_ptr: 0,
         };
@@ -1033,13 +1048,17 @@ mod tests {
         assert!(parse_pe_file(&[0u8; 0x40]).is_err());
         // A valid e_lfanew that points past the end of the file.
         let mut file = vec![0u8; 0x40];
+        file[..2].copy_from_slice(b"MZ");
         file[0x3c] = 0xff;
-        assert!(parse_pe_file(&file).is_err());
+        let error = parse_pe_file(&file).unwrap_err();
+        assert!(error.contains("PE signature at e_lfanew 0xff"), "{error}");
         // A PE signature, then nothing.
         let mut file = vec![0u8; 0x80];
+        file[..2].copy_from_slice(b"MZ");
         file[0x3c] = 0x40;
         file[0x40..0x44].copy_from_slice(b"PE\0\0");
-        assert!(parse_pe_file(&file).is_err());
+        let error = parse_pe_file(&file).unwrap_err();
+        assert!(error.contains("PE32+"), "{error}");
     }
 
     // ---- the PE reader, on files made here (always run) --------------------------------------
@@ -1104,7 +1123,7 @@ mod tests {
         let file = two_section_pe();
         let pe = parse_pe_file(&file).unwrap();
         assert_eq!((pe.entry_rva, pe.section_alignment), (0x3010, 0x1000));
-        let names: Vec<&str> = pe.sections.iter().map(|s| s.name_text.as_str()).collect();
+        let names: Vec<String> = pe.sections.iter().map(|s| s.name_text()).collect();
         assert_eq!(names, [".text", ".bind"]);
         let bind = pe.section(".bind").unwrap();
         assert_eq!(
@@ -1115,7 +1134,7 @@ mod tests {
         // A name that fills all 8 bytes has no NUL; the next field must not run into it.
         let long = tiny_pe(0, &[("abcdefgh", 1, 0x1000, 0, 0)]);
         assert_eq!(
-            parse_pe_file(&long).unwrap().sections[0].name_text,
+            parse_pe_file(&long).unwrap().sections[0].name_text(),
             "abcdefgh"
         );
     }
@@ -1171,9 +1190,9 @@ mod tests {
             (u32::MAX, None),
         ];
         for (rva, want) in cases {
-            assert_eq!(pe.section_of(rva), want, "rva {rva:#x}");
+            assert_eq!(pe.section_of(rva).as_deref(), want, "rva {rva:#x}");
         }
-        assert_eq!(pe.section_of(pe.entry_rva), Some(".bind"));
+        assert_eq!(pe.section_of(pe.entry_rva).as_deref(), Some(".bind"));
     }
 
     #[test]
@@ -1234,6 +1253,21 @@ mod tests {
                 pe.raw_virtual(&file, section).unwrap(),
                 &file[0x200..0x200 + len]
             );
+            assert_eq!(
+                pe.section_va_bytes(&file, ".text").unwrap(),
+                (pe.image_base + 0x1000, &file[0x200..0x200 + len])
+            );
+            assert!(pe.section_va_bytes(&file[..0x1ff], ".text").is_err());
+            assert!(pe
+                .section_va_bytes(&file, ".gone")
+                .unwrap_err()
+                .contains(".gone"));
+            let mut overflow = parse_pe_file(&file).unwrap();
+            overflow.image_base = u64::MAX;
+            assert!(overflow
+                .section_va_bytes(&file, ".text")
+                .unwrap_err()
+                .contains("overflow"));
             assert!(pe.raw_virtual(&file[..0x1ff], section).is_err());
             if len > 0 {
                 assert!(pe.raw_virtual(&file[..0x200 + len - 1], section).is_err());
@@ -1250,7 +1284,7 @@ mod tests {
         assert!(pe.raw(&file, section).is_err());
         assert!(pe.raw_virtual(&file, section).is_err());
         assert_eq!(pe.pages_of(section), 0x1_0000_0000);
-        assert_eq!(pe.section_of(u32::MAX), None);
+        assert_eq!(pe.section_of(u32::MAX).as_deref(), None);
 
         let table = 0x188;
         let mut many = synth_pe(&[(".text", 1, 0x1000, 0, 0)], 0x4000);
@@ -1269,8 +1303,8 @@ mod tests {
         let pe = parse_pe_file(&file).unwrap();
         let section = &pe.sections[0];
         assert!(!section.is_named("\u{fffd}text"));
-        assert_eq!(section.name_text, "\u{fffd}text");
-        assert_eq!(pe.section_of(0x1000), Some("\u{fffd}text"));
+        assert_eq!(section.name_text(), "\u{fffd}text");
+        assert_eq!(pe.section_of(0x1000).as_deref(), Some("\u{fffd}text"));
     }
 
     // ---- readable memory ------------------------------------------------------------------

@@ -892,19 +892,12 @@ mod tests {
     /// same code at the same address), from the RE notes.
     const MATCH_VA: u64 = 0x1_4084_90d2;
 
-    /// Return the section address and bytes present in both its raw and virtual ranges.
+    /// The `.text` section of a PE32+ file: its virtual address (image base included)
+    /// and the bytes of it that are in the file (the lesser of raw and virtual size).
     fn text_of(file: &[u8]) -> (u64, &[u8]) {
-        let pe = crate::scan::parse_pe(file).expect("PE32+ headers");
-        let section = pe.section(".text").expect("section in the file");
-        let va = pe
-            .image_base
-            .checked_add(u64::from(section.rva))
-            .expect("section address");
-        (
-            va,
-            pe.raw_virtual(file, section)
-                .expect("section bytes in file"),
-        )
+        crate::scan::parse_pe(file)
+            .and_then(|pe| pe.section_va_bytes(file, ".text"))
+            .expect("section address and bytes in the PE32+ file")
     }
 
     #[test]

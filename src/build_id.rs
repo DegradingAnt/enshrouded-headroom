@@ -501,8 +501,8 @@ mod tests {
 
         // The only code that is new is Steam's stub, and the exe now starts there; the old exe
         // started in the game's own `.text`.
-        assert_eq!(steam.section_of(steam.entry_rva), Some(".bind"));
-        assert_eq!(old.section_of(old.entry_rva), Some(".text"));
+        assert_eq!(steam.section_of(steam.entry_rva).as_deref(), Some(".bind"));
+        assert_eq!(old.section_of(old.entry_rva).as_deref(), Some(".text"));
         println!(
             "entry point: Steam {:#x} in .bind, old {:#x} in .text",
             steam.entry_rva, old.entry_rva
