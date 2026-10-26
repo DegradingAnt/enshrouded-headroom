@@ -176,6 +176,14 @@ VRAM budget: `vram_budget` queries `VkPhysicalDeviceMemoryBudgetPropertiesEXT` f
 
 The governor is a pure state machine with unit tests (section 10).
 
+The runtime reads the present ring every 50 ms using reserved frame and statistics buffers.
+It refreshes the display period every 5 s and checks memory availability every 2 s.
+A successful scene-hook batch is the source of the installed fact. If that hook stops advancing
+for 10 s while frames arrive, the runtime logs once and holds every current step until it recovers.
+A panic stops the governor before it publishes a partial knob batch. Every 30 s the info log
+reports recent frame p50/p95, the effective target, all three steps and active/inactive/backoff state.
+Fixed debug steps obey the same probe, grass capacity and memory gates as automatic raises.
+
 ### 6.5 NVIDIA Reflex (experimental)
 
 Fact: the exe contains none of `vkLatencySleepNV`, `vkSetLatencySleepModeNV`, `vkSetLatencyMarkerNV`, `VK_NV_low_latency`, `low_latency2`, `NvAPI` or `nvapi64` (whole-file ASCII and UTF-16 search, 2026-10-25). The menu has a Reflex option (`nvidiaReflex`), but the Vulkan path cannot call Reflex, so the option is very likely inert.

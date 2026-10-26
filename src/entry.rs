@@ -307,6 +307,10 @@ pub fn start() {
     // 15. Enable every queued hook at once (MinHook's queued enable). This is the only place that
     // enables hooks. It logs one line if any hook was queued.
     knobs::enable_queued_hooks();
+
+    // 16. Verified startup scales precede the governor, whose loop observes only atomics.
+    features::startup_scales::init(&cfg.knobs);
+    crate::governor_thread::spawn(cfg);
 }
 
 #[cfg(test)]

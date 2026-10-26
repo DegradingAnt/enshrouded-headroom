@@ -1,4 +1,4 @@
-//! Planning and diagnostics for the pending 50 ms governor runtime.
+//! The guarded 50 ms governor thread and its allocation-free planning boundary.
 
 /// The value for a validated governor action; invalid knob/step pairs are refused.
 pub fn knob_value(knob: usize, step: u8) -> Option<f32> {
@@ -244,6 +244,376 @@ fn plan_then_publish<T>(plan: impl FnOnce() -> T, publish: impl FnOnce(T)) {
     publish(values);
 }
 
+/// One atomic/input snapshot. No game pointer is retained by the runtime.
+struct Sample<'a> {
+    now_s: f64,
+    frames: &'a [f64],
+    world_active: bool,
+    installed: bool,
+    seen: u64,
+    unknown: u32,
+    baseline_seq: [u32; 3],
+    period_ms: f64,
+    level: u32,
+    probe_ok: bool,
+    probe_failed: bool,
+    last_a: u32,
+    free_mib: Option<u64>,
+}
+
+/// A fully planned publication; all validation and logging precede the atomic writes.
+struct Plan {
+    steps: [u8; 3],
+    values: [f32; 3],
+    signals: SignalEvents,
+    report_probe_failure: bool,
+    state: RuntimeState,
+}
+
+/// Thread-local state and reserved storage. No field is shared with a game hook.
+struct Runtime {
+    cfg: crate::config::Config,
+    governor: crate::governor::Governor,
+    scratch: crate::governor::TickScratch,
+    watch: SignalWatch,
+    baseline_seq: [u32; 3],
+    steps: [u8; 3],
+    probe_failure_reported: bool,
+    history: std::collections::VecDeque<(f64, f64)>,
+    sorted: Vec<f64>,
+}
+
+impl Runtime {
+    /// Allocate bounded buffers before the first tick.
+    fn new(cfg: crate::config::Config) -> Self {
+        let enabled = [
+            cfg.knobs.enable_object_distance,
+            false,
+            cfg.knobs.enable_terrain_distance,
+        ];
+        let maxima = [
+            cfg.knobs.max_object_distance,
+            cfg.knobs.max_scatter_distance,
+            cfg.knobs.max_terrain_distance,
+        ];
+        let specs = enabled
+            .into_iter()
+            .zip(maxima)
+            .map(|(enabled, max_step)| crate::governor::KnobSpec { enabled, max_step })
+            .collect();
+        Self {
+            cfg,
+            governor: crate::governor::Governor::new(cfg.governor, specs),
+            scratch: crate::governor::TickScratch::new(3, crate::frame_timer::RING_LEN),
+            watch: SignalWatch::new(0.0),
+            baseline_seq: [0; 3],
+            steps: [0; 3],
+            probe_failure_reported: false,
+            history: std::collections::VecDeque::with_capacity(crate::frame_timer::RING_LEN),
+            sorted: Vec::with_capacity(crate::frame_timer::RING_LEN),
+        }
+    }
+
+    /// Plan one batch without I/O or allocation. A missing world signal holds every current step,
+    /// including debug holds, menu changes and probe safety reductions, until the signal recovers.
+    fn plan(&mut self, sample: &Sample<'_>) -> Plan {
+        let signals = self.watch.observe(
+            sample.now_s,
+            sample.installed,
+            sample.seen,
+            !sample.frames.is_empty(),
+            sample.unknown,
+        );
+        for &ms in sample
+            .frames
+            .iter()
+            .filter(|ms| ms.is_finite() && **ms > 0.0)
+        {
+            if self.history.len() == crate::frame_timer::RING_LEN {
+                self.history.pop_front();
+            }
+            self.history.push_back((sample.now_s, ms));
+        }
+        while self
+            .history
+            .front()
+            .is_some_and(|(t, _)| sample.now_s - t > self.cfg.governor.window_seconds)
+        {
+            self.history.pop_front();
+        }
+        let report_probe_failure =
+            !signals.freeze && sample.probe_failed && !self.probe_failure_reported;
+        if report_probe_failure {
+            self.probe_failure_reported = true;
+        }
+        if !signals.freeze {
+            let limits = StepLimits {
+                enabled: [
+                    self.cfg.knobs.enable_object_distance,
+                    scatter_enabled(
+                        sample.level,
+                        self.cfg.knobs.enable_scatter_distance,
+                        sample.probe_ok,
+                    ),
+                    self.cfg.knobs.enable_terrain_distance,
+                ],
+                max: [
+                    self.cfg.knobs.max_object_distance,
+                    self.cfg.knobs.max_scatter_distance,
+                    self.cfg.knobs.max_terrain_distance,
+                ],
+                vram_free_mib: sample.free_mib,
+                min_vram_free_mib: self.cfg.governor.min_vram_free_mib,
+                probe_failed: sample.probe_failed,
+                last_a: sample.last_a,
+                scatter_ceiling: u8::try_from(crate::features::scatter_probe::ceiling_step(
+                    &crate::knobs::SCATTER_STEPS,
+                    crate::features::scatter_probe::R_MAX_M,
+                ))
+                .unwrap_or(0),
+            };
+            let forced = forced_steps(self.cfg.general.log_level, &self.cfg.debug);
+            let requested = std::array::from_fn(|k| {
+                forced
+                    .get(k)
+                    .copied()
+                    .flatten()
+                    .unwrap_or(self.steps.get(k).copied().unwrap_or(0))
+            });
+            let held = limit_steps(self.steps, requested, &limits);
+            for knob in 0..3 {
+                let enabled = limits.enabled.get(knob) == Some(&true);
+                self.governor.set_enabled(knob, enabled);
+                self.governor.force_step(
+                    knob,
+                    forced
+                        .get(knob)
+                        .copied()
+                        .flatten()
+                        .map(|_| held.get(knob).copied().unwrap_or(0)),
+                );
+            }
+            let changed = std::array::from_fn::<_, 3, _>(|k| {
+                sample.baseline_seq.get(k) != self.baseline_seq.get(k)
+            });
+            self.baseline_seq = sample.baseline_seq;
+            self.governor.tick_with(
+                &mut self.scratch,
+                &crate::governor::Inputs {
+                    now_s: sample.now_s,
+                    new_frames_ms: sample.frames,
+                    world_active: sample.world_active,
+                    period_ms: sample.period_ms,
+                    vram_free_mib: sample.free_mib,
+                    baseline_changed: &changed,
+                },
+            );
+            let proposed =
+                std::array::from_fn(|k| self.governor.steps().get(k).copied().unwrap_or(0));
+            let next = limit_steps(self.steps, proposed, &limits);
+            for knob in 0..3 {
+                let wanted = next.get(knob).copied().unwrap_or(0);
+                if proposed.get(knob).copied().unwrap_or(0) > wanted {
+                    self.governor.veto_raise(knob);
+                }
+                if self.governor.steps().get(knob).copied() != Some(wanted) {
+                    self.governor.force_step(knob, Some(wanted));
+                    if forced.get(knob).is_none_or(Option::is_none) {
+                        self.governor.force_step(knob, None);
+                    }
+                }
+            }
+            self.steps = next;
+        }
+        let state = if signals.freeze {
+            RuntimeState::Inactive
+        } else {
+            match self.governor.status().state {
+                crate::governor::State::Active => RuntimeState::Active,
+                crate::governor::State::Inactive => RuntimeState::Inactive,
+                crate::governor::State::BackingOff => RuntimeState::BackingOff,
+            }
+        };
+        Plan {
+            steps: self.steps,
+            values: std::array::from_fn(|k| {
+                knob_value(k, self.steps.get(k).copied().unwrap_or(0)).unwrap_or(1.0)
+            }),
+            signals,
+            report_probe_failure,
+            state,
+        }
+    }
+
+    /// Percentiles of the bounded recent frame window, using reserved sort storage.
+    fn percentiles(&mut self) -> (f64, f64) {
+        self.sorted.clear();
+        self.sorted.extend(self.history.iter().map(|(_, ms)| *ms));
+        self.sorted.sort_unstable_by(f64::total_cmp);
+        let at = |percent: usize| {
+            self.sorted
+                .get(
+                    self.sorted
+                        .len()
+                        .saturating_mul(percent)
+                        .div_ceil(100)
+                        .saturating_sub(1),
+                )
+                .copied()
+                .unwrap_or(0.0)
+        };
+        (at(50), at(95))
+    }
+}
+
+/// W23's lifetime-protected provider is not merged yet. Unknown memory blocks every costly
+/// raise. Replace this hook only after the provider is legitimately available on feat/v1.
+fn query_vram_free_mib() -> Option<u64> {
+    None
+}
+
+/// W23's latency_report is not merged yet; this named five-second hook is intentionally empty.
+fn report_reflex_latency_when_available() {}
+
+/// Start once from entry, after queued hooks are applied. No runtime thread is started in unit
+/// tests; tests drive Runtime::plan synchronously with injected snapshots instead.
+pub fn spawn(cfg: crate::config::Config) {
+    if cfg.governor.target_fps == 0 {
+        return;
+    }
+    if let Err(error) = std::thread::Builder::new()
+        .name("headroom-governor".to_owned())
+        .spawn(move || {
+            crate::guard::guard(crate::guard::Feature::Governor, || (), || run(cfg));
+        })
+    {
+        log::warn!("governor: could not start: {error}");
+    }
+}
+
+/// Execute the loop entirely under the feature guard. A panic stops it with shared values held.
+fn run(cfg: crate::config::Config) {
+    use crate::features::scatter_probe as probe;
+    use std::sync::atomic::Ordering::{Acquire, Relaxed};
+    let mut runtime = Runtime::new(cfg);
+    let mut reader = FrameReader::new();
+    let origin = crate::frame_timer::qpc_now();
+    let mut period_ms = 0.0;
+    let mut free_mib = None;
+    let mut display_at = f64::NEG_INFINITY;
+    let mut memory_at = f64::NEG_INFINITY;
+    let mut status_at = 0.0;
+    let mut latency_at = 0.0;
+    let mut probe_at = 0.0;
+    let mut applied = [0; 3];
+    log::info!("governor: started; inactive");
+    loop {
+        if crate::guard::is_disabled(crate::guard::Feature::Governor) {
+            return;
+        }
+        let now_qpc = crate::frame_timer::qpc_now();
+        let now_s = crate::frame_timer::qpc_to_ms(now_qpc.saturating_sub(origin)) / 1000.0;
+        if now_s - display_at >= 5.0 {
+            period_ms = crate::display::period_ms(
+                crate::display::game_window().and_then(crate::display::refresh_hz),
+            );
+            display_at = now_s;
+        }
+        if crate::guard::is_disabled(crate::guard::Feature::Governor) {
+            return;
+        }
+        if now_s - memory_at >= 2.0 {
+            free_mib = query_vram_free_mib();
+            memory_at = now_s;
+        }
+        let seen = crate::knobs::OBJECT.last_seen();
+        let frames = reader.read(&crate::frame_timer::FRAMES, crate::frame_timer::qpc_to_ms);
+        let plan = runtime.plan(&Sample {
+            now_s,
+            frames,
+            world_active: seen != 0
+                && now_qpc
+                    .checked_sub(seen)
+                    .is_some_and(|delta| crate::frame_timer::qpc_to_ms(delta) < 250.0),
+            installed: crate::knobs::object_distance::hook_installed(),
+            seen,
+            unknown: crate::knobs::OBJECT_UNKNOWN_BASELINE.load(Relaxed),
+            baseline_seq: [
+                crate::knobs::OBJECT.baseline().1,
+                crate::knobs::SCATTER.baseline().1,
+                crate::knobs::TERRAIN.baseline().1,
+            ],
+            period_ms,
+            level: crate::knobs::SCATTER_LEVEL.load(Relaxed),
+            probe_ok: probe::PROBE_OK.load(Acquire),
+            probe_failed: probe::FAILED.load(Acquire),
+            last_a: probe::LAST_A.load(Relaxed),
+            free_mib,
+        });
+        plan_then_publish(
+            || {
+                if plan.signals.report_missing {
+                    log::warn!("world signal missing: the governor holds every knob");
+                }
+                if plan.signals.report_unknown {
+                    log::warn!("the game wrote an unexpected object-distance value; scaling skipped for those frames");
+                }
+                if plan.report_probe_failure {
+                    log::warn!("governor: scatter probe failed; grass reset to step 0");
+                }
+                for (knob, (&before, &step)) in applied.iter().zip(&plan.steps).enumerate() {
+                    if before != step {
+                        log::info!("governor: knob {knob} step {before} -> {step}");
+                    }
+                }
+                if now_s - status_at >= 30.0 {
+                    let (p50, p95) = runtime.percentiles();
+                    log::info!(
+                        "{}",
+                        status_line(
+                            p50,
+                            p95,
+                            (1000.0 / f64::from(cfg.governor.target_fps)).max(period_ms),
+                            plan.steps,
+                            plan.state
+                        )
+                    );
+                    status_at = now_s;
+                }
+                if cfg.general.log_level == crate::config::LogLevel::Debug {
+                    if now_s - latency_at >= 5.0 {
+                        report_reflex_latency_when_available();
+                        latency_at = now_s;
+                    }
+                    if cfg.debug.scatter_probe && now_s - probe_at >= 2.0 {
+                        log::debug!(
+                            "scatter probe: A={} peak_A={} B={} peak_B={} C={} peak_C={}",
+                            probe::LAST_A.load(Relaxed),
+                            probe::PEAK_A.load(Relaxed),
+                            probe::LAST_B.load(Relaxed),
+                            probe::PEAK_B.load(Relaxed),
+                            probe::LAST_C.load(Relaxed),
+                            probe::PEAK_C.load(Relaxed)
+                        );
+                        probe_at = now_s;
+                    }
+                }
+                plan.values
+            },
+            |values| {
+                // Every value is already validated. These setters are only atomic stores and cannot
+                // panic, allocate or call user code. No logging occurs between stores.
+                let [object, scatter, terrain] = values;
+                crate::knobs::OBJECT.set(object);
+                crate::knobs::scatter_distance::set_distance(scatter);
+                crate::knobs::TERRAIN.set(terrain);
+            },
+        );
+        applied = plan.steps;
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::alloc::{GlobalAlloc, Layout, System};
@@ -315,6 +685,203 @@ mod tests {
     }
 
     #[test]
+    fn runtime_plan_is_allocation_free_and_unknown_vram_vetoes_all_raises() {
+        let mut cfg = crate::config::Config::default();
+        cfg.governor.settle_seconds = 0.0;
+        cfg.governor.raise_hold_seconds = 0.0;
+        let mut runtime = Runtime::new(cfg);
+        let sample = Sample {
+            now_s: 0.0,
+            frames: &[5.0, 6.0],
+            world_active: true,
+            installed: true,
+            seen: 1,
+            unknown: 0,
+            baseline_seq: [0; 3],
+            period_ms: 0.0,
+            level: 3,
+            probe_ok: true,
+            probe_failed: false,
+            last_a: 0,
+            free_mib: None,
+        };
+        let allocations = allocation_count(|| {
+            for n in 0..100 {
+                let plan = runtime.plan(&Sample {
+                    now_s: f64::from(n) * 0.05,
+                    seen: n as u64 + 1,
+                    ..sample
+                });
+                assert_eq!(plan.steps, [0; 3]);
+            }
+        });
+        assert_eq!(allocations, 0);
+    }
+
+    #[test]
+    fn reusable_tick_has_no_allocations_across_full_batches_and_percentile_sorting() {
+        let mut cfg = crate::config::Config::default().governor;
+        cfg.settle_seconds = 0.0;
+        cfg.raise_hold_seconds = 0.0;
+        let mut governor = crate::governor::Governor::new(
+            cfg,
+            vec![
+                crate::governor::KnobSpec {
+                    enabled: true,
+                    max_step: 4
+                };
+                3
+            ],
+        );
+        let mut scratch = crate::governor::TickScratch::new(3, crate::frame_timer::RING_LEN);
+        let frames = vec![5.0; crate::frame_timer::RING_LEN];
+        let allocations = allocation_count(|| {
+            for n in 0..100 {
+                std::hint::black_box(governor.tick_with(
+                    &mut scratch,
+                    &crate::governor::Inputs {
+                        now_s: f64::from(n) * 0.05,
+                        new_frames_ms: &frames,
+                        world_active: true,
+                        period_ms: 0.0,
+                        vram_free_mib: Some(4096),
+                        baseline_changed: &[false; 3],
+                    },
+                ));
+            }
+        });
+        assert_eq!(allocations, 0);
+    }
+
+    #[test]
+    fn runtime_freeze_holds_fixed_steps_and_defers_resets_until_scene_recovers() {
+        let mut cfg = crate::config::Config::default();
+        cfg.general.log_level = crate::config::LogLevel::Debug;
+        cfg.debug.force_step_object = Some(2);
+        let mut runtime = Runtime::new(cfg);
+        let sample = Sample {
+            now_s: 0.0,
+            frames: &[5.0],
+            world_active: true,
+            installed: true,
+            seen: 1,
+            unknown: 0,
+            baseline_seq: [0; 3],
+            period_ms: 0.0,
+            level: 3,
+            probe_ok: true,
+            probe_failed: false,
+            last_a: 0,
+            free_mib: Some(4096),
+        };
+        assert_eq!(runtime.plan(&sample).steps, [2, 0, 0]);
+        let held = runtime.plan(&Sample {
+            now_s: 10.0,
+            world_active: false,
+            baseline_seq: [1; 3],
+            ..sample
+        });
+        assert!(held.signals.report_missing);
+        assert_eq!(held.steps, [2, 0, 0]);
+        assert_eq!(held.state, RuntimeState::Inactive);
+        let held_again = runtime.plan(&Sample {
+            now_s: 11.0,
+            world_active: false,
+            ..sample
+        });
+        assert!(!held_again.signals.report_missing);
+        assert_eq!(held_again.steps, [2, 0, 0]);
+        assert!(
+            !runtime
+                .plan(&Sample {
+                    now_s: 11.05,
+                    seen: 2,
+                    ..sample
+                })
+                .signals
+                .freeze
+        );
+    }
+
+    #[test]
+    fn missing_signal_freezes_an_automatic_step_across_a_menu_reset() {
+        let mut cfg = crate::config::Config::default();
+        cfg.governor.settle_seconds = 0.0;
+        cfg.governor.raise_hold_seconds = 0.0;
+        let mut runtime = Runtime::new(cfg);
+        let sample = Sample {
+            now_s: 0.0,
+            frames: &[5.0],
+            world_active: true,
+            installed: true,
+            seen: 1,
+            unknown: 0,
+            baseline_seq: [0; 3],
+            period_ms: 0.0,
+            level: 3,
+            probe_ok: true,
+            probe_failed: false,
+            last_a: 0,
+            free_mib: Some(4096),
+        };
+        let before = runtime.plan(&sample).steps;
+        assert!(before[0] > 0);
+        let plan = runtime.plan(&Sample {
+            now_s: 10.0,
+            world_active: false,
+            baseline_seq: [1; 3],
+            ..sample
+        });
+        assert!(plan.signals.freeze);
+        assert_eq!(plan.steps, before);
+    }
+
+    #[test]
+    fn panic_after_complete_runtime_plan_leaves_every_shared_value_unchanged() {
+        let cfg = crate::config::Config::default();
+        let mut runtime = Runtime::new(cfg);
+        let knobs = [
+            crate::knobs::KnobShared::new(0.85),
+            crate::knobs::KnobShared::new(100.0),
+            crate::knobs::KnobShared::new(1.5),
+        ];
+        let before = knobs.each_ref().map(crate::knobs::KnobShared::value);
+        let result = crate::guard::catch("runtime publication test", || {
+            plan_then_publish(
+                || {
+                    let plan = runtime.plan(&Sample {
+                        now_s: 0.0,
+                        frames: &[5.0],
+                        world_active: true,
+                        installed: true,
+                        seen: 1,
+                        unknown: 0,
+                        baseline_seq: [0; 3],
+                        period_ms: 0.0,
+                        level: 3,
+                        probe_ok: true,
+                        probe_failed: false,
+                        last_a: 0,
+                        free_mib: None,
+                    });
+                    std::hint::black_box(plan.values);
+                    panic!("injected log panic before atomic batch");
+                },
+                |values: [f32; 3]| {
+                    for (knob, value) in knobs.iter().zip(values) {
+                        knob.set(value);
+                    }
+                },
+            );
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            knobs.each_ref().map(crate::knobs::KnobShared::value),
+            before
+        );
+    }
+
+    #[test]
     fn owned_tick_helpers_allocate_nothing_after_storage_is_reserved() {
         let positive = allocation_count(|| {
             std::hint::black_box(Vec::<u8>::with_capacity(16));
@@ -357,7 +924,7 @@ mod tests {
     }
 
     #[test]
-    fn current_pure_governor_allocates_and_needs_the_requested_scratch_api() {
+    fn ordinary_tick_convenience_api_is_a_positive_allocation_control() {
         let mut governor = crate::governor::Governor::new(
             crate::config::Config::default().governor,
             vec![
@@ -379,7 +946,10 @@ mod tests {
         let allocations = allocation_count(|| {
             std::hint::black_box(governor.tick(&inputs));
         });
-        assert!(allocations > 0,"this checkpoint must expose the current allocating API rather than claim the loop is done");
+        assert!(
+            allocations > 0,
+            "the convenience API must remain a positive control for the allocation counter"
+        );
     }
     use super::*;
 

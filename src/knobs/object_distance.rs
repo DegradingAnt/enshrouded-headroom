@@ -49,6 +49,24 @@ const MAX_FACTOR: f32 = 1.0;
 pub type SceneSettingsFn =
     unsafe extern "system" fn(scene: *mut u8, settings: *const u8, extra: *const u32);
 
+/// A successfully queued scene hook awaiting the one startup apply.
+static SCENE_QUEUED: AtomicBool = AtomicBool::new(false);
+/// True only after an MH_OK queued apply containing the scene hook.
+static HOOK_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the scene hook's batch was successfully enabled. Partial failures remain false.
+pub fn hook_installed() -> bool {
+    HOOK_INSTALLED.load(Ordering::Acquire)
+}
+
+/// Consume the scene membership even on failure; another batch must not claim this one worked.
+pub(super) fn complete_hook_batch(result: &Result<u32, String>) {
+    let scene = SCENE_QUEUED.swap(false, Ordering::AcqRel);
+    if scene && matches!(result, Ok(n) if *n > 0) {
+        HOOK_INSTALLED.store(true, Ordering::Release);
+    }
+}
+
 /// MinHook's trampoline for the game function, or 0. Stored by [`install`] before the hook is
 /// enabled; read by the detour.
 static TRAMPOLINE: AtomicUsize = AtomicUsize::new(0);
@@ -269,6 +287,7 @@ unsafe fn hook_at(target: usize) -> Result<(), String> {
     // SAFETY: the caller's contract; the detour has the target's type (`const _` above).
     let trampoline = unsafe { create_and_queue(target, detour) }?;
     TRAMPOLINE.store(trampoline, Ordering::Release);
+    SCENE_QUEUED.store(true, Ordering::Release);
     Ok(())
 }
 
@@ -1077,5 +1096,45 @@ mod tests {
                 unsafe { MinHook::remove_hook(target as *mut c_void) }.unwrap();
             },
         );
+    }
+    #[test]
+    fn installed_fact_requires_successful_batch_containing_scene_hook() {
+        in_child(
+            "installed_fact_requires_successful_batch_containing_scene_hook",
+            || {
+                assert!(!hook_installed());
+                super::super::enable_queued_hooks();
+                assert!(
+                    !hook_installed(),
+                    "an empty apply must not invent a scene hook"
+                );
+                let target = fake_scene_settings as *const () as usize;
+                // SAFETY: the child owns this executable stand-in with the detour's exact type.
+                unsafe { hook_at(target) }.unwrap();
+                assert!(!hook_installed(), "queueing is not installation");
+                super::super::enable_queued_hooks();
+                assert!(hook_installed());
+                // SAFETY: no thread calls this child's owned hook now.
+                unsafe { MinHook::remove_hook(target as *mut c_void) }.unwrap();
+            },
+        );
+    }
+
+    #[test]
+    fn failed_scene_batch_does_not_publish_installed_fact() {
+        in_child("failed_scene_batch_does_not_publish_installed_fact", || {
+            let target = fake_scene_settings as *const () as usize;
+            // SAFETY: the child owns this executable stand-in with the detour's exact type.
+            unsafe { hook_at(target) }.unwrap();
+            complete_hook_batch(&Err("injected queued apply failure".to_owned()));
+            assert!(!hook_installed());
+            complete_hook_batch(&Ok(1));
+            assert!(
+                !hook_installed(),
+                "a later unrelated batch cannot publish an earlier failure"
+            );
+            // SAFETY: this child's hook remains disabled and is never executing.
+            unsafe { MinHook::remove_hook(target as *mut c_void) }.unwrap();
+        });
     }
 }
