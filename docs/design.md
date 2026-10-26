@@ -295,7 +295,7 @@ Each knob states:
 - **Capacity (research 2026-10-25, which replaces the doubling plan):**
   - The buffers are fixed per scene view: `ScatteredObjectData[0x14000]` and two `DetailScatteringInstanceData[0x14000]`. One GPU counter (A) fills the 0x14000 budget for both scatter passes each frame. The game reads that counter back to the CPU: last value at entry+0x14, peak at +0x1c, a warn level of 0xf000 (75 %) at +0x20, and the cap of 0x14000 at +0x24.
   - The exe has no CPU-side clamp. The only bound is the shader constant `scatteredObjectCapacity` (`0x140074d52`). The 0x14000 at `0x1400745e0` is counter METADATA, not a buffer size, so patching it would cause an overflow. **Capacity is never changed.**
-  - **Scatter counter probe (7.2a):** a pre-hook on `FUN_1400767a0` reads counter A every 30th frame. It self-checks the pointer chain (warn must be 0xf000 and cap 0x14000; otherwise the probe stays off and the knob stays at 90 m) and publishes the last value.
+  - **Scatter counter probe (7.2a):** a pre-hook on `FUN_1400767a0` reads counter A at most once every 500 ms. It self-checks the pointer chain (warn must be 0xf000 and cap 0x14000; otherwise the probe stays off and the knob stays at 90 m) and publishes the last value.
   - **Live headroom rule:** the governor raises this knob from r to r_next only while `last × (r_next / r)² < 0xf000`, and steps down at once when `last ≥ 0xf000`. The readback is at least one frame late; the 25 % gap between warn and cap is the margin.
   - **Hard ceiling:** r_max = 90 × sqrt(0xf000 / peak₉₀), where peak₉₀ is measured once at vanilla 90 m in the densest grass (the author's measurement session, `[Debug] ScatterProbe = 1`). Until it is measured, the ceiling is 90 m and the knob is inactive.
   - Not covered: the brick gate's own `maxCullElements` (`BrickCullingShaderParameters` +0xec8). The measurement session also watches for missing bricks at the raised distance.
@@ -310,9 +310,11 @@ Each knob states:
   - obj = [pass+0x18];
   - pool = [[pass+0x8]+0x20];
   - entry(h) = [pool+0x48] + (h & 0xffff) × 0x40, for h = [obj+0x8] (counter A), [obj+0xc] (B) and [obj+0x10] (C).
-  - Every pointer is checked readable (VirtualQuery) before it is read.
+  - Each block that a sample reads is checked readable (VirtualQuery) once before it is read: `pass` +0x8..+0x20, owner +0x20..+0x28, pool +0x48..+0x50, obj +0x8..+0x14, and each entry +0x14..+0x3c. That is 7 checks per sample. The probe never reads outside a checked block.
+- **When it is installed:** only with `[Debug] ScatterProbe = 1` and `LogLevel = debug`, or with `EnableScatterDistance = 1` once the measured ceiling r_max allows a raise (`ceiling_step(SCATTER_STEPS, r_max) > 0`). Until r_max is measured, a default install has no probe hook. (The first version was on by default and sampled every 30th call with a check before each of 22 reads. In game it caused a stutter, 2026-10-26.)
 - **Rules:**
-  - The hook samples every 30th call, publishes atomics only, never logs, and always calls the original.
+  - The hook samples at most once every 500 ms of `QueryPerformanceCounter` time, however often the grass pass runs; the first call samples. A call claims a due sample with a compare-exchange on the next due time, so two threads never take the same sample. A call with no sample due reads the clock and one atomic, nothing more.
+  - It publishes atomics only, never logs, and always calls the original exactly once.
   - The self-check requires A.warn = 0xf000 and A.cap = 0x14000. On a failure, the probe turns off for the session (once, logged by the governor thread).
   - It runs inside `guard(Feature::ScatterDistance, ...)`.
 - **Debug output:** with `[Debug] ScatterProbe = 1` and `LogLevel = debug`, the governor thread logs A, B and C (last and peak) every 2 s, and the session peak of A at exit.
@@ -321,7 +323,7 @@ Each knob states:
 ### 7.3 Terrain detail distance (`TerrainDistance`): priority 3
 
 - **What it changes:** `dist0`, the base distance of the voxel-terrain LOD octree. A node refines while `dist × 0.969 ≤ cell × R`, where cell = 32/2^level and R = dist0 × min(2·scale, 1) (agent knob-terrain). With dist0 = 32, full detail reaches about 33 m and each coarser band doubles.
-- **Where it lives:** `FUN_1401e2e80(mgr, camPos, params)` copies 32 bytes from `params` into `mgr+0xc478` on every call (verified at `0x1401e2eed`–`0x1401e2efb`). The defaults are 32 / 128 / 256 (verified at `0x1400fa623`–`0x1400fa631`). A minhook pre-hook multiplies `params[0]` by the knob factor before calling the original.
+- **Where it lives:** `FUN_1401e2e80(mgr, camPos, params)` copies 40 bytes (0x28) from `params` into `mgr+0xc478` on every call (verified at `0x1401e2eed`–`0x1401e2f0c`). `camPos` points at three i64 values. The defaults are 32 / 128 / 256 (verified at `0x1400fa623`–`0x1400fa631`). A minhook pre-hook multiplies `params[0]` by the knob factor before calling the original. It reads and writes only the first 32 bytes of the params buffer; the conditional change to `params[1]` is described under Steps below.
 - **Not used:** `fullyMeshedRange` (`mgr+0xc444`). It is a per-frame measurement, rolled over at `0x1401e2ee4`.
 - **Baseline:** the incoming `params[0]`, published to an atomic.
 - **Steps:** factor 1.0 → 1.25 → 1.5 → 1.75 → 2.0. If dist1 < dist0 × factor, dist1 is raised by the same factor, so that the order holds. dist2 is unchanged.
@@ -362,6 +364,8 @@ The governor raises 7.1, then 7.2, then 7.3. The order is re-checked after the i
 `[Hdr]`:
 
 - `PaperWhiteNits = game | <number>` (default `game`; finite 40..=400 nits). Invalid or out-of-range values warn and use `game`.
+- `FixPeak = on | off` (default `off` until the author's in-game A/B test).
+- `DisplayPeakNits = game | <whole number>` (default `game`; 80..=10000 nits). Used only with `FixPeak = on`. Invalid or out-of-range values warn and use `game`. Decimal commas with zero fraction are accepted.
 
 `[Governor]`: the keys in 6.4.
 
@@ -372,11 +376,11 @@ The governor raises 7.1, then 7.2, then 7.3. The order is re-checked after the i
 - `DecoDistanceScale = 1.0`, `DistantObjectsScale = 1.0`, `TerrainRingScale = 1.0`
 
 `[Debug]` (debug only, needs `LogLevel = debug`; not in the default file; at any other log level the mod ignores these keys):
-- `ScatterProbe = 0 | 1` (default 0): read and log the scatter counters (7.2a). With `EnableScatterDistance = 0`, this key is the only reason to install the probe hook.
+- `ScatterProbe = 0 | 1` (default 0): read and log the scatter counters (7.2a). Until r_max is measured, this key is the only reason to install the probe hook (7.2a).
 - `ForceStepObjectDistance`, `ForceStepScatterDistance`, `ForceStepTerrainDistance = 0..=4` (default: absent, the knob is not held): hold that knob at a fixed step for testing (pre-flight ruling for Task 17). A whole number outside 0..=4 is clamped with a warning. Other text warns and counts as absent.
 
 Unknown keys and invalid values are logged. Invalid choices use their defaults.
-Out-of-range numeric values are clamped, except `PaperWhiteNits`, which falls back to `game`.
+Out-of-range numeric values are clamped, except `PaperWhiteNits` and `DisplayPeakNits`, which fall back to `game`.
 
 ### HDR paper white
 
@@ -389,12 +393,38 @@ by another tool. Each outcome produces one `hdr paper white:` line.
 
 The effective-value accessor starts at 250 and publishes the chosen number only after a
 successful checked write. Skips and failed writes do not publish the configured number.
-It does not measure another tool's replacement value.
+It does not measure another tool's replacement value. A typed read-back failure also
+marks the value unverified, because the immediate may have changed despite the numeric
+getter staying at its last verified value. Dependent peak correction stays off in that case.
 
 The default remains `game` until the in-game A/B test (Task 17). The research proposes
 trying 80 nits first. The scale mismatch and visible HDR improvement remain hypotheses
-until that test. Peak changes, shader replacement and HDR metadata are later tasks.
+until that test. Shader replacement and HDR metadata are later tasks.
 See `docs/re-notes.md`, "HDR paper white", for the verified instruction and context.
+
+### HDR tonemapper peak
+
+With `FixPeak = on`, the Task 12 post-hook corrects the u16 at scene+0x41e only when the
+colour-space byte at scene+0x408 is 1 or 2. It reads the game's fresh peak on each call,
+then uses `DisplayPeakNits` when set. It writes `round(target * 80 / paperWhite)`, clamped
+to 1..=10000, with an unaligned store. Invalid paper white skips the write. Paper white
+comes from the same effective-value accessor as W13, including its 250-nit fallback.
+Windows' full-frame luminance can be below the panel's true peak, so an explicit panel
+target can replace the game's figure.
+
+Start-up configures and logs this feature after paper white and before queued hook enable.
+A failed paper-white read-back keeps it off and produces one start-up reason. It requires
+code hooks to be allowed and at least one distance knob to be enabled. With
+all distance knobs off, the existing Task 12 gate omits the hook; peak correction stays
+off and logs why. A failed scene-hook installation is reported by `object distance:`.
+The correction runs before object publication or scaling inside Task 12's inner guard.
+Its normal hook path allocates nothing, takes no lock and logs nothing. A panic there
+leaves the original scene untouched, disables the shared scene feature and does not run
+the original again. If the game skips the scene-settings call, it retains its own peak.
+
+The default remains off until the in-game A/B test. The shader-side chain and visible
+roll-off remain hypotheses, with the limits recorded in `docs/re-notes.md`,
+"HDR tonemapper peak (2026-10-26; plan route B2)".
 
 ## 9. Failure handling
 

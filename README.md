@@ -31,6 +31,7 @@ Place these files in the game folder, next to the game executable:
   dinput8.dll                       Ultimate ASI Loader v10.0.0 x64
   ultimate-asi-loader-LICENSE.txt   the loader's MIT licence
   LICENSE                           this mod's MIT licence
+  THIRD_PARTY_NOTICES.md            dependency and bundled-library notices
   plugins\
     enshrouded-headroom.asi         this mod
     enshrouded-headroom.ini         settings
@@ -50,9 +51,9 @@ Edit `enshrouded-headroom.ini` as UTF-8. The plugin looks for the first readable
 
 If neither folder has a readable file, it tries to create the default file in the first usable folder where no INI exists. It never overwrites an existing INI. If neither location works, it uses built-in defaults. The `settings:` log line names the chosen file or says that defaults are in use.
 
-Missing keys use their defaults. Invalid values use their defaults, and numeric values outside their ranges are clamped, except `PaperWhiteNits`, which falls back to `game`. Unknown sections and keys are ignored with warnings. If `LowerAbove` is not greater than `RaiseBelow`, both return to their defaults. Section names, key names and word choices are case-insensitive. Boolean values accept `0`, `1`, `false` or `true`. Lines starting with `;` or `#` are comments.
+Missing keys use their defaults. Invalid values use their defaults, and numeric values outside their ranges are clamped, except `PaperWhiteNits` and `DisplayPeakNits`, which fall back to `game`. Unknown sections and keys are ignored with warnings. If `LowerAbove` is not greater than `RaiseBelow`, both return to their defaults. Section names, key names and word choices are case-insensitive. Boolean values accept `0`, `1`, `false` or `true`. Lines starting with `;` or `#` are comments.
 
-The tables list all 29 keys from [the default INI](enshrouded-headroom.default.ini), with their defaults as written there. GiB and MiB are binary units.
+The tables list all 31 keys from [the default INI](enshrouded-headroom.default.ini), with their defaults as written there. GiB and MiB are binary units.
 
 ### `[General]`
 
@@ -77,6 +78,13 @@ For async compute, an argument containing `async-compute` skips the patch, even 
 | Key | Default | Meaning |
 |---|---|---|
 | `PaperWhiteNits` | `game` | `game` keeps the game's 250-nit HDR composite paper white. A finite number from 40 to 400 patches it once at start-up on an allowed build. Invalid or out-of-range values warn and use `game`. Decimal commas are accepted. The default stays `game` until the in-game HDR comparison. Check `hdr paper white:` in the log for the outcome. |
+| `FixPeak` | `off` | `on` corrects the HDR tonemapper peak after the game rebuilds scene settings. It uses the paper white actually patched by this mod, or 250 nits if the patch did not apply. A failed paper-white read-back leaves peak correction off because the value is unverified. SDR is unchanged. Code hooks must be allowed and at least one distance knob must be enabled. Check `hdr peak:` and `object distance:` in the log. The default stays off until the in-game HDR comparison. |
+| `DisplayPeakNits` | `game` | Used only with `FixPeak=on`. `game` reads the game's fresh peak each call. A whole number from 80 to 10000 overrides it with the panel peak in nits. Windows' full-frame luminance, which the game uses, can be below the panel's true peak. Invalid or out-of-range values warn and use `game`; decimal commas with zero fraction are accepted. |
+
+The peak correction writes `round(target * 80 / effective paper white)`, bounded to 1 through 10000.
+It runs before distance scaling, inside the scene hook's panic guard. If the game skips the
+scene-settings call, that frame retains the game's peak. The visible result remains unverified
+until the author's in-game A/B test.
 
 ### `[Governor]`
 
@@ -159,7 +167,7 @@ State that tests were not run when submitting a change checked only on Linux, so
 
 ## Licence
 
-This mod uses the MIT licence; see [LICENSE](LICENSE). Ultimate ASI Loader also uses the MIT licence. Its licence must accompany the bundled loader as `ultimate-asi-loader-LICENSE.txt`.
+This mod uses the MIT licence; see [LICENSE](LICENSE). Ultimate ASI Loader also uses the MIT licence. Its licence must accompany the bundled loader as `ultimate-asi-loader-LICENSE.txt`. The release also includes [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), with the MinHook, HDE and loader notices and the resolved Rust package licences.
 
 ## Credits
 

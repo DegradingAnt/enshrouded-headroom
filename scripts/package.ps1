@@ -66,6 +66,7 @@ try {
         Copy-Item -LiteralPath (Join-Path $projectRoot 'target/release/enshrouded-headroom.asi') -Destination (Join-Path $stage 'plugins/enshrouded-headroom.asi')
         Copy-Item -LiteralPath (Join-Path $projectRoot 'enshrouded-headroom.default.ini') -Destination (Join-Path $stage 'plugins/enshrouded-headroom.ini')
         Copy-Item -LiteralPath (Join-Path $projectRoot 'LICENSE') -Destination (Join-Path $stage 'LICENSE')
+        Copy-Item -LiteralPath (Join-Path $projectRoot 'THIRD_PARTY_NOTICES.md') -Destination (Join-Path $stage 'THIRD_PARTY_NOTICES.md')
 
         # Exact text from Ultimate ASI Loader v10.0.0's lowercase source file "license".
         # https://raw.githubusercontent.com/ThirteenAG/Ultimate-ASI-Loader/v10.0.0/license
@@ -95,14 +96,14 @@ SOFTWARE.
         [System.IO.File]::WriteAllText((Join-Path $stage 'ultimate-asi-loader-LICENSE.txt'), ($loaderLicense -replace "`r`n", "`n") + "`n", [System.Text.UTF8Encoding]::new($false))
 
         $stagedZip = Join-Path $stage 'package.zip'
-        $contents = @('dinput8.dll', 'ultimate-asi-loader-LICENSE.txt', 'plugins', 'LICENSE') | ForEach-Object { Join-Path $stage $_ }
+        $contents = @('dinput8.dll', 'ultimate-asi-loader-LICENSE.txt', 'plugins', 'LICENSE', 'THIRD_PARTY_NOTICES.md') | ForEach-Object { Join-Path $stage $_ }
         Compress-Archive -LiteralPath $contents -DestinationPath $stagedZip
         $archive = [System.IO.Compression.ZipFile]::OpenRead($stagedZip)
         try {
-            $expectedEntries = @('LICENSE', 'dinput8.dll', 'plugins/enshrouded-headroom.asi', 'plugins/enshrouded-headroom.ini', 'ultimate-asi-loader-LICENSE.txt') | Sort-Object -CaseSensitive
+            $expectedEntries = @('LICENSE', 'THIRD_PARTY_NOTICES.md', 'dinput8.dll', 'plugins/enshrouded-headroom.asi', 'plugins/enshrouded-headroom.ini', 'ultimate-asi-loader-LICENSE.txt') | Sort-Object -CaseSensitive
             $actualEntries = @($archive.Entries.FullName | Sort-Object -CaseSensitive)
             if (@(Compare-Object -ReferenceObject $expectedEntries -DifferenceObject $actualEntries -CaseSensitive).Count -ne 0) {
-                throw 'Package archive entries do not match the expected five files. Refusing to package.'
+                throw 'Package archive entries do not match the expected six files. Refusing to package.'
             }
             Write-Output 'Zip contents:'
             $archive.Entries | ForEach-Object { Write-Output ("  {0} ({1} bytes)" -f $_.FullName, $_.Length) }

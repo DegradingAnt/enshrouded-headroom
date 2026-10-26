@@ -10,6 +10,20 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  deny:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --locked --all-features --target x86_64-pc-windows-msvc
+          # Current cargo-deny selects advisory scope in deny.toml and severity here.
+          command-arguments: --warn unmaintained
+          rust-version: 1.99.1
+
   check:
     runs-on: windows-latest
     steps:

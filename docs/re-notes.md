@@ -85,6 +85,19 @@ Enum types: `keen::pc::RenderDistantObjectsSetting` and similar; member tables a
 | async compute override | 0x1408490d2 | `88 4d 3e 44 38 b6 89 52 03 00 74 ??` |
 | terrain update fn (pre-hook) | 0x1401e2e80 | `48 89 5c 24 10 4c 89 44 24 18 55 56 57 41 54 41 55 41 56 41 57 48 8d ac 24 50 e0 ff ff` (prologue only; unique in this build, but fragile across updates, so prefer pairing with a body check) |
 
+### Terrain update argument layout: VERIFIED (PR #29 review)
+
+REA disassembly of `FUN_1401e2e80` in Steam build f68140a3 verifies these facts:
+
+- The original copies 40 bytes (0x28) from `params` into `mgr+0xc478`:
+  - `0x1401e2eed` `MOVUPS XMM0, [RBX]` and `0x1401e2ef0` `MOVUPS [RSI+0xc478], XMM0`;
+  - `0x1401e2ef7` `MOVUPS XMM1, [RBX+0x10]` and `0x1401e2efb` `MOVUPS [RSI+0xc488], XMM1`;
+  - `0x1401e2f02` `MOVSD XMM0, [RBX+0x20]` and `0x1401e2f0c` `MOVSD [RSI+0xc498], XMM0`.
+- The caller builds a 10-dword buffer (caller code `0x14012a427`..`0x14012a4ad`).
+- The camera argument (RDX, kept in R14) points at three i64 values, not floats: `0x1401e2f45` `CVTSI2SS XMM3, [R14]`, `0x1401e2f21` `CVTSI2SS XMM1, [R14+0x8]`, `0x1401e2f3f` `CVTSI2SS XMM2, [R14+0x10]`.
+
+The hook reads and writes only the first 32 bytes of the params buffer. It never reads the camera argument. Its `*const f32` camera type remains an opaque pointer forwarded unchanged.
+
 Several signatures include the original constant, so a match also proves the expected original bytes are present.
 
 **Extended patterns (controller, 2026-10-25, for plan Task 4).** Two rows above stop before their patch sites, so a match proved nothing about the bytes to be patched. Both were extended to cover every patch byte, and each was re-checked against `enshrouded.exe` (sha256 b28b448a…): exactly 1 match each.
@@ -435,5 +448,5 @@ Evidence: REA/Ghidra on the old-build exe (sha256 `b28b448a...`; the Steam exe h
   - (warn `0x100000`, cap `0x100000`), call `0x140074652`, handle to `[obj+0x10]` at `0x14007465c`: counter C.
   - `0x1400a8800` writes entry+0x10 = idx × 4, +0x14 = arg 5 (0 here), +0x18 = qword 0, +0x20 = arg 6 (warn), +0x24 = arg 7 (cap), and +0x38 = idx | 0x10000 (`bts eax,0x10`). That value is the handle. The index is a 16-bit free-list entry.
 - **The counter fields (VERIFIED, ev_30587ee1).** The pool update `0x1400a8fd0` walks the entries (stride 0x40). For each live entry (byte +0x3c) it writes +0x14 = the read-back value (last), +0x18 = min, +0x1c = max (peak) and +0x28 = a frame stamp. It never writes +0x20 or +0x24. The peak is never reset, so it is the peak since the scene view was built.
-- **What the probe reads (design).** Every 30th call, before the original runs: obj, pool and the entry base from the chain; for A, B and C the handle, then `[entry+0x38]` (must equal the handle, which must not be 0), last (+0x14), peak (+0x1c), warn (+0x20) and cap (+0x24). Each read is checked with `VirtualQuery` first. The self-check needs A.warn = `0xf000` and A.cap = `0x14000`.
+- **What the probe reads (design).** At most once every 500 ms (QPC time), before the original runs: obj, pool and the entry base from the chain; for A, B and C the handle, then `[entry+0x38]` (must equal the handle, which must not be 0), last (+0x14), peak (+0x1c), warn (+0x20) and cap (+0x24). The reads come from 7 blocks (`pass` +0x8..+0x20, owner +0x20..+0x28, pool +0x48..+0x50, obj +0x8..+0x14, and each entry +0x14..+0x3c). Each block is checked once with `VirtualQuery` before it is read. (It sampled every 30th call with a check per read until the stutter fix, 2026-10-26.) The self-check needs A.warn = `0xf000` and A.cap = `0x14000`.
 - **Not verified (HYPOTHESIS).** That `FUN_1400767a0` runs once per frame (one caller; not traced to the frame loop). Which thread runs the pool update compared with this function: a read can see a value from the frame before. That the game never frees or moves the entry array while the scene view lives.
