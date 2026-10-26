@@ -22,6 +22,12 @@
 //! The code realigns at +19. A scan of the 8017 `.pdata` chunks within 1 MiB found no direct
 //! branch into +4..+18; indirect jumps (jump tables) were not checked.
 //!
+//! The patch also removes the `cmp` (flags) and the `movzx` (`eax`). Nothing reads them: after
+//! the patch, the only instructions that run before `call 0x140e28450` are `mov [rbp+0xa98], cl`
+//! and `mov rcx, [rsi+0x5a8]` (decoded from the bytes, controller, 2026-10-26). Under the Win64
+//! calling convention the flags and the upper bits of `rax` are dead across that call. Caveat:
+//! whether the callee takes a custom calling convention is not known.
+//!
 //! # When it runs
 //!
 //! [`init`], from `entry::start`, once, before the game's threads run. It patches only when
@@ -29,7 +35,7 @@
 //!
 //! 1. code patches are allowed for this build (`entry::code_patches_allowed`);
 //! 2. the settings file does not say `AsyncCompute = game`;
-//! 3. the command line does not already set it (see [`decide`]).
+//! 3. no argument of the command line mentions `async-compute` (see [`decide`]).
 //!
 //! [`apply`] finds `ASYNC_OVERRIDE` (it must match exactly once), adds the patch offset 3 and
 //! calls `write_checked` with all 16 [`ORIGINAL`] bytes. That includes +11, the `je`
@@ -40,7 +46,8 @@
 //!
 //! The 2026-10-23 launcher passes `--enable-async-compute`. With it still in use the command line
 //! sets the flag, [`decide`] skips, and the game does what the launcher asked. A second run of
-//! [`apply`] does not find the signature (it covers the patched bytes) and writes nothing.
+//! [`apply`] does not find the signature (it covers the patched bytes) and writes nothing; the log
+//! says the game code was not found, whichever tool changed it.
 
 use log::Level;
 use windows_sys::Win32::System::Environment::GetCommandLineW;
@@ -48,7 +55,7 @@ use windows_sys::Win32::System::Environment::GetCommandLineW;
 use crate::config::AsyncCompute;
 use crate::entry;
 use crate::patch::{write_checked, PatchError};
-use crate::scan::{find_in_sections, main_module, Module, Pattern};
+use crate::scan::{find_in_sections, main_module, Module, Pattern, ScanError};
 use crate::sigs::ASYNC_OVERRIDE;
 
 /// The 16 bytes at +3 of the signature's match, as the game has them: `cmp [rsi+0x35289], r14b`,
@@ -63,8 +70,10 @@ pub const NEW: [u8; 16] = [
     0xb0, 0x01, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00, 0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00,
 ];
 
-/// The command-line flags with which the game sets async compute itself, in lower case.
-const FLAGS: [&str; 2] = ["--disable-async-compute", "--enable-async-compute"];
+/// What the game's own flags, `--enable-async-compute` and `--disable-async-compute`, have in
+/// common, in lower case. An argument that contains it is taken to set async compute (see
+/// [`sets_async_compute`]).
+const MARKER: &str = "async-compute";
 
 /// Whether to patch, and if not, why not (the reason goes into the log).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,22 +89,29 @@ fn is_blank(c: char) -> bool {
 
 /// `cmdline` without its first token, the program. A program name in double quotes runs to the
 /// next quote (or to the end of the line if there is none), so spaces inside it do not split it.
+/// Blanks at the start are not skipped: a command line that starts with a blank has an empty
+/// program name, and its first word is an argument (as `CommandLineToArgvW`, the UCRT and Rust's
+/// `std` read it).
 fn arguments(cmdline: &str) -> &str {
-    let line = cmdline.trim_start_matches(is_blank);
-    match line.strip_prefix('"') {
+    match cmdline.strip_prefix('"') {
         Some(quoted) => quoted.split_once('"').map_or("", |(_, rest)| rest),
-        None => line.split_once(is_blank).map_or("", |(_, rest)| rest),
+        None => cmdline.split_once(is_blank).map_or("", |(_, rest)| rest),
     }
 }
 
-/// Does an argument of `cmdline` (the program name does not count) equal `--enable-async-compute`
-/// or `--disable-async-compute`, ignoring case and surrounding double quotes? A flag that is
-/// only part of a longer word or path is not one.
+/// Does an argument of `cmdline` contain `async-compute`, ignoring ASCII case and with every
+/// double quote removed from the argument? The program name is never an argument.
+///
+/// The game's own flags are the ASCII words `--enable-async-compute` and
+/// `--disable-async-compute`, but its parser's rules for case and prefix were not traced. So this
+/// takes more than those two exact words: `--disable-async-compute=1`, `-Disable-Async-Compute`
+/// and `--disable-"async"-compute` count too. A skip is the safe direction: the game keeps its
+/// own choice.
 fn sets_async_compute(cmdline: &str) -> bool {
-    arguments(cmdline)
-        .split(is_blank)
-        .map(|token| token.trim_matches('"'))
-        .any(|token| FLAGS.iter().any(|flag| token.eq_ignore_ascii_case(flag)))
+    arguments(cmdline).split(is_blank).any(|token| {
+        let bare: String = token.chars().filter(|&c| c != '"').collect();
+        bare.to_ascii_lowercase().contains(MARKER)
+    })
 }
 
 /// Should async compute be patched? The checks run in this order, and the first that fails gives
@@ -103,8 +119,9 @@ fn sets_async_compute(cmdline: &str) -> bool {
 ///
 /// 1. `code_patches == false` gives `"unknown build"`;
 /// 2. `AsyncCompute = game` gives `"ini: game"`;
-/// 3. an argument of the command line that is `--enable-async-compute` or
-///    `--disable-async-compute` (see [`sets_async_compute`]) gives `"command line sets it"`.
+/// 3. an argument of the command line that contains `async-compute` (see
+///    [`sets_async_compute`]) gives `"command line sets it"`. The program name is not an
+///    argument.
 ///
 /// Otherwise `Patch`. Pure: the command line is passed in (see [`command_line`]).
 pub fn decide(cmdline: &str, cfg: &AsyncCompute, code_patches: bool) -> Decision {
@@ -127,21 +144,24 @@ const MAX_COMMAND_LINE: usize = 32767;
 /// This process's command line (`GetCommandLineW`), decoded lossily from UTF-16.
 fn command_line() -> String {
     // SAFETY: `GetCommandLineW` has no preconditions. It returns a pointer to the process's
-    // command line, a NUL-terminated UTF-16 string that lives as long as the process.
+    // command line, a NUL-terminated UTF-16 string (a `WCHAR` buffer, so 2-byte aligned as `u16`
+    // needs) that lives as long as the process.
     let start = unsafe { GetCommandLineW() };
     if start.is_null() {
         return String::new();
     }
     let mut len = 0;
-    // SAFETY: `start` is not null and points to a NUL-terminated string that does not change.
-    // The read at `len` happens only after units `0..len` were all non-NUL, so it is at or
-    // before the NUL and inside the string. `MAX_COMMAND_LINE` is the longest string Windows
-    // allows, a second guard against a string that has no end.
+    // SAFETY: `start` is not null and points to a NUL-terminated string that does not change; it
+    // is a `WCHAR` buffer, so it is 2-byte aligned as a `u16` read needs, and so is every
+    // `start.add(len)`. The read at `len` happens only after units `0..len` were all non-NUL, so
+    // it is at or before the NUL and inside the string. `MAX_COMMAND_LINE` is the longest string
+    // Windows allows, a second guard against a string that has no end.
     while len < MAX_COMMAND_LINE && unsafe { *start.add(len) } != 0 {
         len += 1;
     }
     // SAFETY: the `len` units from `start` were all read above, so they are valid and readable;
-    // `u16` has no validity requirement, and the string is not written meanwhile.
+    // `start` is 2-byte aligned (a `WCHAR` buffer, as above); `u16` has no validity requirement,
+    // and the string is not written meanwhile.
     let units = unsafe { std::slice::from_raw_parts(start, len) };
     String::from_utf16_lossy(units)
 }
@@ -180,23 +200,49 @@ fn failure_text(site: usize, error: PatchError) -> String {
 /// code as it is. `Err` is the reason for the log, and starts with what became of the feature
 /// (`off: ...`) except for a read-back failure, where the bytes were written.
 ///
-/// Start-up only: it scans live image memory with [`find_in_sections`] and changes code with
-/// `write_checked`, and both rely on no other thread running the code. Call it from
-/// `entry::start`, and only after [`decide`] said [`Decision::Patch`].
-pub fn apply(m: &Module) -> Result<(), String> {
+/// A signature that is not found says "the game code was not found (another tool or a different
+/// build may have changed it)": it is also what a second run, or an earlier tool that turned
+/// async compute on, leaves behind. The scan's own error goes to the debug log.
+///
+/// # Safety
+///
+/// Start-up only, before the game's threads run the code that is patched: `find_in_sections`
+/// reads the image in place and `write_checked` changes code, and both rely on no other thread
+/// writing or running it. Call it from `entry::start`, and only after [`decide`] said
+/// [`Decision::Patch`]. `m` must describe mapped, readable memory of the module (as
+/// `main_module()` does).
+pub unsafe fn apply(m: &Module) -> Result<(), String> {
     let name = ASYNC_OVERRIDE.name;
     let pattern =
         Pattern::parse(ASYNC_OVERRIDE.pattern).map_err(|error| format!("off: {name}: {error}"))?;
-    let found = find_in_sections(m, ASYNC_OVERRIDE.sections, &pattern)
-        .map_err(|error| format!("off: {name}: {error}"))?;
+    let found = find_in_sections(m, ASYNC_OVERRIDE.sections, &pattern).map_err(|error| {
+        log::debug!("async compute: {name}: {error}");
+        scan_failure_text(&error)
+    })?;
     let site = found
         .checked_add(ASYNC_OVERRIDE.patch_offset())
         .ok_or_else(|| format!("off: {name}: the patch site is past the end of memory"))?;
     log::debug!("async compute: {name} matched at {found:#x}, patching {site:#x}");
-    // SAFETY: start-up only (see above): `entry::start` runs before the game's threads, so none
-    // runs the code at `site`. The 16 bytes at `site` end at the end of the 19-byte match
-    // `find_in_sections` just found in `.text`, so they are mapped code of this exe.
+    // SAFETY: the caller's contract for `apply`: start-up only, so no thread runs the code at
+    // `site`. The 16 bytes at `site` end at the end of the 19-byte match `find_in_sections` just
+    // found in `.text`, in the mapped, readable memory of `m`.
     unsafe { write_site(site) }.map_err(|error| failure_text(site, error))
+}
+
+/// The log text for a signature that did not match exactly once, starting with what became of
+/// the feature.
+fn scan_failure_text(error: &ScanError) -> String {
+    match error {
+        ScanError::Multiple(count) => format!(
+            "off: the game code matched {count} times, not once (another tool or a different \
+             build may have changed it)"
+        ),
+        ScanError::NotFound | ScanError::BadPattern(_) => {
+            "off: the game code was not found (another tool or a different build may have \
+             changed it)"
+                .to_owned()
+        }
+    }
 }
 
 /// The body of [`init`], with the command line, the code-patch answer and the patching passed in.
@@ -221,7 +267,11 @@ fn start_up(
 /// [`apply`]).
 pub fn init(cfg: &AsyncCompute) {
     let (level, line) = start_up(cfg, &command_line(), entry::code_patches_allowed(), || {
-        apply(&main_module())
+        // SAFETY: `init` is called once from `entry::start`, at start-up and before the game's
+        // threads run the code that is patched (the start-up-only rule in `apply`'s `# Safety`),
+        // and `start_up` calls this only after `decide` said `Patch`. `main_module()` is the
+        // running exe: mapped, readable memory.
+        unsafe { apply(&main_module()) }
     });
     log::log!(level, "{line}");
 }
@@ -346,39 +396,99 @@ mod tests {
     }
 
     #[test]
-    fn a_flag_inside_the_quoted_exe_path_does_not_count() {
-        // Whitespace inside the quotes would otherwise cut the path into tokens, one of them the
-        // flag.
-        let cmd = r#""C:\a --disable-async-compute b\enshrouded.exe""#;
-        assert_eq!(decide(cmd, &AsyncCompute::On, true), Decision::Patch);
-        let cmd = r#""C:\a --enable-async-compute b\enshrouded.exe" -windowed"#;
-        assert_eq!(decide(cmd, &AsyncCompute::On, true), Decision::Patch);
-    }
-
-    #[test]
-    fn a_flag_spelled_as_part_of_a_path_does_not_count() {
+    fn async_compute_in_the_program_name_does_not_count() {
         for cmd in [
+            // Quoted, with blanks inside the quotes that would cut the path into words.
+            r#""C:\a --disable-async-compute b\enshrouded.exe""#,
+            r#""C:\a --enable-async-compute b\enshrouded.exe" -windowed"#,
+            // The flag spelled as part of a path, quoted or not.
             r"C:\--disable-async-compute\x.exe",
             r"C:\--enable-async-compute\x.exe",
-            // ...and as an argument, not just as the program:
-            r"x.exe C:\--disable-async-compute\x.exe",
-            r#"x.exe "D:\data\--enable-async-compute\save.dat""#,
-            // A flag with something glued to either end is another word.
-            "x.exe --disable-async-computes",
-            "x.exe --disable-async-compute-now",
-            "x.exe x--enable-async-compute",
-            "x.exe ---enable-async-compute",
-            "x.exe --enable-async-compute=1",
-            // Close, but not the flags.
-            "x.exe --async-compute",
-            "x.exe --disable-async",
-            "x.exe -enable-async-compute",
+            r#""C:\--disable-async-compute\x.exe" -windowed"#,
+            r"C:\async-compute\x.exe -windowed",
         ] {
             assert_eq!(
                 decide(cmd, &AsyncCompute::On, true),
                 Decision::Patch,
                 "{cmd}"
             );
+        }
+    }
+
+    #[test]
+    fn any_argument_that_mentions_async_compute_counts() {
+        for cmd in [
+            // A path given as an argument is an argument (T8-7).
+            r"x.exe C:\--disable-async-compute\x.exe",
+            r#"x.exe "D:\data\--enable-async-compute\save.dat""#,
+            // Something glued to either end of a flag, or another prefix for it.
+            "x.exe --disable-async-computes",
+            "x.exe --disable-async-compute-now",
+            "x.exe x--enable-async-compute",
+            "x.exe ---enable-async-compute",
+            "x.exe --enable-async-compute=1",
+            "x.exe --disable-async-compute=1",
+            "x.exe --async-compute",
+            "x.exe -enable-async-compute",
+            "x.exe -Disable-Async-Compute",
+            "x.exe /enable-async-compute",
+            // Quotes inside the word.
+            r#"x.exe --disable-"async"-compute"#,
+            r#"x.exe "--disable-async-compute"#,
+            r#"x.exe --disable-async-compute""#,
+        ] {
+            assert_eq!(
+                decide(cmd, &AsyncCompute::On, true),
+                Decision::Skip("command line sets it"),
+                "{cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn arguments_that_only_resemble_the_flags_do_not_count() {
+        for cmd in [
+            "x.exe --disable-async",
+            "x.exe --async_compute",
+            "x.exe --disable-async-comput",
+            "x.exe --asynccompute",
+            "x.exe --compute-async",
+            // Two words, neither of which has it.
+            "x.exe --disable-async -compute",
+        ] {
+            assert_eq!(
+                decide(cmd, &AsyncCompute::On, true),
+                Decision::Patch,
+                "{cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_command_line_that_starts_with_a_blank_has_an_empty_program_name() {
+        // The first word is then an argument, as CommandLineToArgvW, the UCRT and Rust's std read
+        // it (T8-1): it is not skipped as the program.
+        assert_eq!(arguments(" a b"), "a b");
+        assert_eq!(arguments("\ta"), "a");
+        assert_eq!(arguments("  a"), " a");
+        assert_eq!(arguments(" "), "");
+        assert_eq!(arguments("a b c"), "b c");
+        assert_eq!(arguments(r#""a b" c"#), " c");
+        assert_eq!(arguments(""), "");
+        for cmd in [
+            " --disable-async-compute",
+            "\t--enable-async-compute",
+            "  x.exe --disable-async-compute",
+        ] {
+            assert_eq!(
+                decide(cmd, &AsyncCompute::On, true),
+                Decision::Skip("command line sets it"),
+                "{cmd:?}"
+            );
+        }
+        // No argument that mentions it, so nothing to skip.
+        for cmd in [" x.exe", " ", "  "] {
+            assert_eq!(decide(cmd, &AsyncCompute::On, true), Decision::Patch);
         }
     }
 
@@ -407,7 +517,6 @@ mod tests {
             "x.exe -windowed --Enable-Async-Compute -nosplash",
             r#"x.exe "--disable-async-compute""#,
             r#"x.exe -windowed "--Enable-Async-Compute" -nosplash"#,
-            "  x.exe --disable-async-compute",
             // No space between the closing quote of the program and the first argument.
             r#""x.exe"--disable-async-compute"#,
         ] {
@@ -450,15 +559,30 @@ mod tests {
             "{cmd}"
         );
         assert!(!cmd.contains('\0'), "{cmd:?}");
-        // The program name this module skips is the one the standard library reports.
+
+        // This module's own `arguments` against what the standard library reports (T8-6). The
+        // program name comes before the arguments, and is argv[0].
+        let args = arguments(&cmd);
+        assert!(cmd.ends_with(args), "{cmd}");
+        let program = &cmd[..cmd.len() - args.len()];
         let exe = std::env::args().next().expect("argv[0]");
-        let skipped = cmd.trim_start().strip_prefix('"').map_or_else(
-            || cmd.split([' ', '\t']).next().unwrap_or_default(),
-            |after| after.split('"').next().unwrap_or_default(),
+        assert!(
+            program.contains(&exe),
+            "program {program:?}, argv[0] {exe:?}"
         );
-        assert_eq!(skipped, exe);
-        // Nothing the test harness passes is one of the flags.
-        assert_eq!(decide(&cmd, &AsyncCompute::On, true), Decision::Patch);
+        assert!(!args.contains(&exe), "{args:?} must not hold the program");
+
+        // The harness's own arguments (`--exact`, a test filter, ...) are plain words. When they
+        // are (no blank or quote in any), they are the words of `arguments`, in order.
+        let rest: Vec<String> = std::env::args().skip(1).collect();
+        if rest.iter().all(|a| !a.contains([' ', '\t', '"'])) {
+            let words: Vec<String> = args
+                .split(is_blank)
+                .filter(|word| !word.is_empty())
+                .map(|word| word.replace('"', ""))
+                .collect();
+            assert_eq!(words, rest, "{cmd}");
+        }
     }
 
     // ---- the bytes ---------------------------------------------------------------------------
@@ -608,12 +732,27 @@ mod tests {
         code
     }
 
+    /// What `apply` says when the signature is not in the code (T8-3). It does not say "no
+    /// match" or name a section, and it does not blame one cause: another tool may have turned
+    /// async compute on already. The scan's own error goes to the debug log.
+    const NOT_FOUND: &str =
+        "off: the game code was not found (another tool or a different build may have changed it)";
+
+    /// `apply`, called as `init` calls it, on memory of this test process.
+    fn apply_here(m: &Module) -> Result<(), String> {
+        // SAFETY: the tests pass a `Module` for a synthetic image (read-write memory of this
+        // process, described by a header the test wrote) or for the test exe itself, whose
+        // `.text` has no such code, so nothing is written there. No thread runs any of the bytes
+        // that can be written.
+        unsafe { apply(m) }
+    }
+
     #[test]
     fn apply_finds_the_signature_adds_three_and_writes_new() {
         let (mem, module) = image();
         let code = function_around_site();
         mem.put(0x1100, &code);
-        assert_eq!(apply(&module), Ok(()));
+        assert_eq!(apply_here(&module), Ok(()));
         let got = mem.get(0x1100, code.len());
         // The signature starts at +0x20; the patch is 3 bytes later.
         assert_eq!(&got[..0x23], &code[..0x23], "before the patch");
@@ -625,11 +764,12 @@ mod tests {
     fn apply_twice_says_so_and_changes_nothing_more() {
         let (mem, module) = image();
         mem.put(0x1100, &function_around_site());
-        assert_eq!(apply(&module), Ok(()));
+        assert_eq!(apply_here(&module), Ok(()));
         let after_first = mem.get(0x1000, 0x1000);
-        let second = apply(&module).unwrap_err();
-        // The signature covers the patched bytes, so once patched it is no longer found.
-        assert!(second.contains("ASYNC_OVERRIDE"), "{second}");
+        let second = apply_here(&module).unwrap_err();
+        // The signature covers the patched bytes, so once patched it is no longer found; the
+        // text does not say who changed it (T8-3).
+        assert_eq!(second, NOT_FOUND);
         assert_eq!(mem.get(0x1000, 0x1000), after_first);
     }
 
@@ -647,7 +787,7 @@ mod tests {
             Ok(mem.base + 0x1120)
         );
         // ...but apply compares all sixteen bytes and leaves the code as it is.
-        let why = apply(&module).unwrap_err();
+        let why = apply_here(&module).unwrap_err();
         assert!(why.contains("not the original"), "{why}");
         assert!(why.contains("left alone"), "{why}");
         assert!(why.contains(&format!("{:#x}", mem.base + 0x1123)), "{why}");
@@ -659,9 +799,8 @@ mod tests {
         let (mem, module) = image();
         mem.put(0x1100, &[0x90; 0x80]);
         let before = mem.get(0x1000, 0x1000);
-        let why = apply(&module).unwrap_err();
-        assert!(why.contains("ASYNC_OVERRIDE"), "{why}");
-        assert!(why.starts_with("off:"), "{why}");
+        let why = apply_here(&module).unwrap_err();
+        assert_eq!(why, NOT_FOUND);
         assert_eq!(mem.get(0x1000, 0x1000), before);
     }
 
@@ -672,9 +811,9 @@ mod tests {
         mem.put(0x1100, &code);
         mem.put(0x1800, &code);
         let before = mem.get(0x1000, 0x1000);
-        let why = apply(&module).unwrap_err();
-        assert!(why.contains("ASYNC_OVERRIDE"), "{why}");
-        assert!(why.contains("2 matches"), "{why}");
+        let why = apply_here(&module).unwrap_err();
+        assert!(why.starts_with("off: "), "{why}");
+        assert!(why.contains("matched 2 times"), "{why}");
         assert_eq!(mem.get(0x1000, 0x1000), before);
     }
 
@@ -682,8 +821,8 @@ mod tests {
     fn apply_on_this_test_binary_finds_no_signature_and_changes_nothing() {
         // The test exe is not the game: its `.text` has no such code. (A match would be written
         // to, so the assertion is also what keeps this test honest.)
-        let why = apply(&main_module()).unwrap_err();
-        assert!(why.contains("ASYNC_OVERRIDE"), "{why}");
+        let why = apply_here(&main_module()).unwrap_err();
+        assert_eq!(why, NOT_FOUND);
     }
 
     // ---- the start-up step -------------------------------------------------------------------
@@ -816,7 +955,7 @@ mod tests {
         let (mem, module) = image();
         let around = &text[at - 0x80..at + 0x100];
         mem.put(0x1100, around);
-        assert_eq!(apply(&module), Ok(()));
+        assert_eq!(apply_here(&module), Ok(()));
         let got = mem.get(0x1100, around.len());
         let mut want = around.to_vec();
         want[0x80 + 3..0x80 + 19].copy_from_slice(&NEW);
