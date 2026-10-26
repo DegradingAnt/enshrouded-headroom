@@ -653,6 +653,33 @@ pub(crate) mod test_support {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
     };
 
+    /// Run this one live-image test in a child; the parent never reaches its mutation body.
+    /// The child checks a different process id and runs with one test worker.
+    pub(crate) fn isolated_process(test: &str, parent_env: &str) -> bool {
+        let constrained =
+            std::env::args()
+                .skip(1)
+                .eq(["--exact", test, "--nocapture", "--test-threads=1"]
+                    .into_iter()
+                    .map(str::to_owned));
+        let current = std::ffi::OsString::from(std::process::id().to_string());
+        if constrained && std::env::var_os(parent_env).is_some_and(|parent| parent != current) {
+            return false;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(parent_env, std::process::id().to_string())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "isolated test failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
+
     /// Some `VirtualAlloc` memory that is released on drop.
     ///
     /// `put`, `get` and `protect` are safe functions, so each one checks that its range lies
@@ -1330,9 +1357,23 @@ mod tests {
 
     #[test]
     fn a_read_only_image_page_can_be_patched_without_the_execute_bit() {
+        if super::test_support::isolated_process(
+            "patch::tests::a_read_only_image_page_can_be_patched_without_the_execute_bit",
+            "HEADROOM_HEADER_MUTATION_PARENT",
+        ) {
+            return;
+        }
+        assert!(
+            std::env::var_os("HEADROOM_HEADER_MUTATION_PARENT").is_some(),
+            "image mutation must run in an isolated child"
+        );
+        assert!(
+            std::env::args().any(|arg| arg == "--test-threads=1"),
+            "live image mutation needs a single test worker"
+        );
         // The first page of this test's own exe: PE headers in an image section, read-only, as
-        // the game's `.rdata` is. Four bytes of the DOS stub are changed and put back; nothing
-        // reads them.
+        // the game's `.rdata` is. The isolated child changes and restores four DOS-stub bytes;
+        // no parallel scanner test reads the image headers.
         let base = crate::scan::main_module().base;
         assert_ne!(base, 0);
         let target = base + 0x44;
@@ -1344,8 +1385,8 @@ mod tests {
         changed[0] ^= 0xff;
 
         let mut spy = SpyOs::default();
-        // SAFETY: the four DOS-stub bytes are data nothing uses; `original` and `changed` are
-        // separate vectors.
+        // SAFETY: only this child test reads or writes these DOS-stub bytes; `original` and
+        // `changed` are separate vectors.
         let r = unsafe { write_checked_with(&mut spy, target, &original, &changed) };
         assert!(r.is_ok(), "{r:?}");
         // SAFETY: as above; this puts the bytes back.
