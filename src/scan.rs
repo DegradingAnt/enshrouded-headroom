@@ -2309,3 +2309,187 @@ mod tests {
         );
     }
 }
+
+/// Property tests use only owned strings and byte slices, never native image memory.
+#[cfg(test)]
+mod property_tests {
+    use super::{find_unique, Pattern, ScanError};
+    use proptest::prelude::*;
+
+    /// Small alphabets make accidental and overlapping matches common; full bytes stay covered.
+    fn byte() -> impl Strategy<Value = u8> {
+        prop_oneof![3 => 0u8..=3, 1 => any::<u8>()]
+    }
+
+    /// Arbitrary private patterns include empty and all-wildcard values for the refusal contract.
+    fn cells() -> impl Strategy<Value = Vec<Option<u8>>> {
+        proptest::collection::vec(proptest::option::of(byte()), 0..=16)
+    }
+
+    /// Insert a literal rather than rejecting generated cases; every result parses successfully.
+    fn valid_cells() -> impl Strategy<Value = Vec<Option<u8>>> {
+        (
+            proptest::collection::vec(proptest::option::of(any::<u8>()), 0..=23),
+            any::<u8>(),
+            0usize..24,
+        )
+            .prop_map(|(mut cells, literal, position)| {
+                cells.insert(position % (cells.len() + 1), Some(literal));
+                cells
+            })
+    }
+
+    /// Independent linear oracle: enumerate every complete window, then compare literals directly.
+    /// Empty and all-wildcard private patterns are NotFound, as the scanner has no literal anchor.
+    fn naive(hay: &[u8], cells: &[Option<u8>]) -> Result<usize, ScanError> {
+        if !cells.iter().any(Option::is_some) {
+            return Err(ScanError::NotFound);
+        }
+        let mut hits = Vec::new();
+        for (offset, window) in hay.windows(cells.len()).enumerate() {
+            let mut matches = true;
+            for (index, cell) in cells.iter().enumerate() {
+                if let Some(expected) = cell {
+                    if window[index] != *expected {
+                        matches = false;
+                        break;
+                    }
+                }
+            }
+            if matches {
+                hits.push(offset);
+            }
+        }
+        match hits.as_slice() {
+            [] => Err(ScanError::NotFound),
+            [only] => Ok(*only),
+            several => Err(ScanError::Multiple(several.len())),
+        }
+    }
+
+    /// Render independent generated cells as canonical two-digit lowercase hex and wildcards.
+    fn canonical(cells: &[Option<u8>]) -> String {
+        cells
+            .iter()
+            .map(|cell| match cell {
+                Some(byte) => format!("{byte:02x}"),
+                None => "??".to_owned(),
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Fill wildcards without asking the production parser or matcher which bytes would fit.
+    fn materialize(cells: &[Option<u8>], fill: u8) -> Vec<u8> {
+        cells.iter().map(|cell| cell.unwrap_or(fill)).collect()
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 32, max_shrink_iters: 1024, ..ProptestConfig::default() })]
+
+        #[test]
+        fn arbitrary_unicode_pattern_text_never_panics(chars in proptest::collection::vec(any::<char>(), 0..=96)) {
+            let text: String = chars.into_iter().collect();
+            let _result = Pattern::parse(&text);
+        }
+
+        #[test]
+        fn malformed_utf8_lossy_text_is_refused_without_panicking(mut bytes in proptest::collection::vec(any::<u8>(), 0..=128)) {
+            // This final isolated malformed token guarantees the string is not a valid pattern.
+            bytes.extend_from_slice(&[b' ', 0xff]);
+            let text = String::from_utf8_lossy(&bytes);
+            prop_assert!(matches!(Pattern::parse(&text), Err(ScanError::BadPattern(_))));
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 64, max_shrink_iters: 1024, ..ProptestConfig::default() })]
+
+        #[test]
+        fn valid_pattern_roundtrip_preserves_every_literal_and_wildcard(
+            cells in valid_cells(), uppercase in any::<bool>(),
+            separator in prop::sample::select(vec![" ", "\t", "\r\n", "\n", "\x0c"])
+        ) {
+            let canonical = canonical(&cells);
+            let spelled = if uppercase { canonical.to_ascii_uppercase() } else { canonical.clone() };
+            let text = format!("{separator}{}{separator}", spelled.replace(' ', separator));
+            let parsed = Pattern::parse(&text).expect("generator always inserts a literal");
+            prop_assert_eq!(&parsed, &Pattern(cells));
+            prop_assert_eq!(Pattern::parse(&canonical), Ok(parsed));
+        }
+
+        #[test]
+        fn arbitrary_and_planted_scans_agree_with_independent_oracle(
+            mut hay in proptest::collection::vec(byte(), 0..=128), cells in cells(),
+            plant in any::<bool>(), position in 0usize..=128, fill in any::<u8>()
+        ) {
+            if plant && cells.iter().any(Option::is_some) {
+                let at = position % (hay.len() + 1);
+                hay.splice(at..at, materialize(&cells, fill));
+            }
+            prop_assert_eq!(find_unique(&hay, &Pattern(cells.clone())), naive(&hay, &cells));
+        }
+
+        #[test]
+        fn exact_fit_always_finds_the_one_complete_window(cells in valid_cells(), fill in any::<u8>()) {
+            let hay = materialize(&cells, fill);
+            // Every case has exactly one possible start, so excluding the end is always caught.
+            prop_assert_eq!(find_unique(&hay, &Pattern(cells)), Ok(0));
+        }
+
+        #[test]
+        fn planted_last_boundary_is_always_included(literal in any::<u8>(), prefix in 0usize..=64, trailing in 0usize..=16) {
+            let other = literal.wrapping_add(1);
+            let mut hay = vec![other; prefix];
+            hay.push(literal);
+            hay.extend(std::iter::repeat_n(other, trailing));
+            let mut cells = vec![Some(literal)];
+            cells.extend(std::iter::repeat_n(None, trailing));
+            prop_assert_eq!(find_unique(&hay, &Pattern(cells)), Ok(prefix));
+        }
+
+        #[test]
+        fn leading_and_trailing_wildcards_match_an_exact_fit(first in any::<u8>(), literal in any::<u8>(), last in any::<u8>()) {
+            prop_assert_eq!(find_unique(&[first,literal,last], &Pattern(vec![None,Some(literal),None])), Ok(0));
+        }
+
+        #[test]
+        fn repeated_literal_patterns_count_every_overlapping_start(literal in any::<u8>(), width in 1usize..=16, extra in 1usize..=16) {
+            let hay = vec![literal; width + extra];
+            let pattern = Pattern(vec![Some(literal); width]);
+            prop_assert_eq!(find_unique(&hay, &pattern), Err(ScanError::Multiple(extra + 1)));
+        }
+
+        #[test]
+        fn two_planted_patterns_count_all_matches_including_accidental_overlaps(
+            cells in valid_cells(), fill in any::<u8>(), separator in proptest::collection::vec(byte(), 0..=16)
+        ) {
+            let body = materialize(&cells, fill);
+            let mut hay = body.clone();
+            hay.extend(separator);
+            hay.extend(body);
+            let expected = naive(&hay, &cells);
+            prop_assert!(matches!(&expected, Err(ScanError::Multiple(count)) if *count >= 2));
+            prop_assert_eq!(find_unique(&hay, &Pattern(cells)), expected);
+        }
+
+        #[test]
+        fn empty_buffers_and_shorter_buffers_never_match(cells in valid_cells(), fill in any::<u8>()) {
+            let short = materialize(&cells, fill).into_iter().take(cells.len() - 1).collect::<Vec<_>>();
+            let pattern = Pattern(cells);
+            prop_assert_eq!(find_unique(&[], &pattern), Err(ScanError::NotFound));
+            prop_assert_eq!(find_unique(&short, &pattern), Err(ScanError::NotFound));
+        }
+
+        #[test]
+        fn empty_and_all_wildcard_patterns_obey_the_existing_refusal_contract(width in 1usize..=32, hay in proptest::collection::vec(byte(), 0..=64)) {
+            let wildcards = vec![None; width];
+            prop_assert!(matches!(Pattern::parse(""), Err(ScanError::BadPattern(_))));
+            prop_assert!(matches!(Pattern::parse(&canonical(&wildcards)), Err(ScanError::BadPattern(_))));
+            for cells in [Vec::new(), wildcards] {
+                prop_assert_eq!(find_unique(&hay, &Pattern(cells.clone())), Err(ScanError::NotFound));
+                prop_assert_eq!(naive(&hay, &cells), Err(ScanError::NotFound));
+            }
+        }
+    }
+}
