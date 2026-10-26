@@ -51,7 +51,7 @@ Test-environment note: the test machine is the Steam install of the game (`C:\Pr
     enshrouded-headroom.log         run-time log
 ```
 
-If the game folder is not writable, the `.ini` and `.log` go to `%LOCALAPPDATA%\enshrouded-headroom\`, and the log says so.
+If the plugin folder is not writable, the `.log` goes to `%LOCALAPPDATA%\enshrouded-headroom\`, and the log says so. The `.ini` is looked for in the plugin folder first, then in `%LOCALAPPDATA%\enshrouded-headroom\`, and the first one that exists and can be read is used. If there is none, the default `.ini` is written to the first of the two folders where that works, so a player can also put their own `.ini` in the second folder. The log has one `settings:` line that names the file in use, or says that the defaults are in use.
 
 How the loader runs the mod (loader source v10.0.0): it loads `*.asi` from `plugins\` and calls the export `InitializeASI()`. It does so on the game exe's first qualifying kernel32 import call, before WinMain, before the game parses its command line and before Vulkan starts. Before it calls `InitializeASI`, the loader puts back the original kernel32 import slots (`startup.cpp:152-161`). To confirm this on the author's build, the first test uses `DebugLog=1`.
 

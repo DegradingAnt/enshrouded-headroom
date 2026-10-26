@@ -14,7 +14,7 @@ use configparser::ini::Ini;
 /// Name of the settings file, next to the `.asi`.
 pub const INI_FILE_NAME: &str = "enshrouded-headroom.ini";
 
-/// The settings file that `load_or_create` writes when there is none. It parses without warnings
+/// The settings file that `write_default` writes when there is none. It parses without warnings
 /// and gives the same `Config` as `Config::default()`.
 pub const DEFAULT_INI: &str = include_str!("../enshrouded-headroom.default.ini");
 
@@ -325,16 +325,27 @@ pub fn parse(text: &str) -> (Config, Vec<String>) {
     )
 }
 
-/// Read `<dir>\enshrouded-headroom.ini`. If the file is missing, write `DEFAULT_INI` there and use
-/// the defaults. An existing file is never overwritten.
-pub fn load_or_create(dir: &Path) -> (Config, Vec<String>) {
-    let path = dir.join(INI_FILE_NAME);
-    match std::fs::read(&path) {
+/// Read and parse `<dir>\enshrouded-headroom.ini`. `Ok(None)` means there is no such file; any
+/// other failure to read it is an `Err`.
+pub fn read_ini(dir: &Path) -> io::Result<Option<(Config, Vec<String>)>> {
+    match std::fs::read(dir.join(INI_FILE_NAME)) {
         // Bytes that are not UTF-8 become U+FFFD instead of an error. A hand-edited file with one
         // odd character in a comment must not cost the player their settings.
-        Ok(bytes) => parse(&String::from_utf8_lossy(&bytes)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let warnings = match write_default(dir, &path) {
+        Ok(bytes) => Ok(Some(parse(&String::from_utf8_lossy(&bytes)))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Read `<dir>\enshrouded-headroom.ini`. If the file is missing, write `DEFAULT_INI` there and use
+/// the defaults. An existing file is never overwritten. (One folder only: `entry` tries several
+/// with `read_ini` and `write_default`.)
+pub fn load_or_create(dir: &Path) -> (Config, Vec<String>) {
+    let path = dir.join(INI_FILE_NAME);
+    match read_ini(dir) {
+        Ok(Some(loaded)) => loaded,
+        Ok(None) => {
+            let warnings = match write_default(dir) {
                 Ok(()) => Vec::new(),
                 Err(error) => vec![format!(
                     "cannot create {} ({error}), using the defaults",
@@ -353,9 +364,11 @@ pub fn load_or_create(dir: &Path) -> (Config, Vec<String>) {
     }
 }
 
-/// Write `DEFAULT_INI` to `path`, creating `dir` first.
-fn write_default(dir: &Path, path: &Path) -> io::Result<()> {
-    create_new_file(dir, path, |file| file.write_all(DEFAULT_INI.as_bytes()))
+/// Write `DEFAULT_INI` as `<dir>\enshrouded-headroom.ini`, creating `dir` first. An existing file
+/// is an error, not overwritten.
+pub fn write_default(dir: &Path) -> io::Result<()> {
+    let path = dir.join(INI_FILE_NAME);
+    create_new_file(dir, &path, |file| file.write_all(DEFAULT_INI.as_bytes()))
 }
 
 /// Create `path` (and `dir` before it) and fill it with `fill`. `create_new` makes sure a file that

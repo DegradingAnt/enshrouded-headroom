@@ -16,8 +16,8 @@ use crate::config::{self, Config, INI_FILE_NAME};
 use crate::features;
 use crate::guard;
 
-/// Sub-folder of `%LOCALAPPDATA%` for the settings file when there is no module folder. It is the
-/// same folder the log falls back to.
+/// Sub-folder of `%LOCALAPPDATA%` for the settings file when the module folder has none and cannot
+/// hold one. It is the same folder the log falls back to.
 const FALLBACK_DIR_NAME: &str = "enshrouded-headroom";
 
 /// Set once by [`start`]. Unset (before `start`, or if it stopped early) reads as "not allowed".
@@ -44,29 +44,70 @@ fn first_call(flag: &AtomicBool) -> bool {
     !flag.swap(true, Ordering::AcqRel)
 }
 
-/// The folder for the settings file: the module folder, else `%LOCALAPPDATA%\enshrouded-headroom`,
-/// else `None`. Both must be absolute paths: a relative path would land in whatever folder the
-/// game happens to be running from.
-fn settings_dir(module_dir: Option<&Path>, local_app_data: Option<&OsStr>) -> Option<PathBuf> {
-    if let Some(dir) = module_dir.filter(|dir| dir.is_absolute()) {
-        return Some(dir.to_path_buf());
-    }
-    let base = Path::new(local_app_data?);
-    base.is_absolute().then(|| base.join(FALLBACK_DIR_NAME))
+/// The folders that may hold the settings file, best first: the module folder, then
+/// `%LOCALAPPDATA%\enshrouded-headroom`. Both must be absolute paths (a relative path would land in
+/// whatever folder the game happens to be running from); one that is not, or is missing, is left
+/// out.
+fn settings_dirs(module_dir: Option<&Path>, local_app_data: Option<&OsStr>) -> Vec<PathBuf> {
+    let module = module_dir
+        .filter(|dir| dir.is_absolute())
+        .map(Path::to_path_buf);
+    let fallback = local_app_data
+        .map(Path::new)
+        .filter(|base| base.is_absolute())
+        .map(|base| base.join(FALLBACK_DIR_NAME));
+    module.into_iter().chain(fallback).collect()
 }
 
-/// Read (or create) the settings file in `dir`. With no folder, the defaults and a warning.
-fn load_settings(dir: Option<&Path>) -> (Config, Vec<String>) {
-    match dir {
-        Some(dir) => config::load_or_create(dir),
-        None => (
-            Config::default(),
-            vec![
-                "no folder for the settings file (no module folder, no %LOCALAPPDATA%); \
-                 using the defaults"
-                    .to_owned(),
-            ],
-        ),
+/// Find the settings in `dirs`, best folder first, and say which file they came from (`None`:
+/// none, so the defaults).
+/// 1. The first folder with an ini that can be read wins, so an ini that the player put in a
+///    later folder is used even when an earlier folder is writable. An ini that exists but cannot
+///    be read gives a warning and the next folder is tried.
+/// 2. With no ini anywhere, the default ini is created in the first folder where that works. A
+///    failed creation gives a warning and the next folder is tried.
+/// 3. If that fails everywhere, the defaults.
+///
+/// Each folder that fails adds one warning, with its path and the reason.
+fn load_settings(dirs: &[PathBuf]) -> (Config, Vec<String>, Option<PathBuf>) {
+    let mut warnings = Vec::new();
+    // The folders that have no ini yet, in order.
+    let mut empty = Vec::new();
+    for dir in dirs {
+        match config::read_ini(dir) {
+            Ok(Some((cfg, parse_warnings))) => {
+                warnings.extend(parse_warnings);
+                return (cfg, warnings, Some(dir.join(INI_FILE_NAME)));
+            }
+            Ok(None) => empty.push(dir),
+            Err(error) => warnings.push(format!(
+                "cannot read {} ({error})",
+                dir.join(INI_FILE_NAME).display()
+            )),
+        }
+    }
+    for dir in empty {
+        let path = dir.join(INI_FILE_NAME);
+        match config::write_default(dir) {
+            Ok(()) => return (Config::default(), warnings, Some(path)),
+            Err(error) => warnings.push(format!("cannot create {} ({error})", path.display())),
+        }
+    }
+    if dirs.is_empty() {
+        warnings.push(
+            "no folder for the settings file (no module folder, no %LOCALAPPDATA%); \
+             using the defaults"
+                .to_owned(),
+        );
+    }
+    (Config::default(), warnings, None)
+}
+
+/// The log line for where the settings came from.
+fn settings_line(file: Option<&Path>) -> String {
+    match file {
+        Some(path) => format!("settings: {}", path.display()),
+        None => "settings: defaults (no usable folder)".to_owned(),
     }
 }
 
@@ -170,8 +211,8 @@ pub fn start() {
     // log level.
     let module = crate::module_dir();
     let local_app_data = std::env::var_os("LOCALAPPDATA");
-    let settings = settings_dir(module.as_deref(), local_app_data.as_deref());
-    let (cfg, warnings) = load_settings(settings.as_deref());
+    let settings = settings_dirs(module.as_deref(), local_app_data.as_deref());
+    let (cfg, warnings, settings_file) = load_settings(&settings);
 
     // 3. The log. No usable module folder is an empty path, which sends it to its own fallback.
     let log_dir = module
@@ -185,6 +226,7 @@ pub fn start() {
 
     // 5. What has been learned so far.
     log::info!("enshrouded-headroom {} loaded", env!("CARGO_PKG_VERSION"));
+    log::info!("{}", settings_line(settings_file.as_deref()));
     for warning in &warnings {
         log::warn!("{warning}");
     }
@@ -250,47 +292,240 @@ mod tests {
     const LOCAL: &str = r"C:\Users\someone\AppData\Local";
 
     #[test]
-    fn settings_live_next_to_the_module() {
-        let got = settings_dir(Some(Path::new(GAME_DIR)), Some(OsStr::new(LOCAL)));
-        assert_eq!(got, Some(PathBuf::from(GAME_DIR)));
+    fn settings_are_looked_for_next_to_the_module_first() {
+        let got = settings_dirs(Some(Path::new(GAME_DIR)), Some(OsStr::new(LOCAL)));
+        assert_eq!(
+            got,
+            [
+                PathBuf::from(GAME_DIR),
+                Path::new(LOCAL).join("enshrouded-headroom")
+            ]
+        );
     }
 
     #[test]
     fn without_a_module_folder_settings_go_to_local_app_data() {
-        let want = Some(Path::new(LOCAL).join("enshrouded-headroom"));
-        assert_eq!(settings_dir(None, Some(OsStr::new(LOCAL))), want);
+        let want = [Path::new(LOCAL).join("enshrouded-headroom")];
+        assert_eq!(settings_dirs(None, Some(OsStr::new(LOCAL))), want);
         // An empty path is the same as none (T3-7).
         assert_eq!(
-            settings_dir(Some(Path::new("")), Some(OsStr::new(LOCAL))),
+            settings_dirs(Some(Path::new("")), Some(OsStr::new(LOCAL))),
             want
         );
     }
 
     #[test]
-    fn settings_dir_is_never_a_relative_path() {
+    fn settings_dirs_are_never_relative_paths() {
         let local = Some(OsStr::new(LOCAL));
         // A relative module folder is not used; the fallback is.
         assert_eq!(
-            settings_dir(Some(Path::new(r"plugins")), local),
-            Some(Path::new(LOCAL).join("enshrouded-headroom"))
+            settings_dirs(Some(Path::new(r"plugins")), local),
+            [Path::new(LOCAL).join("enshrouded-headroom")]
         );
-        // No usable fallback either: no folder at all, not "the current folder".
-        assert_eq!(settings_dir(None, None), None);
-        assert_eq!(settings_dir(None, Some(OsStr::new(""))), None);
-        assert_eq!(settings_dir(None, Some(OsStr::new(r"AppData\Local"))), None);
+        // A relative fallback is not used; the module folder is.
         assert_eq!(
-            settings_dir(Some(Path::new(r"plugins")), Some(OsStr::new(r"Local"))),
-            None
+            settings_dirs(
+                Some(Path::new(GAME_DIR)),
+                Some(OsStr::new(r"AppData\Local"))
+            ),
+            [PathBuf::from(GAME_DIR)]
         );
+        assert_eq!(
+            settings_dirs(Some(Path::new(GAME_DIR)), None),
+            [PathBuf::from(GAME_DIR)]
+        );
+        // No usable folder at all: none, not "the current folder".
+        assert!(settings_dirs(None, None).is_empty());
+        assert!(settings_dirs(None, Some(OsStr::new(""))).is_empty());
+        assert!(settings_dirs(None, Some(OsStr::new(r"AppData\Local"))).is_empty());
+        assert!(settings_dirs(Some(Path::new(r"plugins")), Some(OsStr::new(r"Local"))).is_empty());
     }
 
     #[test]
     fn no_settings_folder_gives_the_defaults_and_a_warning() {
-        // `load_settings(None)` has no path to read or write, so it cannot touch any file.
-        let (cfg, warnings) = load_settings(None);
+        // An empty list has no path to read or write, so it cannot touch any file.
+        let (cfg, warnings, file) = load_settings(&[]);
         assert_eq!(cfg, Config::default());
+        assert_eq!(file, None);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("settings"), "{}", warnings[0]);
+    }
+
+    /// Run `test` with a fresh, empty directory under the system temp dir, then remove it.
+    /// (If `test` panics the directory stays, which helps to see what went wrong.)
+    fn with_scratch(label: &str, test: impl FnOnce(&Path)) {
+        use std::sync::atomic::AtomicUsize;
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir()
+            .join("enshrouded-headroom-tests")
+            .join(format!(
+                "entry-{}-{}-{label}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        test(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A folder that can neither hold the settings file nor be created: it would sit below a
+    /// regular file. (Not a read-only attribute: Windows ignores that on folders.)
+    fn unusable_dir(base: &Path, name: &str) -> PathBuf {
+        let blocker = base.join(format!("{name}-is-a-file"));
+        std::fs::write(&blocker, b"x").unwrap();
+        blocker.join("plugins")
+    }
+
+    /// A folder that exists and is empty.
+    fn empty_dir(base: &Path, name: &str) -> PathBuf {
+        let dir = base.join(name);
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    /// Write a settings file in `dir` that sets `TargetFps` (the default is 75).
+    fn write_ini(dir: &Path, target_fps: u32) -> PathBuf {
+        let path = dir.join(INI_FILE_NAME);
+        std::fs::write(&path, format!("[Governor]\nTargetFps={target_fps}\n")).unwrap();
+        path
+    }
+
+    #[test]
+    fn an_unusable_module_folder_gets_its_ini_in_the_fallback() {
+        with_scratch("module-unusable-create", |base| {
+            let module = unusable_dir(base, "module");
+            let fallback = base.join("fallback"); // not there yet: creating the ini makes it
+            let (cfg, warnings, file) = load_settings(&[module.clone(), fallback.clone()]);
+            assert_eq!(cfg, Config::default());
+            assert_eq!(file, Some(fallback.join(INI_FILE_NAME)));
+            assert_eq!(
+                std::fs::read_to_string(fallback.join(INI_FILE_NAME)).unwrap(),
+                config::DEFAULT_INI
+            );
+            // One line, for the module folder, which is the one that failed.
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert!(
+                warnings[0].contains(&module.display().to_string()),
+                "{}",
+                warnings[0]
+            );
+        });
+    }
+
+    #[test]
+    fn an_unusable_module_folder_reads_the_ini_in_the_fallback() {
+        with_scratch("module-unusable-read", |base| {
+            let module = unusable_dir(base, "module");
+            let fallback = empty_dir(base, "fallback");
+            let ini = write_ini(&fallback, 100);
+            let (cfg, warnings, file) = load_settings(&[module, fallback]);
+            assert_eq!(cfg.governor.target_fps, 100);
+            assert_eq!(file, Some(ini));
+            // The ini was found, so nothing was created in the module folder and nothing failed.
+            assert!(warnings.is_empty(), "{warnings:?}");
+        });
+    }
+
+    #[test]
+    fn the_module_ini_wins_over_the_fallback_ini() {
+        with_scratch("precedence", |base| {
+            let module = empty_dir(base, "module");
+            let fallback = empty_dir(base, "fallback");
+            let module_ini = write_ini(&module, 100);
+            write_ini(&fallback, 120);
+            let (cfg, warnings, file) = load_settings(&[module, fallback]);
+            assert_eq!(cfg.governor.target_fps, 100);
+            assert_eq!(file, Some(module_ini));
+            assert!(warnings.is_empty(), "{warnings:?}");
+        });
+    }
+
+    #[test]
+    fn an_ini_the_player_put_in_the_fallback_is_used_and_nothing_is_created_in_the_module_folder() {
+        with_scratch("player-ini", |base| {
+            let module = empty_dir(base, "module"); // usable, but has no ini
+            let fallback = empty_dir(base, "fallback");
+            let ini = write_ini(&fallback, 120);
+            let (cfg, warnings, file) = load_settings(&[module.clone(), fallback]);
+            assert_eq!(cfg.governor.target_fps, 120);
+            assert_eq!(file, Some(ini));
+            assert!(warnings.is_empty(), "{warnings:?}");
+            assert!(
+                !module.join(INI_FILE_NAME).exists(),
+                "the module folder must stay empty"
+            );
+        });
+    }
+
+    #[test]
+    fn a_usable_module_folder_gets_the_default_ini_and_the_fallback_is_not_touched() {
+        with_scratch("module-create", |base| {
+            let module = empty_dir(base, "module");
+            let fallback = base.join("fallback");
+            let (cfg, warnings, file) = load_settings(&[module.clone(), fallback.clone()]);
+            assert_eq!(cfg, Config::default());
+            assert_eq!(file, Some(module.join(INI_FILE_NAME)));
+            assert!(warnings.is_empty(), "{warnings:?}");
+            assert_eq!(
+                std::fs::read_to_string(module.join(INI_FILE_NAME)).unwrap(),
+                config::DEFAULT_INI
+            );
+            assert!(!fallback.exists(), "the fallback must not be created");
+        });
+    }
+
+    #[test]
+    fn an_ini_that_cannot_be_read_gives_a_warning_and_the_next_folder_is_tried() {
+        with_scratch("ini-unreadable", |base| {
+            let module = empty_dir(base, "module");
+            let fallback = empty_dir(base, "fallback");
+            // A folder where the file should be: it exists, and it cannot be read.
+            std::fs::create_dir(module.join(INI_FILE_NAME)).unwrap();
+            let ini = write_ini(&fallback, 120);
+            let (cfg, warnings, file) = load_settings(&[module.clone(), fallback]);
+            assert_eq!(cfg.governor.target_fps, 120);
+            assert_eq!(file, Some(ini));
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert!(
+                warnings[0].contains(&module.join(INI_FILE_NAME).display().to_string()),
+                "{}",
+                warnings[0]
+            );
+            assert!(module.join(INI_FILE_NAME).is_dir(), "it is not replaced");
+        });
+    }
+
+    #[test]
+    fn no_usable_folder_gives_the_defaults_and_one_warning_per_folder() {
+        with_scratch("both-unusable", |base| {
+            let module = unusable_dir(base, "module");
+            let fallback = unusable_dir(base, "fallback");
+            let (cfg, warnings, file) = load_settings(&[module.clone(), fallback.clone()]);
+            assert_eq!(cfg, Config::default());
+            assert_eq!(file, None);
+            assert_eq!(warnings.len(), 2, "{warnings:?}");
+            assert!(
+                warnings[0].contains(&module.display().to_string()),
+                "{}",
+                warnings[0]
+            );
+            assert!(
+                warnings[1].contains(&fallback.display().to_string()),
+                "{}",
+                warnings[1]
+            );
+        });
+    }
+
+    #[test]
+    fn the_settings_line_names_the_file_or_says_defaults() {
+        let file = Path::new(GAME_DIR).join(INI_FILE_NAME);
+        assert_eq!(
+            settings_line(Some(&file)),
+            format!("settings: {}", file.display())
+        );
+        assert_eq!(settings_line(None), "settings: defaults (no usable folder)");
     }
 
     fn hash_of_abc() -> [u8; 32] {
