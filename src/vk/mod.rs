@@ -96,6 +96,9 @@ static GAME_DEVICE: OnceLock<GameDevice> = OnceLock::new();
 /// The handle of the first device, taken by `compare_exchange` from 0. Only the thread that takes
 /// it sets [`GAME_DEVICE`], so that `set` never waits for another thread and never fails.
 static FIRST_DEVICE_TAKEN: AtomicUsize = AtomicUsize::new(0);
+/// The first device's dispatch shortcut never applies again after native destruction begins.
+/// A replacement device may reuse its raw handle but does not inherit its saved entry points.
+static FIRST_DEVICE_RETIRED: AtomicBool = AtomicBool::new(false);
 
 /// The game's device: the first one it created, and its physical device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -278,7 +281,7 @@ fn hand_out(slot: &AtomicUsize, real: usize, wrapper: usize, any_held_is_valid: 
 
 /// [`hand_out`] for a device-level function (`vkQueuePresentKHR`, `vkCreateSwapchainKHR`,
 /// `vkGetDeviceProcAddr`) looked up with `vkGetDeviceProcAddr` on `device`. `game_device` is the
-/// device of [`game_device()`], 0 while there is none.
+/// live first device's handle, or 0 before publication and permanently after its retirement.
 ///
 /// - The game's device: wrapped whatever the slot holds. It holds either the loader's trampoline
 ///   (from a `vkGetInstanceProcAddr` lookup), which serves every device, or this device's own
@@ -841,7 +844,9 @@ unsafe fn gdpa_choose(
         None | Some(Wrap::Gipa | Wrap::CreateDevice) => return found,
     };
     let device = device.as_raw() as usize;
-    let game = game_device().map_or(0, |game| game.device);
+    let game = game_device()
+        .filter(|_| !FIRST_DEVICE_RETIRED.load(Ordering::Acquire))
+        .map_or(0, |game| game.device);
     let out = match classify_gdpa(name) {
         // Only admission proves that the saved instance endpoint is compatible with this device.
         // Being the first GAME_DEVICE alone is not proof: optional admission may have failed.
@@ -1789,8 +1794,14 @@ pub unsafe extern "system" fn wrap_destroy_device(
         if finished.replace(true) {
             return;
         }
+        let raw_device = device.as_raw() as usize;
+        if game_device().is_some_and(|game| game.device == raw_device) {
+            // Retire dispatch identity as well as query resources. A later device can recycle
+            // these handle bits, but its own lookup must retain its own native endpoint.
+            FIRST_DEVICE_RETIRED.store(true, Ordering::Release);
+        }
         // SAFETY: called before native destruction, including the disabled-feature fallback.
-        DEVICE_QUERIES.retire(device.as_raw() as usize);
+        DEVICE_QUERIES.retire(raw_device);
         unsafe { crate::reflex::before_destroy(device, None) };
         let real = REAL_DESTROY_DEVICE.load(Ordering::Acquire);
         if real != 0 {
@@ -2944,5 +2955,267 @@ mod present_tests {
             vk::Result::SUBOPTIMAL_KHR
         );
         assert_eq!(PRESENTS.load(Ordering::Relaxed), 2);
+    }
+}
+
+#[cfg(test)]
+mod device_reuse_tests {
+    use super::*;
+    use std::sync::atomic::AtomicU32;
+
+    /// A later native device deliberately reuses this value after the first is destroyed.
+    const DEVICE: u64 = 0x51;
+    static CREATES: AtomicU32 = AtomicU32::new(0);
+    static DESTROYS: AtomicU32 = AtomicU32::new(0);
+    static A_PRESENTS: AtomicU32 = AtomicU32::new(0);
+    static B_PRESENTS: AtomicU32 = AtomicU32::new(0);
+    static A_SWAPS: AtomicU32 = AtomicU32::new(0);
+    static B_SWAPS: AtomicU32 = AtomicU32::new(0);
+
+    /// The two non-overlapping device generations deliberately share handle bits.
+    /// # Safety
+    /// The synchronous fake caller supplies a writable device output.
+    unsafe extern "system" fn create(
+        _: vk::PhysicalDevice,
+        _: *const vk::DeviceCreateInfo<'_>,
+        _: *const vk::AllocationCallbacks<'_>,
+        out: *mut vk::Device,
+    ) -> vk::Result {
+        let body = || {
+            CREATES.fetch_add(1, Ordering::Relaxed);
+            // SAFETY: the test owns the aligned output through the synchronous wrapper call.
+            unsafe { out.write(vk::Device::from_raw(DEVICE)) };
+            vk::Result::SUCCESS
+        };
+        guard(Feature::VkWrap, body, body)
+    }
+    /// Each completed generation has one matching native destructor call.
+    /// # Safety
+    /// This fake accepts opaque arguments and dereferences neither one.
+    unsafe extern "system" fn destroy(_: vk::Device, _: *const vk::AllocationCallbacks<'_>) {
+        let body = || {
+            DESTROYS.fetch_add(1, Ordering::Relaxed);
+        };
+        guard(Feature::VkWrap, body, body);
+    }
+    /// Record a call through the first generation's device-specific present entry point.
+    /// # Safety
+    /// This fake accepts opaque handles and does not read the present pointer.
+    unsafe extern "system" fn present_a(
+        _: vk::Queue,
+        _: *const vk::PresentInfoKHR<'_>,
+    ) -> vk::Result {
+        let body = || {
+            A_PRESENTS.fetch_add(1, Ordering::Relaxed);
+            vk::Result::SUCCESS
+        };
+        guard(Feature::VkWrap, body, body)
+    }
+    /// Record a call through the replacement generation's distinct present entry point.
+    /// # Safety
+    /// This fake accepts opaque handles and does not read the present pointer.
+    unsafe extern "system" fn present_b(
+        _: vk::Queue,
+        _: *const vk::PresentInfoKHR<'_>,
+    ) -> vk::Result {
+        let body = || {
+            B_PRESENTS.fetch_add(1, Ordering::Relaxed);
+            vk::Result::SUBOPTIMAL_KHR
+        };
+        guard(Feature::VkWrap, body, body)
+    }
+    /// Record the first generation's create-swapchain endpoint.
+    /// # Safety
+    /// The synchronous fake caller supplies a writable swapchain output.
+    unsafe extern "system" fn swap_a(
+        _: vk::Device,
+        _: *const vk::SwapchainCreateInfoKHR<'_>,
+        _: *const vk::AllocationCallbacks<'_>,
+        out: *mut vk::SwapchainKHR,
+    ) -> vk::Result {
+        let body = || {
+            A_SWAPS.fetch_add(1, Ordering::Relaxed);
+            // SAFETY: the synchronous test caller owns this aligned swapchain output.
+            unsafe { out.write(vk::SwapchainKHR::from_raw(0x61)) };
+            vk::Result::SUCCESS
+        };
+        guard(Feature::VkWrap, body, body)
+    }
+    /// The replacement returns a different endpoint even though the device bits are the same.
+    /// # Safety
+    /// The synchronous fake caller supplies a writable swapchain output.
+    unsafe extern "system" fn swap_b(
+        _: vk::Device,
+        _: *const vk::SwapchainCreateInfoKHR<'_>,
+        _: *const vk::AllocationCallbacks<'_>,
+        out: *mut vk::SwapchainKHR,
+    ) -> vk::Result {
+        let body = || {
+            B_SWAPS.fetch_add(1, Ordering::Relaxed);
+            // SAFETY: the synchronous test caller owns this aligned swapchain output.
+            unsafe { out.write(vk::SwapchainKHR::from_raw(0x62)) };
+            vk::Result::SUCCESS
+        };
+        guard(Feature::VkWrap, body, body)
+    }
+    /// A common native resolver supplies endpoints for the currently live fake generation.
+    /// # Safety
+    /// The lookup name is a live NUL-terminated string.
+    unsafe extern "system" fn gdpa(_: vk::Device, name: *const c_char) -> vk::PFN_vkVoidFunction {
+        let body = || {
+            // SAFETY: wrapper lookup forwards the test's static NUL-terminated name.
+            let name = unsafe { CStr::from_ptr(name) };
+            let replacement = CREATES.load(Ordering::Relaxed) == 2;
+            to_void(match name.to_bytes() {
+                b"vkQueuePresentKHR" if replacement => present_b as *const () as usize,
+                b"vkQueuePresentKHR" => present_a as *const () as usize,
+                b"vkCreateSwapchainKHR" if replacement => swap_b as *const () as usize,
+                b"vkCreateSwapchainKHR" => swap_a as *const () as usize,
+                b"vkDestroyDevice" => destroy as *const () as usize,
+                _ => 0,
+            })
+        };
+        guard(Feature::VkWrap, body, body)
+    }
+
+    /// Lookup, invoke and check native endpoints through the real wrapper.
+    /// # Safety
+    /// The configured fake resolver owns this live device generation and all selected endpoints.
+    unsafe fn exercise(device: vk::Device, replacement: bool) {
+        // SAFETY: the common fake resolver and current live fake device match these static names.
+        let present = unsafe { wrap_gdpa(device, c"vkQueuePresentKHR".as_ptr()) };
+        // SAFETY: same resolver contract for the create endpoint.
+        let swap = unsafe { wrap_gdpa(device, c"vkCreateSwapchainKHR".as_ptr()) };
+        // SAFETY: the exact lookup names supply these PFN signatures.
+        let present: vk::PFN_vkQueuePresentKHR = unsafe { std::mem::transmute(present.unwrap()) };
+        // SAFETY: the exact lookup name supplies this PFN signature.
+        let swap: vk::PFN_vkCreateSwapchainKHR = unsafe { std::mem::transmute(swap.unwrap()) };
+        let info = vk::PresentInfoKHR::default();
+        let create = vk::SwapchainCreateInfoKHR::default();
+        let mut out = vk::SwapchainKHR::null();
+        // SAFETY: this fake accepts these initialized input/output records and live fake handles.
+        let result = unsafe {
+            present(
+                vk::Queue::from_raw(if replacement { 0x72 } else { 0x71 }),
+                &info,
+            )
+        };
+        assert_eq!(
+            result.as_raw(),
+            if replacement {
+                vk::Result::SUBOPTIMAL_KHR.as_raw()
+            } else {
+                vk::Result::SUCCESS.as_raw()
+            }
+        );
+        // SAFETY: these initialized fake records and device match the resolver's generation.
+        assert_eq!(
+            unsafe { swap(device, &create, std::ptr::null(), &mut out) }.as_raw(),
+            vk::Result::SUCCESS.as_raw()
+        );
+        assert_eq!(out.as_raw(), if replacement { 0x62 } else { 0x61 });
+    }
+
+    /// A dead first-device handle cannot authorize routing for a replacement with recycled bits.
+    #[test]
+    fn reused_device_handle_keeps_its_own_native_endpoints_after_destruction() {
+        const TEST: &str = "vk::device_reuse_tests::reused_device_handle_keeps_its_own_native_endpoints_after_destruction";
+        let Ok(case) = std::env::var("HEADROOM_DEVICE_REUSE") else {
+            for case in [
+                "admitted",
+                "unadmitted",
+                "disabled-admitted",
+                "disabled-unadmitted",
+            ] {
+                let out = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", TEST, "--nocapture"])
+                    .env("HEADROOM_DEVICE_REUSE", case)
+                    .output()
+                    .unwrap();
+                assert!(
+                    out.status.success(),
+                    "{case}: {}\n{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            return;
+        };
+        REAL_GDPA.store(gdpa as *const () as usize, Ordering::Release);
+        REAL_CREATE_DEVICE.store(create as *const () as usize, Ordering::Release);
+        let create = vk::DeviceCreateInfo::default();
+        let mut device = vk::Device::null();
+        // SAFETY: the real wrapper calls only the configured fake device creator with owned records.
+        assert_eq!(
+            unsafe {
+                wrap_create_device(
+                    vk::PhysicalDevice::from_raw(0x81),
+                    &create,
+                    std::ptr::null(),
+                    &mut device,
+                )
+            }
+            .as_raw(),
+            vk::Result::SUCCESS.as_raw()
+        );
+        if matches!(case.as_str(), "admitted" | "disabled-admitted") {
+            DEVICE_QUERIES.publish(
+                GameDevice {
+                    device: DEVICE as usize,
+                    phys: 0x81,
+                },
+                Arc::new(InstanceContext::new(0x91, 0)),
+            );
+        }
+        // SAFETY: the first fake generation is live and owns the selected endpoints.
+        unsafe { exercise(device, false) };
+        // SAFETY: exact fake native destructor name, handle still live.
+        let destroy = unsafe { wrap_gdpa(device, c"vkDestroyDevice".as_ptr()) }.unwrap();
+        if case.starts_with("disabled-") {
+            crate::guard::disable_silent(Feature::VkWrap);
+        }
+        // SAFETY: exact queried signature; first-generation calls have finished and no child query remains.
+        unsafe {
+            std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkDestroyDevice>(destroy)(
+                device,
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(DESTROYS.load(Ordering::Relaxed), 1);
+        assert!(
+            with_game_device(|_, _, _| ()).is_none(),
+            "the first query generation stays retired"
+        );
+        // SAFETY: A was destroyed; the valid fake replacement may now recycle its handle bits.
+        assert_eq!(
+            unsafe {
+                wrap_create_device(
+                    vk::PhysicalDevice::from_raw(0x82),
+                    &create,
+                    std::ptr::null(),
+                    &mut device,
+                )
+            }
+            .as_raw(),
+            vk::Result::SUCCESS.as_raw()
+        );
+        assert_eq!(device.as_raw(), DEVICE);
+        // SAFETY: newly refetched endpoints must dispatch this live replacement generation.
+        unsafe { exercise(device, true) };
+        assert_eq!(CREATES.load(Ordering::Relaxed), 2);
+        assert_eq!(A_PRESENTS.load(Ordering::Relaxed), 1);
+        assert_eq!(B_PRESENTS.load(Ordering::Relaxed), 1);
+        assert_eq!(A_SWAPS.load(Ordering::Relaxed), 1);
+        assert_eq!(B_SWAPS.load(Ordering::Relaxed), 1);
+        // SAFETY: the replacement's own refetched destructor has the exact native signature.
+        let destroy = unsafe { wrap_gdpa(device, c"vkDestroyDevice".as_ptr()) }.unwrap();
+        // SAFETY: no fake child remains in use; retire the final live generation exactly once.
+        unsafe {
+            std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkDestroyDevice>(destroy)(
+                device,
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(DESTROYS.load(Ordering::Relaxed), 2);
     }
 }
