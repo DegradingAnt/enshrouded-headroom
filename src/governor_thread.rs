@@ -597,4 +597,3 @@ mod tests {
         assert_eq!(knob_value(0, 5), None);
     }
 }
-
