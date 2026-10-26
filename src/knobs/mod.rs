@@ -14,6 +14,7 @@
 //! as its last step, so every code hook goes live in one batch.
 
 pub mod object_distance;
+pub mod scatter_distance;
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -110,7 +111,8 @@ impl KnobShared {
 /// signal.
 pub static OBJECT: KnobShared = KnobShared::new(1.0);
 
-/// Grass and detail-scatter distance (design.md 7.2), in metres. Task 13 sets it.
+/// Grass and detail-scatter distance (design.md 7.2), in metres. A mirror for the log:
+/// `scatter_distance::set_distance` sets it together with the float the game reads.
 pub static SCATTER: KnobShared = KnobShared::new(90.0);
 
 /// Terrain detail distance (design.md 7.3): a factor on the terrain LOD base distance. Task 14's

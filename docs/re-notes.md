@@ -110,6 +110,11 @@ Hits, all in `FUN_1400744e0` (the allocation function):
 Scope limit: GPU shader code is not in the exe and was not audited.
 **Ruling for Task 13:** `cap_ok` stays false until the role of 0xf000 is known AND the shaders are confirmed to read the capacity only from the constant. Otherwise the grass knob tops out at 90 m.
 **Implication for Task 13:** doubling capacity needs at least 7 sites changed together (2× 0x14000 args, 0xa0000, 2× 0x280000, the shader constant, and the 0xf000 args to be understood). Unless a chunk-aware audit maps every use, `cap_ok` must be false: the grass knob stays at 90 m.
+**Result used by Task 13 (`src/knobs/scatter_distance.rs`, 2026-10-26):** the audit above and its correction under "Research results, 2026-10-25" are the whole audit. It was not redone. `CAP_OK = false`, `CAP_SITES` is empty, `max_step` is 0, and no capacity site is written. The knob stays at 90 m until the counter probe (design.md 7.2a) measures r_max.
+Distance-load sites (controller, from the bytes of the Steam exe, 2026-10-26; the ignored test `scatter_sigs_unique_in_game_exe` reads them again):
+- `SCATTER_BRICK_LOAD` matches once at `0x140079502`. Its disp32 is at `0x14007950b`; the instruction ends at `0x14007950f`.
+- `SCATTER_INSTANCE_LOADS` matches once at `0x14007691c`. Its distance disp32 is at `0x14007693a`; the instruction ends at `0x14007693e`. The other two loads in that pattern read 1.0 (`0x1413b3c90`) and 14.0 (`0x1413b65e0`) and are not touched.
+- Both distance disp32s read the same `.rdata` constant, `0x1413b65fc` = 90.0 (bytes `00 00 b4 42`). It is never written. `install` redirects the two loads only if both still read one address that holds exactly 90.0.
 
 
 ## Reflex menu option location (controller, 2026-10-25; pre-research for plan Task 16)

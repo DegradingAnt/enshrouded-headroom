@@ -275,10 +275,17 @@ pub fn start() {
     // is only created and queued here: the last step enables it.
     knobs::object_distance::init(&cfg.knobs);
 
+    // 12. The grass distance redirect: both High-level grass distance loads are pointed at a float
+    // in the mod's own page, which holds the game's 90 m. It patches code (two disp32s, no hook),
+    // so it asks `code_patches_allowed`; it runs only with `EnableScatterDistance = 1` and logs its
+    // own line, including why it is off. It must run before the game builds a scene, which holds
+    // here: `InitializeASI` runs before `WinMain`.
+    knobs::scatter_distance::init(&cfg.knobs);
+
     // Later code hooks (Task 14's terrain hook) are created and queued above this line, so they
     // join the one batch below.
 
-    // 12. Enable every queued hook at once (MinHook's queued enable). This is the only place that
+    // 13. Enable every queued hook at once (MinHook's queued enable). This is the only place that
     // enables hooks. It logs one line if any hook was queued.
     knobs::enable_queued_hooks();
 }
