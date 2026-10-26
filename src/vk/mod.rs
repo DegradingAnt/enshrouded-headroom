@@ -81,13 +81,51 @@ pub static REAL_GET_MEMORY_PROPERTIES: AtomicUsize = AtomicUsize::new(0);
 pub static REAL_GET_PROPERTIES: AtomicUsize = AtomicUsize::new(0);
 /// The first non-null `VkInstance` the game passes to `vkGetInstanceProcAddr`.
 pub static GAME_INSTANCE: AtomicUsize = AtomicUsize::new(0);
-/// The first `VkDevice` the game creates.
-pub static GAME_DEVICE: AtomicUsize = AtomicUsize::new(0);
-/// The `VkPhysicalDevice` of [`GAME_DEVICE`]. It is stored just after `GAME_DEVICE`, so a reader
-/// on another thread can see the device a moment before it sees this.
-pub static GAME_PHYS: AtomicUsize = AtomicUsize::new(0);
 /// Set when [`wrap_gpa`] hands out [`wrap_gipa`]: the game is now inside the chain.
 pub static WRAPPER_ENGAGED: AtomicBool = AtomicBool::new(false);
+
+/// The first `VkDevice` the game creates and the `VkPhysicalDevice` it is on, published together:
+/// a reader sees both or neither. Read it with [`game_device`].
+static GAME_DEVICE: OnceLock<GameDevice> = OnceLock::new();
+/// The handle of the first device, taken by `compare_exchange` from 0. Only the thread that takes
+/// it sets [`GAME_DEVICE`], so that `set` never waits for another thread and never fails.
+static FIRST_DEVICE_TAKEN: AtomicUsize = AtomicUsize::new(0);
+
+/// The game's device: the first one it created, and its physical device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GameDevice {
+    /// The `VkDevice` handle.
+    pub device: usize,
+    /// The `VkPhysicalDevice` handle it was created on.
+    pub phys: usize,
+}
+
+/// The game's first device and its physical device, or `None` until it has created one. One
+/// atomic load; the two handles always belong together.
+pub fn game_device() -> Option<GameDevice> {
+    GAME_DEVICE.get().copied()
+}
+
+/// Publish `device` on `phys` in `cell` if it is the first device: `taken` is still 0. Returns
+/// `true` for that first device only (the caller then does the one-time work); `false` for a null
+/// handle and for every later device, which leave `cell` as it is.
+fn record_first_device(
+    taken: &AtomicUsize,
+    cell: &OnceLock<GameDevice>,
+    device: usize,
+    phys: usize,
+) -> bool {
+    if device == 0
+        || taken
+            .compare_exchange(0, device, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+    {
+        return false;
+    }
+    // Only the thread that took `taken` gets here, so the cell is empty and `set` succeeds.
+    let _ = cell.set(GameDevice { device, phys });
+    true
+}
 
 /// What `wrap_create_device` needs from the settings file. Set once, by [`init`].
 static TEXTURE_SETTINGS: OnceLock<TextureSettings> = OnceLock::new();
@@ -145,6 +183,10 @@ pub fn classify_gipa(name: &[u8]) -> Option<Wrap> {
 }
 
 /// The wrapper for a `vkGetDeviceProcAddr` name. Pure. No submit wrapper (ruling G10).
+///
+/// `vkGetDeviceProcAddr` itself is mapped so a game that re-fetches it at device level stays in
+/// the chain; the loader then gives the top of the device's chain, so it goes through
+/// [`device_function`] like the other two (see [`gdpa_choose`]).
 pub fn classify_gdpa(name: &[u8]) -> Option<Wrap> {
     match name {
         b"vkGetDeviceProcAddr" => Some(Wrap::Gdpa),
@@ -220,12 +262,13 @@ fn hand_out(slot: &AtomicUsize, real: usize, wrapper: usize, any_held_is_valid: 
     }
 }
 
-/// [`hand_out`] for a device-level function (`vkQueuePresentKHR`, `vkCreateSwapchainKHR`) looked
-/// up with `vkGetDeviceProcAddr` on `device`. `game_device` is [`GAME_DEVICE`].
+/// [`hand_out`] for a device-level function (`vkQueuePresentKHR`, `vkCreateSwapchainKHR`,
+/// `vkGetDeviceProcAddr`) looked up with `vkGetDeviceProcAddr` on `device`. `game_device` is the
+/// device of [`game_device()`], 0 while there is none.
 ///
 /// - The game's device: wrapped whatever the slot holds. It holds either the loader's trampoline
 ///   (from a `vkGetInstanceProcAddr` lookup), which serves every device, or this device's own
-///   pointer.
+///   pointer. (For `vkGetDeviceProcAddr` it is always the trampoline: see [`gdpa_choose`].)
 /// - Another device, once the game's is known (a second GPU, or a device made again after a device
 ///   loss): nothing is stored, and it is wrapped only if the slot already holds this very pointer,
 ///   so the wrapper calls exactly what the game would have. Otherwise the real pointer comes back
@@ -585,8 +628,9 @@ unsafe fn gipa_choose(
 
 /// Stands in for `vkGetDeviceProcAddr`.
 ///
-/// Every call goes to [`REAL_GDPA`] with the original arguments; `vkQueuePresentKHR` and
-/// `vkCreateSwapchainKHR` get their wrappers (see [`device_function`]).
+/// Every call goes to [`REAL_GDPA`] with the original arguments; `vkQueuePresentKHR`,
+/// `vkCreateSwapchainKHR` and `vkGetDeviceProcAddr` itself get their wrappers (see
+/// [`gdpa_choose`] and [`device_function`]).
 ///
 /// # Safety
 ///
@@ -610,7 +654,33 @@ pub unsafe extern "system" fn wrap_gdpa(
     })
 }
 
+/// One flag per device-level name: "an unwrapped hand-out has been logged".
+static UNWRAPPED_GDPA: AtomicBool = AtomicBool::new(false);
+static UNWRAPPED_PRESENT: AtomicBool = AtomicBool::new(false);
+static UNWRAPPED_CREATE_SWAPCHAIN: AtomicBool = AtomicBool::new(false);
+
+/// `true` for the first call on `flag`, `false` for every later one.
+fn first_time(flag: &AtomicBool) -> bool {
+    !flag.swap(true, Ordering::Relaxed)
+}
+
+/// The warning for a device-level function handed back unwrapped. Without it, a probe device
+/// created first would leave the frame timer dead with no clue in the log.
+fn unwrapped_line(name: &str, device: usize, game: usize) -> String {
+    format!("vk: {name} for device {device:#x} handed back unwrapped: the game device is {game:#x}")
+}
+
 /// The part of [`wrap_gdpa`] after the real call returned `found`.
+///
+/// All three names it wraps go through [`device_function`]. For `vkGetDeviceProcAddr` that is
+/// safe as for the other two: [`REAL_GDPA`] always holds what `vkGetInstanceProcAddr` gave (it is
+/// stored before `wrap_gdpa` is ever handed out, so this path never stores into it), which is the
+/// loader's trampoline and dispatches on the device it is given. Asked at device level, the
+/// Khronos loader gives the top of that device's chain instead, a different pointer, which is why
+/// the plain "same pointer" rule of [`hand_out`] would leave it unwrapped.
+///
+/// A name handed back unwrapped is logged once (one-time lookups, so the log is allowed; neither
+/// `hand_out` nor `wrap_present` logs).
 ///
 /// # Safety
 ///
@@ -629,42 +699,43 @@ unsafe fn gdpa_choose(
     let Some(name) = (unsafe { read_name(name.cast(), &mut buf) }) else {
         return found;
     };
-    let device = device.as_raw() as usize;
-    let game_device = GAME_DEVICE.load(Ordering::Acquire);
-    let out = match classify_gdpa(name) {
-        None => return found,
-        Some(Wrap::Gdpa) => hand_out(
+    let (slot, wrapper, logged, what) = match classify_gdpa(name) {
+        Some(Wrap::Gdpa) => (
             &REAL_GDPA,
-            found_addr,
             wrap_gdpa as *const () as usize,
-            false,
+            &UNWRAPPED_GDPA,
+            "vkGetDeviceProcAddr",
         ),
-        Some(Wrap::Present) => device_function(
+        Some(Wrap::Present) => (
             &REAL_PRESENT,
-            found_addr,
             wrap_present as *const () as usize,
-            device,
-            game_device,
+            &UNWRAPPED_PRESENT,
+            "vkQueuePresentKHR",
         ),
-        Some(Wrap::CreateSwapchain) => device_function(
+        Some(Wrap::CreateSwapchain) => (
             &REAL_CREATE_SWAPCHAIN,
-            found_addr,
             wrap_create_swapchain as *const () as usize,
-            device,
-            game_device,
+            &UNWRAPPED_CREATE_SWAPCHAIN,
+            "vkCreateSwapchainKHR",
         ),
         // `classify_gdpa` gives no other variant.
-        Some(Wrap::Gipa | Wrap::CreateDevice) => return found,
+        None | Some(Wrap::Gipa | Wrap::CreateDevice) => return found,
     };
+    let device = device.as_raw() as usize;
+    let game = game_device().map_or(0, |game| game.device);
+    let out = device_function(slot, found_addr, wrapper, device, game);
+    if out != wrapper && first_time(logged) {
+        log::warn!("{}", unwrapped_line(what, device, game));
+    }
     to_void(out)
 }
 
 /// Stands in for `vkCreateDevice`.
 ///
 /// Calls the real one with the game's arguments, unchanged (Task 9 adds no extension, so the
-/// game's extension list goes through as it is). On the first device that is created it records
-/// [`GAME_DEVICE`] and [`GAME_PHYS`], logs `wrapper chain engaged (device created)`, and sizes the
-/// texture budget for the card (see [`texture_step`]).
+/// game's extension list goes through as it is). On the first device that is created it publishes
+/// the device and its physical device together (see [`game_device`]), logs `wrapper chain engaged
+/// (device created)`, and sizes the texture budget for the card (see [`texture_step`]).
 ///
 /// # Safety
 ///
@@ -715,14 +786,14 @@ unsafe fn after_create_device(
     // SAFETY: on SUCCESS the driver has written the new handle to `device`, a valid, aligned
     // pointer the game passed in.
     let device = unsafe { device.read() }.as_raw() as usize;
-    if device == 0
-        || GAME_DEVICE
-            .compare_exchange(0, device, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-    {
+    if !record_first_device(
+        &FIRST_DEVICE_TAKEN,
+        &GAME_DEVICE,
+        device,
+        phys.as_raw() as usize,
+    ) {
         return;
     }
-    first_wins(&GAME_PHYS, phys.as_raw() as usize);
     // SAFETY: `phys` is the physical device the first device was just created on.
     unsafe { on_first_device(phys) };
 }
@@ -831,7 +902,8 @@ const _: vk::PFN_vkQueuePresentKHR = wrap_present;
 ///
 /// # Safety
 ///
-/// `device` is 0 (gives `None`) or a live `VkDevice` of the game (normally [`GAME_DEVICE`]).
+/// `device` is 0 (gives `None`) or a live `VkDevice` of the game (normally the one
+/// [`game_device`] gives).
 pub unsafe fn device_proc(device: usize, name: &CStr) -> Option<usize> {
     let real = REAL_GDPA.load(Ordering::Acquire);
     if real == 0 || device == 0 {
@@ -991,16 +1063,18 @@ fn texture_step<P>(
                 &mode,
             ))
         }
+        // No budget: say why, in this order. The setting first (it decides on any GPU), then an
+        // integrated GPU, then the reserve.
+        None if matches!(mode, TextureBudget::Off) => Some((
+            Level::Info,
+            "texture budget: off: TextureBudget = off in the settings file".to_owned(),
+        )),
         None if gpu.integrated() => Some((
             Level::Info,
             format!(
                 "texture budget: unchanged: integrated GPU (device-local {})",
                 gib(gpu.device_local)
             ),
-        )),
-        None if matches!(mode, TextureBudget::Off) => Some((
-            Level::Info,
-            "texture budget: off: TextureBudget = off in the settings file".to_owned(),
         )),
         None => Some((
             Level::Info,
@@ -1177,7 +1251,21 @@ mod tests {
         static FAKE_LAST: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
     }
 
-    /// A `GetProcAddress` that only counts and records its arguments and finds nothing.
+    /// What `fake_gpa` "finds": a real, non-null function, so the code after the real call (the
+    /// module and ordinal checks in `gpa_choose`) runs on it. Never called.
+    ///
+    /// # Safety
+    ///
+    /// None needed: it does nothing.
+    unsafe extern "system" fn fake_found() -> isize {
+        0
+    }
+
+    fn fake_found_addr() -> usize {
+        fake_found as *const () as usize
+    }
+
+    /// A `GetProcAddress` that only counts and records its arguments and answers `fake_found`.
     ///
     /// # Safety
     ///
@@ -1186,7 +1274,7 @@ mod tests {
     unsafe extern "system" fn fake_gpa(module: HMODULE, name: PCSTR) -> FARPROC {
         FAKE_CALLS.with(|c| c.set(c.get() + 1));
         FAKE_LAST.with(|c| c.set((module as usize, name as usize)));
-        None
+        to_farproc(fake_found_addr())
     }
 
     /// Only the two `wrap_gpa` tests set REAL_GPA, both to `fake_gpa`, and no unit test calls
@@ -1209,7 +1297,11 @@ mod tests {
         let name = b"Sleep\0";
         // SAFETY: a live module handle and a NUL-terminated name.
         let got = unsafe { wrap_gpa(kernel32(), name.as_ptr()) };
-        assert!(got.is_none(), "the fake's answer comes back");
+        assert_eq!(
+            addr_of(got),
+            fake_found_addr(),
+            "the fake's answer comes back"
+        );
         assert_eq!(FAKE_CALLS.with(Cell::get) - before, 1);
         assert_eq!(
             FAKE_LAST.with(Cell::get),
@@ -1221,18 +1313,39 @@ mod tests {
     fn wrap_gpa_ordinal_passthrough() {
         set_real_gpa_for_test(fake_gpa as *const () as usize);
         let before = FAKE_CALLS.with(Cell::get);
-        // Ordinal 5: address 5 is never mapped, so reading it would crash the test.
+        // Ordinal 5. Address 5 is in the first 64 KiB, which Windows never maps, so a read of the
+        // "name" would fault and end the test.
+        let ordinal = 5usize as PCSTR;
         // SAFETY: an ordinal is a valid GetProcAddress name argument.
-        let _ = unsafe { wrap_gpa(kernel32(), 5usize as PCSTR) };
+        let got = unsafe { wrap_gpa(kernel32(), ordinal) };
+        // The fake found something, so the checks after the real call ran on it, and it came
+        // back as it was.
+        assert_eq!(addr_of(got), fake_found_addr());
         assert_eq!(FAKE_CALLS.with(Cell::get) - before, 1);
         assert_eq!(FAKE_LAST.with(Cell::get), (kernel32() as usize, 5));
+
+        // The same answer with the module equal to "vulkan-1": now only the ordinal check stands
+        // between the lookup and a name read. It returns before the module is even compared.
+        let compared = Cell::new(0);
+        let vulkan_is_this_module = || {
+            compared.set(compared.get() + 1);
+            kernel32()
+        };
+        // SAFETY: an ordinal, which must not be read (that is what is tested).
+        let got = unsafe { gpa_choose(got, kernel32(), ordinal, vulkan_is_this_module) };
+        assert_eq!(
+            addr_of(got),
+            fake_found_addr(),
+            "passed through, not wrapped"
+        );
+        assert_eq!(compared.get(), 0, "no module compare, so no name read");
     }
 
     // ---- which names are read, and how far -----------------------------------------------------
 
     /// A stand-in for an address `GetProcAddress` returned.
     fn some_function() -> FARPROC {
-        to_farproc(fake_gpa as *const () as usize)
+        to_farproc(fake_found_addr())
     }
 
     #[test]
@@ -1413,6 +1526,71 @@ mod tests {
             device_function(&AtomicUsize::new(0), 0, WRAPPER, GAME, GAME),
             0
         );
+    }
+
+    #[test]
+    fn an_unwrapped_lookup_is_logged_once_per_name() {
+        assert_eq!(
+            unwrapped_line("vkQueuePresentKHR", 0x3333_1000, 0x3333_0000),
+            "vk: vkQueuePresentKHR for device 0x33331000 handed back unwrapped: the game device \
+             is 0x33330000"
+        );
+        let flag = AtomicBool::new(false);
+        assert!(
+            first_time(&flag),
+            "the first unwrapped lookup of a name is logged"
+        );
+        assert!(!first_time(&flag), "later ones are not");
+        assert!(!first_time(&flag));
+    }
+
+    // ---- the game's device: both handles or neither ---------------------------------------------
+
+    #[test]
+    fn the_first_device_is_published_with_its_physical_device() {
+        let taken = AtomicUsize::new(0);
+        let cell = OnceLock::new();
+        assert!(
+            !record_first_device(&taken, &cell, 0, 0x22),
+            "a null device is not one"
+        );
+        assert_eq!(cell.get(), None);
+        assert!(record_first_device(&taken, &cell, 0xD1, 0x22));
+        let first = GameDevice {
+            device: 0xD1,
+            phys: 0x22,
+        };
+        assert_eq!(cell.get(), Some(&first));
+        // A second device (same or another GPU) leaves the first in place.
+        assert!(!record_first_device(&taken, &cell, 0xD2, 0x23));
+        assert_eq!(cell.get(), Some(&first));
+    }
+
+    #[test]
+    fn one_thread_publishes_the_first_device_and_its_pair_stays_together() {
+        let taken = AtomicUsize::new(0);
+        let cell = OnceLock::new();
+        let winners = std::thread::scope(|s| {
+            let handles: Vec<_> = (1..=8usize)
+                .map(|i| {
+                    let (taken, cell) = (&taken, &cell);
+                    s.spawn(move || record_first_device(taken, cell, i * 0x100, i * 0x100 + 1))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .filter(|&won| won)
+                .count()
+        });
+        assert_eq!(winners, 1);
+        let game = cell.get().copied().unwrap();
+        assert_eq!(
+            game.phys,
+            game.device + 1,
+            "device and phys of the same call"
+        );
+        assert_eq!(taken.load(Ordering::Relaxed), game.device);
     }
 
     // ---- a null real pointer is never called ---------------------------------------------------
@@ -1681,6 +1859,36 @@ mod tests {
         let (level, line) = texture_step(Some(()), Some(&big), None, never).unwrap();
         assert_eq!(level, Level::Warn);
         assert!(line.contains("not applied"), "{line}");
+    }
+
+    /// The reasons are checked in order: TextureBudget = off first, then an integrated GPU, then
+    /// the reserve. An integrated GPU with the feature off is "off", not "integrated".
+    #[test]
+    fn texture_budget_off_is_named_before_the_gpu_or_the_reserve() {
+        let never = |(): (), _: u64| -> Result<(), PatchError> { panic!("must not apply") };
+        let off = TextureSettings {
+            mode: TextureBudget::Off,
+            reserve_gib: 11.0,
+        };
+        for card in [
+            gpu(16 * GIB, vk::PhysicalDeviceType::INTEGRATED_GPU),
+            gpu(12 * GIB, vk::PhysicalDeviceType::DISCRETE_GPU),
+            gpu(16 * GIB, vk::PhysicalDeviceType::DISCRETE_GPU),
+        ] {
+            let (level, line) = texture_step(Some(()), Some(&card), Some(&off), never).unwrap();
+            assert_eq!(level, Level::Info);
+            assert!(
+                line.contains("off") && !line.contains("integrated") && !line.contains("reserve"),
+                "{line}"
+            );
+        }
+        // An integrated GPU with the feature on names the GPU, not the reserve.
+        let laptop = gpu(12 * GIB, vk::PhysicalDeviceType::INTEGRATED_GPU);
+        let (_, line) = texture_step(Some(()), Some(&laptop), Some(&AUTO), never).unwrap();
+        assert!(
+            line.contains("integrated") && !line.contains("reserve"),
+            "{line}"
+        );
     }
 
     #[test]

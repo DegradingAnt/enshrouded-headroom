@@ -30,10 +30,10 @@ use ash::vk::{self, Handle};
 use enshrouded_headroom::config::TextureBudget;
 use enshrouded_headroom::frame_timer::FRAMES;
 use enshrouded_headroom::vk::{
-    device_proc, types, wrap_create_device, wrap_create_swapchain, wrap_gdpa, wrap_gipa, wrap_gpa,
-    wrap_present, TextureSettings, GAME_DEVICE, GAME_INSTANCE, GAME_PHYS, REAL_CREATE_DEVICE,
-    REAL_CREATE_SWAPCHAIN, REAL_GDPA, REAL_GET_MEMORY_PROPERTIES, REAL_GET_PROPERTIES, REAL_GIPA,
-    REAL_GPA, REAL_PRESENT, WRAPPER_ENGAGED,
+    device_proc, game_device, types, wrap_create_device, wrap_create_swapchain, wrap_gdpa,
+    wrap_gipa, wrap_gpa, wrap_present, GameDevice, TextureSettings, GAME_INSTANCE,
+    REAL_CREATE_DEVICE, REAL_CREATE_SWAPCHAIN, REAL_GDPA, REAL_GET_MEMORY_PROPERTIES,
+    REAL_GET_PROPERTIES, REAL_GIPA, REAL_GPA, REAL_PRESENT, WRAPPER_ENGAGED,
 };
 use windows_sys::core::PCSTR;
 use windows_sys::Win32::Foundation::{FreeLibrary, FARPROC, HMODULE};
@@ -118,7 +118,15 @@ fn addr(f: *const ()) -> usize {
 unsafe extern "system" fn fake_gpa(module: HMODULE, name: PCSTR) -> FARPROC {
     let fake_vk = FAKE_VK.load(Ordering::Acquire);
     if module.is_null() || (fake_vk != 0 && module as usize == fake_vk) {
-        // SAFETY: the test passes only names for these modules.
+        if name as usize <= 0xFFFF {
+            // An ordinal: noted by number, never read, and found.
+            note(format!("gpa({:#x}, #{})", module as usize, name as usize));
+            // SAFETY: a function address as the Option<fn> it is.
+            return unsafe {
+                std::mem::transmute::<usize, FARPROC>(addr(other_farproc as *const ()))
+            };
+        }
+        // SAFETY: not an ordinal, and the test passes only names for these modules.
         let n = unsafe { name_of(name.cast()) };
         note(format!("gpa({:#x}, {n})", module as usize));
         let out = if n == "vkGetInstanceProcAddr" {
@@ -179,8 +187,20 @@ unsafe extern "system" fn fake_gdpa(
         // The second device is on "another driver": its present is another function.
         ("vkQueuePresentKHR", _) => addr(fake_present_2 as *const ()),
         ("vkCreateSwapchainKHR", _) => addr(fake_create_swapchain as *const ()),
+        // As the Khronos loader does: asked at device level, vkGetDeviceProcAddr gives the top of
+        // the device's chain, not the trampoline vkGetInstanceProcAddr gave.
+        ("vkGetDeviceProcAddr", _) => addr(fake_gdpa_top as *const ()),
         _ => addr(other_vk as *const ()),
     })
+}
+
+/// The top-of-chain `vkGetDeviceProcAddr` a device-level lookup gives. Never called.
+///
+/// # Safety
+///
+/// None needed: it reads neither argument.
+unsafe extern "system" fn fake_gdpa_top(_: vk::Device, _: *const c_char) -> vk::PFN_vkVoidFunction {
+    None
 }
 
 /// The fake `vkCreateDevice`: makes `DEVICE`, then `DEVICE_2`.
@@ -483,6 +503,16 @@ fn scenario(dir: &Path) {
     let got = unsafe { gpa_via_slot(slot, vulkan, c"vkCreateInstance") };
     assert_eq!(got, other_farproc as *const () as usize);
     take_calls();
+    // An ordinal on vulkan-1 itself, which the fake finds: the module matches, so only the
+    // ordinal check keeps wrap_gpa from reading address 5 (never mapped: a read would kill this
+    // process). It comes back as the fake gave it.
+    // SAFETY: the slot holds a GetProcAddress-typed function; an ordinal is a valid name.
+    let got = unsafe {
+        let gpa = std::mem::transmute::<usize, GpaFn>(slot.read_volatile());
+        gpa(vulkan, 5usize as PCSTR).map_or(0, |f| f as usize)
+    };
+    assert_eq!(got, other_farproc as *const () as usize);
+    assert_eq!(take_calls(), [format!("gpa({:#x}, #5)", vulkan as usize)]);
 
     // SAFETY: what the chain handed out has vkGetInstanceProcAddr's type.
     let gipa = unsafe { std::mem::transmute::<usize, vk::PFN_vkGetInstanceProcAddr>(gipa) };
@@ -546,8 +576,11 @@ fn scenario(dir: &Path) {
         );
         assert_eq!(result, vk::Result::SUCCESS);
         assert_eq!(device.as_raw(), DEVICE);
-        assert_eq!(load(&GAME_DEVICE), DEVICE as usize);
-        assert_eq!(load(&GAME_PHYS), PHYS as usize);
+        let first = GameDevice {
+            device: DEVICE as usize,
+            phys: PHYS as usize,
+        };
+        assert_eq!(game_device(), Some(first), "device and phys, together");
         assert_eq!(
             take_calls(),
             [
@@ -575,8 +608,11 @@ fn scenario(dir: &Path) {
         );
         assert_eq!(result, vk::Result::SUCCESS);
         assert_eq!(device_2.as_raw(), DEVICE_2);
-        assert_eq!(load(&GAME_DEVICE), DEVICE as usize);
-        assert_eq!(load(&GAME_PHYS), PHYS as usize);
+        assert_eq!(
+            game_device(),
+            Some(first),
+            "the first device stays the game's"
+        );
         assert_eq!(take_calls().len(), 1, "only the create call");
 
         // vkGetDeviceProcAddr on the game's device.
@@ -603,13 +639,27 @@ fn scenario(dir: &Path) {
             void_addr(gdpa(device, c"vkQueueSubmit2".as_ptr())),
             other_vk as *const () as usize
         );
-        // The other device's present is another driver's function: handed back unwrapped.
+        // T9-1: vkGetDeviceProcAddr asked at device level gives the top of the chain, which is not
+        // the trampoline in REAL_GDPA; the trampoline serves the game's device, so it is wrapped.
+        let again = gdpa(device, c"vkGetDeviceProcAddr".as_ptr());
+        assert_eq!(void_addr(again), wrap_gdpa as *const () as usize);
+        assert_eq!(load(&REAL_GDPA), fake_gdpa as *const () as usize);
+        // The other device's present is another driver's function: handed back unwrapped (and
+        // logged once, however often it is asked for).
+        for _ in 0..2 {
+            let got = gdpa(
+                vk::Device::from_raw(DEVICE_2),
+                c"vkQueuePresentKHR".as_ptr(),
+            );
+            assert_eq!(void_addr(got), fake_present_2 as *const () as usize);
+        }
+        assert_eq!(load(&REAL_PRESENT), fake_present as *const () as usize);
+        // Its vkGetDeviceProcAddr is not the one in the slot either: unwrapped, logged once.
         let got = gdpa(
             vk::Device::from_raw(DEVICE_2),
-            c"vkQueuePresentKHR".as_ptr(),
+            c"vkGetDeviceProcAddr".as_ptr(),
         );
-        assert_eq!(void_addr(got), fake_present_2 as *const () as usize);
-        assert_eq!(load(&REAL_PRESENT), fake_present as *const () as usize);
+        assert_eq!(void_addr(got), fake_gdpa_top as *const () as usize);
         // device_proc goes to the real vkGetDeviceProcAddr (Task 16's entry points).
         assert_eq!(
             device_proc(DEVICE as usize, c"vkLatencySleepNV"),
@@ -622,7 +672,10 @@ fn scenario(dir: &Path) {
                 "gdpa(0x33330000, vkCreateSwapchainKHR)",
                 "gdpa(0x33330000, vkQueueSubmit)",
                 "gdpa(0x33330000, vkQueueSubmit2)",
+                "gdpa(0x33330000, vkGetDeviceProcAddr)",
                 "gdpa(0x33331000, vkQueuePresentKHR)",
+                "gdpa(0x33331000, vkQueuePresentKHR)",
+                "gdpa(0x33331000, vkGetDeviceProcAddr)",
                 "gdpa(0x33330000, vkLatencySleepNV)",
             ]
         );
@@ -767,6 +820,14 @@ fn the_wrapper_chain_works_end_to_end() {
     );
     // No texture-budget line: this exe has no texture table, so nothing was prepared.
     assert!(!log.contains("texture budget"), "{log}");
+    // T9-2: each name handed back unwrapped is logged once, with both devices; nothing else is.
+    for name in ["vkQueuePresentKHR", "vkGetDeviceProcAddr"] {
+        let line = format!(
+            "vk: {name} for device 0x33331000 handed back unwrapped: the game device is 0x33330000"
+        );
+        assert_eq!(log.matches(&line).count(), 1, "{line}\n{log}");
+    }
+    assert_eq!(log.matches("handed back unwrapped").count(), 2, "{log}");
     assert!(
         !log.contains("VkWrap disabled"),
         "no wrapper panicked:\n{log}"
