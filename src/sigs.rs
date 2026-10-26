@@ -130,6 +130,22 @@ pub const SCATTER_FRAME_FN: Sig = Sig {
     patch_offsets: &[0],
 };
 
+/// RIP-relative address of the five-row point-light shadow quality table; disp32 at +12.
+pub const MLS_QUALITY_TABLE_LEA: Sig = Sig {
+    name: "MLS_QUALITY_TABLE_LEA",
+    pattern: "8B 02 48 8B F1 4C 6B C0 2C 48 8D 05 ?? ?? ?? ?? C7 45 E0 01 00 01 01",
+    sections: &[".text"],
+    patch_offsets: &[12],
+};
+
+/// Ultra sun-cascade resolution immediate, 2048 pixels at +10.
+pub const SUN_SHADOW_ULTRA: Sig = Sig {
+    name: "SUN_SHADOW_ULTRA",
+    pattern: "C7 41 5C 06 00 00 00 C7 41 78 00 08 00 00 C7 41 2C 04 00 00 00 C7 41 30 0C 00 00 00",
+    sections: &[".text"],
+    patch_offsets: &[10],
+};
+
 /// Every signature in this file, in table order.
 pub const ALL: &[&Sig] = &[
     &SCENE_SETTINGS_FN,
@@ -143,19 +159,37 @@ pub const ALL: &[&Sig] = &[
     &ASYNC_OVERRIDE,
     &TERRAIN_UPDATE_FN,
     &SCATTER_FRAME_FN,
+    &MLS_QUALITY_TABLE_LEA,
+    &SUN_SHADOW_ULTRA,
 ];
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn shadow_signatures_are_registered_with_verified_sites() {
+        assert!(ALL.contains(&&MLS_QUALITY_TABLE_LEA));
+        assert!(ALL.contains(&&SUN_SHADOW_ULTRA));
+        assert_eq!(
+            MLS_QUALITY_TABLE_LEA.pattern,
+            "8B 02 48 8B F1 4C 6B C0 2C 48 8D 05 ?? ?? ?? ?? C7 45 E0 01 00 01 01"
+        );
+        assert_eq!(MLS_QUALITY_TABLE_LEA.patch_offsets, &[12]);
+        assert_eq!(
+            SUN_SHADOW_ULTRA.pattern,
+            "C7 41 5C 06 00 00 00 C7 41 78 00 08 00 00 C7 41 2C 04 00 00 00 C7 41 30 0C 00 00 00"
+        );
+        assert_eq!(SUN_SHADOW_ULTRA.patch_offsets, &[10]);
+    }
+
     fn tokens(s: &Sig) -> Vec<&'static str> {
         s.pattern.split_ascii_whitespace().collect()
     }
 
     #[test]
-    fn all_has_the_eleven_entries_with_distinct_names_and_patterns() {
-        assert_eq!(ALL.len(), 11);
+    fn all_has_the_thirteen_entries_with_distinct_names_and_patterns() {
+        assert_eq!(ALL.len(), 13);
         for (i, a) in ALL.iter().enumerate() {
             for b in ALL.iter().skip(i + 1) {
                 assert_ne!(a.name, b.name);
@@ -182,6 +216,8 @@ mod tests {
                 "ASYNC_OVERRIDE",
                 "TERRAIN_UPDATE_FN",
                 "SCATTER_FRAME_FN",
+                "MLS_QUALITY_TABLE_LEA",
+                "SUN_SHADOW_ULTRA",
             ]
         );
     }

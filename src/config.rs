@@ -165,6 +165,29 @@ pub struct DebugCfg {
     pub force_step_terrain: Option<u8>,
 }
 
+/// A shadow setting that leaves the existing Ultra value alone unless requested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShadowValue<T> {
+    /// Keep the game's value.
+    #[default]
+    Game,
+    /// Replace the Ultra constant at start-up.
+    Override(T),
+}
+
+/// The optional `[Shadows]` start-up constants. All defaults are `game`.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ShadowsCfg {
+    /// Ultra ray budget, 65 to 256.
+    pub point_light_rays: ShadowValue<u32>,
+    /// Ultra static-light distance in metres, 101 to 400.
+    pub point_light_static_distance: ShadowValue<f32>,
+    /// Ultra atlas tile size, 224 or 256 pixels.
+    pub point_light_tile: ShadowValue<u32>,
+    /// Ultra sun-cascade resolution, 4096 pixels.
+    pub sun_resolution: ShadowValue<u32>,
+}
+
 /// All settings.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Config {
@@ -173,6 +196,8 @@ pub struct Config {
     pub knobs: KnobsCfg,
     /// The `[Debug]` keys; all off by default.
     pub debug: DebugCfg,
+    /// Optional Ultra shadow constants.
+    pub shadows: ShadowsCfg,
 }
 
 /// The default settings. `parse` falls back to these values, and `DEFAULT_INI` repeats them (a test
@@ -212,6 +237,12 @@ const BUILTIN: Config = Config {
         distant_objects_scale: 1.0,
         terrain_ring_scale: 1.0,
     },
+    shadows: ShadowsCfg {
+        point_light_rays: ShadowValue::Game,
+        point_light_static_distance: ShadowValue::Game,
+        point_light_tile: ShadowValue::Game,
+        sun_resolution: ShadowValue::Game,
+    },
     debug: DebugCfg {
         scatter_probe: false,
         force_step_object: None,
@@ -228,7 +259,7 @@ impl Default for Config {
 
 /// The sections this version knows, spelled as the spec spells them. A section that is not here is
 /// unknown.
-const SECTIONS: [&str; 4] = ["General", "Governor", "Knobs", "Debug"];
+const SECTIONS: [&str; 5] = ["General", "Governor", "Knobs", "Shadows", "Debug"];
 
 /// Parse the text of a settings file. The `Vec` holds one warning per problem found.
 pub fn parse(text: &str) -> (Config, Vec<String>) {
@@ -397,6 +428,23 @@ pub fn parse(text: &str) -> (Config, Vec<String>) {
         force_step_terrain: r.force_step("ForceStepTerrainDistance"),
     };
 
+    let shadows = ShadowsCfg {
+        point_light_rays: r.shadow("PointLightRays", |v| {
+            v.parse::<u32>().ok().filter(|n| (65..=256).contains(n))
+        }),
+        point_light_static_distance: r.shadow("PointLightStaticDistance", |v| {
+            parse_number(v)
+                .filter(|n| (101.0..=400.0).contains(n))
+                .map(|n| n as f32)
+        }),
+        point_light_tile: r.shadow("PointLightTile", |v| {
+            v.parse::<u32>().ok().filter(|n| matches!(n, 224 | 256))
+        }),
+        sun_resolution: r.shadow("SunResolution", |v| {
+            v.parse::<u32>().ok().filter(|n| *n == 4096)
+        }),
+    };
+
     r.report_unknown();
     (
         Config {
@@ -404,6 +452,7 @@ pub fn parse(text: &str) -> (Config, Vec<String>) {
             governor,
             knobs,
             debug,
+            shadows,
         },
         r.warnings,
     )
@@ -475,6 +524,24 @@ struct Reader {
 }
 
 impl Reader {
+    /// An optional shadow constant. Invalid values warn once and keep the game value.
+    fn shadow<T>(&mut self, key: &str, parse: impl FnOnce(&str) -> Option<T>) -> ShadowValue<T> {
+        let Some(text) = self.raw("Shadows", key) else {
+            return ShadowValue::Game;
+        };
+        let value = text.trim();
+        if value.eq_ignore_ascii_case("game") {
+            return ShadowValue::Game;
+        }
+        match parse(value) {
+            Some(value) => ShadowValue::Override(value),
+            None => {
+                self.not_valid("Shadows", key, &text, "a supported shadow override", "game");
+                ShadowValue::Game
+            }
+        }
+    }
+
     /// The text of `[section] key`, or `None` if the file does not have it. A key written without
     /// `=` has no text, which reads as an empty value.
     fn raw(&mut self, section: &str, key: &str) -> Option<String> {
@@ -703,6 +770,57 @@ mod tests {
     /// Parse a file that holds one key.
     fn one(section: &str, key: &str, value: &str) -> (Config, Vec<String>) {
         parse(&format!("[{section}]\n{key}={value}\n"))
+    }
+
+    #[test]
+    fn shadows_parse_ranges_and_keep_game_defaults() {
+        assert_eq!(parse("").0.shadows, ShadowsCfg::default());
+        for (key, good, bad) in [
+            (
+                "PointLightRays",
+                vec!["65", "128", "256"],
+                vec!["64", "257", "65.5", "NaN"],
+            ),
+            (
+                "PointLightStaticDistance",
+                vec!["101", "250,5", "400"],
+                vec!["0", "100", "401", "inf"],
+            ),
+            (
+                "PointLightTile",
+                vec!["224", "256"],
+                vec!["192", "225", "256.5"],
+            ),
+            (
+                "SunResolution",
+                vec!["4096"],
+                vec!["2048", "8192", "4096.5"],
+            ),
+        ] {
+            for value in good {
+                let (cfg, warnings) = one("Shadows", key, value);
+                assert!(warnings.is_empty(), "{key}={value}: {warnings:?}");
+                assert_ne!(cfg.shadows, ShadowsCfg::default(), "{key}={value}");
+            }
+            for value in bad {
+                let (cfg, warnings) = one("Shadows", key, value);
+                assert_eq!(cfg.shadows, ShadowsCfg::default(), "{key}={value}");
+                assert_eq!(warnings.len(), 1, "{key}={value}: {warnings:?}");
+                assert!(warnings[0].contains("default game"));
+            }
+            let (cfg, warnings) = one("sHaDoWs", key, " GaMe ");
+            assert_eq!(cfg.shadows, ShadowsCfg::default());
+            assert!(warnings.is_empty());
+        }
+        let (cfg, warnings) = parse("[Shadows]\nPointLightRays=128\nPointLightStaticDistance=250,5\nPointLightTile=224\nSunResolution=4096\n");
+        assert!(warnings.is_empty());
+        assert_eq!(cfg.shadows.point_light_rays, ShadowValue::Override(128));
+        assert_eq!(
+            cfg.shadows.point_light_static_distance,
+            ShadowValue::Override(250.5)
+        );
+        assert_eq!(cfg.shadows.point_light_tile, ShadowValue::Override(224));
+        assert_eq!(cfg.shadows.sun_resolution, ShadowValue::Override(4096));
     }
 
     /// Every value is inside its range, whatever the input was.
@@ -1144,7 +1262,7 @@ mod tests {
                 .lines()
                 .filter(|line| !line.starts_with(';') && line.contains('='))
                 .count(),
-            28
+            32
         );
     }
 

@@ -265,6 +265,7 @@ pub fn start() {
         crate::vk::TextureSettings {
             mode: cfg.general.texture_budget,
             reserve_gib: cfg.general.texture_reserve_gib,
+            shadow_reserve_bytes: features::shadows::extra_vram_bytes(&cfg.shadows),
         },
         cfg.general.priority,
     );

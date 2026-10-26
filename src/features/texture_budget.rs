@@ -107,6 +107,29 @@ pub fn budget_bytes(
     }
 }
 
+/// Subtract opt-in shadow texture bytes from the base target, with no second floor.
+///
+/// Zero extra bytes preserves [`budget_bytes`] exactly. With a reservation, Auto also
+/// lowers the stock 2 GiB pool when it previously returned `None`. Off and integrated
+/// GPUs remain unchanged. A NaN Auto reserve still gives `None`.
+pub fn budget_bytes_with_shadow_reserve(
+    device_local: u64,
+    reserve_gib: f64,
+    integrated: bool,
+    mode: &TextureBudget,
+    shadow_reserve_bytes: u64,
+) -> Option<u64> {
+    let base = budget_bytes(device_local, reserve_gib, integrated, mode);
+    if shadow_reserve_bytes == 0 {
+        return base;
+    }
+    let base = base.or_else(|| {
+        (!integrated && matches!(mode, TextureBudget::Auto) && !reserve_gib.is_nan())
+            .then_some(MIN_BYTES)
+    })?;
+    Some(base.saturating_sub(shadow_reserve_bytes))
+}
+
 /// `gib` GiB in bytes. A negative number is 0 and one too big for a `u64` is `u64::MAX` (a
 /// float-to-integer `as` cast saturates). NaN is `None`.
 fn gib_to_bytes(gib: f64) -> Option<u64> {
@@ -409,6 +432,41 @@ mod tests {
     use super::*;
     use crate::patch::test_support::{protect_of, Mem};
     use windows_sys::Win32::System::Memory::PAGE_READONLY;
+
+    #[test]
+    fn shadow_reservation_saturates_and_zero_preserves_legacy_cases() {
+        assert_eq!(
+            budget_bytes_with_shadow_reserve(
+                16 * GIB,
+                11.0,
+                false,
+                &TextureBudget::Gib(2.0),
+                u64::MAX
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            budget_bytes_with_shadow_reserve(16 * GIB, f64::NAN, false, &TextureBudget::Auto, 1),
+            None
+        );
+        for (heap, mode, expected) in [
+            (12 * GIB, TextureBudget::Auto, None),
+            (13 * GIB, TextureBudget::Auto, None),
+            (16 * GIB, TextureBudget::Auto, Some(5 * GIB)),
+            (24 * GIB, TextureBudget::Auto, Some(8 * GIB)),
+            (16 * GIB, TextureBudget::Gib(2.0), Some(2 * GIB)),
+            (16 * GIB, TextureBudget::Off, None),
+        ] {
+            assert_eq!(
+                budget_bytes_with_shadow_reserve(heap, 11.0, false, &mode, 0),
+                expected
+            );
+        }
+        assert_eq!(
+            budget_bytes_with_shadow_reserve(16 * GIB, 11.0, true, &TextureBudget::Auto, 0),
+            None
+        );
+    }
 
     // ---- the values the plan gives verbatim ---------------------------------------------------
 

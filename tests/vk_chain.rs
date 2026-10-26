@@ -433,6 +433,7 @@ fn scenario(dir: &Path) {
         TextureSettings {
             mode: TextureBudget::Auto,
             reserve_gib: 11.0,
+            shadow_reserve_bytes: 0,
         },
         Priority::Normal,
     );

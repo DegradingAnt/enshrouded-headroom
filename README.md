@@ -52,14 +52,14 @@ If neither folder has a readable file, it tries to create the default file in th
 
 Missing keys use their defaults. Invalid values use their defaults, and numeric values outside their ranges are clamped. Unknown sections and keys are ignored with warnings. If `LowerAbove` is not greater than `RaiseBelow`, both return to their defaults. Section names, key names and word choices are case-insensitive. Boolean values accept `0`, `1`, `false` or `true`. Lines starting with `;` or `#` are comments.
 
-The tables list all 28 keys from [the default INI](enshrouded-headroom.default.ini), with their defaults as written there. GiB and MiB are binary units.
+The tables list all 32 keys from [the default INI](enshrouded-headroom.default.ini), with their defaults as written there. GiB and MiB are binary units.
 
 ### `[General]`
 
 | Key | Default | Meaning |
 |---|---|---|
 | `Enabled` | `1` | `1` enables feature start-up. `0` still reads settings and opens the log, then skips executable hashing, features and hooks. |
-| `TextureBudget` | `auto` | `auto` uses the GPU heap and reserve formula above. `off` leaves the budget alone and skips the table search. A number from 2 to 8 sets a fixed budget in GiB, without subtracting the reserve. Integrated GPUs remain unchanged. |
+| `TextureBudget` | `auto` | `auto` uses the GPU heap and reserve formula above. `off` leaves the budget alone and skips the table search. A number from 2 to 8 sets a fixed budget in GiB, without subtracting TextureReserveGiB. Optional shadow texture memory is subtracted from both auto and fixed targets. Integrated GPUs remain unchanged. |
 | `TextureReserveGiB` | `11` | Amount subtracted from the largest device-local heap in `auto` mode, in GiB. Range: 4–16. It has no effect with a fixed budget or `off`. This is a calculation input, not a live VRAM reservation. |
 | `AsyncCompute` | `on` | `on` attempts the checked code patch on an allowed build. `game` leaves the game's choice unchanged. The command-line rule below can also skip the patch. |
 | `Priority` | `above_normal` | Attempts Above Normal process priority once after the first Vulkan device is created. `normal` leaves the current priority unchanged. A failed Windows request is logged. |
@@ -104,6 +104,29 @@ For async compute, an argument containing `async-compute` skips the patch, even 
 | `DecoDistanceScale` | `1.0` | Start-up scale for the decoration culling threshold. Range: 0.5–1.0; 1.0 keeps the game's value. A lower value is expected to draw farther, but that direction is unconfirmed in-game. |
 | `DistantObjectsScale` | `1.0` | Start-up scale for the distant-object culling threshold. Range: 0.5–1.0; 1.0 keeps the game's value. A lower value is expected to draw farther, but that direction is unconfirmed in-game. |
 | `TerrainRingScale` | `1.0` | Start-up scale for terrain detail rings. Range: 1.0–1.6; 1.0 keeps the game's value. Higher values are intended to widen the rings. |
+
+### `[Shadows]`: Shadow quality above Ultra (experimental)
+
+**defaults unchanged; experimental; not verified in game.** All four settings default to `game`.
+Restart after changing a key and select Ultra for that shadow type. Lower menu levels keep their
+own constants. These settings have not been shown to fix shadow pop-in. The GPU chooses which
+lights receive shadows, and shader limits above 64 rays or 192-pixel tiles are unknown.
+
+| Key | Default | Allowed override |
+|---|---|---|
+| `PointLightRays` | `game` | Whole number 65 to 256; Ultra uses 64. |
+| `PointLightStaticDistance` | `game` | 101 to 400 metres; Ultra uses 100. Decimal comma is accepted. This is not a verified shadow-distance control. |
+| `PointLightTile` | `game` | 224 or 256 pixels; Ultra uses 192. Reserves 104 or 224 MiB extra. |
+| `SunResolution` | `game` | 4096 pixels; Ultra uses 2048. Reserves 288 MiB extra. |
+
+Invalid shadow values warn once and use `game`, including values outside the allowed range.
+For texture-budget auto and numeric modes, the 2 to 8 GiB limit applies to the base target.
+The requested shadow reserve is then subtracted with saturation and no second minimum. With both
+256-pixel tiles and 4096-pixel sun cascades, it subtracts 512 MiB. Even when auto previously left
+the stock 2 GiB pool alone, this opt-in combination sets a 1.5 GiB pool. The reservation follows
+requested settings even if their patches refuse, so it is a conservative estimate. TextureBudget
+off and integrated GPUs keep their original behavior. The estimate excludes two optional small
+sun textures; check measured VRAM. See the [A/B protocol](docs/design.md#shadow-quality-above-ultra-experimental).
 
 ## Logs and troubleshooting
 
