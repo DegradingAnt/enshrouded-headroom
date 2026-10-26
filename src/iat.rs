@@ -519,6 +519,10 @@ mod tests {
             std::env::var_os("HEADROOM_IAT_MUTATION_PARENT").is_some(),
             "image mutation must run in an isolated child"
         );
+        assert!(
+            std::env::args().any(|arg| arg == "--test-threads=1"),
+            "live image mutation needs a single test worker"
+        );
         let m = crate::scan::main_module();
         let slot = find_in(&m, "kernel32.dll", "GetProcAddress").unwrap() as *mut usize;
         let before = protect_of(slot as usize);

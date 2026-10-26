@@ -656,11 +656,14 @@ pub(crate) mod test_support {
     /// Run this one live-image test in a child; the parent never reaches its mutation body.
     /// The child checks a different process id and runs with one test worker.
     pub(crate) fn isolated_process(test: &str, parent_env: &str) -> bool {
-        if let Some(parent) = std::env::var_os(parent_env) {
-            assert_ne!(
-                parent,
-                std::ffi::OsString::from(std::process::id().to_string())
-            );
+        let constrained =
+            std::env::args()
+                .skip(1)
+                .eq(["--exact", test, "--nocapture", "--test-threads=1"]
+                    .into_iter()
+                    .map(str::to_owned));
+        let current = std::ffi::OsString::from(std::process::id().to_string());
+        if constrained && std::env::var_os(parent_env).is_some_and(|parent| parent != current) {
             return false;
         }
         let output = std::process::Command::new(std::env::current_exe().unwrap())
@@ -1363,6 +1366,10 @@ mod tests {
         assert!(
             std::env::var_os("HEADROOM_HEADER_MUTATION_PARENT").is_some(),
             "image mutation must run in an isolated child"
+        );
+        assert!(
+            std::env::args().any(|arg| arg == "--test-threads=1"),
+            "live image mutation needs a single test worker"
         );
         // The first page of this test's own exe: PE headers in an image section, read-only, as
         // the game's `.rdata` is. The isolated child changes and restores four DOS-stub bytes;
