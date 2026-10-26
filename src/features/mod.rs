@@ -3,4 +3,5 @@
 
 pub mod async_compute;
 pub mod priority;
+pub mod scatter_probe;
 pub mod texture_budget;

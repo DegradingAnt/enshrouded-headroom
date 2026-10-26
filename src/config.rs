@@ -149,12 +149,30 @@ pub struct KnobsCfg {
     pub terrain_ring_scale: f64,
 }
 
+/// The `[Debug]` section (design.md section 8). It is not in the default file, so every key is off
+/// unless the player adds it. It is for testing only: a consumer honours it only with
+/// `LogLevel = debug`, and that check is the consumer's job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DebugCfg {
+    /// `ScatterProbe`: read the game's scatter GPU counters (design.md 7.2a), so the governor can
+    /// log them.
+    pub scatter_probe: bool,
+    /// `ForceStepObjectDistance`: hold the object knob at this step (0 to 4); `None` when absent.
+    pub force_step_object: Option<u8>,
+    /// `ForceStepScatterDistance`: hold the grass knob at this step (0 to 4); `None` when absent.
+    pub force_step_scatter: Option<u8>,
+    /// `ForceStepTerrainDistance`: hold the terrain knob at this step (0 to 4); `None` when absent.
+    pub force_step_terrain: Option<u8>,
+}
+
 /// All settings.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Config {
     pub general: General,
     pub governor: GovernorCfg,
     pub knobs: KnobsCfg,
+    /// The `[Debug]` keys; all off by default.
+    pub debug: DebugCfg,
 }
 
 /// The default settings. `parse` falls back to these values, and `DEFAULT_INI` repeats them (a test
@@ -194,6 +212,12 @@ const BUILTIN: Config = Config {
         distant_objects_scale: 1.0,
         terrain_ring_scale: 1.0,
     },
+    debug: DebugCfg {
+        scatter_probe: false,
+        force_step_object: None,
+        force_step_scatter: None,
+        force_step_terrain: None,
+    },
 };
 
 impl Default for Config {
@@ -203,8 +227,8 @@ impl Default for Config {
 }
 
 /// The sections this version knows, spelled as the spec spells them. A section that is not here is
-/// unknown. Task 15 adds `Debug`.
-const SECTIONS: [&str; 3] = ["General", "Governor", "Knobs"];
+/// unknown.
+const SECTIONS: [&str; 4] = ["General", "Governor", "Knobs", "Debug"];
 
 /// Parse the text of a settings file. The `Vec` holds one warning per problem found.
 pub fn parse(text: &str) -> (Config, Vec<String>) {
@@ -366,12 +390,20 @@ pub fn parse(text: &str) -> (Config, Vec<String>) {
         terrain_ring_scale: r.float("Knobs", "TerrainRingScale", k.terrain_ring_scale, 1.0, 1.6),
     };
 
+    let debug = DebugCfg {
+        scatter_probe: r.boolean("Debug", "ScatterProbe", d.debug.scatter_probe),
+        force_step_object: r.force_step("ForceStepObjectDistance"),
+        force_step_scatter: r.force_step("ForceStepScatterDistance"),
+        force_step_terrain: r.force_step("ForceStepTerrainDistance"),
+    };
+
     r.report_unknown();
     (
         Config {
             general,
             governor,
             knobs,
+            debug,
         },
         r.warnings,
     )
@@ -537,6 +569,26 @@ impl Reader {
     fn max_step(&mut self, key: &str, default: u8) -> u8 {
         let step = self.int("Knobs", key, u32::from(default), 0, 4, false);
         u8::try_from(step).unwrap_or(default)
+    }
+
+    /// A `[Debug] ForceStep*` key: `None` when absent, else a step from 0 to 4. A whole number
+    /// outside that range is clamped with a warning. Text that is not a whole number warns and
+    /// counts as absent.
+    fn force_step(&mut self, key: &str) -> Option<u8> {
+        let text = self.raw("Debug", key)?;
+        let Some(number) = parse_number(&text).filter(|number| number.fract() == 0.0) else {
+            self.not_valid("Debug", key, &text, "a whole number from 0 to 4", "none");
+            return None;
+        };
+        // A float-to-integer `as` cast saturates, like in `int`.
+        let value = number as i64;
+        let kept = value.clamp(0, 4);
+        if kept != value {
+            self.warnings.push(format!(
+                "[Debug] {key}: {value} is outside 0..=4, using {kept}"
+            ));
+        }
+        u8::try_from(kept).ok()
     }
 
     fn boolean(&mut self, section: &str, key: &str, default: bool) -> bool {
@@ -1566,5 +1618,92 @@ mod tests {
                 "{key}: {warnings:?}"
             );
         }
+    }
+
+    // ---- [Debug] (plan Task 13b) ----
+
+    #[test]
+    fn debug_keys_are_read_and_a_step_out_of_range_is_clamped_with_one_warning() {
+        let (c, w) = parse("[Debug]\nScatterProbe=1\nForceStepScatterDistance=7\n");
+        assert_eq!(
+            c.debug,
+            DebugCfg {
+                scatter_probe: true,
+                force_step_object: None,
+                force_step_scatter: Some(4),
+                force_step_terrain: None,
+            }
+        );
+        assert_eq!(
+            w,
+            ["[Debug] ForceStepScatterDistance: 7 is outside 0..=4, using 4"],
+            "{w:?}"
+        );
+    }
+
+    #[test]
+    fn the_default_file_has_no_debug_section_and_gives_debug_off() {
+        assert!(!DEFAULT_INI.to_ascii_lowercase().contains("[debug]"));
+        let (c, w) = parse(DEFAULT_INI);
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(c.debug, DebugCfg::default());
+        assert_eq!(Config::default().debug, DebugCfg::default());
+        assert_eq!(
+            DebugCfg::default(),
+            DebugCfg {
+                scatter_probe: false,
+                force_step_object: None,
+                force_step_scatter: None,
+                force_step_terrain: None,
+            }
+        );
+    }
+
+    #[test]
+    fn every_force_step_key_keeps_0_to_4_without_a_warning() {
+        for step in 0u8..=4 {
+            let (c, w) = parse(&format!(
+                "[Debug]\nForceStepObjectDistance={step}\nForceStepScatterDistance={step}\n\
+                 ForceStepTerrainDistance={step}\n"
+            ));
+            assert!(w.is_empty(), "{step}: {w:?}");
+            assert_eq!(c.debug.force_step_object, Some(step));
+            assert_eq!(c.debug.force_step_scatter, Some(step));
+            assert_eq!(c.debug.force_step_terrain, Some(step));
+            assert!(!c.debug.scatter_probe);
+        }
+    }
+
+    #[test]
+    fn a_force_step_below_0_clamps_to_0_and_garbage_is_absent_with_a_warning() {
+        let (c, w) = one("Debug", "ForceStepObjectDistance", "-3");
+        assert_eq!(c.debug.force_step_object, Some(0));
+        assert_eq!(
+            w,
+            ["[Debug] ForceStepObjectDistance: -3 is outside 0..=4, using 0"]
+        );
+        for garbage in ["two", "2.5", ""] {
+            let (c, w) = one("Debug", "ForceStepTerrainDistance", garbage);
+            assert_eq!(c.debug.force_step_terrain, None, "{garbage:?}");
+            assert_eq!(w.len(), 1, "{garbage:?}: {w:?}");
+            assert!(
+                w[0].starts_with("[Debug] ForceStepTerrainDistance: "),
+                "{garbage:?}: {w:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn scatter_probe_takes_the_usual_booleans_and_debug_is_a_known_section() {
+        for (text, want) in [("1", true), ("true", true), ("0", false), ("FALSE", false)] {
+            let (c, w) = one("Debug", "ScatterProbe", text);
+            assert!(w.is_empty(), "{text}: {w:?}");
+            assert_eq!(c.debug.scatter_probe, want, "{text}");
+        }
+        let (c, w) = one("Debug", "ScatterProbe", "yes");
+        assert!(!c.debug.scatter_probe);
+        assert_eq!(w.len(), 1, "{w:?}");
+        let (_, w) = parse("[debug]\nscatterprobe=1\nNope=1\n");
+        assert_eq!(w, ["[Debug] nope: unknown key, ignored"], "{w:?}");
     }
 }

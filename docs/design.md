@@ -367,9 +367,9 @@ The governor raises 7.1, then 7.2, then 7.3. The order is re-checked after the i
 - `EnableTerrainDistance = 1`, `MaxTerrainDistance = 4`
 - `DecoDistanceScale = 1.0`, `DistantObjectsScale = 1.0`, `TerrainRingScale = 1.0`
 
-`[Debug]` (honoured only with `LogLevel = debug`; not in the default file):
-- `ScatterProbe = 0 | 1`: log the scatter counters (7.2a).
-- `ForceStepObjectDistance`, `ForceStepScatterDistance`, `ForceStepTerrainDistance = 0..=4`: hold that knob at a fixed step for testing (pre-flight ruling for Task 17).
+`[Debug]` (debug only, needs `LogLevel = debug`; not in the default file; at any other log level the mod ignores these keys):
+- `ScatterProbe = 0 | 1` (default 0): read and log the scatter counters (7.2a). With `EnableScatterDistance = 0`, this key is the only reason to install the probe hook.
+- `ForceStepObjectDistance`, `ForceStepScatterDistance`, `ForceStepTerrainDistance = 0..=4` (default: absent, the knob is not held): hold that knob at a fixed step for testing (pre-flight ruling for Task 17). A whole number outside 0..=4 is clamped with a warning. Other text warns and counts as absent.
 
 Unknown keys and invalid values are logged. Invalid choices use their defaults. Out-of-range numeric values are clamped.
 
