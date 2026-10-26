@@ -2091,6 +2091,608 @@ mod tests {
         assert!(drift.is_empty(), "match differs from its anchor: {drift:?}");
     }
 
+    /// Independent file-only oracles: no game executable is loaded as code or written.
+    mod file_oracles {
+        use super::*;
+        use iced_x86::{
+            ConstantOffsets, Decoder, DecoderOptions, Formatter, Instruction, IntelFormatter,
+            Mnemonic, Register,
+        };
+
+        /// Check a local offset by decoding from a verified instruction start, not by recovering CFG.
+        fn instruction_boundary(bytes: &[u8], ip: u64, offset: usize) -> Result<(), String> {
+            if offset >= bytes.len() {
+                return Err(format!("offset +{offset:#x} is outside code"));
+            }
+            let mut decoder = Decoder::with_ip(64, bytes, ip, DecoderOptions::NONE);
+            while decoder.position() < offset {
+                let start = decoder.position();
+                let instruction = decoder.decode();
+                if instruction.is_invalid() {
+                    return Err(format!(
+                        "invalid instruction at +{start:#x}: {}",
+                        intel(&instruction)
+                    ));
+                }
+                if decoder.position() > offset {
+                    return Err(format!(
+                        "offset +{offset:#x} is inside +{start:#x}: {}",
+                        intel(&instruction)
+                    ));
+                }
+            }
+            Ok(())
+        }
+
+        /// Intel syntax is included in every instruction-layout diagnostic.
+        fn intel(instruction: &Instruction) -> String {
+            let mut text = String::new();
+            IntelFormatter::new().format(instruction, &mut text);
+            text
+        }
+
+        /// Validate the documented patch contract using independent decoder constant offsets.
+        fn validate_sig(sig: &sigs::Sig, bytes: &[u8], ip: u64) -> Result<Vec<String>, String> {
+            let length = Pattern::parse(sig.pattern)
+                .map_err(|error| error.to_string())?
+                .len();
+            let rows = decode_prefix(bytes, ip, length)?;
+            let first = rows.first().ok_or("empty instruction stream")?;
+            let first_mnemonic = match sig.name {
+                "SCATTER_BRICK_LOAD"
+                | "SCATTER_INSTANCE_LOADS"
+                | "DECO_HIGH_IMM"
+                | "DISTANT_HIGH_IMM" => Mnemonic::Cmp,
+                "SCENE_SETTINGS_FN" | "TERRAIN_UPDATE_FN" | "SCATTER_FRAME_FN"
+                | "SCATTER_CAP_CONST" | "SCATTER_CAP_ALLOC" | "VOXEL_HIGH_IMMS"
+                | "ASYNC_OVERRIDE" | "HDR_PAPER_WHITE" => Mnemonic::Mov,
+                name => return Err(format!("no documented oracle contract for {name}")),
+            };
+            if first.start != 0
+                || first.instruction.ip() != ip
+                || first.instruction.mnemonic() != first_mnemonic
+            {
+                return Err(format!(
+                    "{}: unexpected verified signature start: {}",
+                    sig.name,
+                    first.summary()
+                ));
+            }
+            if matches!(
+                sig.name,
+                "SCENE_SETTINGS_FN" | "TERRAIN_UPDATE_FN" | "SCATTER_FRAME_FN"
+            ) {
+                if sig.patch_offsets != [0] {
+                    return Err(format!(
+                        "{}: hook must start at its verified entry, got {:?}\n{}",
+                        sig.name,
+                        sig.patch_offsets,
+                        first.summary()
+                    ));
+                }
+                instruction_boundary(bytes, ip, sig.patch_offset())?;
+                let mut covered = 0;
+                let mut lengths = Vec::new();
+                for row in &rows {
+                    if covered >= 5 {
+                        break;
+                    }
+                    lengths.push(row.instruction.len());
+                    covered += row.instruction.len();
+                }
+                let expected: &[usize] = if sig.name == "SCENE_SETTINGS_FN" {
+                    &[3, 8]
+                } else {
+                    &[5]
+                };
+                if lengths != expected {
+                    return Err(format!(
+                        "{}: hook coverage {:?}, expected {:?}\n{}",
+                        sig.name,
+                        lengths,
+                        expected,
+                        rows.iter()
+                            .map(Decoded::summary)
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    ));
+                }
+                if sig.name == "SCENE_SETTINGS_FN" {
+                    if first.instruction.op0_register() != Register::EAX
+                        || first.instruction.memory_base() != Register::R8
+                        || rows[1].instruction.mnemonic() != Mnemonic::Movss
+                        || rows[1].instruction.memory_base() != Register::RIP
+                    {
+                        return Err(format!(
+                            "{}: expected mov eax,[r8] then RIP-relative movss",
+                            sig.name
+                        ));
+                    }
+                } else {
+                    let source = if sig.name == "TERRAIN_UPDATE_FN" {
+                        Register::RBX
+                    } else {
+                        Register::RDX
+                    };
+                    if first.instruction.memory_base() != Register::RSP
+                        || first.instruction.memory_displacement64() != 0x10
+                        || first.instruction.op1_register() != source
+                    {
+                        return Err(format!(
+                            "{}: wrong hook prologue: {}",
+                            sig.name,
+                            first.summary()
+                        ));
+                    }
+                }
+                return Ok(rows.iter().map(Decoded::summary).collect());
+            }
+            if sig.name == "ASYNC_OVERRIDE" {
+                if sig.patch_offsets.len() != 1 {
+                    return Err("ASYNC_OVERRIDE requires one 16-byte span".into());
+                }
+                let start = sig.patch_offset();
+                let end = start.checked_add(16).ok_or("async span overflow")?;
+                instruction_boundary(bytes, ip, start)?;
+                let span: Vec<_> = rows
+                    .iter()
+                    .filter(|row| (start..end).contains(&row.start))
+                    .collect();
+                let lengths: Vec<_> = span.iter().map(|row| row.instruction.len()).collect();
+                let mnemonics: Vec<_> = span.iter().map(|row| row.instruction.mnemonic()).collect();
+                if span.first().map(|row| row.start) != Some(start)
+                    || span.last().map(|row| row.start + row.instruction.len()) != Some(end)
+                    || lengths != [7, 2, 7]
+                    || mnemonics != [Mnemonic::Cmp, Mnemonic::Je, Mnemonic::Movzx]
+                {
+                    return Err(format!("ASYNC_OVERRIDE: +{start:#x}..+{end:#x} must be whole cmp/je/movzx instructions [7,2,7]\n{}",rows.iter().map(Decoded::summary).collect::<Vec<_>>().join("\n")));
+                }
+                // The existing module disassembly documents these three fields inside +3..+19.
+                exact_field(sig.name, &rows, 6, 4, Field::Displacement(Mnemonic::Cmp))?;
+                exact_field(sig.name, &rows, 11, 1, Field::Branch)?;
+                exact_field(sig.name, &rows, 15, 4, Field::Displacement(Mnemonic::Movzx))?;
+                if span[0].instruction.memory_base() != Register::RSI
+                    || span[0].instruction.memory_displacement64() != 0x35289
+                    || span[2].instruction.memory_base() != Register::RSI
+                    || span[2].instruction.memory_displacement64() != 0x35288
+                {
+                    return Err("ASYNC_OVERRIDE: unexpected optional-bool addresses in decoded instructions".into());
+                }
+                return Ok(rows.iter().map(Decoded::summary).collect());
+            }
+            let fields = match sig.name {
+                "SCATTER_BRICK_LOAD" => vec![Field::RipLoad(Register::XMM0)],
+                "SCATTER_INSTANCE_LOADS" => vec![Field::RipLoad(Register::XMM8)],
+                "SCATTER_CAP_CONST" | "SCATTER_CAP_ALLOC" => vec![Field::Immediate(0x14000)],
+                "DECO_HIGH_IMM" => vec![Field::Immediate(1.5f32.to_bits())],
+                "DISTANT_HIGH_IMM" => vec![Field::Immediate(2.5f32.to_bits())],
+                "VOXEL_HIGH_IMMS" => vec![
+                    Field::Immediate(32.0f32.to_bits()),
+                    Field::Immediate(128.0f32.to_bits()),
+                    Field::Immediate(160.0f32.to_bits()),
+                ],
+                "HDR_PAPER_WHITE" => vec![Field::Immediate(250.0f32.to_bits())],
+                name => return Err(format!("oracle layout not implemented for {name}")),
+            };
+            if sig.patch_offsets.len() != fields.len() {
+                return Err(format!(
+                    "{}: expected {} documented fields, got {:?}",
+                    sig.name,
+                    fields.len(),
+                    sig.patch_offsets
+                ));
+            }
+            for (&offset, kind) in sig.patch_offsets.iter().zip(fields) {
+                exact_field(sig.name, &rows, offset, 4, kind)?;
+            }
+            Ok(rows.iter().map(Decoded::summary).collect())
+        }
+
+        /// One instruction decoded from a documented signature start.
+        struct Decoded {
+            /// Byte offset from the documented signature start.
+            start: usize,
+            /// The independently decoded 64-bit instruction.
+            instruction: Instruction,
+            /// Constant fields reported by iced, relative to that instruction.
+            constants: ConstantOffsets,
+        }
+
+        impl Decoded {
+            /// Include Intel syntax and both independently decoded constant ranges.
+            fn summary(&self) -> String {
+                format!(
+                    "{:#x} +{:#x} len {}: {} (imm +{:#x}/{}; disp +{:#x}/{})",
+                    self.instruction.ip(),
+                    self.start,
+                    self.instruction.len(),
+                    intel(&self.instruction),
+                    self.start + self.constants.immediate_offset(),
+                    self.constants.immediate_size(),
+                    self.start + self.constants.displacement_offset(),
+                    self.constants.displacement_size()
+                )
+            }
+        }
+
+        /// Decode whole instructions covering a signature; no control-flow recovery is claimed.
+        fn decode_prefix(bytes: &[u8], ip: u64, minimum: usize) -> Result<Vec<Decoded>, String> {
+            let mut decoder = Decoder::with_ip(64, bytes, ip, DecoderOptions::NONE);
+            let mut rows = Vec::new();
+            while decoder.position() < minimum {
+                if !decoder.can_decode() {
+                    return Err(format!("truncated code before +{minimum:#x}"));
+                }
+                let start = decoder.position();
+                let instruction = decoder.decode();
+                if instruction.is_invalid() {
+                    return Err(format!(
+                        "invalid instruction at {:#x}: {}",
+                        instruction.ip(),
+                        intel(&instruction)
+                    ));
+                }
+                let constants = decoder.get_constant_offsets(&instruction);
+                rows.push(Decoded {
+                    start,
+                    instruction,
+                    constants,
+                });
+            }
+            Ok(rows)
+        }
+
+        /// The exact constant kind and, for documented immediates, original bits.
+        #[derive(Debug, Clone, Copy)]
+        enum Field {
+            /// A mov imm32 with the documented original bits.
+            Immediate(u32),
+            /// A memory displacement belonging to the documented instruction kind.
+            Displacement(Mnemonic),
+            /// The specific RIP-relative scatter distance load, not another nearby load.
+            RipLoad(Register),
+            /// The async span's one-byte conditional branch field.
+            Branch,
+        }
+
+        /// A patch field must equal one complete iced constant range, never a byte inside it.
+        fn exact_field(
+            name: &str,
+            rows: &[Decoded],
+            offset: usize,
+            size: usize,
+            kind: Field,
+        ) -> Result<(), String> {
+            let end = offset.checked_add(size).ok_or("patch range overflow")?;
+            let found = rows.iter().find(|row| {
+                let (field, length) = match kind {
+                    Field::Immediate(_) | Field::Branch => (
+                        row.constants.immediate_offset(),
+                        row.constants.immediate_size(),
+                    ),
+                    Field::Displacement(_) | Field::RipLoad(_) => (
+                        row.constants.displacement_offset(),
+                        row.constants.displacement_size(),
+                    ),
+                };
+                length == size && length != 0 && row.start + field == offset
+            });
+            let context = || {
+                rows.iter()
+                    .map(Decoded::summary)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            let row = found.ok_or_else(|| {
+                format!(
+                    "{name}: +{offset:#x}..+{end:#x} is not one exact {kind:?} field\n{}",
+                    context()
+                )
+            })?;
+            let expected = match kind {
+                Field::Immediate(value) => {
+                    row.instruction.mnemonic() == Mnemonic::Mov
+                        && row.instruction.immediate32() == value
+                }
+                Field::Displacement(mnemonic) => row.instruction.mnemonic() == mnemonic,
+                Field::RipLoad(register) => {
+                    row.instruction.mnemonic() == Mnemonic::Movss
+                        && row.instruction.memory_base() == Register::RIP
+                        && row.instruction.op0_register() == register
+                }
+                Field::Branch => row.instruction.mnemonic() == Mnemonic::Je,
+            };
+            if !expected {
+                return Err(format!(
+                    "{name}: wrong instruction/value for +{offset:#x} {kind:?}: {}",
+                    row.summary()
+                ));
+            }
+            Ok(())
+        }
+
+        /// Fill fixture wildcards with zero; callers supply any documented immediate values.
+        fn signature_bytes(sig: &sigs::Sig) -> Vec<u8> {
+            sig.pattern
+                .split_ascii_whitespace()
+                .map(|byte| u8::from_str_radix(byte, 16).unwrap_or(0))
+                .collect()
+        }
+
+        /// Check all three hook contracts and reject shifted/truncated prologues.
+        #[test]
+        fn all_documented_hook_entries_cover_whole_instructions() {
+            for sig in [
+                &sigs::SCENE_SETTINGS_FN,
+                &sigs::TERRAIN_UPDATE_FN,
+                &sigs::SCATTER_FRAME_FN,
+            ] {
+                let bytes = signature_bytes(sig);
+                assert!(validate_sig(sig, &bytes, 0).is_ok(), "{}", sig.name);
+                let wrong = sigs::Sig {
+                    patch_offsets: &[1],
+                    ..*sig
+                };
+                assert!(validate_sig(&wrong, &bytes, 0).is_err(), "{}", sig.name);
+                assert!(validate_sig(sig, &bytes[..4], 0).is_err(), "{}", sig.name);
+            }
+        }
+
+        /// The documented async patch spans cmp/je/movzx rather than one constant field.
+        #[test]
+        fn async_patch_is_three_whole_instructions_not_one_constant() {
+            let mut bytes = signature_bytes(&sigs::ASYNC_OVERRIDE);
+            assert!(validate_sig(&sigs::ASYNC_OVERRIDE, &bytes, 0).is_ok());
+            let shifted = sigs::Sig {
+                patch_offsets: &[4],
+                ..sigs::ASYNC_OVERRIDE
+            };
+            assert!(validate_sig(&shifted, &bytes, 0).is_err());
+            bytes[12] = 0x90;
+            assert!(validate_sig(&sigs::ASYNC_OVERRIDE, &bytes, 0).is_err());
+        }
+
+        /// Raw PE header values; VirtualSize and SizeOfRawData stay separate.
+        #[derive(Debug, PartialEq, Eq)]
+        struct RawSection {
+            /// The exact eight header bytes, including NUL padding.
+            name: [u8; 8],
+            /// VirtualAddress is an RVA in IMAGE_SECTION_HEADER.
+            virtual_address: u32,
+            /// Unaligned virtual length, without substituting a raw size.
+            virtual_size: u32,
+            /// PointerToRawData in the file.
+            raw_offset: u32,
+            /// SizeOfRawData, independently of VirtualSize.
+            raw_size: u32,
+        }
+
+        /// Compare actual IMAGE_SECTION_HEADER fields, not unified section-size semantics.
+        fn compare_pe_sections(bytes: &[u8], ours: &PeInfo) -> Result<Vec<String>, String> {
+            use object::LittleEndian as LE;
+            let independent = object::read::pe::PeFile64::parse(bytes)
+                .map_err(|error| format!("object PE parse: {error}"))?;
+            let table = independent.section_table();
+            if table.len() != ours.sections.len() {
+                return Err(format!(
+                    "section count: ours {}, object {}",
+                    ours.sections.len(),
+                    table.len()
+                ));
+            }
+            let image_base = independent.nt_headers().optional_header.image_base.get(LE);
+            if image_base != ours.image_base {
+                return Err(format!(
+                    "image base: ours {:#x}, object {image_base:#x}",
+                    ours.image_base
+                ));
+            }
+            let mut summaries = Vec::new();
+            for (index, (section, raw)) in ours.sections.iter().zip(table.iter()).enumerate() {
+                let actual = RawSection {
+                    name: section.name,
+                    virtual_address: section.rva,
+                    virtual_size: section.virtual_size,
+                    raw_offset: section.raw_ptr,
+                    raw_size: section.raw_size,
+                };
+                let expected = RawSection {
+                    name: raw.name,
+                    virtual_address: raw.virtual_address.get(LE),
+                    virtual_size: raw.virtual_size.get(LE),
+                    raw_offset: raw.pointer_to_raw_data.get(LE),
+                    raw_size: raw.size_of_raw_data.get(LE),
+                };
+                if actual != expected {
+                    return Err(format!("section {index}: raw header mismatch\nours {actual:#x?}\nobject {expected:#x?}"));
+                }
+                summaries.push(format!("section {index} {}: RVA={:#x} VA={:#x} virtual_size={:#x} raw_offset={:#x} raw_size={:#x}",section.name_text(),actual.virtual_address,image_base+u64::from(actual.virtual_address),actual.virtual_size,actual.raw_offset,actual.raw_size));
+            }
+            Ok(summaries)
+        }
+
+        /// Alter each raw field in each synthetic section to make missing comparisons visible.
+        #[test]
+        fn pe_oracle_distinguishes_virtual_and_raw_fields_and_checks_every_row() {
+            let bytes = synth_pe(
+                &[
+                    (".text", 0x1234, 0x1000, 0x200, 0x400),
+                    (".rdata", 0x111, 0x3000, 0x400, 0x600),
+                ],
+                0x5000,
+            );
+            assert!(compare_pe_sections(&bytes, &parse_pe_file(&bytes).unwrap()).is_ok());
+            for index in 0..2 {
+                for changed in 0..5 {
+                    let mut ours = parse_pe_file(&bytes).unwrap();
+                    let row = &mut ours.sections[index];
+                    match changed {
+                        0 => row.name[0] = b'!',
+                        1 => row.rva += 1,
+                        2 => row.virtual_size = row.raw_size,
+                        3 => row.raw_ptr += 1,
+                        4 => row.raw_size = row.virtual_size,
+                        _ => unreachable!(),
+                    }
+                    assert!(
+                        compare_pe_sections(&bytes, &ours).is_err(),
+                        "section {index}, changed field {changed}"
+                    );
+                }
+            }
+            let mut missing = parse_pe_file(&bytes).unwrap();
+            missing.sections.pop();
+            assert!(compare_pe_sections(&bytes, &missing).is_err());
+        }
+
+        /// Preserve the existing Steam helper's explicit-path panic/default-missing skip rules.
+        fn steam_image(test: &str) -> Option<(Vec<u8>, PeInfo)> {
+            use crate::build_id::test_support::steam_exe_or_skip;
+            use crate::build_id::{classify, sha256_file, to_hex};
+            let path = steam_exe_or_skip(test)?;
+            let hash = sha256_file(&path).expect("hash Steam exe");
+            println!(
+                "file {} SHA256={} {:?}",
+                path.display(),
+                to_hex(&hash),
+                classify(hash)
+            );
+            let bytes = std::fs::read(&path).expect("read Steam exe as data");
+            let pe = parse_pe_file(&bytes).expect("shared file PE parser");
+            Some((bytes, pe))
+        }
+
+        /// Decode layouts at RE-verified signature starts; this does not recover control flow.
+        #[test]
+        #[ignore = "reads Steam exe only (ENSHROUDED_STEAM_EXE, else Steam path); run by exact name with --ignored --nocapture"]
+        fn instruction_fields_match_steam_exe() {
+            let Some((bytes, pe)) = steam_image("instruction_fields_match_steam_exe") else {
+                return;
+            };
+            let (text_va, text) = pe
+                .section_va_bytes(&bytes, ".text")
+                .expect("file .text bytes");
+            let mut failures = Vec::new();
+            for sig in sigs::ALL {
+                assert_eq!(
+                    sig.sections,
+                    [".text"],
+                    "{} requires an explicit section policy",
+                    sig.name
+                );
+                let pattern = Pattern::parse(sig.pattern).expect("signature pattern");
+                let at = match find_unique(text, &pattern) {
+                    Ok(at) => at,
+                    Err(error) => {
+                        failures.push(format!("{}: {error}", sig.name));
+                        continue;
+                    }
+                };
+                let ip = text_va + at as u64;
+                let rest = &text[at..];
+                let window = &rest[..pattern.len().max(32).min(rest.len())];
+                println!(
+                    "{} match {ip:#x}, patch offsets {:?}",
+                    sig.name, sig.patch_offsets
+                );
+                // The addresses are the existing, documented anchors, not a global linear sweep.
+                match ANCHORS.iter().find(|(name, _)| *name == sig.name) {
+                    Some((_, anchor)) if *anchor == ip => (),
+                    other => failures.push(format!(
+                        "{}: start {ip:#x} differs from verified anchor {other:?}",
+                        sig.name
+                    )),
+                }
+                match validate_sig(sig, window, ip) {
+                    Ok(lines) => {
+                        for line in lines {
+                            println!("  {line}");
+                        }
+                    }
+                    Err(error) => {
+                        let decoded = decode_prefix(window, ip, pattern.len())
+                            .map(|rows| {
+                                rows.iter()
+                                    .map(Decoded::summary)
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            })
+                            .unwrap_or_else(|error| error);
+                        failures.push(format!(
+                            "{} at {ip:#x}: {error}\ndecoded instructions:\n{decoded}",
+                            sig.name
+                        ));
+                    }
+                }
+            }
+            assert!(
+                failures.is_empty(),
+                "instruction oracle failures:\n{}",
+                failures.join("\n")
+            );
+        }
+
+        /// Compare every raw PE section header against object's independent parser.
+        #[test]
+        #[ignore = "reads Steam exe only (ENSHROUDED_STEAM_EXE, else Steam path); run by exact name with --ignored --nocapture"]
+        fn pe_section_headers_match_steam_exe() {
+            let Some((bytes, pe)) = steam_image("pe_section_headers_match_steam_exe") else {
+                return;
+            };
+            let lines = compare_pe_sections(&bytes, &pe).unwrap_or_else(|error| panic!("{error}"));
+            for line in lines {
+                println!("{line}");
+            }
+        }
+
+        /// The distance is the third load; another valid RIP displacement is not interchangeable.
+        #[test]
+        fn instance_oracle_rejects_another_valid_rip_displacement() {
+            let bytes = signature_bytes(&sigs::SCATTER_INSTANCE_LOADS);
+            assert!(validate_sig(&sigs::SCATTER_INSTANCE_LOADS, &bytes, 0).is_ok());
+            let wrong = sigs::Sig {
+                patch_offsets: &[13],
+                ..sigs::SCATTER_INSTANCE_LOADS
+            };
+            let error = validate_sig(&wrong, &bytes, 0).unwrap_err();
+            assert!(error.contains("movss"), "{error}");
+        }
+
+        /// Reject shifted imm32 and disp32 fields while accepting their exact documented ranges.
+        #[test]
+        fn a_shifted_patch_must_fail_the_exact_constant_field_check() {
+            let mut bytes = signature_bytes(&sigs::HDR_PAPER_WHITE);
+            bytes[3..7].copy_from_slice(&250.0f32.to_le_bytes());
+            assert!(validate_sig(&sigs::HDR_PAPER_WHITE, &bytes, 0).is_ok());
+            let wrong = sigs::Sig {
+                patch_offsets: &[4],
+                ..sigs::HDR_PAPER_WHITE
+            };
+            let error = validate_sig(&wrong, &bytes, 0).unwrap_err();
+            assert!(error.contains("mov"), "{error}");
+            assert!(error.contains("+0x4"), "{error}");
+            let bytes = signature_bytes(&sigs::SCATTER_BRICK_LOAD);
+            assert!(validate_sig(&sigs::SCATTER_BRICK_LOAD, &bytes, 0).is_ok());
+            let wrong = sigs::Sig {
+                patch_offsets: &[10],
+                ..sigs::SCATTER_BRICK_LOAD
+            };
+            assert!(validate_sig(&wrong, &bytes, 0).is_err());
+        }
+
+        /// A synthetic stream proves that decoding from an arbitrary byte is insufficient.
+        #[test]
+        fn a_match_inside_an_immediate_is_not_an_instruction_boundary() {
+            // Fixture only: mov eax,90909090h; ret. Starting at +2 would decode a false nop.
+            let bytes = [0xc7, 0xc0, 0x90, 0x90, 0x90, 0x90, 0xc3];
+            assert!(instruction_boundary(&bytes, 0, 0).is_ok());
+            assert!(instruction_boundary(&bytes, 0, 6).is_ok());
+            let error = instruction_boundary(&bytes, 0, 2).unwrap_err();
+            assert!(error.contains("mov"), "{error}");
+            assert!(instruction_boundary(&bytes, 0, bytes.len()).is_err());
+        }
+    }
+
     #[test]
     fn scan_errors_explain_the_failure_and_match_count() {
         assert_eq!(
@@ -2307,5 +2909,189 @@ mod tests {
             short, 0,
             "a partial information struct cannot prove readability"
         );
+    }
+}
+
+/// Property tests use only owned strings and byte slices, never native image memory.
+#[cfg(test)]
+mod property_tests {
+    use super::{find_unique, Pattern, ScanError};
+    use proptest::prelude::*;
+
+    /// Small alphabets make accidental and overlapping matches common; full bytes stay covered.
+    fn byte() -> impl Strategy<Value = u8> {
+        prop_oneof![3 => 0u8..=3, 1 => any::<u8>()]
+    }
+
+    /// Arbitrary private patterns include empty and all-wildcard values for the refusal contract.
+    fn cells() -> impl Strategy<Value = Vec<Option<u8>>> {
+        proptest::collection::vec(proptest::option::of(byte()), 0..=16)
+    }
+
+    /// Insert a literal rather than rejecting generated cases; every result parses successfully.
+    fn valid_cells() -> impl Strategy<Value = Vec<Option<u8>>> {
+        (
+            proptest::collection::vec(proptest::option::of(any::<u8>()), 0..=23),
+            any::<u8>(),
+            0usize..24,
+        )
+            .prop_map(|(mut cells, literal, position)| {
+                cells.insert(position % (cells.len() + 1), Some(literal));
+                cells
+            })
+    }
+
+    /// Independent linear oracle: enumerate every complete window, then compare literals directly.
+    /// Empty and all-wildcard private patterns are NotFound, as the scanner has no literal anchor.
+    fn naive(hay: &[u8], cells: &[Option<u8>]) -> Result<usize, ScanError> {
+        if !cells.iter().any(Option::is_some) {
+            return Err(ScanError::NotFound);
+        }
+        let mut hits = Vec::new();
+        for (offset, window) in hay.windows(cells.len()).enumerate() {
+            let mut matches = true;
+            for (index, cell) in cells.iter().enumerate() {
+                if let Some(expected) = cell {
+                    if window[index] != *expected {
+                        matches = false;
+                        break;
+                    }
+                }
+            }
+            if matches {
+                hits.push(offset);
+            }
+        }
+        match hits.as_slice() {
+            [] => Err(ScanError::NotFound),
+            [only] => Ok(*only),
+            several => Err(ScanError::Multiple(several.len())),
+        }
+    }
+
+    /// Render independent generated cells as canonical two-digit lowercase hex and wildcards.
+    fn canonical(cells: &[Option<u8>]) -> String {
+        cells
+            .iter()
+            .map(|cell| match cell {
+                Some(byte) => format!("{byte:02x}"),
+                None => "??".to_owned(),
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Fill wildcards without asking the production parser or matcher which bytes would fit.
+    fn materialize(cells: &[Option<u8>], fill: u8) -> Vec<u8> {
+        cells.iter().map(|cell| cell.unwrap_or(fill)).collect()
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 32, max_shrink_iters: 1024, ..ProptestConfig::default() })]
+
+        #[test]
+        fn arbitrary_unicode_pattern_text_never_panics(chars in proptest::collection::vec(any::<char>(), 0..=96)) {
+            let text: String = chars.into_iter().collect();
+            let _result = Pattern::parse(&text);
+        }
+
+        #[test]
+        fn malformed_utf8_lossy_text_is_refused_without_panicking(mut bytes in proptest::collection::vec(any::<u8>(), 0..=128)) {
+            // This final isolated malformed token guarantees the string is not a valid pattern.
+            bytes.extend_from_slice(&[b' ', 0xff]);
+            let text = String::from_utf8_lossy(&bytes);
+            prop_assert!(matches!(Pattern::parse(&text), Err(ScanError::BadPattern(_))));
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 64, max_shrink_iters: 1024, ..ProptestConfig::default() })]
+
+        #[test]
+        fn valid_pattern_roundtrip_preserves_every_literal_and_wildcard(
+            cells in valid_cells(), uppercase in any::<bool>(),
+            separator in prop::sample::select(vec![" ", "\t", "\r\n", "\n", "\x0c"])
+        ) {
+            let canonical = canonical(&cells);
+            let spelled = if uppercase { canonical.to_ascii_uppercase() } else { canonical.clone() };
+            let text = format!("{separator}{}{separator}", spelled.replace(' ', separator));
+            let parsed = Pattern::parse(&text).expect("generator always inserts a literal");
+            prop_assert_eq!(&parsed, &Pattern(cells));
+            prop_assert_eq!(Pattern::parse(&canonical), Ok(parsed));
+        }
+
+        #[test]
+        fn arbitrary_and_planted_scans_agree_with_independent_oracle(
+            mut hay in proptest::collection::vec(byte(), 0..=128), cells in cells(),
+            plant in any::<bool>(), position in 0usize..=128, fill in any::<u8>()
+        ) {
+            if plant && cells.iter().any(Option::is_some) {
+                let at = position % (hay.len() + 1);
+                hay.splice(at..at, materialize(&cells, fill));
+            }
+            prop_assert_eq!(find_unique(&hay, &Pattern(cells.clone())), naive(&hay, &cells));
+        }
+
+        #[test]
+        fn exact_fit_always_finds_the_one_complete_window(cells in valid_cells(), fill in any::<u8>()) {
+            let hay = materialize(&cells, fill);
+            // Every case has exactly one possible start, so excluding the end is always caught.
+            prop_assert_eq!(find_unique(&hay, &Pattern(cells)), Ok(0));
+        }
+
+        #[test]
+        fn planted_last_boundary_is_always_included(literal in any::<u8>(), prefix in 0usize..=64, trailing in 0usize..=16) {
+            let other = literal.wrapping_add(1);
+            let mut hay = vec![other; prefix];
+            hay.push(literal);
+            hay.extend(std::iter::repeat_n(other, trailing));
+            let mut cells = vec![Some(literal)];
+            cells.extend(std::iter::repeat_n(None, trailing));
+            prop_assert_eq!(find_unique(&hay, &Pattern(cells)), Ok(prefix));
+        }
+
+        #[test]
+        fn leading_and_trailing_wildcards_match_an_exact_fit(first in any::<u8>(), literal in any::<u8>(), last in any::<u8>()) {
+            prop_assert_eq!(find_unique(&[first,literal,last], &Pattern(vec![None,Some(literal),None])), Ok(0));
+        }
+
+        #[test]
+        fn repeated_literal_patterns_count_every_overlapping_start(literal in any::<u8>(), width in 1usize..=16, extra in 1usize..=16) {
+            let hay = vec![literal; width + extra];
+            let pattern = Pattern(vec![Some(literal); width]);
+            prop_assert_eq!(find_unique(&hay, &pattern), Err(ScanError::Multiple(extra + 1)));
+        }
+
+        #[test]
+        fn two_planted_patterns_count_all_matches_including_accidental_overlaps(
+            cells in valid_cells(), fill in any::<u8>(), separator in proptest::collection::vec(byte(), 0..=16)
+        ) {
+            let body = materialize(&cells, fill);
+            let mut hay = body.clone();
+            hay.extend(separator);
+            hay.extend(body);
+            let expected = naive(&hay, &cells);
+            prop_assert!(matches!(&expected, Err(ScanError::Multiple(count)) if *count >= 2));
+            prop_assert_eq!(find_unique(&hay, &Pattern(cells)), expected);
+        }
+
+        #[test]
+        fn empty_buffers_and_shorter_buffers_never_match(cells in valid_cells(), fill in any::<u8>()) {
+            let short = materialize(&cells, fill).into_iter().take(cells.len() - 1).collect::<Vec<_>>();
+            let pattern = Pattern(cells);
+            prop_assert_eq!(find_unique(&[], &pattern), Err(ScanError::NotFound));
+            prop_assert_eq!(find_unique(&short, &pattern), Err(ScanError::NotFound));
+        }
+
+        #[test]
+        fn empty_and_all_wildcard_patterns_obey_the_existing_refusal_contract(width in 1usize..=32, hay in proptest::collection::vec(byte(), 0..=64)) {
+            let wildcards = vec![None; width];
+            prop_assert!(matches!(Pattern::parse(""), Err(ScanError::BadPattern(_))));
+            prop_assert!(matches!(Pattern::parse(&canonical(&wildcards)), Err(ScanError::BadPattern(_))));
+            for cells in [Vec::new(), wildcards] {
+                prop_assert_eq!(find_unique(&hay, &Pattern(cells.clone())), Err(ScanError::NotFound));
+                prop_assert_eq!(naive(&hay, &cells), Err(ScanError::NotFound));
+            }
+        }
     }
 }

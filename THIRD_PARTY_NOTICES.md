@@ -149,21 +149,39 @@ $metadata.packages |
 ```
 
 - ash 0.38.0+1.3.281: MIT OR Apache-2.0
+- autocfg 1.5.1: Apache-2.0 OR MIT
+- bitflags 2.13.2: MIT OR Apache-2.0
 - cc 1.10.0: MIT OR Apache-2.0
+- cfg-if 1.0.5: MIT OR Apache-2.0
+- chacha20 0.10.2: MIT OR Apache-2.0
 - configparser 3.3.0: MIT OR LGPL-3.0-or-later
+- core_detect 1.0.0: MIT/Apache-2.0
+- cpufeatures 0.3.1: MIT OR Apache-2.0
 - fern 0.7.1: MIT
 - find-msvc-tools 0.1.15: MIT OR Apache-2.0
+- getrandom 0.4.3: MIT OR Apache-2.0
+- iced-x86 1.21.0: MIT
+- lazy_static 1.5.1: MIT OR Apache-2.0
 - log 0.4.34: MIT OR Apache-2.0
+- memchr 2.8.3: Unlicense OR MIT
 - minhook 0.9.0: MIT
+- num-traits 0.2.19: MIT OR Apache-2.0
+- object 0.40.0: Apache-2.0 OR MIT
 - once_cell 1.21.4: MIT OR Apache-2.0
 - pin-project-lite 0.2.17: Apache-2.0 OR MIT
 - proc-macro2 1.0.107: MIT OR Apache-2.0
+- proptest 1.12.0: MIT OR Apache-2.0
 - quote 1.0.47: MIT OR Apache-2.0
+- rand 0.10.3: MIT OR Apache-2.0
+- rand_core 0.10.1: MIT OR Apache-2.0
+- rand_xorshift 0.5.0: MIT OR Apache-2.0
+- regex-syntax 0.8.11: MIT OR Apache-2.0
 - shlex 2.0.1: MIT OR Apache-2.0
 - syn 2.0.119: MIT OR Apache-2.0
 - tracing 0.1.44: MIT
 - tracing-attributes 0.1.31: MIT
 - tracing-core 0.1.36: MIT
+- unarray 0.1.4: MIT OR Apache-2.0
 - unicode-ident 1.0.27: (MIT OR Apache-2.0) AND Unicode-3.0
 - windows-link 0.2.1: MIT OR Apache-2.0
 - windows-sys 0.61.2: MIT OR Apache-2.0
