@@ -150,6 +150,8 @@ In the no-consumer line, `{debug}` is `[Debug] ScatterProbe = 0` or `LogLevel is
 
 The background sampler checks every 500 ms and reads counters only after new hook calls. It does not sample on the game thread. A good sample resets the transient-miss count. Ten consecutive transient misses while calls continue, or one copied counter-layout mismatch, latch sampling off for the session. Those checks update internal state without a dedicated runtime failure log. A sampler panic also latches failure; see the generic panic messages below. Restart to begin a new session, and retain the startup and hook-enable lines when reporting missing probe data. No sample or startup line proves a measured grass ceiling or an in-game result.
 
+With `LogLevel=debug`, `ScatterProbe=1` and the governor running (`TargetFps > 0`), each two-second counter line includes `session_peak_A`. It is the largest `peak_A` observed by the 50 ms governor loop during that run. It survives scene-view resets and can miss a peak that resets between observations.
+
 ## HDR paper white and peak
 
 HDR is optional. The game-value/default settings preserve the original paper white and leave peak correction off. A startup “on” line describes configuration and installation, not a verified picture on the display.

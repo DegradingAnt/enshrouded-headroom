@@ -60,6 +60,34 @@ pub fn status_line(
     format!("governor: p50 {p50_ms:.2} ms, p95 {p95_ms:.2} ms, target {target_ms:.2} ms; steps object={object} scatter={scatter} terrain={terrain}; {state}")
 }
 
+/// Periodic scatter diagnostics, sampled only by the configured debug governor loop.
+#[derive(Default)]
+struct ScatterDiagnostics {
+    /// Largest scene-view peak observed by this governor run, retained across scene resets.
+    session_peak_a: u32,
+    /// Time of the last emitted counter report.
+    reported_at_s: f64,
+}
+
+impl ScatterDiagnostics {
+    /// Observe a scene-view peak and return a value only when the two-second report is due.
+    fn observe(&mut self, now_s: f64, peak_a: u32) -> Option<u32> {
+        self.session_peak_a = self.session_peak_a.max(peak_a);
+        if now_s - self.reported_at_s >= 2.0 {
+            self.reported_at_s = now_s;
+            Some(self.session_peak_a)
+        } else {
+            None
+        }
+    }
+}
+
+/// Format counters only when the debug report is emitted.
+fn scatter_probe_line(counters: [u32; 6], session_peak_a: u32) -> String {
+    let [a, peak_a, b, peak_b, c, peak_c] = counters;
+    format!("scatter probe: A={a} peak_A={peak_a} B={b} peak_B={peak_b} C={c} peak_C={peak_c} session_peak_A={session_peak_a}")
+}
+
 /// A tick's latched hold and one-time signal reports, without allocating log text.
 #[derive(Debug, Clone, Copy, Default)]
 struct SignalEvents {
@@ -504,7 +532,7 @@ fn run(cfg: crate::config::Config) {
     let mut memory_at = f64::NEG_INFINITY;
     let mut status_at = 0.0;
     let mut latency_at = 0.0;
-    let mut probe_at = 0.0;
+    let mut scatter_diagnostics = ScatterDiagnostics::default();
     let mut applied = [0; 3];
     log::info!("governor: started; inactive");
     loop {
@@ -585,17 +613,24 @@ fn run(cfg: crate::config::Config) {
                         report_reflex_latency_when_available();
                         latency_at = now_s;
                     }
-                    if cfg.debug.scatter_probe && now_s - probe_at >= 2.0 {
-                        log::debug!(
-                            "scatter probe: A={} peak_A={} B={} peak_B={} C={} peak_C={}",
-                            probe::LAST_A.load(Relaxed),
-                            probe::PEAK_A.load(Relaxed),
-                            probe::LAST_B.load(Relaxed),
-                            probe::PEAK_B.load(Relaxed),
-                            probe::LAST_C.load(Relaxed),
-                            probe::PEAK_C.load(Relaxed)
-                        );
-                        probe_at = now_s;
+                    if cfg.debug.scatter_probe {
+                        let peak_a = probe::PEAK_A.load(Relaxed);
+                        if let Some(session_peak_a) = scatter_diagnostics.observe(now_s, peak_a) {
+                            log::debug!(
+                                "{}",
+                                scatter_probe_line(
+                                    [
+                                        probe::LAST_A.load(Relaxed),
+                                        peak_a,
+                                        probe::LAST_B.load(Relaxed),
+                                        probe::PEAK_B.load(Relaxed),
+                                        probe::LAST_C.load(Relaxed),
+                                        probe::PEAK_C.load(Relaxed),
+                                    ],
+                                    session_peak_a
+                                )
+                            );
+                        }
                     }
                 }
                 plan.values
@@ -682,6 +717,55 @@ mod tests {
         body();
         drop(scope);
         ALLOCATIONS.with(Cell::get)
+    }
+
+    #[test]
+    fn scatter_debug_reports_keep_the_observed_session_peak_across_scene_resets() {
+        let mut diagnostics = ScatterDiagnostics::default();
+        assert_eq!(diagnostics.observe(0.0, 0), None);
+        assert_eq!(diagnostics.observe(0.05, 70_000), None);
+        assert_eq!(diagnostics.observe(1.95, 3), None);
+        let retained = diagnostics.observe(2.0, 0).expect("first report due");
+        assert_eq!(
+            scatter_probe_line([10, 0, 20, 21, 30, 31], retained),
+            "scatter probe: A=10 peak_A=0 B=20 peak_B=21 C=30 peak_C=31 session_peak_A=70000"
+        );
+        assert_eq!(diagnostics.observe(2.05, 80_000), None);
+        assert_eq!(diagnostics.observe(3.95, 1), None);
+        let retained = diagnostics.observe(4.0, 0).expect("second report due");
+        assert_eq!(
+            scatter_probe_line([11, 0, 22, 23, 32, 33], retained),
+            "scatter probe: A=11 peak_A=0 B=22 peak_B=23 C=32 peak_C=33 session_peak_A=80000"
+        );
+    }
+
+    #[test]
+    fn scatter_debug_session_peak_keeps_zero_and_the_u32_maximum() {
+        let mut diagnostics = ScatterDiagnostics::default();
+        assert_eq!(diagnostics.observe(0.0, 0), None);
+        assert_eq!(diagnostics.observe(2.0, 0), Some(0));
+        assert_eq!(diagnostics.observe(2.05, u32::MAX), None);
+        assert_eq!(diagnostics.observe(4.0, 0), Some(u32::MAX));
+        assert_eq!(diagnostics.observe(6.0, u32::MAX - 1), Some(u32::MAX));
+        assert_eq!(diagnostics.observe(8.0, 0), Some(u32::MAX));
+    }
+
+    #[test]
+    fn scatter_debug_sampling_allocates_only_when_formatting_a_report() {
+        let mut diagnostics = ScatterDiagnostics::default();
+        let sampling = allocation_count(|| {
+            for tick in 0..10_000u32 {
+                std::hint::black_box(diagnostics.observe(f64::from(tick) * 0.05, tick));
+            }
+        });
+        assert_eq!(sampling, 0);
+        let formatting = allocation_count(|| {
+            std::hint::black_box(scatter_probe_line([1, 2, 3, 4, 5, 6], 70_000));
+        });
+        assert!(
+            formatting > 0,
+            "the emitted line is an allocation positive control"
+        );
     }
 
     #[test]
