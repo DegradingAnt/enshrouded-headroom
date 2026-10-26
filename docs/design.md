@@ -28,7 +28,7 @@ Out of scope for version 1:
 - An in-game menu or overlay.
 - Any setting below the player's menu choice.
 
-Test-environment note: the test machine is the Steam install of the game (`C:\Program Files (x86)\Steam\steamapps\common\Enshrouded`). Its exe starts in Steam's DRM stub, the `.bind` section, and the folder has no `winmm.dll`. After the loader install step in plan Task 17, the folder holds one loader (Ultimate ASI Loader) and nothing else that could change what sits in the import slots. (The old install, which is being deleted, had an unexplained `winmm.dll`, 577,024 bytes, "ACME Corporation".) Ultimate ASI Loader handles `.bind`: it ignores calls from that section as triggers (from loader source v10.0.0, unconfirmed in game). The first in-game run uses the loader's `DebugLog=1`.
+Test-environment note: the test machine is the Steam install of the game (`<Steam game folder>`). Its exe starts in Steam's DRM stub, the `.bind` section, and the folder has no `winmm.dll`. After the loader install step in plan Task 17, the folder holds one loader (Ultimate ASI Loader) and nothing else that could change what sits in the import slots. (An earlier install had an unexplained `winmm.dll`, 577,024 bytes, "ACME Corporation".) Ultimate ASI Loader handles `.bind`: it ignores calls from that section as triggers (from loader source v10.0.0, unconfirmed in game). The first in-game run uses the loader's `DebugLog=1`.
 
 ## 3. Constraints
 
@@ -498,7 +498,7 @@ In-game checks on the author's machine:
 ## 12. Release
 
 1. The author reads all code.
-2. Public GitHub repo at `C:\Modding\Enshrouded`, MIT licence. The README covers what the mod does, install, uninstall, the `.ini` reference, the tested build, and the disclosure in the author's words.
+2. Public GitHub repo at `<repository>`, MIT licence. The README covers what the mod does, install, uninstall, the `.ini` reference, the tested build, and the disclosure in the author's words.
 3. The Nexus zip has the section 4 layout and the loader's MIT licence.
 4. The mod page states the tested game build and that a game update turns the knobs off until the mod is updated (section 9).
 

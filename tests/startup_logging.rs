@@ -213,6 +213,33 @@ fn start_up_logs_one_grass_distance_line_after_object_distance() {
     );
 
     let messages: Vec<&str> = log.lines().map(message).collect();
+    // Release version agreement uses the actual loaded child's log, not source-code text.
+    let manifest = include_str!("../Cargo.toml");
+    let package = manifest
+        .split_once("[package]")
+        .unwrap()
+        .1
+        .split("\n[")
+        .next()
+        .unwrap();
+    let version = package
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("version = "))
+        .unwrap()
+        .trim_matches('"');
+    assert_eq!(version, "0.1.0", "W28 does not change the package version");
+    let heading = include_str!("../CHANGELOG.md")
+        .lines()
+        .find(|line| line.starts_with("## ["))
+        .unwrap();
+    assert_eq!(heading, format!("## [{version}] - unreleased"));
+    let loaded = format!("enshrouded-headroom {version} loaded");
+    assert_eq!(
+        messages.iter().filter(|line| **line == loaded).count(),
+        1,
+        "actual startup version: {log}"
+    );
+
     let at = |prefix: &str| -> Vec<usize> {
         (0..messages.len())
             .filter(|&i| messages[i].starts_with(prefix))
