@@ -1778,4 +1778,464 @@ mod tests {
         let (_, w) = parse("[debug]\nscatterprobe=1\nNope=1\n");
         assert_eq!(w, ["[Debug] nope: unknown key, ignored"], "{w:?}");
     }
+
+    /// Properties exercise the public parser, independently of its range constants.
+    mod properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Destructure every field so a new setting requires a coverage decision.
+        fn assert_ranges(config: &Config) {
+            let Config {
+                general:
+                    General {
+                        enabled: _,
+                        texture_budget,
+                        texture_reserve_gib,
+                        async_compute: _,
+                        priority: _,
+                        reflex: _,
+                        anti_lag: _,
+                        allow_unknown_build: _,
+                        log_level: _,
+                    },
+                governor:
+                    GovernorCfg {
+                        target_fps,
+                        window_seconds,
+                        raise_below,
+                        raise_hold_seconds,
+                        settle_seconds,
+                        lower_above,
+                        lower_hold_seconds,
+                        hitch_factor,
+                        block_seconds,
+                        min_vram_free_mib,
+                    },
+                knobs:
+                    KnobsCfg {
+                        enable_object_distance: _,
+                        max_object_distance,
+                        enable_scatter_distance: _,
+                        max_scatter_distance,
+                        enable_terrain_distance: _,
+                        max_terrain_distance,
+                        deco_distance_scale,
+                        distant_objects_scale,
+                        terrain_ring_scale,
+                    },
+                hdr: HdrCfg { paper_white_nits },
+                debug:
+                    DebugCfg {
+                        scatter_probe: _,
+                        force_step_object,
+                        force_step_scatter,
+                        force_step_terrain,
+                    },
+            } = *config;
+            assert!(target_fps == 0 || (30..=360).contains(&target_fps));
+            assert!((4.0..=16.0).contains(&texture_reserve_gib));
+            if let TextureBudget::Gib(value) = texture_budget {
+                assert!((2.0..=8.0).contains(&value));
+            }
+            for (value, low, high) in [
+                (window_seconds, 0.5, 10.0),
+                (raise_below, 0.5, 0.99),
+                (raise_hold_seconds, 0.1, 10.0),
+                (settle_seconds, 0.1, 10.0),
+                (lower_above, 0.8, 1.0),
+                (lower_hold_seconds, 0.1, 10.0),
+                (hitch_factor, 1.2, 5.0),
+                (block_seconds, 1.0, 300.0),
+                (deco_distance_scale, 0.5, 1.0),
+                (distant_objects_scale, 0.5, 1.0),
+                (terrain_ring_scale, 1.0, 1.6),
+            ] {
+                assert!(
+                    (low..=high).contains(&value),
+                    "{value} outside {low}..={high}"
+                );
+            }
+            assert!(lower_above > raise_below);
+            assert!(min_vram_free_mib <= 8192);
+            for step in [
+                max_object_distance,
+                max_scatter_distance,
+                max_terrain_distance,
+            ] {
+                assert!(step <= 4);
+            }
+            if let PaperWhiteNits::Nits(value) = paper_white_nits {
+                assert!((40.0..=400.0).contains(&value));
+            }
+            for step in [force_step_object, force_step_scatter, force_step_terrain]
+                .into_iter()
+                .flatten()
+            {
+                assert!(step <= 4);
+            }
+        }
+
+        /// Numeric spelling and fallback policy, taken from the settings documentation.
+        #[derive(Clone, Copy, PartialEq)]
+        enum Kind {
+            Float,
+            Whole,
+            Target,
+            PaperWhite,
+            ForceStep,
+            Boolean,
+        }
+
+        /// One documented numeric key and its independent, literal bounds.
+        struct NumericKey {
+            section: &'static str,
+            key: &'static str,
+            low: f64,
+            high: f64,
+            kind: Kind,
+        }
+
+        /// All bounded numbers, plus the six switches whose accepted numbers are 0 and 1.
+        const NUMERIC_KEYS: &[NumericKey] = &[
+            NumericKey {
+                section: "General",
+                key: "TextureBudget",
+                low: 2.0,
+                high: 8.0,
+                kind: Kind::Float,
+            },
+            NumericKey {
+                section: "General",
+                key: "TextureReserveGiB",
+                low: 4.0,
+                high: 16.0,
+                kind: Kind::Float,
+            },
+            NumericKey {
+                section: "Governor",
+                key: "TargetFps",
+                low: 30.0,
+                high: 360.0,
+                kind: Kind::Target,
+            },
+            NumericKey {
+                section: "Governor",
+                key: "WindowSeconds",
+                low: 0.5,
+                high: 10.0,
+                kind: Kind::Float,
+            },
+            NumericKey {
+                section: "Governor",
+                key: "RaiseBelow",
+                low: 0.5,
+                high: 0.99,
+                kind: Kind::Float,
+            },
+            NumericKey {
+                section: "Governor",
+                key: "RaiseHoldSeconds",
+                low: 0.1,
+                high: 10.0,
+                kind: Kind::Float,
+            },
+            NumericKey {
+                section: "Governor",
+                key: "SettleSeconds",
+                low: 0.1,
+                high: 10.0,
+                kind: Kind::Float,
+            },
+            NumericKey {
+                section: "Governor",
+                key: "LowerAbove",
+                low: 0.8,
+                high: 1.0,
+                kind: Kind::Float,
+            },
+            NumericKey {
+                section: "Governor",
+                key: "LowerHoldSeconds",
+                low: 0.1,
+                high: 10.0,
+                kind: Kind::Float,
+            },
+            NumericKey {
+                section: "Governor",
+                key: "HitchFactor",
+                low: 1.2,
+                high: 5.0,
+                kind: Kind::Float,
+            },
+            NumericKey {
+                section: "Governor",
+                key: "BlockSeconds",
+                low: 1.0,
+                high: 300.0,
+                kind: Kind::Float,
+            },
+            NumericKey {
+                section: "Governor",
+                key: "MinVramFreeMiB",
+                low: 0.0,
+                high: 8192.0,
+                kind: Kind::Whole,
+            },
+            NumericKey {
+                section: "Knobs",
+                key: "MaxObjectDistance",
+                low: 0.0,
+                high: 4.0,
+                kind: Kind::Whole,
+            },
+            NumericKey {
+                section: "Knobs",
+                key: "MaxScatterDistance",
+                low: 0.0,
+                high: 4.0,
+                kind: Kind::Whole,
+            },
+            NumericKey {
+                section: "Knobs",
+                key: "MaxTerrainDistance",
+                low: 0.0,
+                high: 4.0,
+                kind: Kind::Whole,
+            },
+            NumericKey {
+                section: "Knobs",
+                key: "DecoDistanceScale",
+                low: 0.5,
+                high: 1.0,
+                kind: Kind::Float,
+            },
+            NumericKey {
+                section: "Knobs",
+                key: "DistantObjectsScale",
+                low: 0.5,
+                high: 1.0,
+                kind: Kind::Float,
+            },
+            NumericKey {
+                section: "Knobs",
+                key: "TerrainRingScale",
+                low: 1.0,
+                high: 1.6,
+                kind: Kind::Float,
+            },
+            NumericKey {
+                section: "Hdr",
+                key: "PaperWhiteNits",
+                low: 40.0,
+                high: 400.0,
+                kind: Kind::PaperWhite,
+            },
+            NumericKey {
+                section: "Debug",
+                key: "ForceStepObjectDistance",
+                low: 0.0,
+                high: 4.0,
+                kind: Kind::ForceStep,
+            },
+            NumericKey {
+                section: "Debug",
+                key: "ForceStepScatterDistance",
+                low: 0.0,
+                high: 4.0,
+                kind: Kind::ForceStep,
+            },
+            NumericKey {
+                section: "Debug",
+                key: "ForceStepTerrainDistance",
+                low: 0.0,
+                high: 4.0,
+                kind: Kind::ForceStep,
+            },
+            NumericKey {
+                section: "General",
+                key: "Enabled",
+                low: 0.0,
+                high: 1.0,
+                kind: Kind::Boolean,
+            },
+            NumericKey {
+                section: "General",
+                key: "AllowUnknownBuild",
+                low: 0.0,
+                high: 1.0,
+                kind: Kind::Boolean,
+            },
+            NumericKey {
+                section: "Knobs",
+                key: "EnableObjectDistance",
+                low: 0.0,
+                high: 1.0,
+                kind: Kind::Boolean,
+            },
+            NumericKey {
+                section: "Knobs",
+                key: "EnableScatterDistance",
+                low: 0.0,
+                high: 1.0,
+                kind: Kind::Boolean,
+            },
+            NumericKey {
+                section: "Knobs",
+                key: "EnableTerrainDistance",
+                low: 0.0,
+                high: 1.0,
+                kind: Kind::Boolean,
+            },
+            NumericKey {
+                section: "Debug",
+                key: "ScatterProbe",
+                low: 0.0,
+                high: 1.0,
+                kind: Kind::Boolean,
+            },
+        ];
+
+        /// Set one key without causing an unrelated threshold-order warning.
+        fn fixture(key: &NumericKey, text: &str) -> String {
+            let companion = match key.key {
+                "RaiseBelow" => "LowerAbove=1.0\n",
+                "LowerAbove" => "RaiseBelow=0.5\n",
+                _ => "",
+            };
+            format!("[{}]\n{}={text}\n{companion}", key.section, key.key)
+        }
+
+        /// Read the selected numeric result; word-valued alternatives are represented by None.
+        fn numeric_value(config: &Config, key: &str) -> Option<f64> {
+            Some(match key {
+                "TextureBudget" => match config.general.texture_budget {
+                    TextureBudget::Gib(value) => value,
+                    TextureBudget::Auto | TextureBudget::Off => return None,
+                },
+                "PaperWhiteNits" => match config.hdr.paper_white_nits {
+                    PaperWhiteNits::Nits(value) => f64::from(value),
+                    PaperWhiteNits::Game => return None,
+                },
+                "ForceStepObjectDistance" => f64::from(config.debug.force_step_object?),
+                "ForceStepScatterDistance" => f64::from(config.debug.force_step_scatter?),
+                "ForceStepTerrainDistance" => f64::from(config.debug.force_step_terrain?),
+                "Enabled" => f64::from(config.general.enabled),
+                "AllowUnknownBuild" => f64::from(config.general.allow_unknown_build),
+                "EnableObjectDistance" => f64::from(config.knobs.enable_object_distance),
+                "EnableScatterDistance" => f64::from(config.knobs.enable_scatter_distance),
+                "EnableTerrainDistance" => f64::from(config.knobs.enable_terrain_distance),
+                "ScatterProbe" => f64::from(config.debug.scatter_probe),
+                _ => number(config, key),
+            })
+        }
+
+        /// Validate exactly one selected-key warning as well as the complete returned config.
+        fn warned_parse(key: &NumericKey, text: &str) -> Config {
+            let (config, warnings) = parse(&fixture(key, text));
+            assert_ranges(&config);
+            assert_eq!(warnings.len(), 1, "{}={text}: {warnings:?}", key.key);
+            assert!(
+                warnings[0].starts_with(&format!("[{}] {}:", key.section, key.key)),
+                "{warnings:?}"
+            );
+            config
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig { cases: 32, max_shrink_iters: 128, ..ProptestConfig::default() })]
+
+            #[test]
+            fn arbitrary_text_never_panics_and_stays_in_range(
+                unicode in any::<String>(),
+                bytes in prop::collection::vec(any::<u8>(), 0..256),
+                long_len in 16_384usize..65_536,
+            ) {
+                let mut invalid = vec![0xff, 0xfe];
+                invalid.extend(bytes);
+                let lossy = String::from_utf8_lossy(&invalid).into_owned();
+                let line = "9".repeat(long_len);
+                for text in [
+                    unicode.clone(), lossy, format!("\u{fffd}\0\r{unicode}"), line.clone(),
+                    format!("[General]\r\nTextureBudget={line}\r"),
+                    format!("[Hdr]\nPaperWhiteNits={unicode}\0\r"),
+                ] {
+                    let (config, _) = parse(&text);
+                    assert_ranges(&config);
+                }
+            }
+
+            #[test]
+            fn outside_values_warn_once_for_every_numeric_key(delta in 1u32..10_000) {
+                for key in NUMERIC_KEYS {
+                    let below = if key.kind == Kind::Target {
+                        // Zero is valid; exercise the invalid positive gap using integers.
+                        f64::from(1 + delta % 29)
+                    } else { key.low - f64::from(delta) };
+                    for value in [below, key.high + f64::from(delta)] {
+                        let config = warned_parse(key, &value.to_string());
+                        let expected = match key.kind {
+                            Kind::PaperWhite => None,
+                            Kind::Boolean => numeric_value(&Config::default(), key.key),
+                            _ => Some(value.clamp(key.low, key.high)),
+                        };
+                        assert_eq!(numeric_value(&config, key.key), expected, "{}={value}", key.key);
+                    }
+                }
+            }
+
+            #[test]
+            fn decimal_comma_matches_dot_for_every_numeric_key(sample in 0u32..=1_000) {
+                let (zero, warnings) = parse("[Governor]\nTargetFps=0");
+                assert_eq!(zero.governor.target_fps, 0);
+                assert!(warnings.is_empty());
+                assert_ranges(&zero);
+                for key in NUMERIC_KEYS.iter().filter(|key| key.kind != Kind::Boolean) {
+                    let value = match key.kind {
+                        Kind::Whole | Kind::Target | Kind::ForceStep => key.low + f64::from(sample) % (key.high - key.low + 1.0),
+                        _ => key.low + (key.high - key.low) * f64::from(sample) / 1_000.0,
+                    };
+                    let dot = format!("{value:.6}");
+                    let comma = dot.replace('.', ",");
+                    let (dot_config, dot_warnings) = parse(&fixture(key, &dot));
+                    let (comma_config, comma_warnings) = parse(&fixture(key, &comma));
+                    assert!(dot_warnings.is_empty(), "{}={dot}: {dot_warnings:?}", key.key);
+                    assert!(comma_warnings.is_empty(), "{}={comma}: {comma_warnings:?}", key.key);
+                    assert_eq!(dot_config, comma_config, "{}={dot}/{comma}", key.key);
+                    assert_ranges(&dot_config);
+                    assert_ranges(&comma_config);
+                }
+            }
+
+            #[test]
+            fn nonfinite_numbers_use_defaults_for_every_numeric_key(which in 0usize..4) {
+                let text = ["NaN", "inf", "-inf", "1e999"][which];
+                for key in NUMERIC_KEYS {
+                    let config = warned_parse(key, text);
+                    assert_eq!(numeric_value(&config, key.key), numeric_value(&Config::default(), key.key), "{}={text}", key.key);
+                }
+            }
+
+            #[test]
+            fn fractional_integers_warn_and_use_the_default(sample in 0u32..1_000) {
+                for key in NUMERIC_KEYS.iter().filter(|key| matches!(key.kind, Kind::Whole | Kind::Target | Kind::ForceStep)) {
+                    let value = key.low + f64::from(sample) % (key.high - key.low) + 0.5;
+                    let config = warned_parse(key, &value.to_string());
+                    assert_eq!(numeric_value(&config, key.key), numeric_value(&Config::default(), key.key), "{}={value}", key.key);
+                }
+            }
+
+            #[test]
+            fn unordered_thresholds_reset_both_and_warn(raise in 80u32..=99, lower in 80u32..=99) {
+                let raise = f64::from(raise) / 100.0;
+                let lower = (f64::from(lower) / 100.0).min(raise);
+                let (config, warnings) = parse(&format!("[Governor]\nRaiseBelow={raise}\nLowerAbove={lower}"));
+                assert_eq!(config.governor.raise_below, 0.90);
+                assert_eq!(config.governor.lower_above, 0.97);
+                assert_eq!(warnings.len(), 1, "{warnings:?}");
+                assert!(warnings[0].contains("RaiseBelow") && warnings[0].contains("LowerAbove"));
+                assert_ranges(&config);
+            }
+        }
+    }
 }
