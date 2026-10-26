@@ -87,6 +87,7 @@ The crate is **Windows-only** (`x86_64-pc-windows-msvc`, toolchain pinned in `ru
 ## Do not touch: work in progress elsewhere
 
 - `src/governor/` and the module list in `src/lib.rs`: the governor is being built (Task 11).
+- Exception for W16 (issue #18): it may add tests within the existing `#[cfg(test)]` modules in `src/governor/`. All non-test governor code and the module list in `src/lib.rs` remain reserved.
 - Plan Tasks 12-16 (scene-settings hook, draw-distance knobs, start-up scales, the governor thread and Reflex). They need reverse engineering of the game exe, which is not in this repo.
 - Anything that needs the game exe or an in-game test.
 
