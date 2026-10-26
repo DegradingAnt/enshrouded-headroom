@@ -362,6 +362,8 @@ The governor raises 7.1, then 7.2, then 7.3. The order is re-checked after the i
 `[Hdr]`:
 
 - `PaperWhiteNits = game | <number>` (default `game`; finite 40..=400 nits). Invalid or out-of-range values warn and use `game`.
+- `FixPeak = on | off` (default `off` until the author's in-game A/B test).
+- `DisplayPeakNits = game | <whole number>` (default `game`; 80..=10000 nits). Used only with `FixPeak = on`. Invalid or out-of-range values warn and use `game`. Decimal commas with zero fraction are accepted.
 
 `[Governor]`: the keys in 6.4.
 
@@ -376,7 +378,7 @@ The governor raises 7.1, then 7.2, then 7.3. The order is re-checked after the i
 - `ForceStepObjectDistance`, `ForceStepScatterDistance`, `ForceStepTerrainDistance = 0..=4` (default: absent, the knob is not held): hold that knob at a fixed step for testing (pre-flight ruling for Task 17). A whole number outside 0..=4 is clamped with a warning. Other text warns and counts as absent.
 
 Unknown keys and invalid values are logged. Invalid choices use their defaults.
-Out-of-range numeric values are clamped, except `PaperWhiteNits`, which falls back to `game`.
+Out-of-range numeric values are clamped, except `PaperWhiteNits` and `DisplayPeakNits`, which fall back to `game`.
 
 ### HDR paper white
 
@@ -389,12 +391,38 @@ by another tool. Each outcome produces one `hdr paper white:` line.
 
 The effective-value accessor starts at 250 and publishes the chosen number only after a
 successful checked write. Skips and failed writes do not publish the configured number.
-It does not measure another tool's replacement value.
+It does not measure another tool's replacement value. A typed read-back failure also
+marks the value unverified, because the immediate may have changed despite the numeric
+getter staying at its last verified value. Dependent peak correction stays off in that case.
 
 The default remains `game` until the in-game A/B test (Task 17). The research proposes
 trying 80 nits first. The scale mismatch and visible HDR improvement remain hypotheses
-until that test. Peak changes, shader replacement and HDR metadata are later tasks.
+until that test. Shader replacement and HDR metadata are later tasks.
 See `docs/re-notes.md`, "HDR paper white", for the verified instruction and context.
+
+### HDR tonemapper peak
+
+With `FixPeak = on`, the Task 12 post-hook corrects the u16 at scene+0x41e only when the
+colour-space byte at scene+0x408 is 1 or 2. It reads the game's fresh peak on each call,
+then uses `DisplayPeakNits` when set. It writes `round(target * 80 / paperWhite)`, clamped
+to 1..=10000, with an unaligned store. Invalid paper white skips the write. Paper white
+comes from the same effective-value accessor as W13, including its 250-nit fallback.
+Windows' full-frame luminance can be below the panel's true peak, so an explicit panel
+target can replace the game's figure.
+
+Start-up configures and logs this feature after paper white and before queued hook enable.
+A failed paper-white read-back keeps it off and produces one start-up reason. It requires
+code hooks to be allowed and at least one distance knob to be enabled. With
+all distance knobs off, the existing Task 12 gate omits the hook; peak correction stays
+off and logs why. A failed scene-hook installation is reported by `object distance:`.
+The correction runs before object publication or scaling inside Task 12's inner guard.
+Its normal hook path allocates nothing, takes no lock and logs nothing. A panic there
+leaves the original scene untouched, disables the shared scene feature and does not run
+the original again. If the game skips the scene-settings call, it retains its own peak.
+
+The default remains off until the in-game A/B test. The shader-side chain and visible
+roll-off remain hypotheses, with the limits recorded in `docs/re-notes.md`,
+"HDR tonemapper peak (2026-10-26; plan route B2)".
 
 ## 9. Failure handling
 

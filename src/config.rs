@@ -163,6 +163,10 @@ pub enum PaperWhiteNits {
 pub struct HdrCfg {
     /// The composite pass's paper-white scale.
     pub paper_white_nits: PaperWhiteNits,
+    /// Correct the HDR tonemapper peak after scene settings are rebuilt.
+    pub fix_peak: bool,
+    /// Panel peak in nits; `None` follows the game's fresh value.
+    pub display_peak_nits: Option<u16>,
 }
 
 /// The `[Debug]` section (design.md section 8). It is not in the default file, so every key is off
@@ -197,6 +201,8 @@ pub struct Config {
 const BUILTIN: Config = Config {
     hdr: HdrCfg {
         paper_white_nits: PaperWhiteNits::Game,
+        fix_peak: false,
+        display_peak_nits: None,
     },
     general: General {
         enabled: true,
@@ -412,6 +418,8 @@ pub fn parse(text: &str) -> (Config, Vec<String>) {
 
     let hdr = HdrCfg {
         paper_white_nits: r.paper_white_nits(),
+        fix_peak: r.choice("Hdr", "FixPeak", false, &[("on", true), ("off", false)]),
+        display_peak_nits: r.display_peak_nits(),
     };
     let debug = DebugCfg {
         scatter_probe: r.boolean("Debug", "ScatterProbe", d.debug.scatter_probe),
@@ -702,6 +710,27 @@ impl Reader {
         PaperWhiteNits::Game
     }
 
+    /// `game` or a whole number from 80 through 10000; invalid values use `game`.
+    fn display_peak_nits(&mut self) -> Option<u16> {
+        let text = self.raw("Hdr", "DisplayPeakNits")?;
+        if text.eq_ignore_ascii_case("game") {
+            return None;
+        }
+        if let Some(nits) = parse_number(&text)
+            .filter(|nits| nits.fract() == 0.0 && (80.0..=10000.0).contains(nits))
+        {
+            return Some(nits as u16);
+        }
+        self.not_valid(
+            "Hdr",
+            "DisplayPeakNits",
+            &text,
+            "game or a whole number in 80..=10000",
+            "game",
+        );
+        None
+    }
+
     /// Warn about each section and key that no getter asked for.
     fn report_unknown(&mut self) {
         let mut unknown = Vec::new();
@@ -848,6 +877,37 @@ mod tests {
             assert_eq!(cfg.general.priority, expected, "{value}");
             assert!(warnings.is_empty(), "{warnings:?}");
         }
+    }
+
+    #[test]
+    fn hdr_peak_settings_default_off_and_reject_invalid_targets() {
+        let (cfg, warnings) = parse("");
+        assert!(!cfg.hdr.fix_peak);
+        assert_eq!(cfg.hdr.display_peak_nits, None);
+        assert!(warnings.is_empty());
+        for word in ["on", "ON"] {
+            let (cfg, warnings) = parse(&format!("[HDR]\nFixPeak={word}\nDisplayPeakNits=800,0"));
+            assert!(cfg.hdr.fix_peak);
+            assert_eq!(cfg.hdr.display_peak_nits, Some(800));
+            assert!(warnings.is_empty(), "{warnings:?}");
+        }
+        for text in ["game", "GaMe", "80", "10000", "800.0"] {
+            let (_, warnings) = parse(&format!("[Hdr]\nFixPeak=off\nDisplayPeakNits={text}"));
+            assert!(warnings.is_empty(), "{text}: {warnings:?}");
+        }
+        for text in [
+            "79", "10001", "800.5", "NaN", "inf", "1e300", "", "bad", "-1",
+        ] {
+            let (cfg, warnings) = parse(&format!("[Hdr]\nDisplayPeakNits={text}"));
+            assert_eq!(cfg.hdr.display_peak_nits, None, "{text}");
+            assert_eq!(warnings.len(), 1, "{text}: {warnings:?}");
+            assert!(warnings[0].contains("[Hdr] DisplayPeakNits"));
+            assert!(warnings[0].contains("using the default game"));
+        }
+        let (cfg, warnings) = parse("[Hdr]\nFixPeak=maybe");
+        assert!(!cfg.hdr.fix_peak);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("using the default off"));
     }
 
     #[test]
@@ -1216,7 +1276,7 @@ mod tests {
                 .lines()
                 .filter(|line| !line.starts_with(';') && line.contains('='))
                 .count(),
-            29
+            31
         );
     }
 
