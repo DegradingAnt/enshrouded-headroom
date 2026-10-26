@@ -6,7 +6,8 @@ A Rust ASI plugin for Enshrouded on Windows x64 with the Vulkan renderer. Ultima
 
 - **Texture streaming budget — implemented.** Sizes the top tier of the game's texture budget table for the GPU. In `auto` mode, it uses the largest Vulkan `DEVICE_LOCAL` memory heap minus the configured reserve, clamped to 2–8 GiB. A result of 2 GiB or less leaves the original budget unchanged. Integrated GPUs keep the original budget in every mode.
 - **Async compute — implemented.** Uses the game's own async-compute override path. It leaves the game in charge when `AsyncCompute=game` or a command-line argument mentions `async-compute`.
-- **NVIDIA Reflex — planned.** The settings parser accepts a Reflex choice, but this version does not apply it.
+- **NVIDIA Reflex: pure layer implemented.** Settings, mode decisions and device planning are present. Runtime wiring is planned in Task 16, so the setting has no runtime effect yet.
+- **AMD Anti-Lag 2: experimental pure layer implemented.** Settings, ABI types, decisions and call sequencing are present. Runtime wiring is planned in Task 16b. The setting has no runtime effect yet and is not verified on AMD hardware.
 - **FPS-target governor — in progress.** The planned governor uses spare GPU time to raise object draw distance first, then grass distance, then terrain detail distance. It is intended to undo raises when frames are late and never go below the player's menu settings. The default target is 75 fps. The settings are parsed, but this version has no running governor or draw-distance changes.
 
 The plugin also attempts to set the game's process priority to Above Normal once, after the first Vulkan device is created. `Priority=normal` leaves the current priority unchanged.
@@ -51,7 +52,7 @@ If neither folder has a readable file, it tries to create the default file in th
 
 Missing keys use their defaults. Invalid values use their defaults, and numeric values outside their ranges are clamped. Unknown sections and keys are ignored with warnings. If `LowerAbove` is not greater than `RaiseBelow`, both return to their defaults. Section names, key names and word choices are case-insensitive. Boolean values accept `0`, `1`, `false` or `true`. Lines starting with `;` or `#` are comments.
 
-The tables list all 27 keys from [the default INI](enshrouded-headroom.default.ini), with their defaults as written there. GiB and MiB are binary units.
+The tables list all 28 keys from [the default INI](enshrouded-headroom.default.ini), with their defaults as written there. GiB and MiB are binary units.
 
 ### `[General]`
 
@@ -62,7 +63,8 @@ The tables list all 27 keys from [the default INI](enshrouded-headroom.default.i
 | `TextureReserveGiB` | `11` | Amount subtracted from the largest device-local heap in `auto` mode, in GiB. Range: 4–16. It has no effect with a fixed budget or `off`. This is a calculation input, not a live VRAM reservation. |
 | `AsyncCompute` | `on` | `on` attempts the checked code patch on an allowed build. `game` leaves the game's choice unchanged. The command-line rule below can also skip the patch. |
 | `Priority` | `above_normal` | Attempts Above Normal process priority once after the first Vulkan device is created. `normal` leaves the current priority unchanged. A failed Windows request is logged. |
-| `Reflex` | `game` | Parsed choices: `game`, `off`, `on`, `boost`. They describe following the game, disabling Reflex, enabling it, or enabling it with boost. **Planned: none changes runtime behaviour in this version.** |
+| `Reflex` | `auto` | Choices: `game`, `auto`, `off`, `on`, `boost`. Enabled modes require NVIDIA and `VK_NV_low_latency2`. `game` follows saved values 0/1/2 for off/on/boost; unknown values use auto. `auto` and `on` enable without boost. **Pure layer only: no runtime effect yet.** |
+| `AntiLag` | `auto` | Choices: `auto`, `off`, `on`. `auto` requires AMD (vendor `0x1002`), `VK_AMD_anti_lag` and its feature. `on` requires the extension and feature. Active Reflex blocks Anti-Lag. **Pure layer only: no runtime effect yet; not verified on AMD hardware.** |
 | `AllowUnknownBuild` | `0` | `0` blocks code patches on an unknown executable build. `1` permits attempts on an unknown build; signatures and original-byte checks still apply. Texture data checks and Vulkan API wrappers do not depend on this switch. |
 | `LogLevel` | `info` | Logging threshold: `error`, `warn`, `info` or `debug`. `debug` includes more diagnostic detail. |
 
