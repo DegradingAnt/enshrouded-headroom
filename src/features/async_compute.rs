@@ -55,7 +55,7 @@ use windows_sys::Win32::System::Environment::GetCommandLineW;
 use crate::config::AsyncCompute;
 use crate::entry;
 use crate::patch::{write_checked, PatchError};
-use crate::scan::{find_in_sections, main_module, Module, Pattern, ScanError};
+use crate::scan::{find_in_sections, main_module, Module, Pattern};
 use crate::sigs::ASYNC_OVERRIDE;
 
 /// The 16 bytes at +3 of the signature's match, as the game has them: `cmp [rsi+0x35289], r14b`,
@@ -120,10 +120,10 @@ fn sets_async_compute(cmdline: &str) -> bool {
 /// 1. `code_patches == false` gives `"unknown build"`;
 /// 2. `AsyncCompute = game` gives `"ini: game"`;
 /// 3. an argument of the command line that contains `async-compute` (see
-///    [`sets_async_compute`]) gives `"command line sets it"`. The program name is not an
+///    `sets_async_compute`) gives `"command line sets it"`. The program name is not an
 ///    argument.
 ///
-/// Otherwise `Patch`. Pure: the command line is passed in (see [`command_line`]).
+/// Otherwise `Patch`. Pure: the command line is passed in (see `command_line`).
 pub fn decide(cmdline: &str, cfg: &AsyncCompute, code_patches: bool) -> Decision {
     if !code_patches {
         return Decision::Skip("unknown build");
@@ -217,7 +217,7 @@ pub unsafe fn apply(m: &Module) -> Result<(), String> {
         Pattern::parse(ASYNC_OVERRIDE.pattern).map_err(|error| format!("off: {name}: {error}"))?;
     let found = find_in_sections(m, ASYNC_OVERRIDE.sections, &pattern).map_err(|error| {
         log::debug!("async compute: {name}: {error}");
-        scan_failure_text(&error)
+        format!("off: {}", error.player_text())
     })?;
     let site = found
         .checked_add(ASYNC_OVERRIDE.patch_offset())
@@ -227,22 +227,6 @@ pub unsafe fn apply(m: &Module) -> Result<(), String> {
     // `site`. The 16 bytes at `site` end at the end of the 19-byte match `find_in_sections` just
     // found in `.text`, in the mapped, readable memory of `m`.
     unsafe { write_site(site) }.map_err(|error| failure_text(site, error))
-}
-
-/// The log text for a signature that did not match exactly once, starting with what became of
-/// the feature.
-fn scan_failure_text(error: &ScanError) -> String {
-    match error {
-        ScanError::Multiple(count) => format!(
-            "off: the game code matched {count} times, not once (another tool or a different \
-             build may have changed it)"
-        ),
-        ScanError::NotFound | ScanError::BadPattern(_) => {
-            "off: the game code was not found (another tool or a different build may have \
-             changed it)"
-                .to_owned()
-        }
-    }
 }
 
 /// The body of [`init`], with the command line, the code-patch answer and the patching passed in.
@@ -892,31 +876,12 @@ mod tests {
     /// same code at the same address), from the RE notes.
     const MATCH_VA: u64 = 0x1_4084_90d2;
 
-    /// The `.text` section of a PE32+ file: its virtual address (image base included) and the
-    /// bytes of it that are in the file. Walks the headers by hand because the parser in `scan`
-    /// is private.
+    /// The `.text` section of a PE32+ file: its virtual address (image base included)
+    /// and the bytes of it that are in the file (the lesser of raw and virtual size).
     fn text_of(file: &[u8]) -> (u64, &[u8]) {
-        use crate::scan::{u16_at, u32_at, u64_at};
-        let nt = u32_at(file, 0x3c).unwrap() as usize;
-        let n_sections = u16_at(file, nt + 6).unwrap() as usize;
-        let optional_size = u16_at(file, nt + 20).unwrap() as usize;
-        let optional = nt + 24;
-        assert_eq!(u16_at(file, optional), Some(0x20b), "PE32+");
-        let image_base = u64_at(file, optional + 24).unwrap();
-        let table = optional + optional_size;
-        for i in 0..n_sections {
-            let at = table + i * 40;
-            if file.get(at..at + 8) != Some(b".text\0\0\0".as_slice()) {
-                continue;
-            }
-            let virtual_size = u32_at(file, at + 8).unwrap() as usize;
-            let rva = u32_at(file, at + 12).unwrap() as u64;
-            let raw_size = u32_at(file, at + 16).unwrap() as usize;
-            let raw_ptr = u32_at(file, at + 20).unwrap() as usize;
-            let len = virtual_size.min(raw_size);
-            return (image_base + rva, &file[raw_ptr..raw_ptr + len]);
-        }
-        panic!("no .text section");
+        crate::scan::parse_pe(file)
+            .and_then(|pe| pe.section_va_bytes(file, ".text"))
+            .expect("section address and bytes in the PE32+ file")
     }
 
     #[test]

@@ -421,6 +421,12 @@ pub fn rel32(next_insn: usize, dest: usize) -> Option<i32> {
     i32::try_from(delta).ok()
 }
 
+/// The address a 32-bit displacement `disp` reaches from the end of an instruction (`next_insn`):
+/// the inverse of [`rel32`]. `None` if it would be below 0 or past the end of the address space.
+pub fn rel32_target(next_insn: usize, disp: i32) -> Option<usize> {
+    next_insn.checked_add_signed(isize::try_from(disp).ok()?)
+}
+
 /// Windows hands out address space in blocks of this size.
 const GRANULE: i128 = 0x1_0000;
 /// A `rel32` reaches this far behind, and one byte less ahead.
@@ -512,10 +518,17 @@ pub fn alloc_near(target: usize, size: usize) -> Option<usize> {
     find_near(target, size, limits(), &query, &mut reserve_at)
 }
 
-/// The search behind [`alloc_near`], with the address space (`query`) and the reservation
-/// (`alloc`) as parameters so it can be tested on a made-up address space.
+/// [`alloc_near`] for several displacement sources at once: every byte of the block is within a
+/// `rel32` of EVERY address in `targets` (each the `next_insn` of one instruction). The search
+/// starts at the first target. `None` if `targets` is empty or no such block exists.
 ///
-/// All arithmetic is in `i128`, so `target - 2 GiB` can go negative without wrapping.
+/// Use it when several instructions are pointed at the same block: a block that only the first
+/// of them reaches is no use.
+pub fn alloc_near_all(targets: &[usize], size: usize) -> Option<usize> {
+    find_near_all(targets, size, limits(), &query, &mut reserve_at)
+}
+
+/// The search behind [`alloc_near`]: [`find_near_all`] with one target.
 fn find_near(
     target: usize,
     size: usize,
@@ -523,27 +536,48 @@ fn find_near(
     query: &dyn Fn(usize) -> Option<Region>,
     alloc: &mut dyn FnMut(usize, usize) -> bool,
 ) -> Option<usize> {
+    find_near_all(&[target], size, lim, query, alloc)
+}
+
+/// The search behind [`alloc_near_all`], with the address space (`query`) and the reservation
+/// (`alloc`) as parameters so it can be tested on a made-up address space.
+///
+/// All arithmetic is in `i128`, so `target - 2 GiB` can go negative without wrapping.
+fn find_near_all(
+    targets: &[usize],
+    size: usize,
+    lim: Limits,
+    query: &dyn Fn(usize) -> Option<Region>,
+    alloc: &mut dyn FnMut(usize, usize) -> bool,
+) -> Option<usize> {
+    let &first = targets.first()?;
     if size == 0 || lim.page == 0 {
         return None;
     }
     let span = round_up(size as i128, lim.page as i128);
-    let t = target as i128;
     // Block starts that are on the 64 KiB grid, inside the usable address range, and keep the
-    // first and the last byte of the block within a rel32 of `target`.
-    let lo = round_up((t - REACH).max(lim.min_addr as i128), GRANULE);
-    let hi = round_down(
-        (t + REACH - span).min(lim.max_addr as i128 + 1 - span),
-        GRANULE,
-    );
+    // first and the last byte of the block within a rel32 of every target: the highest of the
+    // low ends and the lowest of the high ends.
+    let mut low = lim.min_addr as i128;
+    let mut high = lim.max_addr as i128 + 1 - span;
+    for &target in targets {
+        let t = target as i128;
+        low = low.max(t - REACH);
+        high = high.min(t + REACH - span);
+    }
+    let lo = round_up(low, GRANULE);
+    let hi = round_down(high, GRANULE);
     if hi < lo {
         return None;
     }
     let fits = |a: i128| {
-        rel32(target, a as usize).is_some() && rel32(target, (a + span - 1) as usize).is_some()
+        targets.iter().all(|&target| {
+            rel32(target, a as usize).is_some() && rel32(target, (a + span - 1) as usize).is_some()
+        })
     };
-    // Two cursors walk away from the target, one up and one down, taking turns. Each is always a
-    // multiple of GRANULE; a cursor outside [lo, hi] is finished.
-    let start = t.clamp(lo, hi);
+    // Two cursors walk away from the first target, one up and one down, taking turns. Each is
+    // always a multiple of GRANULE; a cursor outside [lo, hi] is finished.
+    let start = (first as i128).clamp(lo, hi);
     let mut up = round_up(start, GRANULE);
     let mut down = if start % GRANULE == 0 {
         start - GRANULE
@@ -1358,6 +1392,34 @@ mod tests {
         assert_eq!(rel32(usize::MAX - 0x8000_0000, usize::MAX), None);
     }
 
+    #[test]
+    fn rel32_target_is_the_inverse_of_rel32() {
+        let next = 0x1_4007_693e;
+        for dest in [
+            next,
+            next + 5,
+            next - 5,
+            next + 0x7fff_ffff,
+            next - 0x8000_0000,
+            0x1_413b_65fc,
+        ] {
+            let disp = rel32(next, dest).unwrap();
+            assert_eq!(rel32_target(next, disp), Some(dest), "{dest:#x}");
+        }
+        // The grass instance load of build f68140a3 reads 90.0 at 0x1413b65fc.
+        assert_eq!(rel32_target(next, 0x0133_fcbe), Some(0x1_413b_65fc));
+    }
+
+    #[test]
+    fn rel32_target_cannot_overflow_at_the_ends_of_the_address_space() {
+        assert_eq!(rel32_target(0, -1), None);
+        assert_eq!(rel32_target(usize::MAX, 1), None);
+        assert_eq!(rel32_target(usize::MAX, 0), Some(usize::MAX));
+        assert_eq!(rel32_target(0, i32::MAX), Some(0x7fff_ffff));
+        assert_eq!(rel32_target(0x8000_0000, i32::MIN), Some(0));
+        assert_eq!(rel32_target(0x7fff_ffff, i32::MIN), None);
+    }
+
     // ---- alloc_near: the search, on a fake address space (hazard 5) ------------------------
 
     const LIMITS: Limits = Limits {
@@ -1650,6 +1712,63 @@ mod tests {
         assert_eq!(got, None);
     }
 
+    // ---- alloc_near_all: every target in reach -----------------------------------------------
+
+    /// Run `find_near_all` on `map`, accepting every allocation attempt. Returns the result and
+    /// every address that was tried.
+    fn search_all(map: &Map, targets: &[usize], size: usize) -> (Option<usize>, Vec<usize>) {
+        let mut tries = Vec::new();
+        let got = find_near_all(targets, size, LIMITS, &|a| map.query(a), &mut |a, _| {
+            tries.push(a);
+            true
+        });
+        (got, tries)
+    }
+
+    #[test]
+    fn alloc_near_all_needs_every_target_in_reach() {
+        // Two targets 0x2bd1 bytes apart, like the ends of the two grass distance loads. Their
+        // windows overlap, except for 0x2bd1 bytes at each end.
+        let a = 0x1_4000_0000;
+        let b = a + 0x2bd1;
+        // The lowest granule that `a` reaches, which `b` does not ...
+        let low = (a - GIB2, a - GIB2 + G);
+        // ... and the highest granule that `b` reaches, which `a` does not.
+        let high = (a + GIB2, a + GIB2 + G);
+        assert!(reach_ok(a, low.0, 4096) && !reach_ok(b, low.0, 4096));
+        assert!(reach_ok(b, high.0, 4096) && !reach_ok(a, high.0, 4096));
+
+        let map = Map::with_free(&[low]);
+        assert_eq!(search(&map, a, 4096, |_, _| true).0, Some(low.0), "a alone");
+        assert_eq!(
+            search_all(&map, &[a, b], 4096),
+            (None, vec![]),
+            "b is out of reach"
+        );
+        let map = Map::with_free(&[high]);
+        assert_eq!(
+            search(&map, b, 4096, |_, _| true).0,
+            Some(high.0),
+            "b alone"
+        );
+        assert_eq!(
+            search_all(&map, &[a, b], 4096),
+            (None, vec![]),
+            "a is out of reach"
+        );
+
+        // With a granule that both reach, that one is taken and no other is tried.
+        let both = (a - 0x1000_0000, a - 0x1000_0000 + G);
+        let map = Map::with_free(&[low, both, high]);
+        for targets in [[a, b], [b, a]] {
+            let (got, tries) = search_all(&map, &targets, 4096);
+            assert_eq!(got, Some(both.0), "{targets:x?}");
+            assert_eq!(tries, [both.0], "{targets:x?}");
+        }
+        assert!(reach_ok(a, both.0, 4096) && reach_ok(b, both.0, 4096));
+        assert_eq!(search_all(&map, &[], 4096), (None, vec![]), "no target");
+    }
+
     // ---- alloc_near: the real thing --------------------------------------------------------
 
     #[test]
@@ -1680,6 +1799,23 @@ mod tests {
         // bytes, and nothing else frees it.
         let _block = unsafe { Mem::adopt(a, 4096) };
         assert!(a >= 0x1_0000 && reach_ok(0x2_0000, a, 4096), "{a:#x}");
+    }
+
+    #[test]
+    fn alloc_near_all_gives_a_block_that_every_target_reaches() {
+        let here = alloc_near_all_gives_a_block_that_every_target_reaches as *const () as usize;
+        let targets = [here, here + 0x2bd1];
+        let a = alloc_near_all(&targets, 4096).expect("block");
+        // SAFETY: `alloc_near_all` returns the base of a fresh VirtualAlloc block of at least 4096
+        // bytes, and nothing else frees it.
+        let block = unsafe { Mem::adopt(a, 4096) };
+        assert_eq!(a % G, 0);
+        for t in targets {
+            assert!(reach_ok(t, a, 4096), "{t:#x} -> {a:#x}");
+        }
+        assert_eq!(block.get(0, 4096), vec![0u8; 4096]);
+        assert_eq!(alloc_near_all(&[], 4096), None);
+        assert_eq!(alloc_near_all(&targets, 0), None);
     }
 
     #[test]

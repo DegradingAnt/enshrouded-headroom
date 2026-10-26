@@ -1,7 +1,7 @@
 # Enshrouded mod — design spec v2 (working name: `enshrouded-headroom`)
 
 Status: APPROVED by the author on 2026-10-25 (version 2, with the 23 findings of the adversarial spec review folded in). Next step: the implementation plan.
-Evidence and addresses: [RE-NOTES.md](RE-NOTES.md). Measurements: `reference\old-build\_perf\FINDINGS.md` (a copy from the old install, which is being deleted).
+Evidence and addresses: [RE-NOTES.md](RE-NOTES.md). Measurements: [performance findings](perf-findings.md).
 
 ## 1. Goal
 
@@ -28,7 +28,7 @@ Out of scope for version 1:
 - An in-game menu or overlay.
 - Any setting below the player's menu choice.
 
-Test-environment note: the test machine is the Steam install of the game (`C:\Program Files (x86)\Steam\steamapps\common\Enshrouded`). Its exe starts in Steam's DRM stub, the `.bind` section, and the folder has no `winmm.dll`: one loader (Ultimate ASI Loader), and nothing else that could change what sits in the import slots. (The old install, which is being deleted, had an unexplained `winmm.dll`, 577,024 bytes, "ACME Corporation".) Ultimate ASI Loader handles `.bind`: it ignores calls from that section as triggers (from loader source v10.0.0, unconfirmed in game). The first in-game run uses the loader's `DebugLog=1`.
+Test-environment note: the test machine is the Steam install of the game (`C:\Program Files (x86)\Steam\steamapps\common\Enshrouded`). Its exe starts in Steam's DRM stub, the `.bind` section, and the folder has no `winmm.dll`. After the loader install step in plan Task 17, the folder holds one loader (Ultimate ASI Loader) and nothing else that could change what sits in the import slots. (The old install, which is being deleted, had an unexplained `winmm.dll`, 577,024 bytes, "ACME Corporation".) Ultimate ASI Loader handles `.bind`: it ignores calls from that section as triggers (from loader source v10.0.0, unconfirmed in game). The first in-game run uses the loader's `DebugLog=1`.
 
 ## 3. Constraints
 
@@ -85,7 +85,7 @@ The `_perf\Launch-Enshrouded.ps1` launcher from 2026-10-23 is replaced by this m
 Fact: `FUN_1400f82c0` picks the texture budget from a 5-row table of (VRAM threshold, budget). The top row is ≥10 GiB → 2 GiB. The table is at `0x1413b86d0` and was verified from the decompile and bytes.
 
 Rule: `budget = clamp(VRAM − reserve, 2 GiB, 8 GiB)`, with a default `reserve` of 11 GiB.
-- Why 11 GiB: on the author's 16 GB card with a 6 GiB budget, the card had 15,334 of 16,303 MiB in use, which is about 1 GiB spare (`_perf\FINDINGS.md`, 2026-10-23). The 6.6 GiB that the game uses outside the texture pool comes from the same file (8.6 GiB peak minus the 2 GiB pool).
+- Why 11 GiB: on the author's 16 GB card with a 6 GiB budget, the card had 15,334 of 16,303 MiB in use, which is about 1 GiB spare ([performance findings](perf-findings.md), 2026-10-23). The 6.6 GiB that the game uses outside the texture pool comes from the same file (8.6 GiB peak minus the 2 GiB pool).
 - Examples: 16 GB (15.6 GiB device-local) → 4.6 GiB. 12 GB → 2 GiB, no change. 24 GB → 8 GiB.
 - `.ini`: `TextureBudget = auto | off | <GiB>`.
 
@@ -119,7 +119,7 @@ Fact (bytes at `0x1408490cb`–`0x1408490e8`):
 Method: patch the 16 bytes at `0x1408490d5`–`0x1408490e4` to `b0 01` (`mov al, 1`) followed by 14 bytes of NOPs. The following `mov [rbp+0x3e], al` then stores 1. This is exactly what `--enable-async-compute` produces, and the automatic byte stays untouched.
 
 The patch is skipped if:
-- the command line already has `--enable-async-compute` or `--disable-async-compute`, because the player chose;
+- any command-line argument contains `async-compute` after quotes are removed and ASCII case is ignored (this covers the game's `--enable-async-compute` and `--disable-async-compute`), because the player chose;
 - the `.ini` has `AsyncCompute = game`;
 - the build is unknown (section 9).
 
@@ -318,6 +318,7 @@ The governor raises 7.1, then 7.2, then 7.3. The order is re-checked after the i
 - `Enabled = 1 | 0`
 - `TextureBudget = auto | off | <GiB>` (reserve key `TextureReserveGiB = 11`)
 - `AsyncCompute = on | game`
+- `Priority = above_normal | normal` (default `above_normal`; `normal` leaves the current priority unchanged)
 - `Reflex = auto | off | on | boost`
 - `AllowUnknownBuild = 0 | 1`
 - `LogLevel = error | warn | info | debug`

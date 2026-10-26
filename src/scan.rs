@@ -55,6 +55,24 @@ impl fmt::Display for ScanError {
 
 impl std::error::Error for ScanError {}
 
+impl ScanError {
+    /// The log text for a player: what happened to the game code, not the scan's details (those
+    /// go to the debug log). It does not blame one cause. The caller adds its own prefix.
+    pub fn player_text(&self) -> String {
+        match self {
+            ScanError::Multiple(count) => format!(
+                "the game code matched {count} times, not once (another tool or a different \
+                 build may have changed it)"
+            ),
+            ScanError::NotFound | ScanError::BadPattern(_) => {
+                "the game code was not found (another tool or a different build may have \
+                 changed it)"
+                    .to_owned()
+            }
+        }
+    }
+}
+
 impl Pattern {
     /// Parse space-separated tokens: two hex digits for a byte, `??` for a wildcard.
     ///
@@ -192,20 +210,36 @@ const MAX_HEADER_COPY: usize = 0x10000;
 /// The DOS header is 64 bytes; anything shorter cannot be a PE image.
 const MIN_HEADER_COPY: usize = 0x40;
 
-struct SectionHeader {
+/// One section-table entry, with file and mapped-image ranges kept separate.
+#[derive(Debug)]
+pub(crate) struct SectionHeader {
     /// Zero-padded; a name of exactly 8 bytes has no NUL.
     name: [u8; 8],
-    virtual_size: u32,
-    virtual_address: u32,
-    raw_size: u32,
-    /// File offset of the section's data; only the on-disk cross-check test reads it.
+    /// The section length in memory before alignment.
+    pub(crate) virtual_size: u32,
+    /// The section's relative virtual address.
+    pub(crate) rva: u32,
+    /// The number of bytes stored in the file.
+    pub(crate) raw_size: u32,
+    /// File offset of the section's data; only file tests read it.
     #[cfg_attr(not(test), allow(dead_code))]
-    raw_ptr: u32,
+    pub(crate) raw_ptr: u32,
 }
 
 impl SectionHeader {
-    /// Whole-name comparison. A request longer than 8 bytes never matches (long section names
-    /// that live in the COFF string table are not supported).
+    /// The diagnostic name used by file comparison tests, with invalid UTF-8 replaced.
+    #[cfg(test)]
+    fn name_text(&self) -> String {
+        let end = self
+            .name
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(self.name.len());
+        String::from_utf8_lossy(self.name.get(..end).unwrap_or_default()).into_owned()
+    }
+
+    /// Whole-name comparison. A request longer than 8 bytes never matches
+    /// (long section names that live in the COFF string table are not supported).
     fn is_named(&self, name: &str) -> bool {
         let len = self
             .name
@@ -215,89 +249,254 @@ impl SectionHeader {
         !name.is_empty() && self.name.get(..len) == Some(name.as_bytes())
     }
 
-    /// `(rva, length)` of the section in memory, or `None` if it ends past `limit`. An empty
-    /// section (VirtualSize and SizeOfRawData both 0) is `Some((rva, 0))`, not `None`, so the
-    /// caller can tell "nothing to search" from "outside the module".
+    /// `(rva, length)` of the section in memory, or `None` if it ends past `limit`.
+    /// An empty section (VirtualSize and SizeOfRawData both 0) is `Some((rva, 0))`,
+    /// not `None`, so the caller can tell "nothing to search" from "outside the module".
     fn mem_range(&self, limit: usize) -> Option<(usize, usize)> {
-        // VirtualSize 0 means "use the raw size".
         let len = match self.virtual_size {
             0 => self.raw_size as usize,
             v => v as usize,
         };
-        let rva = self.virtual_address as usize;
+        let rva = self.rva as usize;
         let end = rva.checked_add(len)?;
         (end <= limit).then_some((rva, len))
     }
 }
 
-struct PeInfo {
-    /// Preferred load address; only the on-disk cross-check test reads it (in memory the real
-    /// base comes from the [`Module`]).
+/// Checked PE32+ headers shared by mapped scans and on-disk test helpers.
+#[derive(Debug)]
+pub(crate) struct PeInfo {
+    /// Preferred load address; mapped scans use the actual module base instead.
     #[cfg_attr(not(test), allow(dead_code))]
-    image_base: u64,
+    pub(crate) image_base: u64,
+    /// The loader's declared image length.
     size_of_image: u32,
+    /// The entry point RVA needed by the build comparison.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) entry_rva: u32,
+    /// Section alignment used by the build comparison.
+    #[cfg_attr(not(test), allow(dead_code))]
+    section_alignment: u32,
+    /// End of the complete section table, used by the file validation adapter.
+    #[cfg_attr(not(test), allow(dead_code))]
+    section_table_end: usize,
+    /// Section entries in their original table order.
     sections: Vec<SectionHeader>,
 }
 
+#[cfg(test)]
+impl PeInfo {
+    /// Round the virtual size up to section-aligned pages; zero alignment means one byte.
+    pub(crate) fn pages_of(&self, section: &SectionHeader) -> u64 {
+        let align = u64::from(self.section_alignment.max(1));
+        // Both operands originate in u32 fields, so the rounded value fits u64.
+        u64::from(section.virtual_size)
+            .div_ceil(align)
+            .saturating_mul(align)
+    }
+
+    /// Find the first section by its diagnostic name, as the build comparison does.
+    pub(crate) fn section(&self, name: &str) -> Result<&SectionHeader, String> {
+        self.sections
+            .iter()
+            .find(|s| s.name_text() == name)
+            .ok_or_else(|| format!("no {name} section"))
+    }
+
+    /// The virtual address (image base included) and file bytes of a named section.
+    pub(crate) fn section_va_bytes<'file>(
+        &self,
+        file: &'file [u8],
+        name: &str,
+    ) -> Result<(u64, &'file [u8]), String> {
+        let section = self.section(name)?;
+        let va = self
+            .image_base
+            .checked_add(u64::from(section.rva))
+            .ok_or("section address overflow")?;
+        Ok((va, self.raw_virtual(file, section)?))
+    }
+
+    /// Read the full raw section, including any file padding past its virtual size.
+    pub(crate) fn raw<'file>(
+        &self,
+        file: &'file [u8],
+        section: &SectionHeader,
+    ) -> Result<&'file [u8], String> {
+        self.raw_len(file, section, section.raw_size as usize)
+    }
+
+    /// Read only bytes present in both the file and the declared virtual size.
+    /// Unlike `mem_range`, a zero virtual size yields an empty slice.
+    pub(crate) fn raw_virtual<'file>(
+        &self,
+        file: &'file [u8],
+        section: &SectionHeader,
+    ) -> Result<&'file [u8], String> {
+        self.raw_len(
+            file,
+            section,
+            section.virtual_size.min(section.raw_size) as usize,
+        )
+    }
+
+    /// Extract a checked file range with the requested section length.
+    fn raw_len<'file>(
+        &self,
+        file: &'file [u8],
+        section: &SectionHeader,
+        len: usize,
+    ) -> Result<&'file [u8], String> {
+        let start = section.raw_ptr as usize;
+        let end = start.checked_add(len).ok_or("raw data range overflow")?;
+        file.get(start..end).ok_or_else(|| {
+            format!(
+                "{}: raw data {start:#x}..{end:#x} is past the end of the file ({} bytes)",
+                section.name_text(),
+                file.len()
+            )
+        })
+    }
+
+    /// The `len` file bytes at virtual address `va` (image base included), from the section whose
+    /// bytes in the file (as `raw_virtual` gives them) hold all of them. `Err` if no section does.
+    pub(crate) fn bytes_at_va<'file>(
+        &self,
+        file: &'file [u8],
+        va: u64,
+        len: usize,
+    ) -> Result<&'file [u8], String> {
+        let missing = || format!("{va:#x}+{len:#x} is in no section's bytes in the file");
+        let rva = va
+            .checked_sub(self.image_base)
+            .and_then(|rva| u32::try_from(rva).ok())
+            .ok_or_else(missing)?;
+        for section in &self.sections {
+            let Some(offset) = rva.checked_sub(section.rva) else {
+                continue;
+            };
+            let Ok(bytes) = self.raw_virtual(file, section) else {
+                continue;
+            };
+            let start = offset as usize;
+            if let Some(found) = start.checked_add(len).and_then(|end| bytes.get(start..end)) {
+                return Ok(found);
+            }
+        }
+        Err(missing())
+    }
+
+    /// Name the section containing `rva`, using its unaligned virtual size.
+    pub(crate) fn section_of(&self, rva: u32) -> Option<String> {
+        self.sections
+            .iter()
+            .find(|s| (s.rva..s.rva.saturating_add(s.virtual_size)).contains(&rva))
+            .map(|s| s.name_text())
+    }
+}
+
+/// Read a little-endian word without indexing beyond `b`.
 pub(crate) fn u16_at(b: &[u8], off: usize) -> Option<u16> {
     let end = off.checked_add(2)?;
     Some(u16::from_le_bytes(b.get(off..end)?.try_into().ok()?))
 }
 
+/// Read a little-endian double word without indexing beyond `b`.
 pub(crate) fn u32_at(b: &[u8], off: usize) -> Option<u32> {
     let end = off.checked_add(4)?;
     Some(u32::from_le_bytes(b.get(off..end)?.try_into().ok()?))
 }
 
+/// Read a little-endian quad word without indexing beyond `b`.
 pub(crate) fn u64_at(b: &[u8], off: usize) -> Option<u64> {
     let end = off.checked_add(8)?;
     Some(u64::from_le_bytes(b.get(off..end)?.try_into().ok()?))
 }
 
-/// Parse the PE32+ headers at the start of `b` (a file, or a copy of the header block of a
-/// mapped image). `None` for anything malformed, truncated or not 64-bit; no read goes outside
-/// `b`, and the section table must lie inside `SizeOfImage`.
-fn parse_pe(b: &[u8]) -> Option<PeInfo> {
-    if u16_at(b, 0)? != MZ_MAGIC {
-        return None;
+/// Add a header-relative field offset without wrapping.
+fn pe_offset(base: usize, offset: usize) -> Result<usize, String> {
+    base.checked_add(offset)
+        .ok_or_else(|| "PE header offset overflow".to_owned())
+}
+
+/// Parse PE32+ headers from a file or a copied mapped-image header block.
+/// Every consumed field is bounds checked. The table must end inside `SizeOfImage`.
+/// Mapped scans need the first 24 bytes of each section header; file comparisons
+/// additionally require the whole table through `parse_pe_file`.
+pub(crate) fn parse_pe(b: &[u8]) -> Result<PeInfo, String> {
+    if u16_at(b, 0) != Some(MZ_MAGIC) {
+        return Err("no MZ signature".to_owned());
     }
-    let nt = u32_at(b, 0x3c)? as usize;
-    if u32_at(b, nt)? != PE_SIGNATURE {
-        return None;
+    let nt = u32_at(b, 0x3c).ok_or("no e_lfanew at 0x3c")? as usize;
+    if u32_at(b, nt) != Some(PE_SIGNATURE) {
+        return Err(format!("no PE signature at e_lfanew {nt:#x}"));
     }
-    let file_header = nt.checked_add(4)?;
-    let n_sections = usize::from(u16_at(b, file_header.checked_add(2)?)?);
-    let optional_size = usize::from(u16_at(b, file_header.checked_add(16)?)?);
-    let optional = file_header.checked_add(20)?;
-    if u16_at(b, optional)? != PE32_PLUS_MAGIC || optional_size < MIN_OPTIONAL_HEADER {
-        return None;
+    let file_header = pe_offset(nt, 4)?;
+    let n_sections =
+        usize::from(u16_at(b, pe_offset(file_header, 2)?).ok_or("no NumberOfSections")?);
+    let optional_size =
+        usize::from(u16_at(b, pe_offset(file_header, 16)?).ok_or("no SizeOfOptionalHeader")?);
+    let optional = pe_offset(file_header, 20)?;
+    if u16_at(b, optional) != Some(PE32_PLUS_MAGIC) || optional_size < MIN_OPTIONAL_HEADER {
+        return Err("the optional header is not PE32+ (magic 0x20b) or is too short".to_owned());
     }
-    let image_base = u64_at(b, optional.checked_add(24)?)?;
-    let size_of_image = u32_at(b, optional.checked_add(56)?)?;
+    let image_base = u64_at(b, pe_offset(optional, 24)?).ok_or("no ImageBase")?;
+    let size_of_image = u32_at(b, pe_offset(optional, 56)?).ok_or("no SizeOfImage")?;
     if size_of_image == 0 || n_sections == 0 || n_sections > MAX_SECTIONS {
-        return None;
+        return Err("invalid SizeOfImage or NumberOfSections".to_owned());
     }
-    let table = optional.checked_add(optional_size)?;
-    let table_end = table.checked_add(n_sections * SECTION_HEADER_LEN)?;
+    let table = pe_offset(optional, optional_size)?;
+    let table_len = n_sections
+        .checked_mul(SECTION_HEADER_LEN)
+        .ok_or("section table length overflow")?;
+    let table_end = pe_offset(table, table_len)?;
     if table_end > size_of_image as usize {
-        return None;
+        return Err("section table is past SizeOfImage".to_owned());
     }
     let mut sections = Vec::with_capacity(n_sections);
     for i in 0..n_sections {
-        let at = table.checked_add(i * SECTION_HEADER_LEN)?;
+        let offset = i
+            .checked_mul(SECTION_HEADER_LEN)
+            .ok_or("section offset overflow")?;
+        let at = pe_offset(table, offset)?;
+        let header = b
+            .get(at..pe_offset(at, 24)?)
+            .ok_or_else(|| format!("section header {i} is past the end of the file"))?;
+        let name: [u8; 8] = header
+            .get(..8)
+            .ok_or("section name")?
+            .try_into()
+            .map_err(|_| "section name")?;
         sections.push(SectionHeader {
-            name: b.get(at..at.checked_add(8)?)?.try_into().ok()?,
-            virtual_size: u32_at(b, at.checked_add(8)?)?,
-            virtual_address: u32_at(b, at.checked_add(12)?)?,
-            raw_size: u32_at(b, at.checked_add(16)?)?,
-            raw_ptr: u32_at(b, at.checked_add(20)?)?,
+            name,
+            virtual_size: u32_at(header, 8).ok_or("VirtualSize")?,
+            rva: u32_at(header, 12).ok_or("VirtualAddress")?,
+            raw_size: u32_at(header, 16).ok_or("SizeOfRawData")?,
+            raw_ptr: u32_at(header, 20).ok_or("PointerToRawData")?,
         });
     }
-    Some(PeInfo {
+    Ok(PeInfo {
         image_base,
         size_of_image,
+        entry_rva: u32_at(b, pe_offset(optional, 16)?).ok_or("no AddressOfEntryPoint")?,
+        section_alignment: u32_at(b, pe_offset(optional, 32)?).ok_or("no SectionAlignment")?,
+        section_table_end: table_end,
         sections,
     })
+}
+
+/// Require complete 40-byte section headers for the on-disk build comparison.
+/// This validates the table extent already found by the single shared walker.
+#[cfg(test)]
+pub(crate) fn parse_pe_file(b: &[u8]) -> Result<PeInfo, String> {
+    let pe = parse_pe(b)?;
+    if b.get(..pe.section_table_end).is_none() {
+        return Err(format!(
+            "section header {} is past the end of the file",
+            pe.sections.len().saturating_sub(1)
+        ));
+    }
+    Ok(pe)
 }
 
 // ---- readable memory ----------------------------------------------------------------------
@@ -384,7 +583,7 @@ fn read_pe(m: &Module) -> Option<PeInfo> {
     if m.base == 0 {
         return None;
     }
-    parse_pe(&read_headers(m.base, m.size)?)
+    parse_pe(&read_headers(m.base, m.size)?).ok()
 }
 
 /// The running exe: base from `GetModuleHandleW(NULL)`, size from its PE `SizeOfImage`.
@@ -401,7 +600,7 @@ pub fn main_module() -> Module {
         0
     } else {
         read_headers(base, usize::MAX)
-            .and_then(|h| parse_pe(&h))
+            .and_then(|h| parse_pe(&h).ok())
             .map_or(0, |pe| pe.size_of_image as usize)
     };
     Module { base, size }
@@ -515,6 +714,22 @@ mod tests {
             Pattern::parse("zz"),
             Err(ScanError::BadPattern(_))
         ));
+    }
+
+    #[test]
+    fn player_text_says_what_happened_and_not_the_scan_details() {
+        let not_found = "the game code was not found (another tool or a different build may \
+                         have changed it)";
+        assert_eq!(ScanError::NotFound.player_text(), not_found);
+        assert_eq!(
+            ScanError::BadPattern("bad token".into()).player_text(),
+            not_found
+        );
+        assert_eq!(
+            ScanError::Multiple(3).player_text(),
+            "the game code matched 3 times, not once (another tool or a different build may \
+             have changed it)"
+        );
     }
 
     #[test]
@@ -713,6 +928,20 @@ mod tests {
         b
     }
 
+    /// A section header must fit completely, including its unused trailing fields.
+    #[test]
+    fn shared_file_parser_requires_complete_section_headers() {
+        let file = synth_pe(&[(".text", 0x1000, 0x1000, 0x200, 0x400)], 0x2000);
+        let table = 0x188;
+        for trailing in 24..40 {
+            assert!(
+                parse_pe_file(&file[..table + trailing]).is_err(),
+                "{trailing}"
+            );
+        }
+        assert!(parse_pe_file(&file[..table + 40]).is_ok());
+    }
+
     #[test]
     fn parse_pe_reads_the_fields() {
         let b = synth_pe(
@@ -729,7 +958,7 @@ mod tests {
         let t = &info.sections[0];
         assert!(t.is_named(".text") && !t.is_named(".rdata"));
         assert_eq!(
-            (t.virtual_size, t.virtual_address, t.raw_size, t.raw_ptr),
+            (t.virtual_size, t.rva, t.raw_size, t.raw_ptr),
             (0x2000, 0x1000, 0x1e00, 0x400)
         );
         assert!(info.sections[1].is_named(".rdata"));
@@ -760,7 +989,7 @@ mod tests {
         let h = |vsize, va, rsize| SectionHeader {
             name: [0; 8],
             virtual_size: vsize,
-            virtual_address: va,
+            rva: va,
             raw_size: rsize,
             raw_ptr: 0,
         };
@@ -798,11 +1027,11 @@ mod tests {
     #[test]
     fn parse_pe_rejects_bad_headers() {
         let good = synth_pe(&[(".text", 0x1000, 0x1000, 0x200, 0x400)], 0x2000);
-        assert!(parse_pe(&good).is_some());
+        assert!(parse_pe(&good).is_ok());
         let with = |edit: &dyn Fn(&mut Vec<u8>)| {
             let mut b = good.clone();
             edit(&mut b);
-            parse_pe(&b).is_some()
+            parse_pe(&b).is_ok()
         };
         assert!(!with(&|b| b[0] = b'X'), "bad MZ");
         assert!(!with(&|b| b[0x80] = b'X'), "bad PE signature");
@@ -847,7 +1076,7 @@ mod tests {
             !with(&|b| b[OPT + 56..OPT + 60].copy_from_slice(&0x100u32.to_le_bytes())),
             "table past image"
         );
-        assert!(parse_pe(&[]).is_none());
+        assert!(parse_pe(&[]).is_err());
     }
 
     #[test]
@@ -860,10 +1089,10 @@ mod tests {
             0x3000,
         );
         // Every truncation length. The parser reads the first 24 bytes of each 40-byte section
-        // header, so the last header's fields end at 0x188 + 40 + 24; anything shorter is None.
+        // header, so the last header's fields end at 0x188 + 40 + 24; anything shorter is an error.
         for n in 0..=good.len() {
             let r = parse_pe(&good[..n]);
-            assert_eq!(r.is_some(), n >= 0x188 + 40 + 24, "len {n}");
+            assert_eq!(r.is_ok(), n >= 0x188 + 40 + 24, "len {n}");
         }
         // Every byte of the headers set to each of a few extreme values.
         for i in 0..0x230 {
@@ -873,6 +1102,302 @@ mod tests {
                 let _ = parse_pe(&b);
             }
         }
+    }
+
+    #[test]
+    fn parse_pe_reports_a_bad_file_instead_of_panicking() {
+        assert!(parse_pe_file(&[]).is_err());
+        assert!(parse_pe_file(&[0u8; 0x40]).is_err());
+        // A valid e_lfanew that points past the end of the file.
+        let mut file = vec![0u8; 0x40];
+        file[..2].copy_from_slice(b"MZ");
+        file[0x3c] = 0xff;
+        let error = parse_pe_file(&file).unwrap_err();
+        assert!(error.contains("PE signature at e_lfanew 0xff"), "{error}");
+        // A PE signature, then nothing.
+        let mut file = vec![0u8; 0x80];
+        file[..2].copy_from_slice(b"MZ");
+        file[0x3c] = 0x40;
+        file[0x40..0x44].copy_from_slice(b"PE\0\0");
+        let error = parse_pe_file(&file).unwrap_err();
+        assert!(error.contains("PE32+"), "{error}");
+    }
+
+    // ---- the PE reader, on files made here (always run) --------------------------------------
+
+    /// Where `tiny_pe` puts things: `e_lfanew`, the optional header and the section table.
+    const NT: usize = 0x40;
+    /// Offset of the optional header in `tiny_pe`.
+    const OPTIONAL: usize = NT + 24;
+    /// Optional-header length in `tiny_pe`.
+    const OPTIONAL_SIZE: usize = 0xf0;
+    /// Offset of the section table in `tiny_pe`.
+    const TABLE: usize = OPTIONAL + OPTIONAL_SIZE;
+
+    /// A PE32+ file of 0x600 bytes with the given sections `(name, virtual size, rva, raw size,
+    /// raw pointer)`, `SectionAlignment` 0x1000 and the entry point `entry`. Byte `i` of the file
+    /// is `i as u8` from 0x200 on, so a slice of it can be told by its first and last byte.
+    fn tiny_pe(entry: u32, sections: &[(&str, u32, u32, u32, u32)]) -> Vec<u8> {
+        let mut file = vec![0u8; 0x600];
+        for (i, byte) in file.iter_mut().enumerate().skip(0x200) {
+            *byte = i as u8;
+        }
+        let mut put32 = |at: usize, value: u32| {
+            file[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        };
+        put32(0, 0x5a4d);
+        put32(OPTIONAL + 56, 0x2000_0000);
+        put32(0x3c, NT as u32);
+        put32(OPTIONAL + 16, entry);
+        put32(OPTIONAL + 32, 0x1000);
+        for (i, (_, vsize, rva, raw_size, raw_ptr)) in sections.iter().enumerate() {
+            let at = TABLE + i * 40;
+            put32(at + 8, *vsize);
+            put32(at + 12, *rva);
+            put32(at + 16, *raw_size);
+            put32(at + 20, *raw_ptr);
+        }
+        file[NT..NT + 4].copy_from_slice(b"PE\0\0");
+        file[NT + 6..NT + 8].copy_from_slice(&(sections.len() as u16).to_le_bytes());
+        file[NT + 20..NT + 22].copy_from_slice(&(OPTIONAL_SIZE as u16).to_le_bytes());
+        file[OPTIONAL..OPTIONAL + 2].copy_from_slice(&0x20bu16.to_le_bytes());
+        for (i, (name, ..)) in sections.iter().enumerate() {
+            let at = TABLE + i * 40;
+            file[at..at + name.len()].copy_from_slice(name.as_bytes());
+        }
+        file
+    }
+
+    /// `.text` is rva 0x1000..0x2234 (virtual size 0x1234, raw 0x200 bytes at 0x200) and `.bind`
+    /// is 0x3000..0x3100 (raw 0x100 bytes at 0x400); the entry point is in `.bind`.
+    fn two_section_pe() -> Vec<u8> {
+        tiny_pe(
+            0x3010,
+            &[
+                (".text", 0x1234, 0x1000, 0x200, 0x200),
+                (".bind", 0x100, 0x3000, 0x100, 0x400),
+            ],
+        )
+    }
+
+    #[test]
+    fn parse_pe_reads_the_headers_of_a_two_section_file() {
+        let file = two_section_pe();
+        let pe = parse_pe_file(&file).unwrap();
+        assert_eq!((pe.entry_rva, pe.section_alignment), (0x3010, 0x1000));
+        let names: Vec<String> = pe.sections.iter().map(|s| s.name_text()).collect();
+        assert_eq!(names, [".text", ".bind"]);
+        let bind = pe.section(".bind").unwrap();
+        assert_eq!(
+            (bind.virtual_size, bind.rva, bind.raw_size, bind.raw_ptr),
+            (0x100, 0x3000, 0x100, 0x400)
+        );
+        assert!(pe.section(".gone").unwrap_err().contains(".gone"));
+        // A name that fills all 8 bytes has no NUL; the next field must not run into it.
+        let long = tiny_pe(0, &[("abcdefgh", 1, 0x1000, 0, 0)]);
+        assert_eq!(
+            parse_pe_file(&long).unwrap().sections[0].name_text(),
+            "abcdefgh"
+        );
+    }
+
+    #[test]
+    fn pages_of_rounds_the_virtual_size_up_to_whole_pages() {
+        let file = two_section_pe();
+        let pe = parse_pe_file(&file).unwrap();
+        assert_eq!(pe.pages_of(pe.section(".text").unwrap()), 0x2000);
+        assert_eq!(pe.pages_of(pe.section(".bind").unwrap()), 0x1000);
+        // Zero, one page less one byte, exactly one page, one page and one byte.
+        let sizes = [(0, 0), (0xfff, 0x1000), (0x1000, 0x1000), (0x1001, 0x2000)];
+        for (virtual_size, pages) in sizes {
+            let file = tiny_pe(0, &[("a", virtual_size, 0x1000, 0, 0)]);
+            let pe = parse_pe_file(&file).unwrap();
+            assert_eq!(
+                pe.pages_of(&pe.sections[0]),
+                pages,
+                "size {virtual_size:#x}"
+            );
+        }
+        // The Steam header (exact size) and the old header (rounded) are the same pages.
+        let file = tiny_pe(
+            0,
+            &[
+                ("steam", 0x13b0730, 0x1000, 0, 0),
+                ("old", 0x13b1000, 0x1000, 0, 0),
+            ],
+        );
+        let pe = parse_pe_file(&file).unwrap();
+        assert_eq!(pe.pages_of(&pe.sections[0]), 0x13b1000);
+        assert_eq!(pe.pages_of(&pe.sections[0]), pe.pages_of(&pe.sections[1]));
+        // A zero alignment must not divide by zero: sizes are then taken as they are.
+        let mut file = two_section_pe();
+        file[OPTIONAL + 32..OPTIONAL + 36].fill(0);
+        let pe = parse_pe_file(&file).unwrap();
+        assert_eq!(pe.pages_of(pe.section(".text").unwrap()), 0x1234);
+    }
+
+    #[test]
+    fn section_of_is_exact_at_the_edges_of_a_section() {
+        let file = two_section_pe();
+        let pe = parse_pe_file(&file).unwrap();
+        let cases = [
+            (0x0fff, None),
+            (0x1000, Some(".text")),
+            (0x2233, Some(".text")),
+            (0x2234, None),
+            (0x2fff, None),
+            (0x3000, Some(".bind")),
+            (0x30ff, Some(".bind")),
+            (0x3100, None),
+            (u32::MAX, None),
+        ];
+        for (rva, want) in cases {
+            assert_eq!(pe.section_of(rva).as_deref(), want, "rva {rva:#x}");
+        }
+        assert_eq!(pe.section_of(pe.entry_rva).as_deref(), Some(".bind"));
+    }
+
+    #[test]
+    fn raw_gives_the_bytes_of_a_section_and_an_error_when_the_file_is_too_short() {
+        let file = two_section_pe();
+        let pe = parse_pe_file(&file).unwrap();
+        let (text, bind) = (pe.section(".text").unwrap(), pe.section(".bind").unwrap());
+        let got = pe.raw(&file, text).unwrap();
+        assert_eq!((got.len(), got[0], got[0x1ff]), (0x200, 0x00, 0xff));
+        let got = pe.raw(&file, bind).unwrap();
+        assert_eq!((got.len(), got[0], got[0xff]), (0x100, 0x00, 0xff));
+        // The file ends exactly where `.text` ends: enough. One byte earlier: not.
+        assert!(pe.raw(file.get(..0x400).unwrap(), text).is_ok());
+        let error = pe.raw(file.get(..0x3ff).unwrap(), text).unwrap_err();
+        assert!(
+            error.contains(".text") && error.contains("past the end"),
+            "{error}"
+        );
+        // `.bind` starts past the end of a file of 0x300 bytes.
+        assert!(pe.raw(file.get(..0x300).unwrap(), bind).is_err());
+        assert!(pe.raw(&[], text).is_err());
+    }
+
+    #[test]
+    fn bytes_at_va_reads_the_file_bytes_of_a_virtual_address() {
+        let mut file = two_section_pe();
+        file[OPTIONAL + 24..OPTIONAL + 32].copy_from_slice(&0x1_4000_0000u64.to_le_bytes());
+        let pe = parse_pe_file(&file).unwrap();
+        // Byte `i` of the file is `i as u8` from 0x200 on: `.text` rva 0x1000 is file 0x200,
+        // `.bind` rva 0x3000 is file 0x400.
+        assert_eq!(
+            pe.bytes_at_va(&file, 0x1_4000_1010, 4),
+            Ok(&[0x10, 0x11, 0x12, 0x13][..])
+        );
+        assert_eq!(
+            pe.bytes_at_va(&file, 0x1_4000_11fc, 4),
+            Ok(&[0xfc, 0xfd, 0xfe, 0xff][..])
+        );
+        assert_eq!(
+            pe.bytes_at_va(&file, 0x1_4000_30fc, 4),
+            Ok(&[0xfc, 0xfd, 0xfe, 0xff][..])
+        );
+        for va in [
+            0x1_4000_11fd, // runs past the 0x200 file bytes of `.text`
+            0x1_4000_1200, // in `.text` in memory, but not in the file
+            0x1_4000_2ffe, // between the sections, running into `.bind`
+            0x1_4000_30fd, // runs past the end of `.bind`
+            0x1010,        // below the image base
+            u64::MAX,
+        ] {
+            assert!(pe.bytes_at_va(&file, va, 4).is_err(), "{va:#x}");
+        }
+    }
+
+    #[test]
+    fn a_truncated_or_wrong_pe_is_an_error_not_a_panic() {
+        let file = two_section_pe();
+        // The section table starts at TABLE; its two headers end at TABLE + 80.
+        assert_eq!(TABLE, 0x148);
+        assert!(parse_pe_file(file.get(..TABLE + 80).unwrap()).is_ok());
+        let error = parse_pe_file(file.get(..TABLE + 79).unwrap()).unwrap_err();
+        assert!(error.contains("section header 1"), "{error}");
+        let error = parse_pe_file(file.get(..TABLE + 40).unwrap()).unwrap_err();
+        assert!(error.contains("section header 1"), "{error}");
+        let error = parse_pe_file(file.get(..TABLE).unwrap()).unwrap_err();
+        assert!(error.contains("section header 0"), "{error}");
+        // Cut inside the optional header.
+        assert!(parse_pe_file(file.get(..OPTIONAL + 20).unwrap()).is_err());
+        // A PE32 (magic 0x10b) file is refused.
+        let mut pe32 = two_section_pe();
+        pe32[OPTIONAL..OPTIONAL + 2].copy_from_slice(&0x10bu16.to_le_bytes());
+        assert!(parse_pe_file(&pe32).unwrap_err().contains("PE32+"));
+        // No signature.
+        let mut unsigned = two_section_pe();
+        unsigned[NT] = b'X';
+        assert!(parse_pe_file(&unsigned).unwrap_err().contains("signature"));
+    }
+
+    /// File padding and zero virtual sizes keep the original file-helper semantics.
+    #[test]
+    fn raw_and_raw_virtual_keep_their_distinct_lengths() {
+        for virtual_size in [0u32, 1, 0x100, 0x200, 0x300] {
+            let file = tiny_pe(0, &[(".text", virtual_size, 0x1000, 0x200, 0x200)]);
+            let pe = parse_pe_file(&file).unwrap();
+            let section = pe.section(".text").unwrap();
+            assert_eq!(pe.raw(&file, section).unwrap(), &file[0x200..0x400]);
+            let len = virtual_size.min(0x200) as usize;
+            assert_eq!(
+                pe.raw_virtual(&file, section).unwrap(),
+                &file[0x200..0x200 + len]
+            );
+            assert_eq!(
+                pe.section_va_bytes(&file, ".text").unwrap(),
+                (pe.image_base + 0x1000, &file[0x200..0x200 + len])
+            );
+            assert!(pe.section_va_bytes(&file[..0x1ff], ".text").is_err());
+            assert!(pe
+                .section_va_bytes(&file, ".gone")
+                .unwrap_err()
+                .contains(".gone"));
+            let mut overflow = parse_pe_file(&file).unwrap();
+            overflow.image_base = u64::MAX;
+            assert!(overflow
+                .section_va_bytes(&file, ".text")
+                .unwrap_err()
+                .contains("overflow"));
+            assert!(pe.raw_virtual(&file[..0x1ff], section).is_err());
+            if len > 0 {
+                assert!(pe.raw_virtual(&file[..0x200 + len - 1], section).is_err());
+            }
+        }
+    }
+
+    /// Extreme declared raw ranges return errors without wrapping their end offsets.
+    #[test]
+    fn shared_parser_bounds_extreme_raw_ranges_and_table_counts() {
+        let file = tiny_pe(0, &[(".text", u32::MAX, u32::MAX, u32::MAX, u32::MAX)]);
+        let pe = parse_pe_file(&file).unwrap();
+        let section = pe.section(".text").unwrap();
+        assert!(pe.raw(&file, section).is_err());
+        assert!(pe.raw_virtual(&file, section).is_err());
+        assert_eq!(pe.pages_of(section), 0x1_0000_0000);
+        assert_eq!(pe.section_of(u32::MAX).as_deref(), None);
+
+        let table = 0x188;
+        let mut many = synth_pe(&[(".text", 1, 0x1000, 0, 0)], 0x4000);
+        many.resize(table + MAX_SECTIONS * SECTION_HEADER_LEN, 0);
+        many[0x86..0x88].copy_from_slice(&(MAX_SECTIONS as u16).to_le_bytes());
+        assert_eq!(parse_pe_file(&many).unwrap().sections.len(), MAX_SECTIONS);
+        many[0x86..0x88].copy_from_slice(&((MAX_SECTIONS + 1) as u16).to_le_bytes());
+        assert!(parse_pe_file(&many).is_err());
+    }
+
+    /// Diagnostic UTF-8 replacement never changes the raw-name matching used by scans.
+    #[test]
+    fn shared_parser_keeps_raw_names_and_lossy_diagnostics_separate() {
+        let mut file = two_section_pe();
+        file[TABLE] = 0xff;
+        let pe = parse_pe_file(&file).unwrap();
+        let section = &pe.sections[0];
+        assert!(!section.is_named("\u{fffd}text"));
+        assert_eq!(section.name_text(), "\u{fffd}text");
+        assert_eq!(pe.section_of(0x1000).as_deref(), Some("\u{fffd}text"));
     }
 
     // ---- readable memory ------------------------------------------------------------------
@@ -1608,7 +2133,7 @@ mod tests {
             bytes.resize(end, 0);
             bytes[0x86..0x88].copy_from_slice(&count.to_le_bytes());
             assert_eq!(
-                parse_pe(&bytes).is_some(),
+                parse_pe(&bytes).is_ok(),
                 count == 96,
                 "{count} complete headers"
             );
@@ -1625,7 +2150,7 @@ mod tests {
         assert_eq!(parse_pe(&bytes).unwrap().sections.len(), 2);
         bytes[OPT + 56..OPT + 60].copy_from_slice(&((table_end - 1) as u32).to_le_bytes());
         assert!(
-            parse_pe(&bytes).is_none(),
+            parse_pe(&bytes).is_err(),
             "the last header byte is outside SizeOfImage"
         );
     }

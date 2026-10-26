@@ -15,6 +15,7 @@ use crate::build_id::{self, Build};
 use crate::config::{self, Config, INI_FILE_NAME};
 use crate::features;
 use crate::guard;
+use crate::knobs;
 
 /// Sub-folder of `%LOCALAPPDATA%` for the settings file when the module folder has none and cannot
 /// hold one. It is the same folder the log falls back to.
@@ -259,10 +260,34 @@ pub fn start() {
     // `GetProcAddress` import slot, not code, so it does not wait for `code_patches_allowed` and
     // runs on unknown builds too. It runs after step 8, whose table the first device's hook writes,
     // and logs `vk wrapper installed`, or why it is off.
-    crate::vk::init(crate::vk::TextureSettings {
-        mode: cfg.general.texture_budget,
-        reserve_gib: cfg.general.texture_reserve_gib,
-    });
+    // The first device's hook also applies `Priority` (features::priority).
+    crate::vk::init(
+        crate::vk::TextureSettings {
+            mode: cfg.general.texture_budget,
+            reserve_gib: cfg.general.texture_reserve_gib,
+        },
+        cfg.general.priority,
+    );
+
+    // 11. The scene-settings hook: object draw distance, the detail-scattering level and the
+    // governor's world-rendering signal. It hooks code, so it asks `code_patches_allowed`; it is
+    // installed when any distance knob is on, and logs its own line, including why it is off. It
+    // is only created and queued here: the last step enables it.
+    knobs::object_distance::init(&cfg.knobs);
+
+    // 12. The grass distance redirect: both High-level grass distance loads are pointed at a float
+    // in the mod's own page, which holds the game's 90 m. It patches code (two disp32s, no hook),
+    // so it asks `code_patches_allowed`; it runs only with `EnableScatterDistance = 1` and logs its
+    // own line, including why it is off. It must run before the game builds a scene, which holds
+    // here: `InitializeASI` runs before `WinMain`.
+    knobs::scatter_distance::init(&cfg.knobs);
+
+    // Later code hooks (Task 14's terrain hook) are created and queued above this line, so they
+    // join the one batch below.
+
+    // 13. Enable every queued hook at once (MinHook's queued enable). This is the only place that
+    // enables hooks. It logs one line if any hook was queued.
+    knobs::enable_queued_hooks();
 }
 
 #[cfg(test)]
@@ -392,6 +417,30 @@ mod tests {
     }
 
     #[test]
+    fn unwritable_folder_gives_defaults_and_a_warning() {
+        with_scratch("cfg-unwritable", |base| {
+            let dir = unusable_dir(base, "settings");
+            let (cfg, warnings, file) = load_settings(&[dir]);
+            assert_eq!(cfg, Config::default());
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert_eq!(file, None);
+        });
+    }
+
+    #[test]
+    fn unreadable_settings_path_gives_defaults_and_a_warning_and_is_not_replaced() {
+        with_scratch("cfg-unreadable", |base| {
+            let path = base.join(INI_FILE_NAME);
+            std::fs::create_dir(&path).unwrap(); // a folder where the file should be
+            let (cfg, warnings, file) = load_settings(&[base.to_path_buf()]);
+            assert_eq!(cfg, Config::default());
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert_eq!(file, None);
+            assert!(path.is_dir());
+        });
+    }
+
+    #[test]
     fn an_unusable_module_folder_gets_its_ini_in_the_fallback() {
         with_scratch("module-unusable-create", |base| {
             let module = unusable_dir(base, "module");
@@ -449,11 +498,15 @@ mod tests {
             let ini = write_ini(&fallback, 120);
             let (cfg, warnings, file) = load_settings(&[module.clone(), fallback]);
             assert_eq!(cfg.governor.target_fps, 120);
-            assert_eq!(file, Some(ini));
+            assert_eq!(file, Some(ini.clone()));
             assert!(warnings.is_empty(), "{warnings:?}");
             assert!(
                 !module.join(INI_FILE_NAME).exists(),
                 "the module folder must stay empty"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&ini).unwrap(),
+                "[Governor]\nTargetFps=120\n"
             );
         });
     }
