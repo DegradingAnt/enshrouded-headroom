@@ -208,6 +208,10 @@ pub fn start() {
     // for `code_patches_allowed`: on any build it needs the whole 80-byte table to match. It logs
     // its own line, including why it is off.
     features::texture_budget::init(&cfg.general.texture_budget);
+
+    // 9. Async compute. It patches code, so it asks `code_patches_allowed` (set above) before it
+    // touches the game, and it logs its own line, including why it is off.
+    features::async_compute::init(&cfg.general.async_compute);
 }
 
 #[cfg(test)]
