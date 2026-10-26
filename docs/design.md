@@ -209,13 +209,48 @@ Method (NVIDIA only, and only if the driver lists `VK_NV_low_latency2`):
    - The sleep runs on the thread that presents, before it starts the next frame's work. Whether that also delays the game's input sampling depends on the game's threading, which is not known. That is why Reflex is experimental and must be measured.
 5. **Measurement.** Every 5 s, on the present thread (inside `wrap_present`, on that frame's swapchain, which is valid there), the mod reads `vkGetLatencyTimingsNV` and logs the average latency from simulation start to GPU render end, and present to display.
 
-`.ini`: `Reflex = auto | off | on | boost`.
-- `auto`: on for NVIDIA GPUs whose driver lists `VK_NV_low_latency2`, and off otherwise. The game's own `nvidiaReflex` option is not read: it is not shown on Vulkan, and no game code reads it.
-- Default: `auto` (the author, 2026-10-25: "On for NVIDIA"). This replaces the earlier `game` value, which followed a menu option that does not exist on Vulkan.
+`.ini`: `Reflex = game | auto | off | on | boost`, default `auto`.
+- Every enabled mode requires an NVIDIA GPU whose driver lists `VK_NV_low_latency2`.
+- `auto` and `on` enable Reflex without boost; `boost` enables it with boost; `off` disables it.
+- `game` follows the player's saved in-game Reflex value: 0 is off, 1 is on and 2 is boost.
+  A missing or unknown value uses the `auto` answer. Reading the saved value belongs to future wiring.
+- A bad setting warns and falls back to `auto`.
+
+W19 implements only the pure device planner and mode decision. Its extension list contains
+`VK_NV_low_latency2`, plus `VK_KHR_timeline_semaphore` below Vulkan 1.2, without duplicates.
+Tasks 16/16b own the runtime wiring. Task 16 must also check the driver capabilities, present-ID
+prerequisites and create-call retry rules above before using the plan.
 
 Proof: the mod log shows the extension and latency mode enabled, and the logged latency is lower with Reflex on than off, at the same spot and the same fps. If it is not lower, that result goes to the author, who decides the default.
 
-Types: `ash` 0.38.0 has `SwapchainLatencyCreateInfoNV` but not every newer struct. Missing structs are defined in the mod as `#[repr(C)]` from the Vulkan headers.
+Types: `ash` 0.38.0 already has all `VK_NV_low_latency2` structs. The pure layer reuses them.
+`src/vk/types.rs` defines the missing AMD types from the pinned Khronos registry.
+
+### 6.6 AMD Anti-Lag 2 (experimental)
+
+Anti-Lag is not verified on AMD hardware. W19 adds only pure planning, mode decisions, AMD ABI
+types and an atomic call sequencer. It makes no driver calls. Task 16b owns the runtime wiring.
+
+`.ini`: `AntiLag = auto | off | on`, default `auto`.
+- `auto` enables Anti-Lag for AMD GPUs (vendor ID `0x1002`) only when the driver lists
+  `VK_AMD_anti_lag` and reports the `antiLag` feature.
+- `on` still requires the extension and feature. `off` disables it.
+- A bad setting warns and falls back to `auto`.
+- Reflex and Anti-Lag are never enabled together. The GPU vendor decides the automatic path;
+  an active Reflex mode blocks Anti-Lag even with an explicit `on` setting.
+- The device planner skips groups with more than one device. It avoids duplicate extension and
+  feature-chain entries. Future wiring must query capabilities before applying it.
+
+For one serialized present stream, the counter starts at 1. The first present has no PRESENT marker.
+After it returns, the sequencer plans INPUT(2), then PRESENT(2) before the second present, then
+INPUT(3), and so on. The INPUT stage is an approximation, called after the previous present returns.
+Future wiring must execute every returned call in order. The sequencer itself sends nothing.
+
+A lost device disables the sequencer at once. Three consecutive driver updates taking more than
+100 ms disable it for the session; an update at or below 100 ms resets the streak. The caller
+measures these durations and logs the single disable transition. Counter exhaustion also stops
+planning rather than wrapping a frame ID. The data helper sets ON with no frame-rate cap and
+clears both extension chains. Its presentation-info pointer must remain valid through the call.
 
 ## 7. Knobs
 
@@ -319,7 +354,8 @@ The governor raises 7.1, then 7.2, then 7.3. The order is re-checked after the i
 - `TextureBudget = auto | off | <GiB>` (reserve key `TextureReserveGiB = 11`)
 - `AsyncCompute = on | game`
 - `Priority = above_normal | normal` (default `above_normal`; `normal` leaves the current priority unchanged)
-- `Reflex = auto | off | on | boost`
+- `Reflex = game | auto | off | on | boost` (default `auto`)
+- `AntiLag = auto | off | on` (default `auto`)
 - `AllowUnknownBuild = 0 | 1`
 - `LogLevel = error | warn | info | debug`
 
@@ -335,7 +371,7 @@ The governor raises 7.1, then 7.2, then 7.3. The order is re-checked after the i
 - `ScatterProbe = 0 | 1`: log the scatter counters (7.2a).
 - `ForceStepObjectDistance`, `ForceStepScatterDistance`, `ForceStepTerrainDistance = 0..=4`: hold that knob at a fixed step for testing (pre-flight ruling for Task 17).
 
-Unknown keys and out-of-range values are logged. Out-of-range values are clamped.
+Unknown keys and invalid values are logged. Invalid choices use their defaults. Out-of-range numeric values are clamped.
 
 ## 9. Failure handling
 
