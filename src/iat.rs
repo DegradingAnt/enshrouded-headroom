@@ -509,14 +509,23 @@ mod tests {
 
     #[test]
     fn swapping_a_slot_for_its_own_value_changes_nothing_and_keeps_the_protection() {
+        if crate::patch::test_support::isolated_process(
+            "iat::tests::swapping_a_slot_for_its_own_value_changes_nothing_and_keeps_the_protection",
+            "HEADROOM_IAT_MUTATION_PARENT",
+        ) {
+            return;
+        }
+        assert!(
+            std::env::var_os("HEADROOM_IAT_MUTATION_PARENT").is_some(),
+            "image mutation must run in an isolated child"
+        );
         let m = crate::scan::main_module();
         let slot = find_in(&m, "kernel32.dll", "GetProcAddress").unwrap() as *mut usize;
         let before = protect_of(slot as usize);
         // SAFETY: `slot` is a checked, aligned, readable IAT entry of the test binary's image.
         let current = unsafe { *slot };
-        // Same value in and out: no other test can see a difference.
-        // SAFETY: `slot` is the test binary's own GetProcAddress import. It is written with the
-        // value it already holds, so no running code can notice, and nothing borrows it.
+        // SAFETY: this isolated child runs only this test. No parallel test reads this slot;
+        // the same native function remains installed for calls made by the child.
         assert_eq!(unsafe { swap(slot, current) }, current);
         // SAFETY: as for the first read.
         assert_eq!(unsafe { *slot }, current);
