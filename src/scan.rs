@@ -2261,9 +2261,8 @@ mod tests {
                 return Ok(rows.iter().map(Decoded::summary).collect());
             }
             let fields = match sig.name {
-                "SCATTER_BRICK_LOAD" | "SCATTER_INSTANCE_LOADS" => {
-                    vec![Field::Displacement(Mnemonic::Movss)]
-                }
+                "SCATTER_BRICK_LOAD" => vec![Field::RipLoad(Register::XMM0)],
+                "SCATTER_INSTANCE_LOADS" => vec![Field::RipLoad(Register::XMM8)],
                 "SCATTER_CAP_CONST" | "SCATTER_CAP_ALLOC" => vec![Field::Immediate(0x14000)],
                 "DECO_HIGH_IMM" => vec![Field::Immediate(1.5f32.to_bits())],
                 "DISTANT_HIGH_IMM" => vec![Field::Immediate(2.5f32.to_bits())],
@@ -2350,6 +2349,8 @@ mod tests {
             Immediate(u32),
             /// A memory displacement belonging to the documented instruction kind.
             Displacement(Mnemonic),
+            /// The specific RIP-relative scatter distance load, not another nearby load.
+            RipLoad(Register),
             /// The async span's one-byte conditional branch field.
             Branch,
         }
@@ -2369,7 +2370,7 @@ mod tests {
                         row.constants.immediate_offset(),
                         row.constants.immediate_size(),
                     ),
-                    Field::Displacement(_) => (
+                    Field::Displacement(_) | Field::RipLoad(_) => (
                         row.constants.displacement_offset(),
                         row.constants.displacement_size(),
                     ),
@@ -2393,10 +2394,11 @@ mod tests {
                     row.instruction.mnemonic() == Mnemonic::Mov
                         && row.instruction.immediate32() == value
                 }
-                Field::Displacement(mnemonic) => {
-                    row.instruction.mnemonic() == mnemonic
-                        && (mnemonic != Mnemonic::Movss
-                            || row.instruction.memory_base() == Register::RIP)
+                Field::Displacement(mnemonic) => row.instruction.mnemonic() == mnemonic,
+                Field::RipLoad(register) => {
+                    row.instruction.mnemonic() == Mnemonic::Movss
+                        && row.instruction.memory_base() == Register::RIP
+                        && row.instruction.op0_register() == register
                 }
                 Field::Branch => row.instruction.mnemonic() == Mnemonic::Je,
             };
@@ -2641,6 +2643,19 @@ mod tests {
             for line in lines {
                 println!("{line}");
             }
+        }
+
+        /// The distance is the third load; another valid RIP displacement is not interchangeable.
+        #[test]
+        fn instance_oracle_rejects_another_valid_rip_displacement() {
+            let bytes = signature_bytes(&sigs::SCATTER_INSTANCE_LOADS);
+            assert!(validate_sig(&sigs::SCATTER_INSTANCE_LOADS, &bytes, 0).is_ok());
+            let wrong = sigs::Sig {
+                patch_offsets: &[13],
+                ..sigs::SCATTER_INSTANCE_LOADS
+            };
+            let error = validate_sig(&wrong, &bytes, 0).unwrap_err();
+            assert!(error.contains("movss"), "{error}");
         }
 
         /// Reject shifted imm32 and disp32 fields while accepting their exact documented ranges.
