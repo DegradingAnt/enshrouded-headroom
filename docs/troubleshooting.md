@@ -13,7 +13,7 @@ The tables quote the message templates from the source. Braces such as `{why}` a
 | `enshrouded-headroom {} loaded` | The plugin reached logging. Record the printed version. This alone does not show which features succeeded. |
 | `start-up ran twice; the second run is ignored` | Initialization was requested again. The second request does no work. Keep the log and check for duplicate plugin installations or loader configuration. |
 | `settings: {}` | This is the INI actually selected. Edit this file if settings seem ignored. |
-| `settings: defaults (no usable folder)` | No settings file could be used or created. Defaults apply. Read the preceding folder warnings. |
+| `settings: defaults (no usable folder)` | No settings file could be used or created. Defaults apply. Read the following folder warnings. |
 | `Enabled = 0 in {INI_FILE_NAME}: the mod does nothing` | The INI disabled feature start-up. Set Enabled to 1 only if you want the plugin enabled. |
 | `game build: {label}; code patches {patches}` | The executable hash is known. The final word says whether code patches are allowed, not whether each feature installed. |
 | `game build: unknown sha256 {}; code patches {patches}` | The executable differs from the known builds. Attach this line when requesting compatibility support. |
