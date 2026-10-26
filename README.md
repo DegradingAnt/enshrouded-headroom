@@ -64,6 +64,20 @@ These are instructions for a future approved package. Close the game first.
 
 The package's INI comes from [the default INI](enshrouded-headroom.default.ini). There is no in-game menu or overlay. The `--enable-dxgi` swapchain path is outside this mod's intended Vulkan scope.
 
+## Using with ShroudForge
+
+This guidance comes from the maintainer's read-only review of [ShroudForge](https://github.com/bonsaibauer/shroudforge) 1.7.5, commit `46b59da`, and its release archive. ShroudForge installs its own `dinput8.dll`, `dbghelp.dll` and `winmm.dll` in the game folder. Its `dinput8.dll` has the same filename as Ultimate ASI Loader, which Headroom needs.
+
+By default, ShroudForge checks for automatic updates every 60 minutes and installs them after the game exits, without a confirmation click. Its updater and uninstaller replace or delete `dinput8.dll` by name. If Ultimate ASI Loader is replaced or removed, Headroom silently stops loading.
+
+- Keep Ultimate ASI Loader as `dinput8.dll`.
+- Install ShroudForge without its `dinput8.dll`.
+- Turn ShroudForge's automatic updates off, or verify that `dinput8.dll` is still Ultimate ASI Loader after every ShroudForge update.
+
+A symptom is no fresh `plugins\enshrouded-headroom.log` after a game start. Check the loader if this happens after a ShroudForge update or uninstall.
+
+**Running Headroom and ShroudForge together is untested.** Frame-time measurements with ShroudForge mods running are not comparable to Headroom-only runs: ShroudForge runs its own 16 ms thread that touches game state.
+
 ## Update
 
 Close the game and back up your INI and any diagnostic log you need. Replace the ASI and package notices with the approved new versions. Keep your existing INI; compare the new default file for added settings instead of overwriting your choices. Replace a shared loader only after checking the other plugins that use it. Restart and check the build/settings lines in the log.
