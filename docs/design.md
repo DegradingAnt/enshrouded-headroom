@@ -94,7 +94,8 @@ Method:
   - It uses the largest heap flagged `DEVICE_LOCAL`.
   - If the device type is `INTEGRATED_GPU`, it changes nothing.
   - It writes the new value and reads it back.
-- The game creates the device at about 1 s and reads the table at about 4 s (game log), so the write is in time.
+- The game finishes creating the device at 4.7 s (`Created Vulkan device!`, game log line 931) and reads the table at 9.4 s (`Setting texture streaming budget`, line 1236), so the write is in time (re-checked 2026-10-26).
+- The old `_perf` launcher patches the same top value (to 6 GiB). With it still active, `prepare` sees a changed top value and logs "changed by another tool", so the launcher's texture patch is retired at install (Task 17).
 - Later `vkCreateDevice` calls pass through untouched.
 
 Proof that it worked: the game's own log line `Setting texture streaming budget to …`.
