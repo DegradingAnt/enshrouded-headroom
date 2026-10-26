@@ -57,6 +57,22 @@ jobs:
           Get-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
           exit $testExitCode
 
+      # Read-only W15 oracles run only when the Steam file is available on this runner.
+      - name: Real-exe oracles when available
+        env:
+          ENSHROUDED_STEAM_EXE: ${{ vars.ENSHROUDED_STEAM_EXE }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $steamExe = 'C:\Program Files (x86)\Steam\steamapps\common\Enshrouded\enshrouded.exe'
+          if ([string]::IsNullOrEmpty($env:ENSHROUDED_STEAM_EXE) -and -not (Test-Path -LiteralPath $steamExe)) {
+            Write-Output 'Skipping read-only W15 oracles: no Steam executable is available.'
+            exit 0
+          }
+          cargo test --lib scan::tests::file_oracles::instruction_fields_match_steam_exe -- --ignored --exact --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --lib scan::tests::file_oracles::pe_section_headers_match_steam_exe -- --ignored --exact --nocapture
+          exit $LASTEXITCODE
+
       - name: Loom knob memory orderings
         env:
           RUSTFLAGS: --cfg loom
