@@ -64,6 +64,10 @@ fn table() -> Result<String, Box<dyn Error>> {
     }
     Ok(rendered)
 }
+/// Git may convert LF to CRLF on Windows; all non-newline content must still match.
+fn table_is_current(current: &str, generated: &str) -> bool {
+    current.replace("\r\n", "\n") == generated
+}
 /// Replace the marked table without touching the author's disclosure or other README bytes.
 fn main() -> Result<(), Box<dyn Error>> {
     const START: &str = "<!-- BEGIN GENERATED SETTINGS -->";
@@ -83,7 +87,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         .ok_or("Settings range overflow")?;
     let generated = table()?;
     if std::env::args().skip(1).any(|arg| arg == "--check") {
-        if readme.get(start..end) != Some(generated.as_str()) {
+        if !readme
+            .get(start..end)
+            .is_some_and(|current| table_is_current(current, &generated))
+        {
             return Err("README settings are stale; run the generator".into());
         }
     } else {
@@ -91,4 +98,24 @@ fn main() -> Result<(), Box<dyn Error>> {
         std::fs::write(path, readme)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fresh Windows checkout may use CRLF even though the generated table uses LF.
+    #[test]
+    fn freshness_accepts_windows_checkout_newlines_but_rejects_changed_content() {
+        let generated = table().unwrap();
+        assert!(table_is_current(&generated, &generated));
+        assert!(table_is_current(
+            &generated.replace("\n", "\r\n"),
+            &generated
+        ));
+        assert!(!table_is_current(
+            &generated.replace("Enabled", "Missing"),
+            &generated
+        ));
+    }
 }
