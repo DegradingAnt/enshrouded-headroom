@@ -262,7 +262,10 @@ pub fn start() {
     // Peak correction reads the published effective paper white and runs on the scene hook.
     features::hdr_peak::init(&cfg.hdr, &cfg.knobs);
 
-    // 10. The Vulkan wrapper chain (present timer, device hook). It swaps the exe's
+    // 10. Publish the parsed Reflex mode before Vulkan wrappers can create a device or swapchain.
+    crate::reflex::init(cfg.general.reflex);
+
+    // 11. The Vulkan wrapper chain (present timer, device hook). It swaps the exe's
     // `GetProcAddress` import slot, not code, so it does not wait for `code_patches_allowed` and
     // runs on unknown builds too. It runs after step 8, whose table the first device's hook writes,
     // and logs `vk wrapper installed`, or why it is off.
@@ -275,20 +278,20 @@ pub fn start() {
         cfg.general.priority,
     );
 
-    // 11. The scene-settings hook: object draw distance, the detail-scattering level and the
+    // 12. The scene-settings hook: object draw distance, the detail-scattering level and the
     // governor's world-rendering signal. It hooks code, so it asks `code_patches_allowed`; it is
     // installed when any distance knob is on, and logs its own line, including why it is off. It
     // is only created and queued here: the last step enables it.
     knobs::object_distance::init(&cfg.knobs);
 
-    // 12. The grass distance redirect: both High-level grass distance loads are pointed at a float
+    // 13. The grass distance redirect: both High-level grass distance loads are pointed at a float
     // in the mod's own page, which holds the game's 90 m. It patches code (two disp32s, no hook),
     // so it asks `code_patches_allowed`; it runs only with `EnableScatterDistance = 1` and logs its
     // own line, including why it is off. It must run before the game builds a scene, which holds
     // here: `InitializeASI` runs before `WinMain`.
     knobs::scatter_distance::init(&cfg.knobs);
 
-    // 13. The scatter counter probe: the grass-pass pre-hook only publishes its pass pointer
+    // 14. The scatter counter probe: the grass-pass pre-hook only publishes its pass pointer
     // and a call counter. A detached sampler copies seven blocks with ReadProcessMemory every
     // 500 ms while calls continue. Nine transient misses are tolerated; the tenth or a copied
     // self-check mismatch latches failure (design.md 7.2a). No sampling runs on the game thread.
@@ -297,13 +300,13 @@ pub fn start() {
     // starts the sampler and logs its outcome. The final batch below enables the queued hook.
     features::scatter_probe::init(&cfg);
 
-    // 14. The terrain detail distance: a checked pre-hook on the terrain update function. It is
+    // 15. The terrain detail distance: a checked pre-hook on the terrain update function. It is
     // only created and queued here: the last step enables it.
     knobs::terrain_distance::init(&cfg.knobs);
 
     // Later code hooks are created and queued above this line, so they join the one batch below.
 
-    // 15. Enable every queued hook at once (MinHook's queued enable). This is the only place that
+    // 16. Enable every queued hook at once (MinHook's queued enable). This is the only place that
     // enables hooks. It logs one line if any hook was queued.
     knobs::enable_queued_hooks();
 }
