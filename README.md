@@ -50,9 +50,9 @@ Edit `enshrouded-headroom.ini` as UTF-8. The plugin looks for the first readable
 
 If neither folder has a readable file, it tries to create the default file in the first usable folder where no INI exists. It never overwrites an existing INI. If neither location works, it uses built-in defaults. The `settings:` log line names the chosen file or says that defaults are in use.
 
-Missing keys use their defaults. Invalid values use their defaults, and numeric values outside their ranges are clamped. Unknown sections and keys are ignored with warnings. If `LowerAbove` is not greater than `RaiseBelow`, both return to their defaults. Section names, key names and word choices are case-insensitive. Boolean values accept `0`, `1`, `false` or `true`. Lines starting with `;` or `#` are comments.
+Missing keys use their defaults. Invalid values use their defaults, and numeric values outside their ranges are clamped, except `PaperWhiteNits` and `[Shadows]` overrides, which fall back to `game`. Unknown sections and keys are ignored with warnings. If `LowerAbove` is not greater than `RaiseBelow`, both return to their defaults. Section names, key names and word choices are case-insensitive. Boolean values accept `0`, `1`, `false` or `true`. Lines starting with `;` or `#` are comments.
 
-The tables list all 32 keys from [the default INI](enshrouded-headroom.default.ini), with their defaults as written there. GiB and MiB are binary units.
+The tables list all 33 keys from [the default INI](enshrouded-headroom.default.ini), with their defaults as written there. GiB and MiB are binary units.
 
 ### `[General]`
 
@@ -71,6 +71,12 @@ The tables list all 32 keys from [the default INI](enshrouded-headroom.default.i
 The texture feature requires a unique match for the game's original table. If another tool changed its top budget value, the plugin leaves it alone. Changes affect process memory only; the plugin does not rewrite game files on disk.
 
 For async compute, an argument containing `async-compute` skips the patch, even if it is not a recognised game flag. This check ignores ASCII case and removes double quotes. It excludes the executable path. For example, both `--enable-async-compute` and `--disable-async-compute` leave the game in charge.
+
+### `[Hdr]`
+
+| Key | Default | Meaning |
+|---|---|---|
+| `PaperWhiteNits` | `game` | `game` keeps the game's 250-nit HDR composite paper white. A finite number from 40 to 400 patches it once at start-up on an allowed build. Invalid or out-of-range values warn and use `game`. Decimal commas are accepted. The default stays `game` until the in-game HDR comparison. Check `hdr paper white:` in the log for the outcome. |
 
 ### `[Governor]`
 
