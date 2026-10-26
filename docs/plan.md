@@ -496,7 +496,7 @@ const GIB: u64 = 1 << 30;
   - `pub enum Wrap { Gipa, Gdpa, CreateDevice, CreateSwapchain, Present, Submit, Submit2 }`
   - `pub fn classify_gpa(name: &[u8]) -> Option<Wrap>`, `pub fn classify_gipa(name: &[u8]) -> Option<Wrap>`, `pub fn classify_gdpa(name: &[u8], reflex_active: bool) -> Option<Wrap>`. These are pure. `Submit` and `Submit2` are returned only when `reflex_active`.
   - `pub static WRAPPER_ENGAGED: AtomicBool`. It is set when `wrap_gipa` is handed out.
-  - `pub fn vk::game_device() -> Option<GameDevice>`. It returns the first device the game creates and its physical device together, or `None` before then.
+  - `pub fn vk::game_device() -> Option<GameDevice>`, where `GameDevice { device: usize, phys: usize }`. It returns the first device the game creates and its physical device together, or `None` before then.
   - The extern wrappers are `wrap_gpa`, `wrap_gipa`, `wrap_gdpa`, `wrap_create_device`, `wrap_create_swapchain` and `wrap_present`. Each body runs inside `guard(Feature::VkWrap, call_original, …)`.
     - `wrap_gpa` guards: ordinal names (`name as usize <= 0xFFFF`) pass through. Names are compared only when `hModule == GetModuleHandleW("vulkan-1.dll")`.
     - `wrap_create_device` calls `texture_budget::apply` once, on the first call. It reads `vkGetPhysicalDeviceMemoryProperties` (the largest `DEVICE_LOCAL` heap) and `vkGetPhysicalDeviceProperties` (`deviceType == INTEGRATED_GPU`).
