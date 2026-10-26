@@ -259,10 +259,13 @@ pub fn start() {
     // `GetProcAddress` import slot, not code, so it does not wait for `code_patches_allowed` and
     // runs on unknown builds too. It runs after step 8, whose table the first device's hook writes,
     // and logs `vk wrapper installed`, or why it is off.
-    crate::vk::init(crate::vk::TextureSettings {
-        mode: cfg.general.texture_budget,
-        reserve_gib: cfg.general.texture_reserve_gib,
-    });
+    crate::vk::init(
+        crate::vk::TextureSettings {
+            mode: cfg.general.texture_budget,
+            reserve_gib: cfg.general.texture_reserve_gib,
+        },
+        cfg.general.priority,
+    );
 }
 
 #[cfg(test)]
