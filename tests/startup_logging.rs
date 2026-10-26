@@ -227,9 +227,17 @@ fn start_up_logs_one_grass_distance_line_after_object_distance() {
         "code patches must be on, so the grass step runs its scan:\n{log}"
     );
     let grass = at("grass distance:");
+    let white = at("hdr paper white:");
+    let peak = at("hdr peak:");
+    assert_eq!(white.len(), 1, "one paper-white line:\n{log}");
+    assert_eq!(peak.len(), 1, "one HDR peak line:\n{log}");
     let object = at("object distance:");
     assert_eq!(grass.len(), 1, "one grass distance line:\n{log}");
     assert_eq!(object.len(), 1, "one object distance line:\n{log}");
+    assert!(
+        white[0] < peak[0] && peak[0] < object[0],
+        "HDR settings precede hook creation:\n{log}"
+    );
     assert!(
         object[0] < grass[0],
         "grass distance comes after object distance:\n{log}"
