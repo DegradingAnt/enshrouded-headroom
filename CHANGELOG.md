@@ -34,7 +34,7 @@ These notes cover merged work on `feat/v1`, not a released artifact. The runtime
 
 - Settings and logging can fall back to `%LOCALAPPDATA%\enshrouded-headroom\` when the plugin folder cannot be used.
 - Invalid settings produce a warning and a documented default or clamped value. Decimal commas are accepted for numeric settings.
-- The scatter counter probe is off by default and limits sampling to once every 500 ms.
+- The debug-only scatter probe is off by default. Its hook records atomic observations; a background worker samples counters once every 500 ms.
 
 ### Fixed
 

@@ -6,7 +6,7 @@ This is the author's future release procedure. W28 prepares documents and valida
 
 - [ ] Merge and review W23 (#27, Reflex), W24 (#30, governor) and W25 (#31, Anti-Lag) before claiming their runtime features.
 - [ ] Resolve the parsed-but-unapplied startup scale settings and record whether they are in 0.1.0.
-- [ ] Preserve the grass ceiling until capacity measurements justify changing it; include still-pending validation work such as W27 only after its actual merge and checks.
+- [ ] Preserve the grass ceiling until capacity measurements justify changing it. W27's background sampler is merged; the author's probe-on game validation and capacity evidence are still required.
 - [ ] Update README, descriptions and changelog from the final source; regenerate the settings table with `cargo run --example generate_readme_settings` and verify it with `-- --check`.
 - [ ] Keep Cargo.toml at 0.1.0 and verify the changelog top entry against the actual startup child log.
 - [ ] Run fresh-target fmt, strict clippy, strict docs and tests, then the real `scripts/package.ps1` once; record its six-entry listing, verified loader hash, source/inner ASI equality and zip SHA-256.
