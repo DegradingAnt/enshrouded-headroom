@@ -8,12 +8,14 @@ pub mod build_id;
 pub mod config;
 pub mod entry;
 pub mod features;
+pub mod frame_timer;
 pub mod guard;
 pub mod iat;
 pub mod log;
 pub mod patch;
 pub mod scan;
 pub mod sigs;
+pub mod vk;
 
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;

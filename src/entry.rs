@@ -212,6 +212,15 @@ pub fn start() {
     // 9. Async compute. It patches code, so it asks `code_patches_allowed` (set above) before it
     // touches the game, and it logs its own line, including why it is off.
     features::async_compute::init(&cfg.general.async_compute);
+
+    // 10. The Vulkan wrapper chain (present timer, device hook). It swaps the exe's
+    // `GetProcAddress` import slot, not code, so it does not wait for `code_patches_allowed` and
+    // runs on unknown builds too. It runs after step 8, whose table the first device's hook writes,
+    // and logs `vk wrapper installed`, or why it is off.
+    crate::vk::init(crate::vk::TextureSettings {
+        mode: cfg.general.texture_budget,
+        reserve_gib: cfg.general.texture_reserve_gib,
+    });
 }
 
 #[cfg(test)]

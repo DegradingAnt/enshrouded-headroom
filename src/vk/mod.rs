@@ -1,0 +1,1709 @@
+//! The Vulkan wrapper chain: the mod's way into the game's renderer.
+//!
+//! The game loads `vulkan-1.dll` with `LoadLibraryW` and asks `GetProcAddress`, through its one
+//! KERNEL32 import slot (0x1413b2908 in build f68140a3), for `vkGetInstanceProcAddr`. It gets
+//! `vkGetDeviceProcAddr` and `vkCreateDevice` through that, and `vkQueuePresentKHR` through
+//! `vkGetDeviceProcAddr`; there is one present call site (RE notes, "Present-hook design", verified
+//! from the bytes). So one import-slot swap at start-up puts the mod in front of every step:
+//!
+//! ```text
+//! GetProcAddress slot -> wrap_gpa
+//!   "vkGetInstanceProcAddr" on vulkan-1  -> wrap_gipa
+//!     "vkGetDeviceProcAddr"               -> wrap_gdpa
+//!     "vkCreateDevice"                    -> wrap_create_device
+//!     "vkQueuePresentKHR", "vkCreateSwapchainKHR" (defensive, see classify_gipa)
+//!   wrap_gdpa
+//!     "vkQueuePresentKHR"                 -> wrap_present
+//!     "vkCreateSwapchainKHR"              -> wrap_create_swapchain
+//! ```
+//!
+//! No game address is used, so the chain works on any build and is not a code patch.
+//!
+//! # Rules every wrapper keeps
+//!
+//! - It is `extern "system"` with the exact signature of the function it stands in for; the
+//!   `const` checks below compare each one with ash's `PFN_*` type (and `wrap_gpa` with windows-sys's
+//!   `GetProcAddress`) at compile time.
+//! - Its body runs inside `guard(Feature::VkWrap, original, body)`, and the fallback only calls the
+//!   original. A body calls the original at most once, and nothing after that call can make the
+//!   guard call it again: work after the call runs in an inner guard whose fallback does nothing.
+//! - It never calls a null real pointer: `wrap_gpa` returns null and the others
+//!   `VK_ERROR_INITIALIZATION_FAILED`, and the body logs that once. (The fallback does not log, so
+//!   it cannot panic.)
+//! - Real pointers are kept first-value-wins (`compare_exchange` from 0): game threads may call the
+//!   wrappers at the same time. A wrapper is handed out only when the pointer it will call is right
+//!   for every call that can reach it; otherwise the game gets the real pointer back, unwrapped.
+//!   See [`hand_out`] and [`device_function`].
+//! - `wrap_present` runs every frame, so it touches only atomics: no lock, no allocation, no log.
+//!   The one-time wrappers (device creation) may log.
+
+pub mod types;
+
+use std::ffi::{c_char, CStr};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::OnceLock;
+
+use ash::vk::{self, Handle};
+use log::Level;
+use windows_sys::core::PCSTR;
+use windows_sys::Win32::Foundation::{FARPROC, HMODULE};
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+
+use crate::config::TextureBudget;
+use crate::features::texture_budget::{self, budget_bytes, outcome};
+use crate::frame_timer::{qpc_now, FRAMES};
+use crate::guard::{guard, Feature};
+use crate::iat;
+use crate::patch::PatchError;
+use crate::scan::Module;
+
+// ---- the statics -------------------------------------------------------------------------------
+//
+// All are written first-value-wins and only by this module; other modules (and tests) read them.
+
+/// What the exe's `GetProcAddress` import slot held before [`install`] put [`wrap_gpa`] there:
+/// kernel32's `GetProcAddress`, or another tool's hook of it, which is then chained to.
+pub static REAL_GPA: AtomicUsize = AtomicUsize::new(0);
+/// The real `vkGetInstanceProcAddr`, recorded when [`wrap_gpa`] hands out [`wrap_gipa`].
+pub static REAL_GIPA: AtomicUsize = AtomicUsize::new(0);
+/// The real `vkGetDeviceProcAddr`, recorded when [`wrap_gipa`] hands out [`wrap_gdpa`]. Task 16
+/// loads its entry points through it, with [`device_proc`].
+pub static REAL_GDPA: AtomicUsize = AtomicUsize::new(0);
+/// The real `vkCreateDevice`.
+pub static REAL_CREATE_DEVICE: AtomicUsize = AtomicUsize::new(0);
+/// The real `vkCreateSwapchainKHR`.
+pub static REAL_CREATE_SWAPCHAIN: AtomicUsize = AtomicUsize::new(0);
+/// The real `vkQueuePresentKHR`.
+pub static REAL_PRESENT: AtomicUsize = AtomicUsize::new(0);
+/// `vkGetPhysicalDeviceMemoryProperties`, looked up when `vkCreateDevice` is handed out.
+pub static REAL_GET_MEMORY_PROPERTIES: AtomicUsize = AtomicUsize::new(0);
+/// `vkGetPhysicalDeviceProperties`, looked up when `vkCreateDevice` is handed out.
+pub static REAL_GET_PROPERTIES: AtomicUsize = AtomicUsize::new(0);
+/// The first non-null `VkInstance` the game passes to `vkGetInstanceProcAddr`.
+pub static GAME_INSTANCE: AtomicUsize = AtomicUsize::new(0);
+/// The first `VkDevice` the game creates.
+pub static GAME_DEVICE: AtomicUsize = AtomicUsize::new(0);
+/// The `VkPhysicalDevice` of [`GAME_DEVICE`]. It is stored just after `GAME_DEVICE`, so a reader
+/// on another thread can see the device a moment before it sees this.
+pub static GAME_PHYS: AtomicUsize = AtomicUsize::new(0);
+/// Set when [`wrap_gpa`] hands out [`wrap_gipa`]: the game is now inside the chain.
+pub static WRAPPER_ENGAGED: AtomicBool = AtomicBool::new(false);
+
+/// What `wrap_create_device` needs from the settings file. Set once, by [`init`].
+static TEXTURE_SETTINGS: OnceLock<TextureSettings> = OnceLock::new();
+
+/// One flag per wrapper: "a null real pointer has been logged".
+static NULL_GPA: AtomicBool = AtomicBool::new(false);
+static NULL_GIPA: AtomicBool = AtomicBool::new(false);
+static NULL_GDPA: AtomicBool = AtomicBool::new(false);
+static NULL_CREATE_DEVICE: AtomicBool = AtomicBool::new(false);
+static NULL_CREATE_SWAPCHAIN: AtomicBool = AtomicBool::new(false);
+static NULL_PRESENT: AtomicBool = AtomicBool::new(false);
+
+/// The settings `wrap_create_device` uses for the texture budget.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TextureSettings {
+    pub mode: TextureBudget,
+    pub reserve_gib: f64,
+}
+
+// ---- classifying names -------------------------------------------------------------------------
+
+/// Which wrapper a looked-up name gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wrap {
+    Gipa,
+    Gdpa,
+    CreateDevice,
+    CreateSwapchain,
+    Present,
+}
+
+/// The wrapper for a `GetProcAddress` name (on `vulkan-1.dll`). Pure.
+pub fn classify_gpa(name: &[u8]) -> Option<Wrap> {
+    match name {
+        b"vkGetInstanceProcAddr" => Some(Wrap::Gipa),
+        _ => None,
+    }
+}
+
+/// The wrapper for a `vkGetInstanceProcAddr` name. Pure.
+///
+/// Besides the chain's own steps (`vkGetDeviceProcAddr`, `vkCreateDevice`, and
+/// `vkGetInstanceProcAddr` itself, so a game that re-fetches it stays in the chain), it also maps
+/// `vkQueuePresentKHR` and `vkCreateSwapchainKHR`, in case some path fetches them at instance
+/// level. The game gets them through `vkGetDeviceProcAddr`.
+pub fn classify_gipa(name: &[u8]) -> Option<Wrap> {
+    match name {
+        b"vkGetInstanceProcAddr" => Some(Wrap::Gipa),
+        b"vkGetDeviceProcAddr" => Some(Wrap::Gdpa),
+        b"vkCreateDevice" => Some(Wrap::CreateDevice),
+        b"vkCreateSwapchainKHR" => Some(Wrap::CreateSwapchain),
+        b"vkQueuePresentKHR" => Some(Wrap::Present),
+        _ => None,
+    }
+}
+
+/// The wrapper for a `vkGetDeviceProcAddr` name. Pure. No submit wrapper (ruling G10).
+pub fn classify_gdpa(name: &[u8]) -> Option<Wrap> {
+    match name {
+        b"vkGetDeviceProcAddr" => Some(Wrap::Gdpa),
+        b"vkCreateSwapchainKHR" => Some(Wrap::CreateSwapchain),
+        b"vkQueuePresentKHR" => Some(Wrap::Present),
+        _ => None,
+    }
+}
+
+/// Longest name read for the classifiers, NUL included. The longest name they know is 21 bytes.
+const NAME_CAP: usize = 256;
+
+/// A `GetProcAddress` name at or below 0xFFFF is an ordinal, not a pointer (and 0 is null).
+fn is_ordinal(name: usize) -> bool {
+    name <= 0xFFFF
+}
+
+/// Copy the NUL-terminated name at `name` into `buf` and return it without the NUL. `None` for an
+/// ordinal or null (`name` <= 0xFFFF; nothing is read) and for a name with no NUL in the first
+/// [`NAME_CAP`] bytes (no byte past those is read).
+///
+/// # Safety
+///
+/// Unless it is <= 0xFFFF, `name` must point to a NUL-terminated string, or to at least
+/// [`NAME_CAP`] readable bytes. A `GetProcAddress` / `vkGet*ProcAddr` caller passes the former.
+unsafe fn read_name(name: *const u8, buf: &mut [u8; NAME_CAP]) -> Option<&[u8]> {
+    if is_ordinal(name as usize) {
+        return None;
+    }
+    for len in 0..NAME_CAP {
+        // SAFETY: bytes 0..len were not NUL, so by the contract byte `len` is still part of the
+        // string (or of the NAME_CAP readable bytes); `len` < NAME_CAP.
+        let byte = unsafe { name.add(len).read() };
+        if byte == 0 {
+            return buf.get(..len);
+        }
+        *buf.get_mut(len)? = byte;
+    }
+    None
+}
+
+// ---- handing out wrappers ----------------------------------------------------------------------
+
+/// Store `value` in `slot` unless it already holds something; return what the slot holds now. 0 is
+/// never stored.
+fn first_wins(slot: &AtomicUsize, value: usize) -> usize {
+    if value == 0 {
+        return slot.load(Ordering::Acquire);
+    }
+    match slot.compare_exchange(0, value, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => value,
+        Err(held) => held,
+    }
+}
+
+/// What the game gets for a lookup whose real answer is `real`: `wrapper`, or `real` itself.
+///
+/// - `real` 0 (the function does not exist) or `real` equal to `wrapper` (already ours): `real`,
+///   and nothing is stored, so a wrapper can never be made to call itself.
+/// - Otherwise `real` goes into `slot` first-value-wins, and the wrapper, which calls what `slot`
+///   holds, is handed out when the slot holds `real` itself, or when `any_held_is_valid` says that
+///   whatever it holds is valid for this caller too. Else `real` comes back unwrapped: a later,
+///   different pointer (a reloaded `vulkan-1.dll`, another device's driver) must not be routed to
+///   the first one.
+fn hand_out(slot: &AtomicUsize, real: usize, wrapper: usize, any_held_is_valid: bool) -> usize {
+    if real == 0 || real == wrapper {
+        return real;
+    }
+    if first_wins(slot, real) == real || any_held_is_valid {
+        wrapper
+    } else {
+        real
+    }
+}
+
+/// [`hand_out`] for a device-level function (`vkQueuePresentKHR`, `vkCreateSwapchainKHR`) looked
+/// up with `vkGetDeviceProcAddr` on `device`. `game_device` is [`GAME_DEVICE`].
+///
+/// - The game's device: wrapped whatever the slot holds. It holds either the loader's trampoline
+///   (from a `vkGetInstanceProcAddr` lookup), which serves every device, or this device's own
+///   pointer.
+/// - Another device, once the game's is known (a second GPU, or a device made again after a device
+///   loss): nothing is stored, and it is wrapped only if the slot already holds this very pointer,
+///   so the wrapper calls exactly what the game would have. Otherwise the real pointer comes back
+///   unwrapped: the slot's pointer may belong to another driver.
+/// - No device known yet: wrapped only if the slot ends up holding this very pointer.
+fn device_function(
+    slot: &AtomicUsize,
+    real: usize,
+    wrapper: usize,
+    device: usize,
+    game_device: usize,
+) -> usize {
+    match game_device {
+        0 => hand_out(slot, real, wrapper, false),
+        game if game == device => hand_out(slot, real, wrapper, true),
+        _ if real != 0 && real != wrapper && slot.load(Ordering::Acquire) == real => wrapper,
+        _ => real,
+    }
+}
+
+// ---- calling the real functions ----------------------------------------------------------------
+//
+// None of these logs or can panic: they are the guard fallbacks.
+
+/// `GetProcAddress` as the import slot holds it.
+type GpaFn = unsafe extern "system" fn(HMODULE, PCSTR) -> FARPROC;
+
+/// The address in a `FARPROC` / `PFN_vkVoidFunction`, 0 for none.
+fn addr_of(f: Option<unsafe extern "system" fn() -> isize>) -> usize {
+    f.map_or(0, |f| f as usize)
+}
+
+/// The address in a `PFN_vkVoidFunction`, 0 for none.
+fn void_addr(f: vk::PFN_vkVoidFunction) -> usize {
+    f.map_or(0, |f| f as usize)
+}
+
+/// `addr` as a `FARPROC`.
+fn to_farproc(addr: usize) -> FARPROC {
+    // SAFETY: `FARPROC` is `Option` of a function pointer: the size of a `usize`, with 0 as `None`
+    // (the guaranteed null-pointer niche). Every `addr` passed here is 0 or a function address
+    // that `GetProcAddress` returned or one of this module's wrappers.
+    unsafe { std::mem::transmute::<usize, FARPROC>(addr) }
+}
+
+/// `addr` as a `PFN_vkVoidFunction`.
+fn to_void(addr: usize) -> vk::PFN_vkVoidFunction {
+    // SAFETY: as in `to_farproc`: an `Option` of a function pointer, 0 is `None`, and `addr` is 0
+    // or a function address from the loader or one of this module's wrappers.
+    unsafe { std::mem::transmute::<usize, vk::PFN_vkVoidFunction>(addr) }
+}
+
+/// Call the `GetProcAddress` at `real`, or return null if `real` is 0.
+///
+/// # Safety
+///
+/// `real` is 0 or a function with `GetProcAddress`'s signature; the arguments are the caller's.
+unsafe fn call_gpa(real: usize, module: HMODULE, name: PCSTR) -> FARPROC {
+    if real == 0 {
+        return None;
+    }
+    // SAFETY: non-zero, and by the contract a function of this type.
+    let f = unsafe { std::mem::transmute::<usize, GpaFn>(real) };
+    // SAFETY: the caller's arguments, for the function they were meant for.
+    unsafe { f(module, name) }
+}
+
+/// Call the `vkGetInstanceProcAddr` at `real`, or return null if `real` is 0.
+///
+/// # Safety
+///
+/// `real` is 0 or a `PFN_vkGetInstanceProcAddr`; the arguments are the caller's.
+unsafe fn call_gipa(
+    real: usize,
+    instance: vk::Instance,
+    name: *const c_char,
+) -> vk::PFN_vkVoidFunction {
+    if real == 0 {
+        return None;
+    }
+    // SAFETY: non-zero, and by the contract a function of this type.
+    let f = unsafe { std::mem::transmute::<usize, vk::PFN_vkGetInstanceProcAddr>(real) };
+    // SAFETY: the caller's arguments, for the function they were meant for.
+    unsafe { f(instance, name) }
+}
+
+/// Call the `vkGetDeviceProcAddr` at `real`, or return null if `real` is 0.
+///
+/// # Safety
+///
+/// `real` is 0 or a `PFN_vkGetDeviceProcAddr`; the arguments are the caller's.
+unsafe fn call_gdpa(
+    real: usize,
+    device: vk::Device,
+    name: *const c_char,
+) -> vk::PFN_vkVoidFunction {
+    if real == 0 {
+        return None;
+    }
+    // SAFETY: non-zero, and by the contract a function of this type.
+    let f = unsafe { std::mem::transmute::<usize, vk::PFN_vkGetDeviceProcAddr>(real) };
+    // SAFETY: the caller's arguments, for the function they were meant for.
+    unsafe { f(device, name) }
+}
+
+/// Call the `vkCreateDevice` at `real`, or fail with `VK_ERROR_INITIALIZATION_FAILED` if 0.
+///
+/// # Safety
+///
+/// `real` is 0 or a `PFN_vkCreateDevice`; the arguments are the caller's.
+unsafe fn call_create_device(
+    real: usize,
+    phys: vk::PhysicalDevice,
+    info: *const vk::DeviceCreateInfo<'_>,
+    allocator: *const vk::AllocationCallbacks<'_>,
+    device: *mut vk::Device,
+) -> vk::Result {
+    if real == 0 {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    }
+    // SAFETY: non-zero, and by the contract a function of this type.
+    let f = unsafe { std::mem::transmute::<usize, vk::PFN_vkCreateDevice>(real) };
+    // SAFETY: the caller's arguments, for the function they were meant for.
+    unsafe { f(phys, info, allocator, device) }
+}
+
+/// Call the `vkCreateSwapchainKHR` at `real`, or fail with `VK_ERROR_INITIALIZATION_FAILED` if 0.
+///
+/// # Safety
+///
+/// `real` is 0 or a `PFN_vkCreateSwapchainKHR`; the arguments are the caller's.
+unsafe fn call_create_swapchain(
+    real: usize,
+    device: vk::Device,
+    info: *const vk::SwapchainCreateInfoKHR<'_>,
+    allocator: *const vk::AllocationCallbacks<'_>,
+    swapchain: *mut vk::SwapchainKHR,
+) -> vk::Result {
+    if real == 0 {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    }
+    // SAFETY: non-zero, and by the contract a function of this type.
+    let f = unsafe { std::mem::transmute::<usize, vk::PFN_vkCreateSwapchainKHR>(real) };
+    // SAFETY: the caller's arguments, for the function they were meant for.
+    unsafe { f(device, info, allocator, swapchain) }
+}
+
+/// Call the `vkQueuePresentKHR` at `real`, or fail with `VK_ERROR_INITIALIZATION_FAILED` if 0.
+///
+/// # Safety
+///
+/// `real` is 0 or a `PFN_vkQueuePresentKHR`; the arguments are the caller's.
+unsafe fn call_present(
+    real: usize,
+    queue: vk::Queue,
+    info: *const vk::PresentInfoKHR<'_>,
+) -> vk::Result {
+    if real == 0 {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    }
+    // SAFETY: non-zero, and by the contract a function of this type.
+    let f = unsafe { std::mem::transmute::<usize, vk::PFN_vkQueuePresentKHR>(real) };
+    // SAFETY: the caller's arguments, for the function they were meant for. The present info is
+    // passed on as the game made it, never read or changed here (ruling G12).
+    unsafe { f(queue, info) }
+}
+
+/// Log, once per `flag`, that a wrapper had no real function to call.
+fn warn_null_once(flag: &AtomicBool, what: &str) {
+    if !flag.swap(true, Ordering::Relaxed) {
+        log::warn!("vk: the real {what} is not known; the call fails instead of calling null");
+    }
+}
+
+// ---- the wrappers ------------------------------------------------------------------------------
+
+/// Stands in for `GetProcAddress` in the exe's import slot.
+///
+/// Every call goes to [`REAL_GPA`] with the original arguments. Only a lookup of
+/// `vkGetInstanceProcAddr` on `vulkan-1.dll` is changed: it gets [`wrap_gipa`]. The name is read
+/// only when `module` is not null and is the handle `GetModuleHandleW("vulkan-1.dll")` gives (which
+/// is null while that DLL is not loaded), and never for an ordinal (`name` <= 0xFFFF).
+///
+/// `GetModuleHandleW` is asked only for a non-null module, a name that is not an ordinal and a
+/// lookup that found something. It takes the loader's module-list lock, which the real
+/// `GetProcAddress` takes too; `GetProcAddress` is a lookup, never on the per-frame path.
+///
+/// # Safety
+///
+/// The contract of `GetProcAddress`: `module` is a module handle (or null) and `name` an ordinal
+/// or a NUL-terminated string.
+pub unsafe extern "system" fn wrap_gpa(module: HMODULE, name: PCSTR) -> FARPROC {
+    let real = REAL_GPA.load(Ordering::Acquire);
+    // SAFETY: `real` is 0 or the pointer the import slot held, which has GetProcAddress's
+    // signature; the arguments are the game's own, passed on unchanged.
+    let original = move || unsafe { call_gpa(real, module, name) };
+    guard(Feature::VkWrap, original, || {
+        if real == 0 {
+            warn_null_once(&NULL_GPA, "GetProcAddress");
+            return None;
+        }
+        let found = original();
+        // SAFETY: a module name literal, NUL-terminated; GetModuleHandleW takes no reference and
+        // returns null when the module is not loaded.
+        let vulkan = || unsafe { GetModuleHandleW(windows_sys::w!("vulkan-1.dll")) };
+        // SAFETY: `name` is the caller's GetProcAddress argument (see this function's contract).
+        unsafe { gpa_choose(found, module, name, vulkan) }
+    })
+}
+
+/// The part of [`wrap_gpa`] after the real call: `found` is what `GetProcAddress` returned, and
+/// `vulkan` gives the handle of `vulkan-1.dll` (asked only when it matters).
+///
+/// # Safety
+///
+/// `name` is an ordinal or a NUL-terminated string.
+unsafe fn gpa_choose(
+    found: FARPROC,
+    module: HMODULE,
+    name: PCSTR,
+    vulkan: impl FnOnce() -> HMODULE,
+) -> FARPROC {
+    let found_addr = addr_of(found);
+    if found_addr == 0 || module.is_null() || is_ordinal(name as usize) {
+        return found;
+    }
+    let vulkan = vulkan();
+    if vulkan.is_null() || vulkan != module {
+        return found;
+    }
+    let mut buf = [0u8; NAME_CAP];
+    // SAFETY: not an ordinal, so by the contract a NUL-terminated string.
+    let Some(name) = (unsafe { read_name(name, &mut buf) }) else {
+        return found;
+    };
+    match classify_gpa(name) {
+        Some(Wrap::Gipa) => {
+            let wrapper = wrap_gipa as *const () as usize;
+            let out = hand_out(&REAL_GIPA, found_addr, wrapper, false);
+            if out == wrapper {
+                WRAPPER_ENGAGED.store(true, Ordering::Release);
+            }
+            to_farproc(out)
+        }
+        _ => found,
+    }
+}
+
+/// Stands in for `vkGetInstanceProcAddr`.
+///
+/// Every call goes to [`REAL_GIPA`] with the original arguments; the names [`classify_gipa`] knows
+/// get their wrapper (see [`hand_out`]). The first non-null instance is kept in
+/// [`GAME_INSTANCE`].
+///
+/// # Safety
+///
+/// The contract of `vkGetInstanceProcAddr`.
+pub unsafe extern "system" fn wrap_gipa(
+    instance: vk::Instance,
+    name: *const c_char,
+) -> vk::PFN_vkVoidFunction {
+    let real = REAL_GIPA.load(Ordering::Acquire);
+    // SAFETY: `real` is 0 or the vkGetInstanceProcAddr that GetProcAddress returned; the
+    // arguments are the game's own, passed on unchanged.
+    let original = move || unsafe { call_gipa(real, instance, name) };
+    guard(Feature::VkWrap, original, || {
+        if real == 0 {
+            warn_null_once(&NULL_GIPA, "vkGetInstanceProcAddr");
+            return None;
+        }
+        first_wins(&GAME_INSTANCE, instance.as_raw() as usize);
+        let found = original();
+        // SAFETY: `real` is the real vkGetInstanceProcAddr, and `instance` and `name` are the
+        // game's arguments to it.
+        unsafe { gipa_choose(real, instance, name, found) }
+    })
+}
+
+/// The part of [`wrap_gipa`] after the real call returned `found`.
+///
+/// # Safety
+///
+/// `real_gipa` is the real `vkGetInstanceProcAddr`; `instance` and `name` are valid arguments to
+/// it (a null `name` is passed through without being read).
+unsafe fn gipa_choose(
+    real_gipa: usize,
+    instance: vk::Instance,
+    name: *const c_char,
+    found: vk::PFN_vkVoidFunction,
+) -> vk::PFN_vkVoidFunction {
+    let found_addr = void_addr(found);
+    if found_addr == 0 || is_ordinal(name as usize) {
+        return found;
+    }
+    let mut buf = [0u8; NAME_CAP];
+    // SAFETY: not null, so by the contract a NUL-terminated string.
+    let Some(name) = (unsafe { read_name(name.cast(), &mut buf) }) else {
+        return found;
+    };
+    let out = match classify_gipa(name) {
+        None => return found,
+        Some(Wrap::Gipa) => hand_out(
+            &REAL_GIPA,
+            found_addr,
+            wrap_gipa as *const () as usize,
+            false,
+        ),
+        Some(Wrap::Gdpa) => hand_out(
+            &REAL_GDPA,
+            found_addr,
+            wrap_gdpa as *const () as usize,
+            false,
+        ),
+        Some(Wrap::CreateDevice) => {
+            let wrapper = wrap_create_device as *const () as usize;
+            let out = hand_out(&REAL_CREATE_DEVICE, found_addr, wrapper, false);
+            if out == wrapper {
+                // The instance is live: the game is calling with it right now. These are the
+                // loader's trampolines, which dispatch on the physical device, so they stay valid
+                // for the device `wrap_create_device` will see.
+                // SAFETY: `real_gipa` is the real vkGetInstanceProcAddr and `instance` the
+                // game's live instance; the names are NUL-terminated literals.
+                let (memory, properties) = unsafe {
+                    (
+                        call_gipa(
+                            real_gipa,
+                            instance,
+                            c"vkGetPhysicalDeviceMemoryProperties".as_ptr(),
+                        ),
+                        call_gipa(
+                            real_gipa,
+                            instance,
+                            c"vkGetPhysicalDeviceProperties".as_ptr(),
+                        ),
+                    )
+                };
+                first_wins(&REAL_GET_MEMORY_PROPERTIES, void_addr(memory));
+                first_wins(&REAL_GET_PROPERTIES, void_addr(properties));
+            }
+            out
+        }
+        Some(Wrap::CreateSwapchain) => hand_out(
+            &REAL_CREATE_SWAPCHAIN,
+            found_addr,
+            wrap_create_swapchain as *const () as usize,
+            false,
+        ),
+        Some(Wrap::Present) => hand_out(
+            &REAL_PRESENT,
+            found_addr,
+            wrap_present as *const () as usize,
+            false,
+        ),
+    };
+    to_void(out)
+}
+
+/// Stands in for `vkGetDeviceProcAddr`.
+///
+/// Every call goes to [`REAL_GDPA`] with the original arguments; `vkQueuePresentKHR` and
+/// `vkCreateSwapchainKHR` get their wrappers (see [`device_function`]).
+///
+/// # Safety
+///
+/// The contract of `vkGetDeviceProcAddr`.
+pub unsafe extern "system" fn wrap_gdpa(
+    device: vk::Device,
+    name: *const c_char,
+) -> vk::PFN_vkVoidFunction {
+    let real = REAL_GDPA.load(Ordering::Acquire);
+    // SAFETY: `real` is 0 or the real vkGetDeviceProcAddr; the arguments are the game's own,
+    // passed on unchanged.
+    let original = move || unsafe { call_gdpa(real, device, name) };
+    guard(Feature::VkWrap, original, || {
+        if real == 0 {
+            warn_null_once(&NULL_GDPA, "vkGetDeviceProcAddr");
+            return None;
+        }
+        let found = original();
+        // SAFETY: `name` is the game's argument to vkGetDeviceProcAddr.
+        unsafe { gdpa_choose(device, name, found) }
+    })
+}
+
+/// The part of [`wrap_gdpa`] after the real call returned `found`.
+///
+/// # Safety
+///
+/// `name` is null or a NUL-terminated string.
+unsafe fn gdpa_choose(
+    device: vk::Device,
+    name: *const c_char,
+    found: vk::PFN_vkVoidFunction,
+) -> vk::PFN_vkVoidFunction {
+    let found_addr = void_addr(found);
+    if found_addr == 0 || is_ordinal(name as usize) {
+        return found;
+    }
+    let mut buf = [0u8; NAME_CAP];
+    // SAFETY: not null, so by the contract a NUL-terminated string.
+    let Some(name) = (unsafe { read_name(name.cast(), &mut buf) }) else {
+        return found;
+    };
+    let device = device.as_raw() as usize;
+    let game_device = GAME_DEVICE.load(Ordering::Acquire);
+    let out = match classify_gdpa(name) {
+        None => return found,
+        Some(Wrap::Gdpa) => hand_out(
+            &REAL_GDPA,
+            found_addr,
+            wrap_gdpa as *const () as usize,
+            false,
+        ),
+        Some(Wrap::Present) => device_function(
+            &REAL_PRESENT,
+            found_addr,
+            wrap_present as *const () as usize,
+            device,
+            game_device,
+        ),
+        Some(Wrap::CreateSwapchain) => device_function(
+            &REAL_CREATE_SWAPCHAIN,
+            found_addr,
+            wrap_create_swapchain as *const () as usize,
+            device,
+            game_device,
+        ),
+        // `classify_gdpa` gives no other variant.
+        Some(Wrap::Gipa | Wrap::CreateDevice) => return found,
+    };
+    to_void(out)
+}
+
+/// Stands in for `vkCreateDevice`.
+///
+/// Calls the real one with the game's arguments, unchanged (Task 9 adds no extension, so the
+/// game's extension list goes through as it is). On the first device that is created it records
+/// [`GAME_DEVICE`] and [`GAME_PHYS`], logs `wrapper chain engaged (device created)`, and sizes the
+/// texture budget for the card (see [`texture_step`]).
+///
+/// # Safety
+///
+/// The contract of `vkCreateDevice`.
+pub unsafe extern "system" fn wrap_create_device(
+    phys: vk::PhysicalDevice,
+    info: *const vk::DeviceCreateInfo<'_>,
+    allocator: *const vk::AllocationCallbacks<'_>,
+    device: *mut vk::Device,
+) -> vk::Result {
+    let real = REAL_CREATE_DEVICE.load(Ordering::Acquire);
+    // SAFETY: `real` is 0 or the real vkCreateDevice; the arguments are the game's own, passed on
+    // unchanged.
+    let original = move || unsafe { call_create_device(real, phys, info, allocator, device) };
+    guard(Feature::VkWrap, original, || {
+        if real == 0 {
+            warn_null_once(&NULL_CREATE_DEVICE, "vkCreateDevice");
+            return vk::Result::ERROR_INITIALIZATION_FAILED;
+        }
+        let result = original();
+        // The device exists now. A panic from here on must not make the outer guard create a
+        // second one, so the rest runs in its own guard, whose fallback does nothing.
+        guard(
+            Feature::VkWrap,
+            || (),
+            // SAFETY: `result` and `device` are what the real vkCreateDevice just returned and
+            // wrote; `phys` is the game's physical device.
+            || unsafe { after_create_device(result, phys, device) },
+        );
+        result
+    })
+}
+
+/// Record the first device and do the one-time work for it.
+///
+/// # Safety
+///
+/// `result` is what the real `vkCreateDevice` returned for `phys`, and `device` the output pointer
+/// it was given (on `SUCCESS` it holds the new device).
+unsafe fn after_create_device(
+    result: vk::Result,
+    phys: vk::PhysicalDevice,
+    device: *mut vk::Device,
+) {
+    if result != vk::Result::SUCCESS || device.is_null() {
+        return;
+    }
+    // SAFETY: on SUCCESS the driver has written the new handle to `device`, a valid, aligned
+    // pointer the game passed in.
+    let device = unsafe { device.read() }.as_raw() as usize;
+    if device == 0
+        || GAME_DEVICE
+            .compare_exchange(0, device, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+    {
+        return;
+    }
+    first_wins(&GAME_PHYS, phys.as_raw() as usize);
+    // SAFETY: `phys` is the physical device the first device was just created on.
+    unsafe { on_first_device(phys) };
+}
+
+/// The first device's one-time work: log the engaged line and set the texture budget.
+///
+/// # Safety
+///
+/// `phys` is a live physical device.
+unsafe fn on_first_device(phys: vk::PhysicalDevice) {
+    // SAFETY: the two pointers are 0 or the loader's functions for these names, and `phys` is
+    // live (this function's contract).
+    let gpu = unsafe {
+        query_gpu(
+            REAL_GET_MEMORY_PROPERTIES.load(Ordering::Acquire),
+            REAL_GET_PROPERTIES.load(Ordering::Acquire),
+            phys,
+        )
+    };
+    log::info!("{}", engaged_line(gpu.as_ref()));
+    let step = texture_step(
+        texture_budget::prepared(),
+        gpu.as_ref(),
+        TEXTURE_SETTINGS.get(),
+        |prepared, bytes| {
+            // A DATA write after start-up, while the game's threads run. The rule in patch.rs
+            // allows that for data no thread is using: the game reads this value about 4.6 s after
+            // the device exists (texture_budget module docs).
+            // SAFETY: `prepared` comes from `texture_budget::prepared()`, which hands out only what
+            // `prepare` checked, and this runs right after the first device is created, before the
+            // game reads the table.
+            unsafe { texture_budget::apply(prepared, bytes) }
+        },
+    );
+    if let Some((level, line)) = step {
+        log::log!(level, "{line}");
+    }
+}
+
+/// Stands in for `vkCreateSwapchainKHR`. Task 9 passes every call through unchanged.
+///
+/// # Safety
+///
+/// The contract of `vkCreateSwapchainKHR`.
+pub unsafe extern "system" fn wrap_create_swapchain(
+    device: vk::Device,
+    info: *const vk::SwapchainCreateInfoKHR<'_>,
+    allocator: *const vk::AllocationCallbacks<'_>,
+    swapchain: *mut vk::SwapchainKHR,
+) -> vk::Result {
+    let real = REAL_CREATE_SWAPCHAIN.load(Ordering::Acquire);
+    // SAFETY: `real` is 0 or the real vkCreateSwapchainKHR; the arguments are the game's own,
+    // passed on unchanged.
+    let original =
+        move || unsafe { call_create_swapchain(real, device, info, allocator, swapchain) };
+    guard(Feature::VkWrap, original, || {
+        if real == 0 {
+            warn_null_once(&NULL_CREATE_SWAPCHAIN, "vkCreateSwapchainKHR");
+            return vk::Result::ERROR_INITIALIZATION_FAILED;
+        }
+        original()
+    })
+}
+
+/// Stands in for `vkQueuePresentKHR`: stamps [`FRAMES`] with [`qpc_now`], then calls the real
+/// present with the game's arguments and returns its result.
+///
+/// It never modifies the `VkPresentInfoKHR` or its `pNext` chain (ruling G12): the game chains its
+/// own `VkPresentId2KHR` (sType 1000479001) on every present, and the pointer is passed on as it
+/// came. It runs every frame, so it only touches atomics: no lock, no allocation, no log (the
+/// null-pointer warning cannot happen once a wrapper was handed out, and is logged once).
+///
+/// # Safety
+///
+/// The contract of `vkQueuePresentKHR`.
+pub unsafe extern "system" fn wrap_present(
+    queue: vk::Queue,
+    info: *const vk::PresentInfoKHR<'_>,
+) -> vk::Result {
+    let real = REAL_PRESENT.load(Ordering::Acquire);
+    // SAFETY: `real` is 0 or the real vkQueuePresentKHR; the arguments are the game's own, passed
+    // on unchanged.
+    let original = move || unsafe { call_present(real, queue, info) };
+    guard(Feature::VkWrap, original, || {
+        if real == 0 {
+            warn_null_once(&NULL_PRESENT, "vkQueuePresentKHR");
+            return vk::Result::ERROR_INITIALIZATION_FAILED;
+        }
+        FRAMES.push(qpc_now());
+        original()
+    })
+}
+
+// Each wrapper has the exact type of the function it stands in for.
+const _: GpaFn = wrap_gpa;
+const _: GpaFn = windows_sys::Win32::System::LibraryLoader::GetProcAddress;
+const _: vk::PFN_vkGetInstanceProcAddr = wrap_gipa;
+const _: vk::PFN_vkGetDeviceProcAddr = wrap_gdpa;
+const _: vk::PFN_vkCreateDevice = wrap_create_device;
+const _: vk::PFN_vkCreateSwapchainKHR = wrap_create_swapchain;
+const _: vk::PFN_vkQueuePresentKHR = wrap_present;
+
+/// The real `vkGetDeviceProcAddr`'s answer for `name` on `device`, past every wrapper, or `None` if
+/// the device has no such function or the real `vkGetDeviceProcAddr` is not known yet. Task 16
+/// loads its Reflex entry points through it.
+///
+/// # Safety
+///
+/// `device` is 0 (gives `None`) or a live `VkDevice` of the game (normally [`GAME_DEVICE`]).
+pub unsafe fn device_proc(device: usize, name: &CStr) -> Option<usize> {
+    let real = REAL_GDPA.load(Ordering::Acquire);
+    if real == 0 || device == 0 {
+        return None;
+    }
+    // SAFETY: `real` is the real vkGetDeviceProcAddr, `device` a live device (contract) and
+    // `name` a NUL-terminated string.
+    let found = unsafe { call_gdpa(real, vk::Device::from_raw(device as u64), name.as_ptr()) };
+    Some(void_addr(found)).filter(|&addr| addr != 0)
+}
+
+// ---- the first device: the GPU and the texture budget ------------------------------------------
+
+/// What the mod learns about the GPU the game's device is on. (No `Debug`: ash is built without
+/// its `debug` feature, so `PhysicalDeviceType` has none.)
+#[derive(Clone)]
+struct GpuInfo {
+    name: String,
+    device_type: vk::PhysicalDeviceType,
+    /// The largest heap with `DEVICE_LOCAL`, in bytes.
+    device_local: u64,
+}
+
+impl GpuInfo {
+    fn integrated(&self) -> bool {
+        self.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU
+    }
+}
+
+/// The largest `DEVICE_LOCAL` heap, 0 if none. A heap count above the array size is cut to it.
+fn largest_device_local(memory: &vk::PhysicalDeviceMemoryProperties) -> u64 {
+    let count = usize::try_from(memory.memory_heap_count).unwrap_or(usize::MAX);
+    memory
+        .memory_heaps
+        .iter()
+        .take(count)
+        .filter(|heap| heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+        .map(|heap| heap.size)
+        .max()
+        .unwrap_or(0)
+}
+
+/// The device name: the bytes before the first NUL, or all of the array if it has none.
+fn device_name(properties: &vk::PhysicalDeviceProperties) -> String {
+    let bytes: Vec<u8> = properties
+        .device_name
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn gpu_info(
+    memory: &vk::PhysicalDeviceMemoryProperties,
+    properties: &vk::PhysicalDeviceProperties,
+) -> GpuInfo {
+    GpuInfo {
+        name: device_name(properties),
+        device_type: properties.device_type,
+        device_local: largest_device_local(memory),
+    }
+}
+
+/// Ask the driver about `phys`. `None` if either function is not known.
+///
+/// # Safety
+///
+/// `get_memory` and `get_properties` are 0 or the loader's `vkGetPhysicalDeviceMemoryProperties` /
+/// `vkGetPhysicalDeviceProperties`, and `phys` is a live physical device.
+unsafe fn query_gpu(
+    get_memory: usize,
+    get_properties: usize,
+    phys: vk::PhysicalDevice,
+) -> Option<GpuInfo> {
+    if get_memory == 0 || get_properties == 0 {
+        return None;
+    }
+    // SAFETY: both are the loader's functions with these signatures (contract), non-zero.
+    let (get_memory, get_properties) = unsafe {
+        (
+            std::mem::transmute::<usize, vk::PFN_vkGetPhysicalDeviceMemoryProperties>(get_memory),
+            std::mem::transmute::<usize, vk::PFN_vkGetPhysicalDeviceProperties>(get_properties),
+        )
+    };
+    let mut memory = vk::PhysicalDeviceMemoryProperties::default();
+    let mut properties = vk::PhysicalDeviceProperties::default();
+    // SAFETY: `phys` is live (contract) and both outputs are valid, writable structs of the types
+    // the functions fill.
+    unsafe {
+        get_memory(phys, &mut memory);
+        get_properties(phys, &mut properties);
+    }
+    Some(gpu_info(&memory, &properties))
+}
+
+/// `bytes` as GiB with one decimal.
+fn gib(bytes: u64) -> String {
+    format!("{:.1} GiB", bytes as f64 / (1u64 << 30) as f64)
+}
+
+fn type_name(device_type: vk::PhysicalDeviceType) -> &'static str {
+    match device_type {
+        vk::PhysicalDeviceType::DISCRETE_GPU => "discrete",
+        vk::PhysicalDeviceType::INTEGRATED_GPU => "integrated",
+        vk::PhysicalDeviceType::VIRTUAL_GPU => "virtual",
+        vk::PhysicalDeviceType::CPU => "CPU",
+        _ => "other",
+    }
+}
+
+/// The one log line for the first device.
+fn engaged_line(gpu: Option<&GpuInfo>) -> String {
+    match gpu {
+        Some(gpu) => format!(
+            "wrapper chain engaged (device created): GPU \"{}\", {}, largest device-local heap {}",
+            gpu.name,
+            type_name(gpu.device_type),
+            gib(gpu.device_local)
+        ),
+        None => "wrapper chain engaged (device created); the GPU could not be queried".to_owned(),
+    }
+}
+
+/// The texture-budget step of the first device: `None` when there is nothing to say (the table
+/// was not prepared, and `texture_budget::init` has already logged why), else the one line to log.
+/// `apply` is called at most once, and only with a budget from [`budget_bytes`].
+fn texture_step<P>(
+    prepared: Option<P>,
+    gpu: Option<&GpuInfo>,
+    settings: Option<&TextureSettings>,
+    apply: impl FnOnce(P, u64) -> Result<(), PatchError>,
+) -> Option<(Level, String)> {
+    let prepared = prepared?;
+    let Some(settings) = settings else {
+        return Some((
+            Level::Warn,
+            "texture budget: not applied: the settings were not handed to the Vulkan wrapper"
+                .to_owned(),
+        ));
+    };
+    let Some(gpu) = gpu else {
+        return Some((
+            Level::Warn,
+            "texture budget: not applied: the GPU's memory heaps could not be read".to_owned(),
+        ));
+    };
+    let TextureSettings { mode, reserve_gib } = *settings;
+    match budget_bytes(gpu.device_local, reserve_gib, gpu.integrated(), &mode) {
+        Some(bytes) => {
+            let result = apply(prepared, bytes);
+            Some(outcome(
+                &result,
+                bytes,
+                gpu.device_local,
+                reserve_gib,
+                &mode,
+            ))
+        }
+        None if gpu.integrated() => Some((
+            Level::Info,
+            format!(
+                "texture budget: unchanged: integrated GPU (device-local {})",
+                gib(gpu.device_local)
+            ),
+        )),
+        None if matches!(mode, TextureBudget::Off) => Some((
+            Level::Info,
+            "texture budget: off: TextureBudget = off in the settings file".to_owned(),
+        )),
+        None => Some((
+            Level::Info,
+            format!(
+                "texture budget: unchanged: device-local {} less the {reserve_gib} GiB reserve is \
+                 not above 2 GiB",
+                gib(gpu.device_local)
+            ),
+        )),
+    }
+}
+
+// ---- installing --------------------------------------------------------------------------------
+
+/// Put [`wrap_gpa`] in the exe's KERNEL32 `GetProcAddress` import slot, keeping the old value in
+/// [`REAL_GPA`]. `Err` says why the slot was not changed.
+///
+/// Start-up only (from `entry::start`): it walks the import table and swaps the slot, see the
+/// rules on [`iat::find_slot`] and [`iat::swap`].
+pub fn install(m: &Module) -> Result<(), String> {
+    // SAFETY: start-up only (above), and `m` is the running exe from `scan::main_module`.
+    let slot = unsafe { iat::find_slot(m, "kernel32.dll", "GetProcAddress") }
+        .ok_or_else(|| "the exe has no KERNEL32 GetProcAddress import".to_owned())?;
+    let swap = |slot: *mut usize, new: usize| {
+        // SAFETY: `install_at` passes only the `slot` that `find_slot` returned, and `new` is
+        // `wrap_gpa` (GetProcAddress's exact type, checked above) or the value the slot held
+        // before; start-up only, so the swap's rules hold.
+        unsafe { iat::swap(slot, new) }
+    };
+    // SAFETY: `slot` comes from `find_slot`, so it is an aligned, readable import slot, and `swap`
+    // is `iat::swap`.
+    unsafe { install_at(slot, &REAL_GPA, wrap_gpa as *const () as usize, swap) }.map(|_| ())
+}
+
+/// The body of [`install`], with the slot, the static and the swap passed in. Returns the old
+/// value of the slot.
+///
+/// The old value goes into `real` BEFORE the swap, so a game thread that calls through the slot
+/// the moment it changes finds its real pointer. If the swap does not happen (`swap` returns 0,
+/// Task 5's "not hooked"), `real` stays set but nothing calls it.
+///
+/// # Safety
+///
+/// `slot` is the address of an import slot, readable as a `usize`. `swap(slot, new)` behaves like
+/// [`iat::swap`]: it writes `new` and returns the old value, or returns 0 and changes nothing.
+unsafe fn install_at(
+    slot: *mut usize,
+    real: &AtomicUsize,
+    wrapper: usize,
+    mut swap: impl FnMut(*mut usize, usize) -> usize,
+) -> Result<usize, String> {
+    if slot.is_null() || !slot.is_aligned() {
+        return Err(format!("the import slot {slot:p} is null or not aligned"));
+    }
+    // SAFETY: an aligned, readable usize (contract and the check above).
+    let old = unsafe { slot.read_volatile() };
+    if old == 0 {
+        return Err(format!("the import slot {slot:p} holds 0"));
+    }
+    if old == wrapper {
+        return Err("already installed: the slot holds the wrapper".to_owned());
+    }
+    let held = first_wins(real, old);
+    if held != old {
+        return Err(format!(
+            "already installed once: the real GetProcAddress is kept as {held:#x}"
+        ));
+    }
+    let was = swap(slot, wrapper);
+    if was == 0 {
+        return Err(format!(
+            "not hooked: the import slot {slot:p} was not changed (see the iat warning above)"
+        ));
+    }
+    if was != old {
+        // Something changed the slot between the read above and the swap, so `real` holds a
+        // value that was not the one replaced. Put back what the swap found and give up.
+        let back = swap(slot, was);
+        if back != wrapper {
+            log::error!(
+                "vk: putting {was:#x} back into the import slot {slot:p} failed; it may hold \
+                 {wrapper:#x}"
+            );
+        }
+        return Err(format!(
+            "the import slot {slot:p} changed during install ({old:#x}, then {was:#x}); not \
+             hooked"
+        ));
+    }
+    Ok(old)
+}
+
+/// The start-up step from `entry::start`: keep the texture settings for the first device and
+/// install the chain. It swaps an import slot, not code, so it runs on unknown builds too. Logs
+/// `vk wrapper installed`, or why it is off.
+pub fn init(texture: TextureSettings) {
+    // `entry::start` runs once, so the cell is empty; an `Err` could only mean it was set already.
+    let _ = TEXTURE_SETTINGS.set(texture);
+    match install(&crate::scan::main_module()) {
+        Ok(()) => log::info!("vk wrapper installed"),
+        Err(why) => log::warn!("vk wrapper: off: {why}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::patch::test_support::Mem;
+    use std::cell::Cell;
+    use windows_sys::Win32::System::Memory::PAGE_NOACCESS;
+
+    // ---- the brief's tests (ruling G10: no submit wrappers) -----------------------------------
+
+    #[test]
+    fn classify_names() {
+        assert!(matches!(
+            classify_gpa(b"vkGetInstanceProcAddr"),
+            Some(Wrap::Gipa)
+        ));
+        assert!(classify_gpa(b"vkGetInstanceProcAddrX").is_none());
+        assert!(matches!(
+            classify_gipa(b"vkCreateDevice"),
+            Some(Wrap::CreateDevice)
+        ));
+        assert!(matches!(
+            classify_gdpa(b"vkQueuePresentKHR"),
+            Some(Wrap::Present)
+        ));
+        assert!(classify_gdpa(b"vkQueueSubmit").is_none());
+        assert!(classify_gdpa(b"vkQueueSubmit2").is_none());
+    }
+
+    #[test]
+    fn every_classifier_knows_exactly_its_names() {
+        assert_eq!(classify_gpa(b"vkGetDeviceProcAddr"), None);
+        assert_eq!(classify_gpa(b"vkQueuePresentKHR"), None);
+        assert_eq!(classify_gpa(b""), None);
+        assert_eq!(classify_gpa(b"vkgetinstanceprocaddr"), None, "case matters");
+
+        // Defensive: present and swapchain also at instance level.
+        assert_eq!(classify_gipa(b"vkGetInstanceProcAddr"), Some(Wrap::Gipa));
+        assert_eq!(classify_gipa(b"vkGetDeviceProcAddr"), Some(Wrap::Gdpa));
+        assert_eq!(classify_gipa(b"vkQueuePresentKHR"), Some(Wrap::Present));
+        assert_eq!(
+            classify_gipa(b"vkCreateSwapchainKHR"),
+            Some(Wrap::CreateSwapchain)
+        );
+        assert_eq!(classify_gipa(b"vkCreateInstance"), None);
+        assert_eq!(classify_gipa(b"vkQueueSubmit2"), None);
+
+        assert_eq!(classify_gdpa(b"vkGetDeviceProcAddr"), Some(Wrap::Gdpa));
+        assert_eq!(
+            classify_gdpa(b"vkCreateSwapchainKHR"),
+            Some(Wrap::CreateSwapchain)
+        );
+        assert_eq!(
+            classify_gdpa(b"vkCreateDevice"),
+            None,
+            "not a device-level command"
+        );
+        assert_eq!(classify_gdpa(b"vkGetInstanceProcAddr"), None);
+        assert_eq!(
+            classify_gdpa(b"vkQueuePresentKHR\0"),
+            None,
+            "the NUL is not part of it"
+        );
+    }
+
+    thread_local! {
+        /// Calls of `fake_gpa` on this thread. Each test runs on its own thread and measures a
+        /// difference, so the two tests below do not depend on their order (and both set
+        /// REAL_GPA to the same function).
+        static FAKE_CALLS: Cell<u32> = const { Cell::new(0) };
+        static FAKE_LAST: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    }
+
+    /// A `GetProcAddress` that only counts and records its arguments and finds nothing.
+    ///
+    /// # Safety
+    ///
+    /// None needed: it reads neither argument. It is `unsafe extern "system"` only to have
+    /// `GetProcAddress`'s type.
+    unsafe extern "system" fn fake_gpa(module: HMODULE, name: PCSTR) -> FARPROC {
+        FAKE_CALLS.with(|c| c.set(c.get() + 1));
+        FAKE_LAST.with(|c| c.set((module as usize, name as usize)));
+        None
+    }
+
+    /// Only the two `wrap_gpa` tests set REAL_GPA, both to `fake_gpa`, and no unit test calls
+    /// `install`, so this plain store cannot pull the rug from under another test.
+    fn set_real_gpa_for_test(f: usize) {
+        REAL_GPA.store(f, Ordering::Release);
+    }
+
+    fn kernel32() -> HMODULE {
+        // SAFETY: a module name literal; kernel32 is always loaded.
+        unsafe { GetModuleHandleW(windows_sys::w!("kernel32.dll")) }
+    }
+
+    /// Review focus 2: whatever was in the slot (kernel32, or another tool's hook) is what gets
+    /// called, with the caller's arguments.
+    #[test]
+    fn wrap_gpa_calls_saved_pointer() {
+        set_real_gpa_for_test(fake_gpa as *const () as usize);
+        let before = FAKE_CALLS.with(Cell::get);
+        let name = b"Sleep\0";
+        // SAFETY: a live module handle and a NUL-terminated name.
+        let got = unsafe { wrap_gpa(kernel32(), name.as_ptr()) };
+        assert!(got.is_none(), "the fake's answer comes back");
+        assert_eq!(FAKE_CALLS.with(Cell::get) - before, 1);
+        assert_eq!(
+            FAKE_LAST.with(Cell::get),
+            (kernel32() as usize, name.as_ptr() as usize)
+        );
+    }
+
+    #[test]
+    fn wrap_gpa_ordinal_passthrough() {
+        set_real_gpa_for_test(fake_gpa as *const () as usize);
+        let before = FAKE_CALLS.with(Cell::get);
+        // Ordinal 5: address 5 is never mapped, so reading it would crash the test.
+        // SAFETY: an ordinal is a valid GetProcAddress name argument.
+        let _ = unsafe { wrap_gpa(kernel32(), 5usize as PCSTR) };
+        assert_eq!(FAKE_CALLS.with(Cell::get) - before, 1);
+        assert_eq!(FAKE_LAST.with(Cell::get), (kernel32() as usize, 5));
+    }
+
+    // ---- which names are read, and how far -----------------------------------------------------
+
+    /// A stand-in for an address `GetProcAddress` returned.
+    fn some_function() -> FARPROC {
+        to_farproc(fake_gpa as *const () as usize)
+    }
+
+    #[test]
+    fn a_null_module_or_an_ordinal_never_gets_its_name_compared() {
+        let asked = Cell::new(0);
+        let vulkan_null = || {
+            asked.set(asked.get() + 1);
+            std::ptr::null_mut()
+        };
+        let name: PCSTR = c"vkGetInstanceProcAddr".as_ptr().cast();
+        // A null module while vulkan-1 is not loaded (also null): not equal, not even asked.
+        // SAFETY: `name` is NUL-terminated.
+        let got = unsafe { gpa_choose(some_function(), std::ptr::null_mut(), name, vulkan_null) };
+        assert_eq!(addr_of(got), addr_of(some_function()));
+        assert_eq!(asked.get(), 0, "a null module must not be compared");
+        // An ordinal: passed through, the module is not asked for and address 7 is not read.
+        // SAFETY: an ordinal, which gpa_choose never reads.
+        let got = unsafe { gpa_choose(some_function(), kernel32(), 7usize as PCSTR, kernel32) };
+        assert_eq!(addr_of(got), addr_of(some_function()));
+        // A module that is not vulkan-1: passed through.
+        // SAFETY: `name` is NUL-terminated.
+        let got = unsafe { gpa_choose(some_function(), kernel32(), name, vulkan_null) };
+        assert_eq!(addr_of(got), addr_of(some_function()));
+        assert_eq!(asked.get(), 1);
+        // A null answer stays null.
+        // SAFETY: `name` is NUL-terminated.
+        let got = unsafe { gpa_choose(None, kernel32(), name, kernel32) };
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn names_are_read_up_to_the_nul_and_never_past_the_cap() {
+        // Two pages; the second has no access. Names are put at the very end of the first, so a
+        // read one byte too far faults and fails the test.
+        let mem = Mem::rw(0x2000);
+        mem.protect(0x1000, 0x1000, PAGE_NOACCESS);
+        let end = 0x1000;
+        let mut buf = [0u8; NAME_CAP];
+
+        // A name of NAME_CAP - 1 bytes and its NUL, ending at the page end: read in full.
+        let mut long = vec![b'a'; NAME_CAP - 1];
+        long.push(0);
+        mem.put(end - NAME_CAP, &long);
+        // SAFETY: NAME_CAP readable bytes, NUL-terminated.
+        let got = unsafe { read_name((mem.base + end - NAME_CAP) as *const u8, &mut buf) };
+        assert_eq!(got, Some(&long[..NAME_CAP - 1]));
+
+        // NAME_CAP bytes with no NUL, ending at the page end: not a name, and nothing past them
+        // is read.
+        mem.put(end - NAME_CAP, &[b'b'; NAME_CAP]);
+        // SAFETY: NAME_CAP readable bytes.
+        let got = unsafe { read_name((mem.base + end - NAME_CAP) as *const u8, &mut buf) };
+        assert_eq!(got, None);
+
+        // A short name.
+        mem.put(end - 4, b"abc\0");
+        // SAFETY: NUL-terminated.
+        let got = unsafe { read_name((mem.base + end - 4) as *const u8, &mut buf) };
+        assert_eq!(got, Some(&b"abc"[..]));
+
+        // Null and ordinals: nothing is read.
+        // SAFETY: values <= 0xFFFF are never read.
+        unsafe {
+            assert_eq!(read_name(std::ptr::null(), &mut buf), None);
+            assert_eq!(read_name(0xFFFF as *const u8, &mut buf), None);
+        }
+    }
+
+    // ---- first value wins, and when a wrapper is handed out ------------------------------------
+
+    const WRAPPER: usize = 0x5000_0000;
+
+    #[test]
+    fn the_first_real_pointer_wins_and_a_different_one_is_not_wrapped() {
+        let slot = AtomicUsize::new(0);
+        assert_eq!(hand_out(&slot, 0x1000, WRAPPER, false), WRAPPER);
+        assert_eq!(slot.load(Ordering::Relaxed), 0x1000);
+        // The same pointer again (a second lookup): still wrapped.
+        assert_eq!(hand_out(&slot, 0x1000, WRAPPER, false), WRAPPER);
+        // A different pointer (say vulkan-1 reloaded elsewhere): handed back as it is, and the
+        // slot keeps the first.
+        assert_eq!(hand_out(&slot, 0x2000, WRAPPER, false), 0x2000);
+        assert_eq!(slot.load(Ordering::Relaxed), 0x1000);
+        // ... unless whatever the slot holds is valid for this caller too.
+        assert_eq!(hand_out(&slot, 0x2000, WRAPPER, true), WRAPPER);
+        assert_eq!(slot.load(Ordering::Relaxed), 0x1000);
+    }
+
+    #[test]
+    fn null_and_our_own_wrapper_are_never_stored() {
+        let slot = AtomicUsize::new(0);
+        assert_eq!(
+            hand_out(&slot, 0, WRAPPER, true),
+            0,
+            "no function: null back"
+        );
+        assert_eq!(hand_out(&slot, WRAPPER, WRAPPER, true), WRAPPER);
+        assert_eq!(
+            slot.load(Ordering::Relaxed),
+            0,
+            "storing the wrapper would make it call itself"
+        );
+    }
+
+    #[test]
+    fn first_value_wins_across_threads() {
+        let slot = AtomicUsize::new(0);
+        let winners = std::thread::scope(|s| {
+            let handles: Vec<_> = (1..=8usize)
+                .map(|i| {
+                    let slot = &slot;
+                    s.spawn(move || hand_out(slot, i * 0x1000, WRAPPER, false) == WRAPPER)
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .filter(|&won| won)
+                .count()
+        });
+        assert_eq!(
+            winners, 1,
+            "exactly one thread's pointer is kept and wrapped"
+        );
+        assert_ne!(slot.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn device_functions_are_wrapped_for_the_game_device_only() {
+        const GAME: usize = 0xD1;
+        const OTHER: usize = 0xD2;
+        let trampoline = 0x1000;
+        let driver = 0x2000;
+        let other_driver = 0x3000;
+
+        // The trampoline came first (an instance-level lookup); the game device's own pointer is
+        // different but the trampoline serves it, so it is wrapped.
+        let slot = AtomicUsize::new(trampoline);
+        assert_eq!(device_function(&slot, driver, WRAPPER, GAME, GAME), WRAPPER);
+        assert_eq!(slot.load(Ordering::Relaxed), trampoline);
+
+        // Another device, once the game's is known: unwrapped, and nothing stored.
+        let slot = AtomicUsize::new(0);
+        assert_eq!(
+            device_function(&slot, other_driver, WRAPPER, OTHER, GAME),
+            other_driver
+        );
+        assert_eq!(slot.load(Ordering::Relaxed), 0);
+        // The game's device afterwards still gets its own pointer stored and wrapped.
+        assert_eq!(device_function(&slot, driver, WRAPPER, GAME, GAME), WRAPPER);
+        assert_eq!(slot.load(Ordering::Relaxed), driver);
+        // Another device (made again after a device loss, same driver) whose pointer is the one
+        // the slot holds: the wrapper calls exactly that, so it is wrapped. Nothing changes.
+        assert_eq!(
+            device_function(&slot, driver, WRAPPER, OTHER, GAME),
+            WRAPPER
+        );
+        assert_eq!(slot.load(Ordering::Relaxed), driver);
+        // ... but never our own wrapper, and never a missing function.
+        assert_eq!(
+            device_function(&slot, WRAPPER, WRAPPER, OTHER, GAME),
+            WRAPPER
+        );
+        assert_eq!(device_function(&slot, 0, WRAPPER, OTHER, GAME), 0);
+        assert_eq!(slot.load(Ordering::Relaxed), driver);
+
+        // No device known yet: the first pointer is stored; a different one is not wrapped.
+        let slot = AtomicUsize::new(0);
+        assert_eq!(device_function(&slot, driver, WRAPPER, GAME, 0), WRAPPER);
+        assert_eq!(
+            device_function(&slot, other_driver, WRAPPER, OTHER, 0),
+            other_driver
+        );
+        assert_eq!(slot.load(Ordering::Relaxed), driver);
+
+        // A missing function stays missing.
+        assert_eq!(
+            device_function(&AtomicUsize::new(0), 0, WRAPPER, GAME, GAME),
+            0
+        );
+    }
+
+    // ---- a null real pointer is never called ---------------------------------------------------
+
+    #[test]
+    fn a_null_real_pointer_is_never_called() {
+        let name = c"vkQueuePresentKHR".as_ptr();
+        // SAFETY: with `real` 0 nothing is called and no argument is used.
+        unsafe {
+            assert!(call_gpa(0, kernel32(), name.cast()).is_none());
+            assert!(call_gipa(0, vk::Instance::null(), name).is_none());
+            assert!(call_gdpa(0, vk::Device::null(), name).is_none());
+            let failed = vk::Result::ERROR_INITIALIZATION_FAILED;
+            let null_out = std::ptr::null_mut();
+            assert_eq!(
+                call_create_device(
+                    0,
+                    vk::PhysicalDevice::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    null_out
+                ),
+                failed
+            );
+            assert_eq!(
+                call_create_swapchain(
+                    0,
+                    vk::Device::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null_mut()
+                ),
+                failed
+            );
+            assert_eq!(call_present(0, vk::Queue::null(), std::ptr::null()), failed);
+            assert_eq!(device_proc(0, c"vkQueuePresentKHR"), None);
+        }
+    }
+
+    // ---- install ------------------------------------------------------------------------------
+
+    const OLD: usize = 0x7FF0_1234_5670;
+
+    #[test]
+    fn install_stores_the_real_pointer_before_the_swap() {
+        let mut cell: usize = OLD;
+        let slot: *mut usize = &mut cell;
+        let real = AtomicUsize::new(0);
+        let mut swaps = 0;
+        let swap = |s: *mut usize, new: usize| {
+            swaps += 1;
+            assert_eq!(
+                real.load(Ordering::Acquire),
+                OLD,
+                "the slot must not change before the real pointer is stored"
+            );
+            // SAFETY: `s` is `slot`, a live usize.
+            unsafe { s.replace(new) }
+        };
+        // SAFETY: `slot` is a live, aligned usize; the fake swap writes it like iat::swap.
+        let got = unsafe { install_at(slot, &real, WRAPPER, swap) };
+        assert_eq!(got, Ok(OLD));
+        assert_eq!(swaps, 1);
+        assert_eq!(cell, WRAPPER);
+        assert_eq!(real.load(Ordering::Relaxed), OLD);
+    }
+
+    #[test]
+    fn a_swap_that_does_not_happen_is_an_error() {
+        let mut cell: usize = OLD;
+        let real = AtomicUsize::new(0);
+        // SAFETY: a live usize; the fake swap changes nothing and says so with 0.
+        let got = unsafe { install_at(&mut cell, &real, WRAPPER, |_, _| 0) };
+        assert!(got.unwrap_err().contains("not hooked"));
+        assert_eq!(cell, OLD);
+        // REAL_GPA stays set, unused: nothing is in the slot to call it.
+        assert_eq!(real.load(Ordering::Relaxed), OLD);
+    }
+
+    #[test]
+    fn install_refuses_a_zero_slot_a_second_install_and_our_own_wrapper() {
+        let real = AtomicUsize::new(0);
+        let never = |_: *mut usize, _: usize| -> usize { panic!("must not swap") };
+
+        let mut zero: usize = 0;
+        // SAFETY: a live usize; the swap is never called.
+        let got = unsafe { install_at(&mut zero, &real, WRAPPER, never) };
+        assert!(got.is_err());
+        assert_eq!(real.load(Ordering::Relaxed), 0);
+
+        let mut ours: usize = WRAPPER;
+        // SAFETY: as above.
+        let got = unsafe { install_at(&mut ours, &real, WRAPPER, never) };
+        assert!(got.unwrap_err().contains("already"));
+        assert_eq!(real.load(Ordering::Relaxed), 0);
+
+        // `real` already holds something else: a second install does not chain twice.
+        real.store(0x1111, Ordering::Relaxed);
+        let mut cell: usize = OLD;
+        // SAFETY: as above.
+        let got = unsafe { install_at(&mut cell, &real, WRAPPER, never) };
+        assert!(got.unwrap_err().contains("already"));
+        assert_eq!(cell, OLD);
+    }
+
+    #[test]
+    fn a_slot_that_changed_during_install_is_put_back() {
+        let mut cell: usize = OLD;
+        let slot: *mut usize = &mut cell;
+        let real = AtomicUsize::new(0);
+        let mut calls = Vec::new();
+        // The fake swap reports that the slot held 0x9999 by the time it swapped (someone changed
+        // it after install read it), and otherwise writes like iat::swap.
+        let swap = |s: *mut usize, new: usize| {
+            calls.push(new);
+            // SAFETY: `s` is `slot`, a live usize.
+            let old = unsafe { s.replace(new) };
+            if calls.len() == 1 {
+                0x9999
+            } else {
+                old
+            }
+        };
+        // SAFETY: `slot` is a live, aligned usize.
+        let got = unsafe { install_at(slot, &real, WRAPPER, swap) };
+        assert!(got.unwrap_err().contains("changed"));
+        assert_eq!(
+            calls,
+            [WRAPPER, 0x9999],
+            "the value found by the swap is put back"
+        );
+        assert_eq!(cell, 0x9999);
+    }
+
+    #[test]
+    fn a_misaligned_or_null_slot_is_refused() {
+        let real = AtomicUsize::new(0);
+        let never = |_: *mut usize, _: usize| -> usize { panic!("must not swap") };
+        // SAFETY: neither pointer is read: null and misaligned are refused first.
+        unsafe {
+            assert!(install_at(std::ptr::null_mut(), &real, WRAPPER, never).is_err());
+            let misaligned = std::ptr::without_provenance_mut::<usize>(3);
+            assert!(install_at(misaligned, &real, WRAPPER, never).is_err());
+        }
+    }
+
+    // ---- the first device -----------------------------------------------------------------------
+
+    fn heap(size: u64, flags: vk::MemoryHeapFlags) -> vk::MemoryHeap {
+        vk::MemoryHeap { size, flags }
+    }
+
+    const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn the_largest_device_local_heap_is_found_and_the_count_is_bounded() {
+        let mut memory = vk::PhysicalDeviceMemoryProperties {
+            memory_heap_count: 3,
+            ..Default::default()
+        };
+        memory.memory_heaps[0] = heap(32 * GIB, vk::MemoryHeapFlags::empty());
+        memory.memory_heaps[1] = heap(16 * GIB, vk::MemoryHeapFlags::DEVICE_LOCAL);
+        memory.memory_heaps[2] = heap(GIB / 4, vk::MemoryHeapFlags::DEVICE_LOCAL);
+        assert_eq!(largest_device_local(&memory), 16 * GIB);
+        // Heaps past the count do not count.
+        memory.memory_heap_count = 1;
+        assert_eq!(largest_device_local(&memory), 0);
+        // A count past the array (a broken driver) is cut to it instead of panicking.
+        memory.memory_heap_count = 99;
+        memory.memory_heaps[vk::MAX_MEMORY_HEAPS - 1] =
+            heap(24 * GIB, vk::MemoryHeapFlags::DEVICE_LOCAL);
+        assert_eq!(largest_device_local(&memory), 24 * GIB);
+    }
+
+    #[test]
+    fn the_device_name_stops_at_the_nul_or_the_array_end() {
+        let mut properties = vk::PhysicalDeviceProperties::default();
+        for (dst, &src) in properties.device_name.iter_mut().zip(b"GeForce Test\0junk") {
+            *dst = src as c_char;
+        }
+        assert_eq!(device_name(&properties), "GeForce Test");
+        properties.device_name = [b'x' as c_char; vk::MAX_PHYSICAL_DEVICE_NAME_SIZE];
+        assert_eq!(
+            device_name(&properties).len(),
+            vk::MAX_PHYSICAL_DEVICE_NAME_SIZE
+        );
+    }
+
+    fn gpu(device_local: u64, device_type: vk::PhysicalDeviceType) -> GpuInfo {
+        GpuInfo {
+            name: "Test GPU".to_owned(),
+            device_type,
+            device_local,
+        }
+    }
+
+    const AUTO: TextureSettings = TextureSettings {
+        mode: TextureBudget::Auto,
+        reserve_gib: 11.0,
+    };
+
+    #[test]
+    fn the_texture_budget_is_applied_once_for_a_card_with_room() {
+        let card = gpu(16 * GIB, vk::PhysicalDeviceType::DISCRETE_GPU);
+        let mut applied = Vec::new();
+        let step = texture_step(Some(()), Some(&card), Some(&AUTO), |(), bytes| {
+            applied.push(bytes);
+            Ok(())
+        });
+        let want = budget_bytes(16 * GIB, 11.0, false, &TextureBudget::Auto).unwrap();
+        assert_eq!(applied, [want]);
+        assert_eq!(
+            step,
+            Some(outcome(&Ok(()), want, 16 * GIB, 11.0, &TextureBudget::Auto))
+        );
+    }
+
+    #[test]
+    fn the_texture_budget_reports_what_apply_said() {
+        let card = gpu(16 * GIB, vk::PhysicalDeviceType::DISCRETE_GPU);
+        let fixed = TextureSettings {
+            mode: TextureBudget::Gib(6.0),
+            reserve_gib: 11.0,
+        };
+        let step = texture_step(Some(()), Some(&card), Some(&fixed), |(), _| {
+            Err(PatchError::ReadBack)
+        });
+        assert_eq!(
+            step,
+            Some(outcome(
+                &Err(PatchError::ReadBack),
+                6 * GIB,
+                16 * GIB,
+                11.0,
+                &fixed.mode
+            ))
+        );
+    }
+
+    #[test]
+    fn no_texture_write_without_a_table_room_or_a_discrete_card() {
+        let never = |(): (), _: u64| -> Result<(), PatchError> { panic!("must not apply") };
+        let big = gpu(16 * GIB, vk::PhysicalDeviceType::DISCRETE_GPU);
+        // No table: `texture_budget::init` has said why; nothing more to say.
+        assert_eq!(texture_step(None, Some(&big), Some(&AUTO), never), None);
+        // Integrated GPU (review focus 5).
+        let laptop = gpu(16 * GIB, vk::PhysicalDeviceType::INTEGRATED_GPU);
+        let (level, line) = texture_step(Some(()), Some(&laptop), Some(&AUTO), never).unwrap();
+        assert_eq!(level, Level::Info);
+        assert!(
+            line.contains("unchanged") && line.contains("integrated"),
+            "{line}"
+        );
+        // No room above 2 GiB once the reserve is taken.
+        let small = gpu(12 * GIB, vk::PhysicalDeviceType::DISCRETE_GPU);
+        let (level, line) = texture_step(Some(()), Some(&small), Some(&AUTO), never).unwrap();
+        assert_eq!(level, Level::Info);
+        assert!(
+            line.contains("unchanged") && line.contains("12.0 GiB"),
+            "{line}"
+        );
+        // The GPU could not be asked, or there are no settings: a warning, no write.
+        let (level, line) = texture_step(Some(()), None, Some(&AUTO), never).unwrap();
+        assert_eq!(level, Level::Warn);
+        assert!(line.contains("not applied"), "{line}");
+        let (level, line) = texture_step(Some(()), Some(&big), None, never).unwrap();
+        assert_eq!(level, Level::Warn);
+        assert!(line.contains("not applied"), "{line}");
+    }
+
+    #[test]
+    fn the_engaged_line_names_the_gpu() {
+        let card = gpu(16 * GIB, vk::PhysicalDeviceType::DISCRETE_GPU);
+        let line = engaged_line(Some(&card));
+        assert!(
+            line.starts_with("wrapper chain engaged (device created)"),
+            "{line}"
+        );
+        assert!(
+            line.contains("\"Test GPU\", discrete") && line.contains("16.0 GiB"),
+            "{line}"
+        );
+        assert!(engaged_line(None).starts_with("wrapper chain engaged (device created)"));
+    }
+
+    #[test]
+    fn the_gpu_query_needs_both_functions() {
+        // SAFETY: with a 0 pointer nothing is called.
+        unsafe {
+            assert!(query_gpu(0, 1, vk::PhysicalDevice::null()).is_none());
+            assert!(query_gpu(1, 0, vk::PhysicalDevice::null()).is_none());
+        }
+    }
+}
