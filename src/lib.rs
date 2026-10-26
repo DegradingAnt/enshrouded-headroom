@@ -6,6 +6,7 @@
 
 pub mod build_id;
 pub mod config;
+pub mod display;
 pub mod entry;
 pub mod features;
 pub mod frame_timer;
