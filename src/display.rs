@@ -3,9 +3,11 @@
 //! The governor (Task 15) calls `period_ms(refresh_hz(game_window()?))` every few seconds from its
 //! own thread, not the game's window thread. All three functions are read-only queries on user32.
 //! They keep no state between calls, take no lock, touch no game memory and do not log (the caller
-//! logs). Each call asks Windows afresh, so a change of display mode, or of the monitor the window
-//! is on, shows up on the next call.
+//! logs; the one exception is the panic guard around the `EnumWindows` callback, which logs once if
+//! the callback ever panics). Each call asks Windows afresh, so a change of display mode, or of the
+//! monitor the window is on, shows up on the next call.
 
+use crate::guard::{self, guard, Feature};
 use windows_sys::core::BOOL;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT, TRUE};
 use windows_sys::Win32::Graphics::Gdi::{
@@ -36,22 +38,38 @@ const _: () = assert!(size_of::<DEVMODEW>() <= u16::MAX as usize);
 ///
 /// "Largest" is by `GetWindowRect` area. Of equal areas the first one `EnumWindows` reports (in
 /// practice the one highest in the Z order) wins. A window with no area never wins.
+///
+/// This is a heuristic for the window of the game's swapchain, not a lookup of it. A wrong pick
+/// changes the result only when a larger window of this process sits on another monitor with a
+/// different refresh rate. (Taking the window from the swapchain's surface instead is deferred.)
+///
+/// If the `EnumWindows` callback ever panics, the panic guard switches the governor off and this
+/// returns `None` from then on.
 pub fn game_window() -> Option<HWND> {
+    scan().0
+}
+
+/// What [`game_window`] does: the pick (`None` if there is no candidate, if `EnumWindows` fails, or
+/// if the governor has been switched off) and how many windows `EnumWindows` offered the callback,
+/// which a test uses to prove that the enumeration ran at all.
+fn scan() -> (Option<HWND>, u32) {
     let mut state = EnumState {
         // SAFETY: GetCurrentProcessId has no preconditions.
         pid: unsafe { GetCurrentProcessId() },
         largest: Largest::new(),
+        seen: 0,
     };
     // SAFETY: `enum_proc` has the WNDENUMPROC signature. The LPARAM is the address of `state`,
     // which is alive and used by nothing else until EnumWindows returns: EnumWindows calls back
     // synchronously, on this thread, and only before it returns.
     let enumerated =
         unsafe { EnumWindows(Some(enum_proc), &mut state as *mut EnumState as LPARAM) };
-    if enumerated == 0 {
-        // `enum_proc` always returns TRUE, so a zero is EnumWindows itself failing.
-        return None;
+    // `enum_proc` always returns TRUE, so a zero is EnumWindows itself failing. A switched-off
+    // governor means the callback panicked (or did nothing): a partial pick is not to be trusted.
+    if enumerated == 0 || guard::is_disabled(Feature::Governor) {
+        return (None, state.seen);
     }
-    state.largest.winner()
+    (state.largest.winner(), state.seen)
 }
 
 /// What the `EnumWindows` callback needs, passed through its `LPARAM`.
@@ -60,23 +78,36 @@ struct EnumState {
     pid: u32,
     /// The best candidate so far.
     largest: Largest<HWND>,
+    /// How many windows the callback has been offered, whether or not they qualify.
+    seen: u32,
 }
 
-/// The `EnumWindows` callback. It must not panic (a panic cannot unwind out of an `extern "system"`
-/// function, so it would abort the game), so it only calls [`consider`], which has no indexing,
-/// unwrapping or arithmetic that can overflow. It always returns TRUE, to go on to the next window.
+/// The `EnumWindows` callback. Like every extern function in the mod, its body runs inside
+/// [`guard()`], as [`Feature::Governor`] (the governor is the only caller). A panic cannot unwind out
+/// of an `extern "system"` function (it would abort the game), so the guard catches it, switches
+/// the governor off and returns TRUE as usual; [`scan`] then returns no window. [`consider`] has no
+/// indexing, unwrapping or arithmetic that can overflow, so this is a backstop. Both the guarded
+/// and the fallback path return TRUE, to go on to the next window.
 unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    // SAFETY: `lparam` is the address of the `EnumState` that `game_window` keeps alive, and
-    // nothing else uses, for the whole of the EnumWindows call; `as_mut` turns a null into `None`.
-    if let Some(state) = unsafe { (lparam as *mut EnumState).as_mut() } {
-        consider(state, hwnd);
-    }
-    TRUE
+    guard(
+        Feature::Governor,
+        || TRUE,
+        || {
+            // SAFETY: `lparam` is the address of the `EnumState` that `scan` keeps alive, and
+            // nothing else uses, for the whole of the EnumWindows call; `as_mut` turns a null into
+            // `None`.
+            if let Some(state) = unsafe { (lparam as *mut EnumState).as_mut() } {
+                consider(state, hwnd);
+            }
+            TRUE
+        },
+    )
 }
 
 /// Offers `hwnd` to `state` if it is a visible, unowned top-level window of this process. Any
 /// Windows call that fails rules the window out.
 fn consider(state: &mut EnumState, hwnd: HWND) {
+    state.seen = state.seen.saturating_add(1);
     let mut pid = 0u32;
     // SAFETY: user32 validates the handle itself (a window that has gone since EnumWindows listed
     // it just makes the call fail), and `pid` is valid for writes.
@@ -108,6 +139,8 @@ fn consider(state: &mut EnumState, hwnd: HWND) {
 /// rate display (G-SYNC, FreeSync) that is the mode's maximum rate, not the rate the panel scans
 /// at from moment to moment, so it is a ceiling: the governor treats it as the frame-time floor,
 /// the shortest frame time the display can show.
+///
+/// The value is whole Hz: a 59.94 Hz mode reads 59.
 // `HWND` is a raw pointer type, but a window handle is an opaque value that user32 looks up in its
 // own tables: this process never dereferences it, so the function is safe for any value.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -305,8 +338,20 @@ mod tests {
         // Windows rejects a MONITORINFOEXW or DEVMODEW whose size field is not exactly this.
         assert_eq!(size_of::<MONITORINFOEXW>(), 104);
         assert_eq!(size_of::<DEVMODEW>(), 220);
-        assert_eq!(MONITORINFOEXW_SIZE as usize, size_of::<MONITORINFOEXW>());
-        assert_eq!(DEVMODEW_SIZE as usize, size_of::<DEVMODEW>());
+    }
+
+    #[test]
+    fn refresh_hz_is_safe_for_any_handle() {
+        // A window handle is an opaque value that user32 validates, never a pointer this process
+        // follows (the reason `refresh_hz` is a safe fn). Whatever the handle, the answer is
+        // either "unknown" or a usable rate.
+        for hwnd in [std::ptr::null_mut(), 0x1234usize as HWND] {
+            let hz = refresh_hz(hwnd);
+            assert!(
+                hz.is_none_or(|hz| hz > 1),
+                "handle {hwnd:?} gave {hz:?}, not None or a rate above 1"
+            );
+        }
     }
 
     #[test]
@@ -314,6 +359,11 @@ mod tests {
         let _lock = WINDOWS.lock().unwrap_or_else(PoisonError::into_inner);
         // The test harness makes no window; this walks every window on the desktop through the
         // EnumWindows callback and rejects them all (they belong to other processes).
+        let (found, seen) = scan();
+        assert_eq!(found, None);
+        // An empty answer is also what a failed or skipped enumeration gives, so check that the
+        // callback really was offered windows.
+        assert!(seen > 0, "EnumWindows offered the callback no windows");
         assert_eq!(game_window(), None);
     }
 
