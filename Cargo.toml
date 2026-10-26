@@ -32,6 +32,12 @@ configparser = "=3.3.0"
 log = "=0.4.34"
 fern = "=0.7.1"
 
+[target.'cfg(loom)'.dev-dependencies]
+loom = "=0.7.2"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
 [profile.release]
 panic = "unwind"
 lto = "fat"

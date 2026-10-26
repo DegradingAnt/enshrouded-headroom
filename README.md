@@ -121,6 +121,8 @@ until the author's in-game A/B test.
 
 ## Logs and troubleshooting
 
+See the [troubleshooting guide](docs/troubleshooting.md) for each log message, its meaning and the next step.
+
 The plugin writes `enshrouded-headroom.log` next to the `.asi`. If that location cannot be written, it tries `%LOCALAPPDATA%\enshrouded-headroom\`. If neither location works, file logging stays off. The log is replaced each run, so save a copy before restarting when investigating a problem.
 
 At the default `info` level, check these entries:
