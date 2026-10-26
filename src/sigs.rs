@@ -109,6 +109,16 @@ pub const ASYNC_OVERRIDE: Sig = Sig {
     patch_offsets: &[3],
 };
 
+/// HDR composite paper-white immediate. Anchor 0x1408f88bc; imm32 at +3.
+/// Source: `docs/re-notes.md`, "HDR paper white". Wildcard the immediate so the checked
+/// write can report a value changed by another tool; the following clamp store stays fixed.
+pub const HDR_PAPER_WHITE: Sig = Sig {
+    name: "HDR_PAPER_WHITE",
+    pattern: "c7 45 88 ?? ?? ?? ?? 49 8b 16 c7 45 8c 9a 99 19 3f",
+    sections: &[".text"],
+    patch_offsets: &[3],
+};
+
 /// Terrain update function (pre-hook; prologue only, so fragile across updates). Anchor
 /// 0x1401e2e80.
 pub const TERRAIN_UPDATE_FN: Sig = Sig {
@@ -141,6 +151,7 @@ pub const ALL: &[&Sig] = &[
     &DISTANT_HIGH_IMM,
     &VOXEL_HIGH_IMMS,
     &ASYNC_OVERRIDE,
+    &HDR_PAPER_WHITE,
     &TERRAIN_UPDATE_FN,
     &SCATTER_FRAME_FN,
 ];
@@ -154,8 +165,8 @@ mod tests {
     }
 
     #[test]
-    fn all_has_the_eleven_entries_with_distinct_names_and_patterns() {
-        assert_eq!(ALL.len(), 11);
+    fn all_has_the_twelve_entries_with_distinct_names_and_patterns() {
+        assert_eq!(ALL.len(), 12);
         for (i, a) in ALL.iter().enumerate() {
             for b in ALL.iter().skip(i + 1) {
                 assert_ne!(a.name, b.name);
@@ -180,6 +191,7 @@ mod tests {
                 "DISTANT_HIGH_IMM",
                 "VOXEL_HIGH_IMMS",
                 "ASYNC_OVERRIDE",
+                "HDR_PAPER_WHITE",
                 "TERRAIN_UPDATE_FN",
                 "SCATTER_FRAME_FN",
             ]

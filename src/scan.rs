@@ -2006,7 +2006,7 @@ mod tests {
     /// f68140a3 (sha256 b28b448a...; the Steam exe has the same code at the same addresses). The
     /// game-exe test asserts on them, so a pattern that drifts to a different place fails the
     /// test; it is a build-specific check.
-    const ANCHORS: [(&str, u64); 11] = [
+    const ANCHORS: [(&str, u64); 12] = [
         ("SCENE_SETTINGS_FN", 0x1_400f_72b0),
         ("SCATTER_BRICK_LOAD", 0x1_4007_9502),
         ("SCATTER_INSTANCE_LOADS", 0x1_4007_691c),
@@ -2016,6 +2016,7 @@ mod tests {
         ("DISTANT_HIGH_IMM", 0x1_400d_7816),
         ("VOXEL_HIGH_IMMS", 0x1_400f_7f1f),
         ("ASYNC_OVERRIDE", 0x1_4084_90d2),
+        ("HDR_PAPER_WHITE", 0x1_408f_88bc),
         ("TERRAIN_UPDATE_FN", 0x1_401e_2e80),
         ("SCATTER_FRAME_FN", 0x1_4007_67a0),
     ];

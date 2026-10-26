@@ -359,6 +359,10 @@ The governor raises 7.1, then 7.2, then 7.3. The order is re-checked after the i
 - `AllowUnknownBuild = 0 | 1`
 - `LogLevel = error | warn | info | debug`
 
+`[Hdr]`:
+
+- `PaperWhiteNits = game | <number>` (default `game`; finite 40..=400 nits). Invalid or out-of-range values warn and use `game`.
+
 `[Governor]`: the keys in 6.4.
 
 `[Knobs]`:
@@ -371,7 +375,26 @@ The governor raises 7.1, then 7.2, then 7.3. The order is re-checked after the i
 - `ScatterProbe = 0 | 1` (default 0): read and log the scatter counters (7.2a). With `EnableScatterDistance = 0`, this key is the only reason to install the probe hook.
 - `ForceStepObjectDistance`, `ForceStepScatterDistance`, `ForceStepTerrainDistance = 0..=4` (default: absent, the knob is not held): hold that knob at a fixed step for testing (pre-flight ruling for Task 17). A whole number outside 0..=4 is clamped with a warning. Other text warns and counts as absent.
 
-Unknown keys and invalid values are logged. Invalid choices use their defaults. Out-of-range numeric values are clamped.
+Unknown keys and invalid values are logged. Invalid choices use their defaults.
+Out-of-range numeric values are clamped, except `PaperWhiteNits`, which falls back to `game`.
+
+### HDR paper white
+
+The HDR composite pass multiplies scene and UI by a hard-coded 250.0f before PQ encoding.
+`PaperWhiteNits = game` leaves it unchanged. A finite number from 40 through 400 replaces
+only that four-byte immediate, once at start-up, when `code_patches_allowed()` permits it.
+The mod requires one `HDR_PAPER_WHITE` match in `.text` and checks `00 00 7a 43` before
+writing the little-endian f32 bits. A changed immediate is left alone and logged as changed
+by another tool. Each outcome produces one `hdr paper white:` line.
+
+The effective-value accessor starts at 250 and publishes the chosen number only after a
+successful checked write. Skips and failed writes do not publish the configured number.
+It does not measure another tool's replacement value.
+
+The default remains `game` until the in-game A/B test (Task 17). The research proposes
+trying 80 nits first. The scale mismatch and visible HDR improvement remain hypotheses
+until that test. Peak changes, shader replacement and HDR metadata are later tasks.
+See `docs/re-notes.md`, "HDR paper white", for the verified instruction and context.
 
 ## 9. Failure handling
 
