@@ -169,4 +169,11 @@ mod tests {
         assert_eq!(share_at_or_below(&[f64::NAN, 1.0], 2.0), 0.5);
         assert_eq!(share_at_or_below(&[1.0], f64::NAN), 0.0);
     }
+
+    #[test]
+    fn the_five_percent_band_includes_its_edge_with_slack() {
+        assert!(near_a_multiple(21.0, 20.0));
+        assert!(near_a_multiple(21.0 + EPS, 20.0));
+        assert!(!near_a_multiple(21.0 + 2.0 * EPS, 20.0));
+    }
 }

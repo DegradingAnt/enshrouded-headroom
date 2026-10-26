@@ -1878,4 +1878,285 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn a_block_ends_at_its_slack_boundary() {
+        assert!(!blocked(0.0, EPS));
+        assert!(blocked(0.0, 2.0 * EPS));
+    }
+
+    #[test]
+    fn stall_boundary_frames_are_kept_without_starting_a_gap() {
+        for ms in [STALL_MS, STALL_MS + EPS] {
+            let mut g = gov();
+            g.active = true;
+            g.last_now = Some(0.0);
+            at(&mut g, 0.0, &[ms]);
+            assert_eq!(g.last_gap_frame, None, "{ms}");
+            assert_eq!(g.window, VecDeque::from([Frame { t: 0.0, ms }]));
+        }
+    }
+
+    #[test]
+    fn presents_are_still_active_at_the_slack_boundary() {
+        for now in [PRESENTS_STOPPED_S, PRESENTS_STOPPED_S + EPS] {
+            let mut g = gov();
+            g.active = true;
+            g.last_now = Some(0.0);
+            at(&mut g, now, &[]);
+            assert!(g.active, "{now}");
+        }
+    }
+
+    #[test]
+    fn an_active_world_starts_a_quiet_period_on_its_first_tick() {
+        let mut g = gov();
+        at(&mut g, 5.0, &[8.0]);
+        assert!(g.active);
+        assert_eq!(g.reset_at, 5.0);
+    }
+
+    #[test]
+    fn undo_grace_keeps_frames_out_through_its_slack_boundary() {
+        for now in [UNDO_GRACE_S, UNDO_GRACE_S + EPS] {
+            let mut g = gov();
+            g.active = true;
+            g.last_now = Some(0.0);
+            g.t_last_undo = Some(0.0);
+            at(&mut g, now, &[8.0]);
+            assert!(g.window.is_empty(), "{now}");
+        }
+    }
+
+    #[test]
+    fn clock_steps_inside_the_slack_do_not_reset_the_window() {
+        for raw in [REBASE_S, REBASE_S + EPS, -REBASE_S, -REBASE_S - EPS] {
+            let mut g = gov();
+            g.last_now = Some(0.0);
+            g.window.push_back(Frame { t: 0.0, ms: 8.0 });
+            assert_eq!(g.clamp_time(raw), raw.max(0.0));
+            assert_eq!(g.window.len(), 1, "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_backward_rebase_moves_every_running_clock_by_the_same_amount() {
+        let mut g = gov();
+        g.raise(9.0).unwrap();
+        g.last_now = Some(10.0);
+        g.last_frame_tick = 9.0;
+        g.blocked_until.fill(12.0);
+        g.last_gap_frame = Some(7.0);
+        g.last_stall = Some(6.0);
+        g.t_last_undo = Some(8.0);
+        assert_eq!(g.clamp_time(8.0), 8.0);
+        assert_eq!(g.last_frame_tick, 7.0);
+        assert_eq!(g.blocked_until, [10.0; 3]);
+        assert_eq!(g.stack[0].t, 7.0);
+        assert_eq!(g.last_raise, Some((0, 7.0)));
+        assert_eq!(g.last_gap_frame, Some(5.0));
+        assert_eq!(g.last_stall, Some(4.0));
+        assert_eq!(g.t_last_raise, Some(7.0));
+        assert_eq!(g.t_last_undo, Some(6.0));
+        assert_eq!(g.reset_at, 8.0);
+    }
+
+    #[test]
+    fn a_raise_resets_its_backoff_once_at_the_hold_boundary() {
+        let mut g = gov();
+        g.raise(0.0).unwrap();
+        g.undo_count[0] = 3;
+        g.reset_held_backoff(g.cfg.block_seconds - EPS);
+        assert_eq!(g.undo_count[0], 0);
+        assert!(g.stack[0].held);
+        g.undo_count[0] = 2;
+        g.reset_held_backoff(g.cfg.block_seconds + 1.0);
+        assert_eq!(g.undo_count[0], 2);
+    }
+
+    #[test]
+    fn removing_an_older_knob_keeps_the_latest_post_raise_period() {
+        let mut g = gov_with(vec![knob(1), knob(1)]);
+        g.raise(0.0).unwrap();
+        g.raise(1.0).unwrap();
+        g.remove_raises_of(0);
+        assert_eq!(g.stack.len(), 1);
+        assert_eq!(g.last_raise, Some((1, 1.0)));
+    }
+
+    #[test]
+    fn period_changes_need_more_than_five_percent_plus_slack() {
+        for (period, changed) in [(21.0, false), (21.0 + EPS, false), (22.0, true)] {
+            let mut g = gov();
+            g.last_valid_period = Some(20.0);
+            assert_eq!(g.period_changed(Some(period)), changed, "{period}");
+            assert_eq!(g.last_valid_period, Some(period));
+        }
+    }
+
+    #[test]
+    fn a_hitch_at_the_end_of_the_post_raise_period_still_undoes() {
+        for now in [2.0, 2.0 + EPS] {
+            let mut g = gov();
+            g.raise(0.0).unwrap();
+            assert_eq!(
+                g.hitch_undo(&[100.0], now, 10.0, None),
+                Some(Action::Set { knob: 0, step: 0 })
+            );
+        }
+    }
+
+    #[test]
+    fn a_frame_at_the_hitch_limit_plus_slack_is_not_a_hitch() {
+        for ms in [20.0, 20.0 + EPS] {
+            let mut g = gov();
+            g.raise(0.0).unwrap();
+            assert_eq!(g.hitch_undo(&[ms], 1.0, 10.0, None), None, "{ms}");
+            assert_eq!(g.steps(), [1, 0, 0]);
+        }
+    }
+
+    #[test]
+    fn hitch_limits_use_the_factor_and_allow_one_missed_vsync() {
+        let mut g = gov();
+        assert_eq!(g.hitch_limit(13.0, None), 26.0);
+        g.mode = Mode::Quantised { p: 10.0 };
+        for (factor, target, expected) in [
+            (2.0, 10.0, 21.0),
+            (2.0, 20.0, 40.0),
+            (1.2, 30.0, 42.0),
+            (1.2, 50.0, 60.0),
+        ] {
+            g.cfg.hitch_factor = factor;
+            assert!(
+                (g.hitch_limit(target, None) - expected).abs() < EPS,
+                "factor {factor}, target {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_second_stall_inside_the_window_undoes() {
+        for (first, next, undo) in [
+            (0.0, STALL_WINDOW_S + EPS, true),
+            (3.0, 12.0, true),
+            (3.0, 15.0, false),
+        ] {
+            let mut g = gov();
+            g.raise(0.0).unwrap();
+            assert_eq!(g.stall(first), None);
+            assert_eq!(g.stall(next).is_some(), undo, "{first} then {next}");
+            assert_eq!(g.last_stall, if undo { None } else { Some(next) });
+        }
+    }
+
+    #[test]
+    fn an_undo_ends_the_post_raise_period_it_removes() {
+        let mut g = gov();
+        g.raise(0.0).unwrap();
+        assert_eq!(g.undo(1.0), Some(Action::Set { knob: 0, step: 0 }));
+        assert_eq!(g.last_raise, None);
+    }
+
+    #[test]
+    fn eviction_keeps_frames_at_the_window_age_plus_slack() {
+        for now in [2.0, 2.0 + EPS] {
+            let mut g = gov();
+            g.window.push_back(Frame { t: 0.0, ms: 8.0 });
+            g.evict(now);
+            assert_eq!(g.window.len(), 1, "{now}");
+        }
+    }
+
+    #[test]
+    fn one_long_frame_overloads_only_above_two_percent() {
+        for (total, overload) in [(40, true), (50, false), (100, false)] {
+            let mut g = gov();
+            g.window
+                .extend((1..total).map(|_| Frame { t: 0.0, ms: 10.0 }));
+            g.window.push_back(Frame { t: 0.0, ms: 120.0 });
+            assert_eq!(g.assess(20.0, None), (false, overload), "{total}");
+        }
+    }
+
+    #[test]
+    fn frames_at_the_long_limit_plus_slack_are_not_long() {
+        for ms in [LONG_MS, LONG_MS + EPS] {
+            let mut g = gov();
+            g.window.extend((0..99).map(|_| Frame { t: 0.0, ms: 10.0 }));
+            g.window.push_back(Frame { t: 0.0, ms });
+            assert_eq!(g.assess(20.0, None), (true, false), "{ms}");
+        }
+    }
+
+    #[test]
+    fn quantised_mode_accepts_a_period_at_half_the_target_with_slack() {
+        let mut g = gov();
+        let p = 10.0 - EPS;
+        g.window.push_back(Frame { t: 0.0, ms: p });
+        assert_eq!(g.assess(20.0, Some(p)), (true, false));
+        assert_eq!(g.mode, Mode::Quantised { p });
+    }
+
+    #[test]
+    fn quantised_headroom_and_overload_count_late_frames_with_slack() {
+        for (late, headroom, overload) in [(1, true, false), (2, false, false), (3, false, true)] {
+            let mut g = gov();
+            g.window
+                .extend((0..100 - late).map(|_| Frame { t: 0.0, ms: 20.0 }));
+            g.window
+                .extend((0..late).map(|_| Frame { t: 0.0, ms: 21.02 }));
+            assert_eq!(
+                g.assess(20.0, Some(10.0)),
+                (headroom, overload),
+                "{late} late"
+            );
+        }
+    }
+
+    #[test]
+    fn quantised_frames_at_the_on_time_limit_are_on_time() {
+        let mut g = gov();
+        g.window.extend((0..98).map(|_| Frame { t: 0.0, ms: 20.0 }));
+        g.window.extend((0..2).map(|_| Frame { t: 0.0, ms: 21.0 }));
+        assert_eq!(g.assess(20.0, Some(10.0)), (true, false));
+    }
+
+    #[test]
+    fn p95_thresholds_are_strict_and_include_slack() {
+        for (ms, expected) in [
+            (9.0 - EPS, (false, false)),
+            (9.0, (false, false)),
+            (9.7, (false, false)),
+            (9.7 + EPS, (false, false)),
+            (10.0, (false, true)),
+        ] {
+            let mut g = gov();
+            g.window.push_back(Frame { t: 0.0, ms });
+            assert_eq!(g.assess(10.0, None), expected, "{ms}");
+        }
+    }
+
+    #[test]
+    fn a_raise_is_allowed_at_the_end_of_the_quiet_period_with_slack() {
+        let mut g = gov();
+        g.window.push_back(Frame { t: 0.0, ms: 1.0 });
+        g.headroom_since = Some(-10.0);
+        g.reset_at = 0.0;
+        assert_eq!(
+            g.decide(1.0 - EPS, 10.0, None, None),
+            Some(Action::Set { knob: 0, step: 1 })
+        );
+    }
+
+    #[test]
+    fn probation_and_the_raise_interval_end_at_their_slack_boundaries() {
+        let mut g = gov();
+        g.t_last_undo = Some(0.0);
+        g.t_last_raise = Some(1.0);
+        assert!(g.raise_allowed(20.0 - EPS), "probation has ended");
+        g.t_last_undo = Some(1.0);
+        g.t_last_raise = Some(0.0);
+        assert!(g.raise_allowed(20.0 - EPS), "the last raise is old enough");
+    }
 }
