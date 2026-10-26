@@ -313,6 +313,92 @@ pub const CLIMB: &[&Sig] = &[
     &CLIMB_UPDATE_LOST_TEST,
 ];
 
+// ---- EXPERIMENTAL: climb diagnostic (branch exp/climb-anything; never merged) -----------------
+//
+// Source: docs/re-notes.md, "Climb diagnostic". Each pattern is the start of one climb function,
+// so the match VA is the function and the hook goes at match + 0. A pattern is the shortest run
+// of whole instructions that matches once in the Steam exe's `.text` (sha256 d64966e2...), and
+// it has no wildcard. Each one ends long before the first byte that `features::climb` writes.
+// These entries are in neither [`ALL`] nor [`CLIMB`]; they are in [`CLIMB_DIAG`].
+
+/// The wall probe `FUN_14024abc0(out, ctx, pos, dir, len) -> out`: 25 bytes. Anchor 0x14024abc0.
+pub const CLIMB_DIAG_PROBE_FN: Sig = Sig {
+    name: "CLIMB_DIAG_PROBE_FN",
+    pattern: "48 8b c4 48 89 58 08 55 56 57 41 54 41 55 41 56 41 57 48 8d a8 c8 fe ff ff",
+    sections: &[".text"],
+    patch_offsets: &[0],
+};
+
+/// The start check `FUN_140419570(it)`: 18 bytes. Anchor 0x140419570.
+pub const CLIMB_DIAG_START_FN: Sig = Sig {
+    name: "CLIMB_DIAG_START_FN",
+    pattern: "40 55 57 48 8d 6c 24 d8 48 81 ec 28 01 00 00 48 8b f9",
+    sections: &[".text"],
+    patch_offsets: &[0],
+};
+
+/// The top entry `FUN_14024c320(out, ctx, p3, input, p5) -> out`: 26 bytes. Anchor 0x14024c320.
+pub const CLIMB_DIAG_TOP_ENTRY_FN: Sig = Sig {
+    name: "CLIMB_DIAG_TOP_ENTRY_FN",
+    pattern: "48 8b c4 48 89 58 08 48 89 70 18 55 57 41 54 41 56 41 57 48 8d a8 d8 fe ff ff",
+    sections: &[".text"],
+    patch_offsets: &[0],
+};
+
+/// The bottom/middle entry `FUN_14024c0d0(out, ctx, input, time) -> out`: 23 bytes. Anchor
+/// 0x14024c0d0.
+pub const CLIMB_DIAG_LOW_ENTRY_FN: Sig = Sig {
+    name: "CLIMB_DIAG_LOW_ENTRY_FN",
+    pattern: "48 8b c4 48 89 58 08 48 89 68 18 48 89 70 20 57 48 81 ec 90 00 00 00",
+    sections: &[".text"],
+    patch_offsets: &[0],
+};
+
+/// The wall-lost check `FUN_14024b390(ctx) -> u32`: 19 bytes. Anchor 0x14024b390. Its
+/// voxel-hold site (+0x115) is far past the pattern.
+pub const CLIMB_DIAG_WALL_LOST_FN: Sig = Sig {
+    name: "CLIMB_DIAG_WALL_LOST_FN",
+    pattern: "48 81 ec 88 00 00 00 48 8b 41 08 0f 57 ed f2 0f 10 40 04",
+    sections: &[".text"],
+    patch_offsets: &[0],
+};
+
+/// Stop climbing `FUN_14024a090(ctx, time)`: 20 bytes. Anchor 0x14024a090.
+pub const CLIMB_DIAG_STOP_FN: Sig = Sig {
+    name: "CLIMB_DIAG_STOP_FN",
+    pattern: "48 89 5c 24 08 57 48 83 ec 20 48 8b da 48 8b f9 48 8b 51 08",
+    sections: &[".text"],
+    patch_offsets: &[0],
+};
+
+/// The exit-top check `FUN_14024c9f0(ctx, input) -> bool`: 20 bytes. Anchor 0x14024c9f0.
+pub const CLIMB_DIAG_EXIT_TOP_FN: Sig = Sig {
+    name: "CLIMB_DIAG_EXIT_TOP_FN",
+    pattern: "48 89 5c 24 08 57 48 83 ec 20 48 8b d9 48 8b fa 48 8b 49 28",
+    sections: &[".text"],
+    patch_offsets: &[0],
+};
+
+/// The bottom exit check `FUN_14024c8f0(out, ctx, input) -> out`: 27 bytes. Anchor 0x14024c8f0.
+pub const CLIMB_DIAG_EXIT_LOW_FN: Sig = Sig {
+    name: "CLIMB_DIAG_EXIT_LOW_FN",
+    pattern: "48 89 5c 24 08 48 89 74 24 10 57 48 83 ec 50 48 8b d9 0f 29 74 24 40 48 8b 4a 28",
+    sections: &[".text"],
+    patch_offsets: &[0],
+};
+
+/// Every climb diagnostic signature, in the order `features::climb_diag` hooks them.
+pub const CLIMB_DIAG: &[&Sig] = &[
+    &CLIMB_DIAG_PROBE_FN,
+    &CLIMB_DIAG_START_FN,
+    &CLIMB_DIAG_TOP_ENTRY_FN,
+    &CLIMB_DIAG_LOW_ENTRY_FN,
+    &CLIMB_DIAG_WALL_LOST_FN,
+    &CLIMB_DIAG_STOP_FN,
+    &CLIMB_DIAG_EXIT_TOP_FN,
+    &CLIMB_DIAG_EXIT_LOW_FN,
+];
+
 /// Every signature in this file, in table order.
 pub const ALL: &[&Sig] = &[
     &SCENE_SETTINGS_FN,
@@ -526,6 +612,76 @@ mod tests {
         assert_eq!(t.get(10..14), Some(&["00", "01", "00", "00"][..]));
         let t = tokens(&CLIMB_EXIT_FLOOR_MASK);
         assert_eq!(t.get(9..13), Some(&["21", "00", "00", "00"][..]));
+    }
+
+    // ---- the climb diagnostic's table -----------------------------------------------------------
+
+    /// Eight function entries: each pattern starts at the entry (patch offset 0), has no
+    /// wildcard, and is in neither `ALL` nor `CLIMB`.
+    #[test]
+    fn climb_diag_has_eight_entry_prologues_outside_the_other_tables() {
+        assert_eq!(CLIMB_DIAG.len(), 8);
+        for (i, a) in CLIMB_DIAG.iter().enumerate() {
+            assert!(
+                a.name.starts_with("CLIMB_DIAG_") && a.name.ends_with("_FN"),
+                "{}",
+                a.name
+            );
+            assert_eq!(a.sections, &[".text"], "{}", a.name);
+            assert_eq!(a.patch_offsets, &[0], "{}", a.name);
+            assert!(!tokens(a).contains(&"??"), "{}", a.name);
+            assert!(
+                !ALL.iter().chain(CLIMB).any(|b| b.name == a.name),
+                "{}",
+                a.name
+            );
+            for b in CLIMB_DIAG.iter().skip(i + 1) {
+                assert_ne!(a.name, b.name);
+                assert_ne!(a.pattern, b.pattern, "{} and {}", a.name, b.name);
+            }
+        }
+        let names: Vec<&str> = CLIMB_DIAG.iter().map(|s| s.name).collect();
+        assert_eq!(
+            names,
+            [
+                "CLIMB_DIAG_PROBE_FN",
+                "CLIMB_DIAG_START_FN",
+                "CLIMB_DIAG_TOP_ENTRY_FN",
+                "CLIMB_DIAG_LOW_ENTRY_FN",
+                "CLIMB_DIAG_WALL_LOST_FN",
+                "CLIMB_DIAG_STOP_FN",
+                "CLIMB_DIAG_EXIT_TOP_FN",
+                "CLIMB_DIAG_EXIT_LOW_FN",
+            ]
+        );
+    }
+
+    /// MinHook moves the whole instructions that cover the first five bytes. These are the
+    /// first instructions the RE notes list for each entry (none is RIP-relative or a branch).
+    #[test]
+    fn climb_diag_patterns_start_with_the_noted_first_instructions() {
+        let head = |s: &Sig, n: usize| -> Vec<&'static str> {
+            tokens(s).get(..n).expect("long enough").to_vec()
+        };
+        let rsp_in_rax = ["48", "8b", "c4", "48", "89", "58", "08"];
+        assert_eq!(head(&CLIMB_DIAG_PROBE_FN, 7), rsp_in_rax);
+        assert_eq!(head(&CLIMB_DIAG_TOP_ENTRY_FN, 7), rsp_in_rax);
+        assert_eq!(head(&CLIMB_DIAG_LOW_ENTRY_FN, 7), rsp_in_rax);
+        assert_eq!(
+            head(&CLIMB_DIAG_START_FN, 8),
+            ["40", "55", "57", "48", "8d", "6c", "24", "d8"]
+        );
+        assert_eq!(
+            head(&CLIMB_DIAG_WALL_LOST_FN, 7),
+            ["48", "81", "ec", "88", "00", "00", "00"]
+        );
+        for s in [
+            &CLIMB_DIAG_STOP_FN,
+            &CLIMB_DIAG_EXIT_TOP_FN,
+            &CLIMB_DIAG_EXIT_LOW_FN,
+        ] {
+            assert_eq!(head(s, 5), ["48", "89", "5c", "24", "08"], "{}", s.name);
+        }
     }
 
     #[test]

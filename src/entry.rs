@@ -309,6 +309,15 @@ pub fn start() {
     // runs the climb code, which holds here: `InitializeASI` runs before `WinMain`.
     features::climb::init(&cfg.experimental);
 
+    // 14c. EXPERIMENTAL climb diagnostic (branch exp/climb-anything only; never merged): eight
+    // post-hooks on the game's climb functions that only count what they do, and a `climb-diag`
+    // log thread that writes one line a second while the climb counts change. It hooks code, so
+    // it asks `code_patches_allowed`; it runs only with `[Experimental] ClimbDiag = 1`, with or
+    // without ClimbAnything, and logs one line, including why it is off. It runs after 14b, whose
+    // writes its function-entry signatures do not cover. The hooks are only queued here: the
+    // last step enables them.
+    features::climb_diag::init(&cfg.experimental);
+
     // Later code hooks are created and queued above this line, so they join the one batch below.
 
     // 15. Enable every queued hook at once (MinHook's queued enable). This is the only place that

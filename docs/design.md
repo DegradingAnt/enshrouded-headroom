@@ -386,6 +386,7 @@ The governor raises 7.1, then 7.2, then 7.3. The order is re-checked after the i
 - `ClimbPlaneTolerance = 0.001..=0.5` (default 0.05): how much each normal component of a corner ray may differ from the forward ray's. The game's value is 0.001.
 - `ClimbVoxelHold = 0 | 1` (default 0): a probe hit with EntityId 0 (a voxel wall) keeps the climb going instead of counting as "wall lost".
 - `ClimbClearance = game | solid_walkable | solid` (default `game`): the bit list of the probe's clearance ray. `game` = {1, 3, 5}, `solid_walkable` = {3, 3, 5}, `solid` = {3, 3, 3}.
+- `ClimbDiag = 0 | 1` (default 0): with code patches allowed, queue eight count-only post-hooks on the game's climb functions and start a `climb-diag` log thread (`src/features/climb_diag.rs`; `docs/re-notes.md`, "Climb diagnostic"). The hooks change no argument and no result. The thread writes one `climb diag:` line a second while a climb count changes. It works with `ClimbAnything` on or off. A bad value warns and uses 0.
 
 Unknown keys and invalid values are logged. Invalid choices use their defaults.
 Out-of-range numeric values are clamped, except `PaperWhiteNits` and `DisplayPeakNits`, which fall back to `game`.

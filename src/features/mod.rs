@@ -3,6 +3,7 @@
 
 pub mod async_compute;
 pub mod climb;
+pub mod climb_diag;
 pub mod hdr;
 pub mod hdr_peak;
 pub mod priority;

@@ -217,6 +217,9 @@ pub struct ExperimentalCfg {
     pub climb_voxel_hold: bool,
     /// `ClimbClearance`: the clearance ray's bit list.
     pub climb_clearance: ClimbClearance,
+    /// `ClimbDiag`: hook the game's climb functions to count what they do, and log the counts
+    /// once a second (`features::climb_diag`). It changes nothing the game does.
+    pub climb_diag: bool,
 }
 
 /// All settings.
@@ -286,6 +289,7 @@ const BUILTIN: Config = Config {
         climb_plane_tolerance: 0.05,
         climb_voxel_hold: false,
         climb_clearance: ClimbClearance::Game,
+        climb_diag: false,
     },
 };
 
@@ -499,6 +503,7 @@ pub fn parse(text: &str) -> (Config, Vec<String>) {
                 ("solid", ClimbClearance::Solid),
             ],
         ),
+        climb_diag: r.boolean("Experimental", "ClimbDiag", x.climb_diag),
     };
 
     r.report_unknown();
@@ -1379,13 +1384,13 @@ mod tests {
                 assert!(w[0].contains(key) && w[0].contains("default auto"));
             }
         }
-        // 31 keys, plus the five `[Experimental]` keys of the climb experiment.
+        // 31 keys, plus the six `[Experimental]` keys of the climb experiment.
         assert_eq!(
             DEFAULT_INI
                 .lines()
                 .filter(|line| !line.starts_with(';') && line.contains('='))
                 .count(),
-            36
+            37
         );
     }
 
@@ -1961,6 +1966,7 @@ mod tests {
                 climb_plane_tolerance: 0.05,
                 climb_voxel_hold: false,
                 climb_clearance: ClimbClearance::Game,
+                climb_diag: false,
             }
         );
         // 0x124 = ClimbingWall (8) | Walkable (5) | WorldNormalsNotDisplaced (2).
@@ -1978,6 +1984,7 @@ mod tests {
             "ClimbPlaneTolerance=0.05",
             "ClimbVoxelHold=0",
             "ClimbClearance=game",
+            "ClimbDiag=0",
         ] {
             assert!(
                 DEFAULT_INI.lines().any(|l| l == line),
@@ -1993,7 +2000,7 @@ mod tests {
     fn experimental_keys_are_read() {
         let (c, w) = parse(
             "[Experimental]\nClimbAnything=1\nClimbMask=0x121\nClimbPlaneTolerance=0,2\n\
-             ClimbVoxelHold=true\nClimbClearance=Solid_Walkable\n",
+             ClimbVoxelHold=true\nClimbClearance=Solid_Walkable\nClimbDiag=1\n",
         );
         assert!(w.is_empty(), "{w:?}");
         assert_eq!(
@@ -2004,6 +2011,7 @@ mod tests {
                 climb_plane_tolerance: 0.2,
                 climb_voxel_hold: true,
                 climb_clearance: ClimbClearance::SolidWalkable,
+                climb_diag: true,
             }
         );
         let (c, w) = one("Experimental", "ClimbClearance", "solid");
@@ -2067,10 +2075,16 @@ mod tests {
             ["[Experimental] ClimbClearance: \"none\" is not one of game, solid_walkable, solid, \
               using the default game"]
         );
-        for key in ["ClimbAnything", "ClimbVoxelHold"] {
+        for key in ["ClimbAnything", "ClimbVoxelHold", "ClimbDiag"] {
             let (c, w) = one("Experimental", key, "yes");
             assert_eq!(c.experimental, Config::default().experimental, "{key}");
-            assert_eq!(w.len(), 1, "{key}: {w:?}");
+            assert_eq!(
+                w,
+                [format!(
+                    "[Experimental] {key}: \"yes\" is not 0, 1, true or false, using the default 0"
+                )],
+                "{key}"
+            );
         }
         let (_, w) = parse("[experimental]\nclimbanything=0\nClimbHarder=1\n");
         assert_eq!(w, ["[Experimental] climbharder: unknown key, ignored"]);
@@ -2141,6 +2155,7 @@ mod tests {
                         climb_plane_tolerance,
                         climb_voxel_hold: _,
                         climb_clearance: _,
+                        climb_diag: _,
                     },
             } = *config;
             assert!(climb_mask != 0 && climb_mask & !CLIMB_MASK_BITS == 0);
@@ -2438,6 +2453,13 @@ mod tests {
                 high: 1.0,
                 kind: Kind::Boolean,
             },
+            NumericKey {
+                section: "Experimental",
+                key: "ClimbDiag",
+                low: 0.0,
+                high: 1.0,
+                kind: Kind::Boolean,
+            },
         ];
 
         /// Set one key without causing an unrelated threshold-order warning.
@@ -2473,6 +2495,7 @@ mod tests {
                 "ScatterProbe" => f64::from(config.debug.scatter_probe),
                 "ClimbAnything" => f64::from(config.experimental.climb_anything),
                 "ClimbVoxelHold" => f64::from(config.experimental.climb_voxel_hold),
+                "ClimbDiag" => f64::from(config.experimental.climb_diag),
                 _ => number(config, key),
             })
         }
