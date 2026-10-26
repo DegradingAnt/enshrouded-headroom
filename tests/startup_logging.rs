@@ -232,8 +232,14 @@ fn start_up_logs_one_grass_distance_line_after_object_distance() {
     assert_eq!(white.len(), 1, "one paper-white line:\n{log}");
     assert_eq!(peak.len(), 1, "one HDR peak line:\n{log}");
     let object = at("object distance:");
+    let probe = at("scatter probe:");
+    assert_eq!(probe.len(), 1, "one scatter probe line:\n{log}");
     assert_eq!(grass.len(), 1, "one grass distance line:\n{log}");
     assert_eq!(object.len(), 1, "one object distance line:\n{log}");
+    assert!(
+        grass[0] < probe[0],
+        "scatter probe follows grass distance:\n{log}"
+    );
     assert!(
         white[0] < peak[0] && peak[0] < object[0],
         "HDR settings precede hook creation:\n{log}"

@@ -12,6 +12,7 @@ pub mod entry;
 pub mod features;
 pub mod frame_timer;
 pub mod governor;
+pub mod governor_thread;
 pub mod guard;
 pub mod iat;
 pub mod knobs;
@@ -21,6 +22,7 @@ pub mod reflex;
 pub mod scan;
 pub mod sigs;
 pub mod vk;
+pub mod vram_budget;
 
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;

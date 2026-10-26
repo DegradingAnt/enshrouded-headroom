@@ -155,27 +155,36 @@ The author's decision (2026-10-25): "more aggressive". All values are `.ini` key
 | `SettleSeconds` | 1.0 | Wait after any change before the next decision. |
 | `LowerAbove` | 0.97 | Undo the last step when p95 > 97 % of the target frame time … |
 | `LowerHoldSeconds` | 0.3 | … for this long. |
-| `HitchFactor` | 2.0 | Undo the last step if any single frame within `SettleSeconds + RaiseHoldSeconds` after a raise is longer than 2 × the target frame time. |
-| `BlockSeconds` | 20 | A step that was undone is blocked for this long. |
+| `HitchFactor` | 2.0 | Base multiplier for the post-raise hitch threshold described below. |
+| `BlockSeconds` | 20 | Base block after an undo, and the probation duration. |
 | `MinVramFreeMiB` | 1024 | Do not raise while free VRAM (budget − usage) is below this. |
 
 Rules:
 1. Each knob has steps 0..N. Step 0 is the player's menu value. The governor never goes below it.
 2. **Only while the world is rendering.** The governor is active only when the 7.1 hook ran within the last 250 ms and presents came steadily, with no gap over 250 ms in the last 2 s. In menus, loading screens or pause it holds its current steps and decides nothing.
 3. **Effective target.** The target frame time is `max(1000/TargetFps, display period)`. The display period is the refresh period of the swapchain's monitor (`EnumDisplaySettingsW` for the window's monitor). If the target fps is higher than the refresh rate, the governor holds the refresh rate instead.
-4. **Fixed-refresh vsync (FIFO without VRR).** If at least 90 % of the frame intervals in the window sit within ±5 % of a whole multiple of the display period, frame times are quantised. In that mode:
-   - it raises only while ≥ 95 % of frames make the display period that matches the effective target;
-   - it undoes the last step as soon as more than 2 % of frames fall to the next multiple (for example 60 fps on a 120 Hz screen).
+4. **Fixed-refresh vsync (FIFO without VRR).** The display period must be at least half the effective target frame time. If at least 90 % of the non-long frame intervals in the window sit within ±5 % of one to four display periods, frame times are quantised. In that mode:
+   - a non-long frame is on time at or below 1.05 × the effective target frame time;
+   - it raises only while at least 99 % of non-long frames are on time and the window contains no long frames;
+   - more than 2 % late non-long frames count as overload. The normal `LowerHoldSeconds` and `SettleSeconds` rules still apply.
    - This replaces the p95 thresholds, which would see only 8.3 or 16.7 ms (review finding 5).
-5. **Raising.** It raises the next knob in priority order (section 7) that is below its maximum and not blocked, by one step. It only raises if `vram_budget` reports at least `MinVramFreeMiB` free, or if the budget extension is not available.
-6. **Lowering.** It undoes the most recent raise first (last in, first out). A step that is undone is blocked for `BlockSeconds`.
-7. **Hitches after a raise.** Frames over `HitchFactor` × target in the settle and hold period after a raise count against that raise, including frames over 100 ms (review finding 6). Outside that period, frames over 100 ms are ignored as loading or alt-tab.
+5. **Raising.** It raises the next knob in priority order (section 7) that is below its maximum and not blocked, by one step. It only raises if `vram_budget` reports at least `MinVramFreeMiB` free, and does not raise a VRAM-costly knob when the budget is unknown.
+6. **Lowering.** It undoes the most recent raise first (last in, first out). An undo blocks that knob for `BlockSeconds`, doubling on repeated undos up to 8 × `BlockSeconds`. A later raise that holds for `BlockSeconds`, or a menu reset, resets that knob's undo count.
+7. **Hitches and long frames.** During `SettleSeconds + RaiseHoldSeconds` after a raise, a frame over the hitch threshold undoes that raise at once if it is still the most recent raise. The p95-mode threshold is `HitchFactor` × the effective target. In quantised mode it is at least one display period beyond the on-time multiple, with the 5 % margin. Frames over 100 ms and at most 250 ms stay in the window but are excluded from p95 and the quantised test. They prevent a raise. At least two such frames, or more than 2 % of the window, count as overload under the normal settle and lower-hold rules. Frames over 250 ms are stalls and never enter the window. A second stall within 10 s while the world is active undoes the latest raise.
 8. **Menu changes.** The hooks publish the baseline they saw on each call. If a baseline changes, the player changed a menu setting: the governor drops that knob's added steps and starts again from the new baseline.
-9. **Runaway guard.** The steps are bounded by [0, max]. If frame time does not respond to steps, the governor makes no more than one raise per `BlockSeconds`.
+9. **Bounds and probation.** The steps are bounded by [0, max]. After an undo, raises are on probation until `BlockSeconds` pass without another undo. During probation, a raise also needs `BlockSeconds` since the last raise. Outside probation, raises follow the normal settle and hold rules.
 
-VRAM budget: `vram_budget` queries `VkPhysicalDeviceMemoryBudgetPropertiesEXT` for the game's physical device every 2 s, when the driver lists `VK_EXT_memory_budget` (it does on the author's machine: game log line 502).
+VRAM budget: `vram_budget` queries `VkPhysicalDeviceMemoryBudgetPropertiesEXT` for the game's physical device every 2 s, when the driver lists `VK_EXT_memory_budget` (it does on the author's machine: game log line 502). The query holds the first device's live lease. The core command requires both the observed instance request and physical-device API version to support Vulkan 1.1. Otherwise, only an explicitly enabled `VK_KHR_get_physical_device_properties2` permits the KHR command. Unknown facts, a missing selected command or a retired device return unknown VRAM and block costly raises; the query never falls back to an unproven alias.
 
 The governor is a pure state machine with unit tests (section 10).
+
+The runtime reads the present ring every 50 ms using reserved frame and statistics buffers.
+It refreshes the display period every 5 s and checks memory availability every 2 s.
+A successful scene-hook batch is the source of the installed fact. If that hook stops advancing
+for 10 s while frames arrive, the runtime logs once and holds every current step until it recovers.
+A panic stops the governor before it publishes a partial knob batch. Every 30 s the info log
+reports recent frame p50/p95, the effective target, all three steps and active/inactive/backoff state.
+Fixed debug steps obey the same probe, grass capacity and memory gates as automatic raises.
 
 ### 6.5 NVIDIA Reflex (experimental)
 
@@ -213,7 +222,7 @@ Method (NVIDIA only, and only if the driver lists `VK_NV_low_latency2` revision 
    - `vk::with_game_device` provides the separate governor with a read-only lease on the first device and its enumerated physical-device parent. Only actual outputs from `vkEnumeratePhysicalDevices` or core/KHR physical-device group enumeration establish parentage. SUCCESS and INCOMPLETE outputs count; failed and count-only calls do not. The matching instance generation and real GIPA remain together. This applies to every GPU and Reflex mode, subject to observed parentage and compatible native lifetime entry points.
    - Device and instance teardown reject new leases and wait for old ones. Instance retirement removes its physical-device observations, so reused handle values cannot revive an old device context. After the first device dies the API stays unavailable. Callbacks must not destroy leased handles, retain them after returning, or launch asynchronous native work with them.
    - Unknown or ambiguous parentage fails closed. The registry retains at most 64 live instances and 256 physical-device handles per instance. Untracked handles do not enable Reflex or GPU-info queries. A conflicting first-wins lifetime function leaves the optional feature that requires it unavailable instead of replacing dispatch already issued to another instance. Destruction for an unadmitted device uses its matching original function when addresses differ. Device-query admission proves only the device destructor; swapchain retirement requires Reflex admission. The existing optional GPU-info query resolves through its proven parent; unknown parentage skips that query while preserving native creation, process priority and texture-budget policy.
-6. **Measurement.** `reflex::latency_report() -> Option<String>` calls `vkGetLatencyTimingsNV` under a reader lease and formats averages for valid simulation-start-to-GPU-end and present-call timestamps. Missing timestamps produce no fabricated sample. The API has no display timestamp, so it does not claim a present-to-display measurement. It may allocate and belongs on a background thread. W23 does not schedule or log it; Task 15 owns the later five-second schedule.
+6. **Measurement.** `reflex::latency_report() -> Option<String>` calls `vkGetLatencyTimingsNV` under a reader lease and formats averages for valid simulation-start-to-GPU-end and present-call timestamps. Missing timestamps produce no fabricated sample. The API has no display timestamp, so it does not claim a present-to-display measurement. The governor queries it every 5 s when debug output is enabled and logs only available reports. Formatting an emitted report may allocate; no measurement or formatting runs on the present path.
 
 `.ini`: `Reflex = game | auto | off | on | boost`, default `auto`.
 - Every enabled mode requires an NVIDIA GPU whose driver lists the extension and required capabilities.
@@ -313,7 +322,7 @@ Each knob states:
 
 ### 7.2a Scatter counter probe (the author, 2026-10-25: "Add it to v1")
 
-- **Hook:** a minhook pre-hook on `FUN_1400767a0(_, pass)`. Its signature is the 14-byte prologue `48 89 54 24 10 55 53 57 41 55 41 56 41 57`, unique in build f68140a3 (checked 2026-10-26). Like the terrain signature it is fragile across updates; a mismatch leaves the probe off.
+- **Hook:** a minhook pre-hook on `FUN_1400767a0(rcx, pass, f32 in XMM2)`. Its signature is the 14-byte prologue `48 89 54 24 10 55 53 57 41 55 41 56 41 57`, unique in build f68140a3 (checked 2026-10-26). Like the terrain signature it is fragile across updates; a mismatch leaves the probe off.
 - **Pointer chain** (research write-up; a HYPOTHESIS until the runtime self-check passes):
   - obj = [pass+0x18];
   - pool = [[pass+0x8]+0x20];
@@ -326,7 +335,7 @@ Each knob states:
   - Only after the wanted hook installs, start one detached thread named `scatter-probe`. It sleeps 500 ms without holding a lock. If the call counter is unchanged, it reads nothing. Otherwise it loads the pass pointer with `Acquire` and attempts one sample. Its body runs inside `guard(Feature::ScatterDistance, ...)`; a panic stops it and latches `FAILED`.
   - A failed or short copy, zero handle or ownership mismatch skips that sample. Nine consecutive misses are tolerated; the tenth while calls continue sets `FAILED` and clears `PROBE_OK`. A good complete sample resets the miss count to zero. An unchanged call counter neither reads memory nor counts another miss.
   - A correctly copied counter A must have warn = 0xf000 and cap = 0x14000. A mismatch fails at once. No partial sample is published. Failure stays latched for the session; the governor logs it once.
-- **Debug output:** with `[Debug] ScatterProbe = 1` and `LogLevel = debug`, the governor thread logs A, B and C (last and peak) every 2 s, and the session peak of A at exit.
+- **Debug output:** with `[Debug] ScatterProbe = 1`, `LogLevel = debug` and the governor running (`TargetFps > 0`), each 2 s counter line logs A, B and C (last and peak), followed by `session_peak_A`. The governor observes `PEAK_A` every 50 ms and retains the largest value seen during that run across scene-view resets. A peak that resets between observations may be missed.
 - **Measurement session (the author, once per build):** grass quality High, mod distance left at vanilla 90 m, stand in the densest grass for 60 s, then send the log. The controller computes r_max and records it in the RE notes. The release uses r_max as the knob's ceiling.
 
 ### 7.3 Terrain detail distance (`TerrainDistance`): priority 3
@@ -464,7 +473,7 @@ Unit tests (`cargo test`, no game):
   - FIFO quantised at 60/120 Hz: quantised mode, no flapping;
   - target above refresh: the refresh rate is held;
   - VRAM below `MinVramFreeMiB`: no raise.
-- `governor` runaway guard: steps stay within [0, max]. If frame time does not respond, there is at most one raise per `BlockSeconds`.
+- `governor` bounds and probation: steps stay within [0, max]. After an undo, raises during probation need `BlockSeconds` since the last raise. Steady headroom outside probation can raise after each settle and hold.
 - `config`: defaults, clamping, unknown keys, missing file, read-only folder.
 - Texture budget formula: 8, 10, 12, 16 and 24 GB, and integrated GPUs.
 

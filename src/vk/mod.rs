@@ -1792,7 +1792,7 @@ unsafe extern "system" fn wrap_enumerate_physical(
 }
 /// Shared core/KHR group observation, preserving the exact entry point selected by the caller.
 /// # Safety
-/// The matching vkEnumeratePhysicalDeviceGroups[KHR] contract.
+/// The matching `vkEnumeratePhysicalDeviceGroups` or KHR alias contract.
 unsafe fn enumerate_groups(
     instance: vk::Instance,
     count: *mut u32,
