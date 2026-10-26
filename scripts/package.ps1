@@ -1,4 +1,5 @@
 # WHY NOT RUST: release zipping with Compress-Archive and a hash check; no build step needed
+#Requires -Version 7.0
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
@@ -26,11 +27,24 @@ try {
 
     New-Item -ItemType Directory -Path $cacheRoot -Force | Out-Null
     if (-not (Test-Path -LiteralPath $loaderZip)) {
-        Invoke-WebRequest -Uri $loaderUrl -OutFile $loaderZip
+        $partialZip = "$loaderZip.part"
+        try {
+            Invoke-WebRequest -Uri $loaderUrl -OutFile $partialZip
+            $actualHash = (Get-FileHash -LiteralPath $partialZip -Algorithm SHA256).Hash
+            if ($actualHash -ne $loaderSha256) {
+                throw "Loader SHA-256 mismatch: expected $loaderSha256, got $actualHash. Refusing to package."
+            }
+            Move-Item -LiteralPath $partialZip -Destination $loaderZip
+        }
+        finally {
+            if (Test-Path -LiteralPath $partialZip) {
+                Remove-Item -LiteralPath $partialZip -Force
+            }
+        }
     }
     $actualHash = (Get-FileHash -LiteralPath $loaderZip -Algorithm SHA256).Hash
     if ($actualHash -ne $loaderSha256) {
-        throw "Loader SHA-256 mismatch: expected $loaderSha256, got $actualHash. Refusing to package."
+        throw "Loader SHA-256 mismatch: expected $loaderSha256, got $actualHash. Refusing to package. Delete $loaderZip and run again."
     }
 
     Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -85,6 +99,11 @@ SOFTWARE.
         Compress-Archive -LiteralPath $contents -DestinationPath $stagedZip
         $archive = [System.IO.Compression.ZipFile]::OpenRead($stagedZip)
         try {
+            $expectedEntries = @('LICENSE', 'dinput8.dll', 'plugins/enshrouded-headroom.asi', 'plugins/enshrouded-headroom.ini', 'ultimate-asi-loader-LICENSE.txt') | Sort-Object -CaseSensitive
+            $actualEntries = @($archive.Entries.FullName | Sort-Object -CaseSensitive)
+            if (@(Compare-Object -ReferenceObject $expectedEntries -DifferenceObject $actualEntries -CaseSensitive).Count -ne 0) {
+                throw 'Package archive entries do not match the expected five files. Refusing to package.'
+            }
             Write-Output 'Zip contents:'
             $archive.Entries | ForEach-Object { Write-Output ("  {0} ({1} bytes)" -f $_.FullName, $_.Length) }
             $asi = $archive.GetEntry('plugins/enshrouded-headroom.asi')
