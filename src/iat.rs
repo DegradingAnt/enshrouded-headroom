@@ -18,7 +18,7 @@
 use std::mem::align_of;
 use std::ptr;
 
-use crate::patch::{read_checked, write_checked};
+use crate::patch::{read_checked, write_checked, PatchError, Patched};
 use crate::scan::{readable_run, u16_at, u32_at, u64_at, walk_readable, Module};
 
 const MZ_MAGIC: u16 = 0x5a4d;
@@ -296,27 +296,59 @@ pub unsafe fn find_slot(m: &Module, dll: &str, func: &str) -> Option<*mut usize>
         .map(|f| f.slot as *mut usize)
 }
 
-/// Put `new` in the IAT slot and return what was there. Returns 0 if nothing was changed: `slot`
-/// is null, not 8-byte aligned, not readable memory, or [`crate::patch::write_checked`] refused (the
-/// value changed between the read and the write, or the page could not be made writable). A bound
-/// import slot is never 0, so 0 is not a valid old value. A warning is logged on failure.
+/// Put `new` in the IAT slot and return what was there.
+///
+/// Returns 0 when the slot was not changed: `slot` is null, not 8-byte aligned or not readable
+/// memory; the slot holds 0 (a bound import is never 0, so this is not an import slot and nothing
+/// is written); or [`crate::patch::write_checked`] refused (the value changed between the read and
+/// the write, or the page could not be made writable). A warning is logged in each case.
+///
+/// If the write was done but did not read back as written, the old value is put back (and the
+/// outcome logged) and the result is 0. Only if that put-back fails too can 0 follow a changed
+/// slot; an error is logged then, and the slot may hold a wrong value. That needs another thread
+/// or the hardware to be changing the slot, so it should not happen.
 ///
 /// Uses `write_checked` on the 8 bytes, so it carries the same rules; see its "Start-up only"
 /// section.
 ///
 /// # Safety
 ///
-/// `slot` should come from [`find_slot`]. `new` must be the address of a function with the same
-/// signature and calling convention as the import, or the game will call through a wrong pointer.
+/// - `slot` must come from [`find_slot`], or otherwise be the address of a pointer-sized import
+///   slot.
+/// - `[slot, slot + 8)` must be memory the process may change without breaking code that is
+///   running, and no Rust reference may borrow it.
+/// - It is start-up only: see "Start-up only" on [`crate::patch::write_checked`].
+/// - `new` must be the address of a function with the same signature and calling convention as
+///   the import, or the game will call through a wrong pointer.
 pub unsafe fn swap(slot: *mut usize, new: usize) -> usize {
+    let mut write = |addr: usize, expected: &[u8], new_bytes: &[u8]| {
+        // SAFETY: `swap_with` calls this only with the address of `slot`, whose 8 bytes `swap`'s
+        // `# Safety` makes memory the process may change and no reference borrows; `expected`
+        // and `new_bytes` are owned arrays inside `swap_with`, not part of the target.
+        unsafe { write_checked(addr, expected, new_bytes) }
+    };
+    // SAFETY: this function's contract is the contract of `swap_with`, and `write` behaves like
+    // `write_checked`, as it is `write_checked`.
+    unsafe { swap_with(slot, new, &mut write) }
+}
+
+/// A write of `new` over `expected` at an address, like [`crate::patch::write_checked`].
+type Writer<'a> = dyn FnMut(usize, &[u8], &[u8]) -> Result<Patched, PatchError> + 'a;
+
+/// The body of [`swap`], with the write as a parameter so a failed read-back can be simulated.
+///
+/// # Safety
+///
+/// The contract of [`swap`]. `write(addr, expected, new)` must behave like
+/// [`crate::patch::write_checked`] for the 8 bytes at `addr`.
+unsafe fn swap_with(slot: *mut usize, new: usize, write: &mut Writer<'_>) -> usize {
     let addr = slot as usize;
     if !addr.is_multiple_of(align_of::<usize>()) {
         ::log::warn!("iat: slot {addr:#x} is not aligned");
         return 0;
     }
     // SAFETY: `read_checked` checks with VirtualQuery that the 8 bytes are readable before it
-    // reads them; the start-up rule of `write_checked` covers the gap, and this function's
-    // caller is bound by it.
+    // reads them; the start-up rule of `swap` covers the gap between the check and the read.
     let old = match unsafe { read_checked(addr, SLOT_LEN) } {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -327,12 +359,26 @@ pub unsafe fn swap(slot: *mut usize, new: usize) -> usize {
     let Ok(old) = <[u8; SLOT_LEN]>::try_from(old.as_slice()) else {
         return 0;
     };
-    // SAFETY: the 8 bytes at `addr` are an IAT slot, which this function's contract says is
-    // memory the process may change. `old` and the new value are owned arrays, not borrows of
-    // the target. `write_checked` compares against `old` first, so a slot that changed since the
-    // read above is left alone.
-    match unsafe { write_checked(addr, &old, &new.to_le_bytes()) } {
+    if old == [0u8; SLOT_LEN] {
+        ::log::warn!("iat: slot {addr:#x} holds 0, so it is not a bound import: not written");
+        return 0;
+    }
+    let new_bytes = new.to_le_bytes();
+    match write(addr, &old, &new_bytes) {
         Ok(_) => usize::from_le_bytes(old),
+        Err(PatchError::ReadBack) => {
+            // The 8 bytes were written but did not read back as written. Put the old value back;
+            // the compare in the write leaves the slot alone if something else has changed it.
+            match write(addr, &new_bytes, &old) {
+                Ok(_) => ::log::warn!(
+                    "iat: slot {addr:#x} did not read back as written; the old value was put back"
+                ),
+                Err(e) => ::log::error!(
+                    "iat: slot {addr:#x} did not read back as written, and putting the old value back failed ({e}); the slot may hold a wrong value"
+                ),
+            }
+            0
+        }
         Err(e) => {
             ::log::warn!("iat: cannot swap slot {addr:#x}: {e}");
             0
@@ -362,7 +408,7 @@ mod tests {
     #[test]
     fn finds_own_getprocaddress_slot() {
         let m = crate::scan::main_module();
-        let slot = unsafe { find_slot(&m, "kernel32.dll", "GetProcAddress") };
+        let slot = find_in(&m, "kernel32.dll", "GetProcAddress");
         assert!(slot.is_some());
     }
 
@@ -383,8 +429,8 @@ mod tests {
             !hits.is_empty(),
             "GetProcAddress is not imported by name from any known DLL name"
         );
-        let first = unsafe { find_slot(&m, "kernel32.dll", "GetProcAddress") };
-        assert_eq!(first.map(|p| p as usize), hits.first().map(|f| f.slot));
+        let first = find_in(&m, "kernel32.dll", "GetProcAddress");
+        assert_eq!(first, hits.first().map(|f| f.slot));
     }
 
     /// The DLL name of every descriptor of the main module, in table order.
@@ -432,14 +478,19 @@ mod tests {
     fn every_own_slot_holds_the_real_function_address() {
         let m = crate::scan::main_module();
         let k32: Vec<u16> = "kernel32.dll\0".encode_utf16().collect();
+        // SAFETY: `k32` is a NUL-terminated UTF-16 string that lives through the call.
         let module = unsafe { GetModuleHandleW(k32.as_ptr()) };
         assert!(!module.is_null());
+        // SAFETY: `module` is the handle of kernel32, which stays loaded; the name is a
+        // NUL-terminated C string literal.
         let real = unsafe { GetProcAddress(module, c"GetProcAddress".as_ptr().cast()) }
             .map(|f| f as usize)
             .expect("GetProcAddress resolves");
         let found = find_all(&m, "kernel32.dll", "GetProcAddress");
         assert!(!found.is_empty());
         for f in found {
+            // SAFETY: `find_all` only reports slots it has just checked 8-aligned and readable
+            // inside the test binary's image, which stays mapped.
             assert_eq!(unsafe { *(f.slot as *const usize) }, real, "{f:?}");
         }
     }
@@ -447,23 +498,27 @@ mod tests {
     #[test]
     fn dll_name_match_ignores_case_and_function_name_does_not() {
         let m = crate::scan::main_module();
-        let up = unsafe { find_slot(&m, "KERNEL32.DLL", "GetProcAddress") };
-        let low = unsafe { find_slot(&m, "kernel32.dll", "GetProcAddress") };
+        let up = find_in(&m, "KERNEL32.DLL", "GetProcAddress");
+        let low = find_in(&m, "kernel32.dll", "GetProcAddress");
         assert!(up.is_some());
         assert_eq!(up, low);
-        assert!(unsafe { find_slot(&m, "kernel32.dll", "getprocaddress") }.is_none());
-        assert!(unsafe { find_slot(&m, "kernel32", "GetProcAddress") }.is_none());
-        assert!(unsafe { find_slot(&m, "user32.dll", "GetProcAddress") }.is_none());
+        assert!(find_in(&m, "kernel32.dll", "getprocaddress").is_none());
+        assert!(find_in(&m, "kernel32", "GetProcAddress").is_none());
+        assert!(find_in(&m, "user32.dll", "GetProcAddress").is_none());
     }
 
     #[test]
     fn swapping_a_slot_for_its_own_value_changes_nothing_and_keeps_the_protection() {
         let m = crate::scan::main_module();
-        let slot = unsafe { find_slot(&m, "kernel32.dll", "GetProcAddress") }.unwrap();
+        let slot = find_in(&m, "kernel32.dll", "GetProcAddress").unwrap() as *mut usize;
         let before = protect_of(slot as usize);
+        // SAFETY: `slot` is a checked, aligned, readable IAT entry of the test binary's image.
         let current = unsafe { *slot };
         // Same value in and out: no other test can see a difference.
+        // SAFETY: `slot` is the test binary's own GetProcAddress import. It is written with the
+        // value it already holds, so no running code can notice, and nothing borrows it.
         assert_eq!(unsafe { swap(slot, current) }, current);
+        // SAFETY: as for the first read.
         assert_eq!(unsafe { *slot }, current);
         assert_eq!(protect_of(slot as usize), before);
     }
@@ -639,6 +694,8 @@ mod tests {
     }
 
     fn find_in(m: &Module, dll: &str, func: &str) -> Option<usize> {
+        // SAFETY: `m` is the test binary's own image, or a fake image in memory this test owns;
+        // nothing changes either while the test runs, so the start-up rule is met.
         unsafe { find_slot(m, dll, func) }.map(|p| p as usize)
     }
 
@@ -945,16 +1002,29 @@ mod tests {
 
     // ---- swap ------------------------------------------------------------------------------
 
+    /// The 8 bytes of the slot of descriptor `d`, thunk `i` of a fake image, as a number.
+    fn fake_slot_value(f: &Fake, d: usize, i: usize) -> usize {
+        let bytes: [u8; 8] = f
+            .mem
+            .get(f.iat_rva[d] + 8 * i, 8)
+            .try_into()
+            .expect("8 bytes");
+        usize::from_le_bytes(bytes)
+    }
+
     #[test]
     fn swap_returns_the_old_value_and_writes_the_new_one() {
         let f = Fake::build(&[Imp::new("kernel32.dll").name("Target")]);
-        let slot = unsafe { find_slot(&f.module(), "kernel32.dll", "Target") }.unwrap();
-        let old = unsafe { *slot };
+        let slot = f.find("kernel32.dll", "Target").unwrap() as *mut usize;
+        let old = fake_slot_value(&f, 0, 0);
         assert_eq!(old, 0x1111_0000);
+        // SAFETY: `slot` is an 8-aligned entry in the fake image `f`, memory this test owns and
+        // no other thread uses, and no Rust reference borrows it; the value is never called.
         assert_eq!(unsafe { swap(slot, 0xdead_beef_cafe) }, old);
-        assert_eq!(unsafe { *slot }, 0xdead_beef_cafe);
+        assert_eq!(fake_slot_value(&f, 0, 0), 0xdead_beef_cafe);
+        // SAFETY: as above.
         assert_eq!(unsafe { swap(slot, old) }, 0xdead_beef_cafe);
-        assert_eq!(unsafe { *slot }, old);
+        assert_eq!(fake_slot_value(&f, 0, 0), old);
     }
 
     #[test]
@@ -964,6 +1034,8 @@ mod tests {
             m.put(0x40, &0x1234_5678_9abc_def0u64.to_le_bytes());
             m.protect(0, 0x1000, protect);
             let slot = (m.base + 0x40) as *mut usize;
+            // SAFETY: `slot` is 8 aligned and inside `m`, a page this test owns and no other
+            // thread uses; no Rust reference borrows it.
             assert_eq!(unsafe { swap(slot, 7) }, 0x1234_5678_9abc_def0);
             assert_eq!(protect_of(m.base), protect);
             m.protect(0, 0x1000, PAGE_READWRITE);
@@ -975,18 +1047,140 @@ mod tests {
     fn swap_returns_zero_and_changes_nothing_for_a_bad_slot() {
         let m = Mem::rw(0x1000);
         m.put(0x40, &[0xaa; 16]);
-        // Misaligned.
+        // SAFETY: the slot is inside `m`, a page this test owns; it is misaligned, so `swap`
+        // refuses it before reading or writing anything.
         assert_eq!(unsafe { swap((m.base + 0x41) as *mut usize, 7) }, 0);
         assert_eq!(m.get(0x40, 16), vec![0xaa; 16]);
-        // Null, and an address nothing is mapped at.
+        // SAFETY: null is not mapped; `swap` refuses it (the read check fails) before touching it.
         assert_eq!(unsafe { swap(std::ptr::null_mut(), 7) }, 0);
+        // SAFETY: address 8 is not mapped; `swap` refuses it (the read check fails) before
+        // touching it.
         assert_eq!(
             unsafe { swap(std::ptr::without_provenance_mut::<usize>(8), 7) },
             0
         );
         // No access.
         m.protect(0, 0x1000, PAGE_NOACCESS);
+        // SAFETY: the slot is inside `m`, a page this test owns; the page is unreadable, so `swap`
+        // refuses it (the read check fails) before touching it.
         assert_eq!(unsafe { swap((m.base + 0x40) as *mut usize, 7) }, 0);
         assert_eq!(protect_of(m.base), PAGE_NOACCESS);
+    }
+
+    #[test]
+    fn a_slot_holding_zero_is_not_written() {
+        let m = Mem::rw(0x1000);
+        m.put(0x40, &[0xaa; 16]);
+        m.put(0x48, &[0; 8]);
+        // SAFETY: the slot is 8 aligned and inside `m`, a page this test owns and no other thread
+        // uses; `swap` reads 0 and refuses to write.
+        assert_eq!(unsafe { swap((m.base + 0x48) as *mut usize, 7) }, 0);
+        assert_eq!(m.get(0x40, 16), [vec![0xaa; 8], vec![0; 8]].concat());
+    }
+
+    // ---- swap: a write that does not read back as written ----------------------------------
+
+    const OLD: u64 = 0x1234_5678_9abc_def0;
+    const NEW: usize = 0x0fed_cba9_8765_4321;
+
+    /// A page with `OLD` at offset 0x40.
+    fn slot_page() -> (Mem, *mut usize) {
+        let m = Mem::rw(0x1000);
+        m.put(0x40, &OLD.to_le_bytes());
+        let slot = (m.base + 0x40) as *mut usize;
+        (m, slot)
+    }
+
+    /// The `(expected, new)` bytes one call of the writer was given.
+    type Call = (Vec<u8>, Vec<u8>);
+
+    /// Run `swap_with` with a writer that does the real write, then reports `ReadBack` on its
+    /// first call. `second` decides what the second call (the put-back) does: `None` runs the real
+    /// `write_checked`, `Some(e)` fails with `e` without writing. `interfere` is run between the
+    /// first call's write and its `ReadBack` report. Returns the swap result and every
+    /// `(expected, new)` pair the writer was given.
+    fn swap_with_failing_readback(
+        slot: *mut usize,
+        second: Option<PatchError>,
+        interfere: impl FnOnce(),
+    ) -> (usize, Vec<Call>) {
+        let mut calls: Vec<Call> = Vec::new();
+        let mut interfere = Some(interfere);
+        let mut write = |addr: usize, expected: &[u8], new: &[u8]| {
+            calls.push((expected.to_vec(), new.to_vec()));
+            if calls.len() == 2 {
+                if let Some(e) = second.clone() {
+                    return Err(e);
+                }
+            }
+            // SAFETY: `swap_with` calls this with the address of `slot`, 8 bytes inside a page
+            // the test owns, and with owned arrays that are not part of the target.
+            let r = unsafe { write_checked(addr, expected, new) };
+            if calls.len() == 1 {
+                if let Some(f) = interfere.take() {
+                    f();
+                }
+                return r.and(Err(PatchError::ReadBack));
+            }
+            r
+        };
+        // SAFETY: `slot` is 8 aligned and inside a page the test owns and no other thread uses,
+        // and nothing borrows it; `write` forwards to `write_checked`.
+        let result = unsafe { swap_with(slot, NEW, &mut write) };
+        (result, calls)
+    }
+
+    #[test]
+    fn a_read_back_failure_puts_the_old_value_back_and_returns_zero() {
+        let (m, slot) = slot_page();
+        let (result, calls) = swap_with_failing_readback(slot, None, || {});
+        assert_eq!(result, 0);
+        assert_eq!(m.get(0x40, 8), OLD.to_le_bytes(), "the old value is back");
+        assert_eq!(
+            calls,
+            vec![
+                (OLD.to_le_bytes().to_vec(), NEW.to_le_bytes().to_vec()),
+                (NEW.to_le_bytes().to_vec(), OLD.to_le_bytes().to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn if_the_put_back_fails_too_the_slot_keeps_the_new_value_and_the_result_is_zero() {
+        let (m, slot) = slot_page();
+        let (result, calls) = swap_with_failing_readback(slot, Some(PatchError::Protect(5)), || {});
+        assert_eq!(result, 0);
+        assert_eq!(calls.len(), 2);
+        // The documented case where 0 follows a changed slot.
+        assert_eq!(m.get(0x40, 8), NEW.to_le_bytes());
+    }
+
+    #[test]
+    fn the_put_back_does_not_overwrite_a_value_somebody_else_wrote() {
+        let (m, slot) = slot_page();
+        let other = 0x7777_6666_5555_4444u64.to_le_bytes();
+        let (result, calls) = swap_with_failing_readback(slot, None, || m.put(0x40, &other));
+        assert_eq!(result, 0);
+        // The put-back compared first (it expected NEW), found `other`, and left it alone.
+        assert_eq!(calls.len(), 2);
+        assert_eq!(m.get(0x40, 8), other);
+    }
+
+    #[test]
+    fn another_write_error_returns_zero_without_a_put_back() {
+        let (m, slot) = slot_page();
+        let mut calls = 0;
+        let mut write = |_: usize, _: &[u8], _: &[u8]| -> Result<Patched, PatchError> {
+            calls += 1;
+            Err(PatchError::Mismatch {
+                at: 0,
+                found: vec![],
+            })
+        };
+        // SAFETY: `slot` is 8 aligned and inside a page the test owns and no other thread uses;
+        // this writer never touches memory.
+        assert_eq!(unsafe { swap_with(slot, NEW, &mut write) }, 0);
+        assert_eq!(calls, 1);
+        assert_eq!(m.get(0x40, 8), OLD.to_le_bytes());
     }
 }

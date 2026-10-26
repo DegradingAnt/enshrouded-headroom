@@ -49,8 +49,8 @@ pub enum PatchError {
     /// changed. `at` is the address of the first byte that differs; `found` is everything read
     /// from the checked range, starting at the `addr` that was passed in.
     Mismatch { at: usize, found: Vec<u8> },
-    /// `VirtualProtect` failed. The value is `GetLastError()`. Nothing was written, and every
-    /// page that had already been made writable has been put back.
+    /// `VirtualProtect` failed. The value is `GetLastError()`. Nothing was written. Every page
+    /// that had already been made writable was put back, or a warning was logged if that failed.
     Protect(u32),
     /// The write was done, but the bytes read back afterwards are not the ones written.
     ReadBack,
@@ -91,9 +91,14 @@ struct Piece {
 }
 
 /// What `VirtualQuery` said about the region that holds an address.
+///
+/// `base` is the queried address rounded down to a page, not the start of the allocation: the
+/// region reported is the run of like pages that starts at that page. `alloc_base` is where the
+/// allocation containing the page starts (0 for free memory).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Region {
     base: usize,
+    alloc_base: usize,
     size: usize,
     state: u32,
     protect: u32,
@@ -114,6 +119,7 @@ fn query(addr: usize) -> Option<Region> {
     };
     (written >= size_of::<MEMORY_BASIC_INFORMATION>()).then_some(Region {
         base: info.BaseAddress as usize,
+        alloc_base: info.AllocationBase as usize,
         size: info.RegionSize,
         state: info.State,
         protect: info.Protect,
@@ -194,33 +200,68 @@ fn set_protect(p: &Piece, protect: u32) -> Result<u32, u32> {
     }
 }
 
-/// Put one piece back to the protection `old`; logs a warning if that fails.
-fn put_back(p: &Piece, old: u32) -> bool {
-    let restored = set_protect(p, old);
-    if let Err(code) = restored {
-        ::log::warn!(
-            "patch: could not restore protection {old:#x} at {:#x} (error {code})",
-            p.addr
-        );
-    }
-    restored.is_ok()
+/// The operating-system calls [`write_checked_with`] makes besides `VirtualQuery`, as a trait so
+/// the tests can make each of them fail or record when it is called.
+trait Os {
+    /// Make the pages of `p` writable. Returns their old protection, or `GetLastError()`.
+    fn set_writable(&mut self, p: &Piece) -> Result<u32, u32>;
+
+    /// Put the pages of `p` back to the protection `old`. The error is `GetLastError()`.
+    fn restore(&mut self, p: &Piece, old: u32) -> Result<(), u32>;
+
+    /// Copy `len` bytes from `addr`.
+    ///
+    /// # Safety
+    ///
+    /// `[addr, addr + len)` must be readable memory.
+    unsafe fn read(&mut self, addr: usize, len: usize) -> Vec<u8>;
+
+    /// `FlushInstructionCache` over the range. False on failure.
+    fn flush(&mut self, addr: usize, len: usize) -> bool;
+
+    /// Record a warning.
+    fn warn(&mut self, message: &str);
 }
 
-/// Make each piece writable, in order. If one fails, put back the ones already changed and return
-/// that failure's error code. On success returns each piece with the protection it had.
-///
-/// The two operations are parameters so the rollback can be tested without a page that fails.
-fn unprotect_all(
-    pieces: &[Piece],
-    mut set_writable: impl FnMut(&Piece) -> Result<u32, u32>,
-    mut restore: impl FnMut(&Piece, u32) -> bool,
-) -> Result<Vec<(Piece, u32)>, u32> {
+/// The real calls.
+struct WindowsOs;
+
+impl Os for WindowsOs {
+    fn set_writable(&mut self, p: &Piece) -> Result<u32, u32> {
+        set_protect(p, PAGE_EXECUTE_READWRITE)
+    }
+
+    fn restore(&mut self, p: &Piece, old: u32) -> Result<(), u32> {
+        set_protect(p, old).map(|_| ())
+    }
+
+    unsafe fn read(&mut self, addr: usize, len: usize) -> Vec<u8> {
+        // SAFETY: the caller guarantees `[addr, addr + len)` is readable.
+        unsafe { copy_out(addr, len) }
+    }
+
+    fn flush(&mut self, addr: usize, len: usize) -> bool {
+        // SAFETY: GetCurrentProcess returns a pseudo-handle and has no preconditions.
+        // FlushInstructionCache only reads its arguments (it never dereferences the address) and
+        // reports failure by returning 0.
+        unsafe { FlushInstructionCache(GetCurrentProcess(), addr as *const c_void, len) != 0 }
+    }
+
+    fn warn(&mut self, message: &str) {
+        ::log::warn!("{message}");
+    }
+}
+
+/// Make each piece writable, in order. If one fails, put back the ones already changed (a warning
+/// for each that cannot be) and return that failure's error code. On success returns each piece
+/// with the protection it had.
+fn unprotect_all(pieces: &[Piece], os: &mut impl Os) -> Result<Vec<(Piece, u32)>, u32> {
     let mut changed: Vec<(Piece, u32)> = Vec::with_capacity(pieces.len());
     for piece in pieces {
-        match set_writable(piece) {
+        match os.set_writable(piece) {
             Ok(old) => changed.push((*piece, old)),
             Err(code) => {
-                restore_all(&changed, &mut restore);
+                restore_all(&changed, os);
                 return Err(code);
             }
         }
@@ -228,12 +269,18 @@ fn unprotect_all(
     Ok(changed)
 }
 
-/// Put every piece back to its old protection. Tries all of them even if one fails; true only if
-/// all succeeded.
-fn restore_all(changed: &[(Piece, u32)], restore: &mut impl FnMut(&Piece, u32) -> bool) -> bool {
+/// Put every piece back to its old protection, with a warning for each one that cannot be. Tries
+/// all of them even if one fails; true only if all succeeded.
+fn restore_all(changed: &[(Piece, u32)], os: &mut impl Os) -> bool {
     let mut all_ok = true;
     for (piece, old) in changed {
-        all_ok &= restore(piece, *old);
+        if let Err(code) = os.restore(piece, *old) {
+            all_ok = false;
+            os.warn(&format!(
+                "patch: could not restore protection {old:#x} at {:#x} (error {code})",
+                piece.addr
+            ));
+        }
     }
     all_ok
 }
@@ -267,6 +314,23 @@ pub unsafe fn write_checked(
     expected: &[u8],
     new: &[u8],
 ) -> Result<Patched, PatchError> {
+    // SAFETY: the caller's contract for `write_checked` is the contract of `write_checked_with`,
+    // and `WindowsOs` makes the real protection and read calls it needs.
+    unsafe { write_checked_with(&mut WindowsOs, addr, expected, new) }
+}
+
+/// The body of [`write_checked`], with the operating-system calls in `os`.
+///
+/// # Safety
+///
+/// The contract of [`write_checked`]. In addition `os.set_writable` must make the pages writable
+/// when it returns `Ok`, since the write below relies on that.
+unsafe fn write_checked_with(
+    os: &mut impl Os,
+    addr: usize,
+    expected: &[u8],
+    new: &[u8],
+) -> Result<Patched, PatchError> {
     let len = expected.len();
     if len == 0 || len != new.len() {
         return Err(PatchError::BadLength);
@@ -274,35 +338,30 @@ pub unsafe fn write_checked(
     let pieces = readable_pieces(addr, len).ok_or(PatchError::NotMapped)?;
     // SAFETY: `readable_pieces` just reported every byte of `[addr, addr + len)` committed and
     // readable.
-    let found = unsafe { copy_out(addr, len) };
+    let found = unsafe { os.read(addr, len) };
     if let Some(i) = found.iter().zip(expected).position(|(a, b)| a != b) {
         return Err(PatchError::Mismatch {
             at: addr.saturating_add(i),
             found,
         });
     }
-    let changed = unprotect_all(
-        &pieces,
-        |p| set_protect(p, PAGE_EXECUTE_READWRITE),
-        put_back,
-    )
-    .map_err(PatchError::Protect)?;
-    // SAFETY: `unprotect_all` succeeded, so every page of `[addr, addr + len)` is now
-    // PAGE_EXECUTE_READWRITE, and the range was committed a moment ago. `ptr::copy` is a memmove,
-    // so it is sound even if the caller broke the "do not borrow the target" rule above.
-    unsafe { ptr::copy(new.as_ptr(), addr as *mut u8, len) };
+    let changed = unprotect_all(&pieces, os).map_err(PatchError::Protect)?;
+    // SAFETY: `unprotect_all` succeeded, so every page of `[addr, addr + len)` is now writable
+    // (`os.set_writable` returned Ok for each piece), and the range was committed a moment ago.
+    // `new` is a slice of `len` readable bytes. That `new` and `expected` do not overlap the
+    // target is the caller's contract in `# Safety`.
+    unsafe { ptr::copy_nonoverlapping(new.as_ptr(), addr as *mut u8, len) };
     // Restore before anything else can fail, so no path below leaves the pages writable. A page
-    // that cannot be restored is logged by `put_back` and stays writable; the patch stays too.
-    restore_all(&changed, &mut put_back);
+    // that cannot be restored is logged by `restore_all` and stays writable; the patch stays too.
+    restore_all(&changed, os);
     // SAFETY: the range was readable before the write, and a page is now either back to its old
     // (readable) protection or, if the restore failed, still read-write; so it is readable.
-    let back = unsafe { copy_out(addr, len) };
-    // SAFETY: GetCurrentProcess returns a pseudo-handle and has no preconditions; the range is
-    // committed memory of this process. A failed flush is harmless on x86-64 (the instruction
-    // cache is coherent there), so the result is only logged.
-    let flushed = unsafe { FlushInstructionCache(GetCurrentProcess(), addr as *const c_void, len) };
-    if flushed == 0 {
-        ::log::warn!("patch: FlushInstructionCache failed for {addr:#x}");
+    let back = unsafe { os.read(addr, len) };
+    // A failed flush is harmless on x86-64 (the instruction cache is coherent there).
+    if !os.flush(addr, len) {
+        os.warn(&format!(
+            "patch: FlushInstructionCache failed for {addr:#x}"
+        ));
     }
     if back != new {
         return Err(PatchError::ReadBack);
@@ -341,8 +400,9 @@ pub fn rel32(next_insn: usize, dest: usize) -> Option<i32> {
 const GRANULE: i128 = 0x1_0000;
 /// A `rel32` reaches this far behind, and one byte less ahead.
 const REACH: i128 = 1 << 31;
-/// More region steps than the whole 4 GiB window can have (65536 granules per direction at most,
-/// and every step moves at least one granule). A bound for a `query` that misbehaves.
+/// The most steps the search takes before it gives up. Each of the two cursors moves at least one
+/// granule per step and the window is 4 GiB (65536 granules), so a `query` that behaves needs at
+/// most about 131072 steps in all; this is twice that. Only a misbehaving `query` can reach it.
 const MAX_STEPS: usize = 1 << 18;
 
 /// The address-space facts the near search needs.
@@ -394,8 +454,17 @@ fn reserve_at(addr: usize, size: usize) -> bool {
     }
     // Not the address that was asked for (VirtualAlloc should not do that): give it back.
     // SAFETY: `got` is the base of the allocation that was just made; MEM_RELEASE with size 0
-    // frees all of it.
-    unsafe { VirtualFree(got, 0, MEM_RELEASE) };
+    // frees all of it. The error code is read straight away, before anything else can overwrite
+    // it.
+    unsafe {
+        if VirtualFree(got, 0, MEM_RELEASE) == 0 {
+            ::log::warn!(
+                "patch: VirtualAlloc gave {:#x} instead of {addr:#x}, and VirtualFree of it failed (error {})",
+                got as usize,
+                GetLastError()
+            );
+        }
+    }
     false
 }
 
@@ -406,7 +475,8 @@ fn reserve_at(addr: usize, size: usize) -> bool {
 ///
 /// Pass the address the displacement is measured from, that is the address of the instruction
 /// after the `jmp`/`call` (`next_insn` in [`rel32`]), not the start of the instruction. The block
-/// nearest to `target` that can be had is chosen, looking both below and above it. The block is
+/// is found near `target`: the search runs outward from it, below and above in turn, and takes the
+/// first block it can reserve (so it is not guaranteed to be the very nearest one). The block is
 /// never freed: it lives as long as the process, as a trampoline or code cave must.
 ///
 /// Walks `VirtualQuery` regions rather than every 64 KiB step, which visits the same candidate
@@ -486,8 +556,18 @@ fn find_near(
                     if base > down || end <= down {
                         down - GRANULE
                     } else if r.state != MEM_FREE {
-                        // Jump below the occupied region.
-                        round_down(base - 1, GRANULE).min(down - GRANULE)
+                        // Jump below the whole allocation. `base` is only the queried page, so
+                        // jumping below it would crawl one granule per query through a big
+                        // allocation. Every page from `alloc_base` up to here is part of the
+                        // allocation, so none of it is free. (A nonsense `alloc_base` falls back
+                        // to `base`.)
+                        let alloc_base = r.alloc_base as i128;
+                        let floor = if alloc_base != 0 && alloc_base <= base {
+                            alloc_base
+                        } else {
+                            base
+                        };
+                        round_down(floor - 1, GRANULE).min(down - GRANULE)
                     } else if down + span > end {
                         // The block would run out of the free region: the highest start that
                         // ends inside it.
@@ -515,15 +595,24 @@ pub(crate) mod test_support {
     };
 
     /// Some `VirtualAlloc` memory that is released on drop.
+    ///
+    /// `put`, `get` and `protect` are safe functions, so each one checks that its range lies
+    /// inside the `size` bytes this value owns and panics if not (this is test code). Whether the
+    /// pages are readable or writable at that moment is up to the test, which set the protection.
     pub(crate) struct Mem {
         pub(crate) base: usize,
+        size: usize,
     }
 
     impl Mem {
         pub(crate) fn new(size: usize, kind: u32, protect: u32) -> Mem {
+            // SAFETY: a null address lets VirtualAlloc choose; it returns fresh pages or null.
             let p = unsafe { VirtualAlloc(null(), size, kind, protect) };
             assert!(!p.is_null(), "VirtualAlloc failed");
-            Mem { base: p as usize }
+            Mem {
+                base: p as usize,
+                size,
+            }
         }
 
         /// Committed read-write memory.
@@ -531,7 +620,32 @@ pub(crate) mod test_support {
             Mem::new(size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
         }
 
+        /// Take over a `VirtualAlloc` block (for example one from `alloc_near`) so it is freed
+        /// when this value is dropped.
+        ///
+        /// # Safety
+        ///
+        /// `base` must be the base address of a live `VirtualAlloc` allocation of at least `size`
+        /// bytes, and nothing else may free it or use it after this value is dropped.
+        pub(crate) unsafe fn adopt(base: usize, size: usize) -> Mem {
+            Mem { base, size }
+        }
+
+        /// Panics unless `[off, off + len)` is inside the allocation.
+        fn check(&self, off: usize, len: usize) {
+            let end = off.checked_add(len).expect("range overflows");
+            assert!(
+                end <= self.size,
+                "range {off:#x}+{len:#x} is outside the {:#x}-byte allocation",
+                self.size
+            );
+        }
+
         pub(crate) fn put(&self, off: usize, bytes: &[u8]) {
+            self.check(off, bytes.len());
+            // SAFETY: the range is inside the allocation this value owns (checked above), so it
+            // is memory of this process; `bytes` is a separate slice, so the ranges cannot
+            // overlap. The caller (a test) has left those pages writable.
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     bytes.as_ptr(),
@@ -542,7 +656,11 @@ pub(crate) mod test_support {
         }
 
         pub(crate) fn get(&self, off: usize, len: usize) -> Vec<u8> {
+            self.check(off, len);
             let mut out = vec![0u8; len];
+            // SAFETY: the range is inside the allocation this value owns (checked above); `out`
+            // is a fresh allocation, so the ranges cannot overlap. The caller (a test) has left
+            // those pages readable.
             unsafe {
                 std::ptr::copy_nonoverlapping((self.base + off) as *const u8, out.as_mut_ptr(), len)
             };
@@ -550,7 +668,10 @@ pub(crate) mod test_support {
         }
 
         pub(crate) fn protect(&self, off: usize, len: usize, protect: u32) {
+            self.check(off, len);
             let mut old = 0;
+            // SAFETY: the range is inside the allocation this value owns (checked above), `old`
+            // is a valid output location, and VirtualProtect touches no memory itself.
             let ok =
                 unsafe { VirtualProtect((self.base + off) as *const _, len, protect, &mut old) };
             assert!(ok != 0, "VirtualProtect failed");
@@ -559,16 +680,16 @@ pub(crate) mod test_support {
 
     impl Drop for Mem {
         fn drop(&mut self) {
+            // SAFETY: `base` is the base of a live allocation that `new` made (or the caller of
+            // `adopt` vouched for) and nothing else frees it; this is the one release.
             unsafe { VirtualFree(self.base as *mut _, 0, MEM_RELEASE) };
         }
     }
 
-    pub(crate) fn release(addr: usize) {
-        unsafe { VirtualFree(addr as *mut _, 0, MEM_RELEASE) };
-    }
-
     pub(crate) fn info(addr: usize) -> MEMORY_BASIC_INFORMATION {
         let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: `info` is a valid buffer of exactly the size passed. VirtualQuery accepts any
+        // address, reads no memory at it, and reports failure by returning 0.
         let n = unsafe {
             VirtualQuery(
                 addr as *const _,
@@ -587,6 +708,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::{info, protect_of, Mem};
     use super::*;
     use windows_sys::Win32::System::Memory::{
         VirtualAlloc, MEM_COMMIT, MEM_FREE, MEM_RESERVE, PAGE_EXECUTE, PAGE_EXECUTE_READ,
@@ -600,6 +722,8 @@ mod tests {
     #[test]
     fn refuses_unexpected_bytes() {
         let mut buf = [1u8, 2, 3, 4];
+        // SAFETY: the range is inside `buf`, a local array only this thread uses; `expected` and
+        // `new` are separate literals, not borrows of it.
         let r = unsafe { write_checked(buf.as_mut_ptr() as usize, &[9, 9], &[5, 6]) };
         assert!(matches!(r, Err(PatchError::Mismatch { .. })));
         assert_eq!(buf, [1, 2, 3, 4]);
@@ -608,6 +732,8 @@ mod tests {
     #[test]
     fn writes_and_keeps_original() {
         let mut buf = [1u8, 2, 3, 4];
+        // SAFETY: the range is inside `buf`, a local array only this thread uses; `expected` and
+        // `new` are separate literals, not borrows of it.
         let p = unsafe { write_checked(buf.as_mut_ptr() as usize + 1, &[2, 3], &[7, 8]) }.unwrap();
         assert_eq!(buf, [1, 7, 8, 4]);
         assert_eq!(p.original, vec![2, 3]);
@@ -617,11 +743,11 @@ mod tests {
     fn alloc_near_is_in_rel32_range() {
         let here = alloc_near_is_in_rel32_range as *const () as usize;
         let a = alloc_near(here, 4096).unwrap();
+        // SAFETY: `alloc_near` returns the base of a fresh VirtualAlloc block of at least the
+        // size asked for, and nothing else frees it.
+        let _block = unsafe { Mem::adopt(a, 4096) };
         assert!(rel32(here, a).is_some() && rel32(here, a + 4095).is_some());
-        release(a);
     }
-
-    use super::test_support::{info, protect_of, release, Mem};
 
     // ---- write_checked: lengths -----------------------------------------------------------
 
@@ -634,6 +760,8 @@ mod tests {
             (&[1, 2][..], &[7][..]),
             (&[1][..], &[7, 8][..]),
         ] {
+            // SAFETY: `at` is the start of `buf`, a local array only this thread uses; the
+            // lengths are rejected before anything is read or written.
             let r = unsafe { write_checked(at, e, n) };
             assert_eq!(r, Err(PatchError::BadLength));
         }
@@ -644,6 +772,8 @@ mod tests {
     fn mismatch_reports_first_differing_address_and_all_bytes_found() {
         let mut buf = [1u8, 2, 3, 4];
         let at = buf.as_mut_ptr() as usize;
+        // SAFETY: the range is `buf`, a local array only this thread uses; `expected` and `new`
+        // are separate literals.
         let r = unsafe { write_checked(at, &[1, 2, 9, 4], &[0, 0, 0, 0]) };
         assert_eq!(
             r,
@@ -659,9 +789,11 @@ mod tests {
     fn write_u32_roundtrip_and_mismatch() {
         let mut word = 0x1122_3344u32;
         let at = &mut word as *mut u32 as usize;
+        // SAFETY: the four bytes are `word`, a local only this thread uses.
         let p = unsafe { write_u32_checked(at, 0x1122_3344, 0xdead_beef) }.unwrap();
         assert_eq!(p.original, 0x1122_3344u32.to_le_bytes().to_vec());
         assert_eq!(word, 0xdead_beef);
+        // SAFETY: as above; the value no longer matches, so nothing is written.
         let r = unsafe { write_u32_checked(at, 0x1122_3344, 1) };
         assert!(matches!(r, Err(PatchError::Mismatch { .. })));
         assert_eq!(word, 0xdead_beef);
@@ -671,18 +803,18 @@ mod tests {
 
     #[test]
     fn null_and_wrapping_ranges_are_not_mapped() {
-        assert_eq!(
-            unsafe { write_checked(0, &[0], &[1]) },
-            Err(PatchError::NotMapped)
-        );
-        assert_eq!(
-            unsafe { write_checked(usize::MAX, &[0, 0], &[1, 1]) },
-            Err(PatchError::NotMapped)
-        );
-        assert_eq!(
-            unsafe { write_checked(usize::MAX - 1, &[0, 0, 0], &[1, 1, 1]) },
-            Err(PatchError::NotMapped)
-        );
+        let cases: [(usize, &[u8], &[u8]); 3] = [
+            (0, &[0], &[1]),
+            (usize::MAX, &[0, 0], &[1, 1]),
+            (usize::MAX - 1, &[0, 0, 0], &[1, 1, 1]),
+        ];
+        for (addr, expected, new) in cases {
+            // SAFETY: none of these ranges is mapped (the null page, and ranges that run off the
+            // end of the address space), so there is no memory to break; `write_checked` refuses
+            // them before reading or writing anything, which is what this test checks.
+            let r = unsafe { write_checked(addr, expected, new) };
+            assert_eq!(r, Err(PatchError::NotMapped), "{addr:#x}");
+        }
     }
 
     #[test]
@@ -697,6 +829,8 @@ mod tests {
             ("guard", &guard, PAGE_READWRITE | PAGE_GUARD),
             ("execute only", &exec_only, PAGE_EXECUTE),
         ] {
+            // SAFETY: `m` is a page this test owns; it is unreadable, so `write_checked` refuses
+            // it before reading or writing it, which is what this test checks.
             let r = unsafe { write_checked(m.base, &[0, 0], &[1, 1]) };
             assert_eq!(r, Err(PatchError::NotMapped), "{name}");
             if name != "reserved" {
@@ -711,10 +845,13 @@ mod tests {
     fn a_range_that_runs_into_uncommitted_memory_is_refused_whole() {
         // Two pages reserved, only the first committed.
         let m = Mem::new(2 * PAGE, MEM_RESERVE, PAGE_NOACCESS);
+        // SAFETY: committing the first page of the region this test just reserved.
         let committed =
             unsafe { VirtualAlloc(m.base as *const _, PAGE, MEM_COMMIT, PAGE_READWRITE) };
         assert!(!committed.is_null());
         m.put(PAGE - 2, &[5, 6]);
+        // SAFETY: the range is in pages this test owns; its second half is uncommitted, so
+        // `write_checked` refuses the whole range before reading or writing it.
         let r = unsafe { write_checked(m.base + PAGE - 2, &[5, 6, 0, 0], &[9, 9, 9, 9]) };
         assert_eq!(r, Err(PatchError::NotMapped));
         assert_eq!(
@@ -725,7 +862,7 @@ mod tests {
         assert_eq!(protect_of(m.base), PAGE_READWRITE);
     }
 
-    // ---- write_checked: protection (hazards 4) ---------------------------------------------
+    // ---- write_checked: protection (hazard 4) ----------------------------------------------
 
     #[test]
     fn read_only_and_execute_read_pages_are_patched_and_put_back() {
@@ -733,6 +870,8 @@ mod tests {
             let m = Mem::rw(PAGE);
             m.put(8, &[1, 2, 3, 4]);
             m.protect(0, PAGE, protect);
+            // SAFETY: the range is inside `m`, a page this test owns and no other thread uses;
+            // `expected` and `new` are separate literals.
             let p = unsafe { write_checked(m.base + 8, &[1, 2, 3, 4], &[9, 8, 7, 6]) }.unwrap();
             assert_eq!(p.original, vec![1, 2, 3, 4]);
             assert_eq!(protect_of(m.base), protect);
@@ -748,6 +887,8 @@ mod tests {
         m.protect(PAGE, PAGE, PAGE_READONLY);
         assert_eq!(protect_of(m.base), PAGE_READWRITE);
         assert_eq!(protect_of(m.base + PAGE), PAGE_READONLY);
+        // SAFETY: the range is inside `m`, two pages this test owns and no other thread uses;
+        // `expected` and `new` are separate literals.
         unsafe { write_checked(m.base + PAGE - 2, &[1, 2, 3, 4], &[5, 6, 7, 8]) }.unwrap();
         assert_eq!(protect_of(m.base), PAGE_READWRITE, "first page");
         assert_eq!(protect_of(m.base + PAGE), PAGE_READONLY, "second page");
@@ -762,8 +903,12 @@ mod tests {
         // make it writable. (`new` equals `expected`, so even a surprise success writes nothing.)
         const KUSER: usize = 0x7ffe_0000;
         let at = KUSER + 0x26c;
+        // SAFETY: KUSER_SHARED_DATA is mapped readable in every Windows process at this address,
+        // and `NtMajorVersion` is a 4-byte aligned `u32` inside it.
         let major = unsafe { *(at as *const u32) };
         let before = protect_of(KUSER);
+        // SAFETY: the value written equals the value read, so even if the page were writable
+        // nothing would change; VirtualProtect is expected to refuse, which is what is tested.
         let r = unsafe { write_u32_checked(at, major, major) };
         eprintln!("VirtualProtect(RWX) on KUSER_SHARED_DATA: {r:?}");
         assert!(
@@ -773,83 +918,256 @@ mod tests {
         assert_eq!(protect_of(KUSER), before);
     }
 
-    // ---- the page-protection rollback logic, with a fake VirtualProtect --------------------
+    // ---- the operating-system calls, replaced by a fake -----------------------------------
+
+    /// An [`Os`] that changes no protection, records every call, and fails on request.
+    #[derive(Default)]
+    struct FakeOs {
+        events: Vec<String>,
+        warnings: Vec<String>,
+        flushes: Vec<(usize, usize)>,
+        reads: usize,
+        /// `set_writable` fails with this code for the piece at this address.
+        fail_set_at: Option<(usize, u32)>,
+        /// `restore` fails (error 5) for the piece at this address.
+        fail_restore_at: Option<usize>,
+        /// The second `read` returns its bytes with the first one flipped.
+        corrupt_second_read: bool,
+        fail_flush: bool,
+    }
+
+    impl Os for FakeOs {
+        fn set_writable(&mut self, p: &Piece) -> Result<u32, u32> {
+            self.events
+                .push(format!("set_writable {:#x}+{}", p.addr, p.len));
+            match self.fail_set_at {
+                Some((at, code)) if at == p.addr => Err(code),
+                // A distinct "old protection" per page, so a restore can be matched to its page.
+                _ => Ok(0x20 + (p.addr >> 12) as u32),
+            }
+        }
+
+        fn restore(&mut self, p: &Piece, old: u32) -> Result<(), u32> {
+            self.events.push(format!("restore {:#x} {old:#x}", p.addr));
+            if self.fail_restore_at == Some(p.addr) {
+                Err(5)
+            } else {
+                Ok(())
+            }
+        }
+
+        unsafe fn read(&mut self, addr: usize, len: usize) -> Vec<u8> {
+            self.reads += 1;
+            self.events.push("read".to_string());
+            // SAFETY: the caller guarantees `[addr, addr + len)` is readable.
+            let mut bytes = unsafe { copy_out(addr, len) };
+            if self.corrupt_second_read && self.reads == 2 {
+                if let Some(first) = bytes.first_mut() {
+                    *first ^= 0xff;
+                }
+            }
+            bytes
+        }
+
+        fn flush(&mut self, addr: usize, len: usize) -> bool {
+            self.events.push("flush".to_string());
+            self.flushes.push((addr, len));
+            !self.fail_flush
+        }
+
+        fn warn(&mut self, message: &str) {
+            self.warnings.push(message.to_string());
+        }
+    }
+
+    /// Run `write_checked_with` over `len` bytes at `off` in a read-write page that holds 1, 2, 3
+    /// ...; the replacement is 0x41, 0x42 ...
+    fn fake_write(
+        fake: &mut FakeOs,
+        m: &Mem,
+        off: usize,
+        len: usize,
+    ) -> Result<Patched, PatchError> {
+        let expected: Vec<u8> = (1..=len as u8).collect();
+        let new: Vec<u8> = (0x41..0x41 + len as u8).collect();
+        m.put(off, &expected);
+        // SAFETY: the range is inside `m`, memory this test owns and no other thread uses, and it
+        // is already read-write, which is all `FakeOs::set_writable` (it changes nothing) needs;
+        // `expected` and `new` are separate vectors.
+        unsafe { write_checked_with(fake, m.base + off, &expected, &new) }
+    }
+
+    #[test]
+    fn the_calls_come_in_order_and_flush_gets_the_address_and_length() {
+        let m = Mem::rw(PAGE);
+        let mut fake = FakeOs::default();
+        let at = m.base + 8;
+        let p = fake_write(&mut fake, &m, 8, 4).unwrap();
+        assert_eq!(p.addr, at);
+        assert_eq!(p.original, vec![1, 2, 3, 4]);
+        assert_eq!(m.get(8, 4), vec![0x41, 0x42, 0x43, 0x44]);
+        // Compare, make writable, write, restore before the read-back, then flush; once each.
+        let page = (at >> 12) as u32;
+        assert_eq!(
+            fake.events,
+            vec![
+                "read".to_string(),
+                format!("set_writable {at:#x}+4"),
+                format!("restore {at:#x} {:#x}", 0x20 + page),
+                "read".to_string(),
+                "flush".to_string(),
+            ]
+        );
+        assert_eq!(fake.flushes, vec![(at, 4)]);
+        assert!(fake.warnings.is_empty());
+    }
+
+    #[test]
+    fn a_failed_restore_after_the_write_keeps_the_patch_and_warns() {
+        let m = Mem::rw(PAGE);
+        let mut fake = FakeOs {
+            fail_restore_at: Some(m.base + 8),
+            ..FakeOs::default()
+        };
+        let p = fake_write(&mut fake, &m, 8, 4).expect("the patch stays in place: Ok");
+        assert_eq!(p.original, vec![1, 2, 3, 4]);
+        assert_eq!(m.get(8, 4), vec![0x41, 0x42, 0x43, 0x44]);
+        assert_eq!(fake.warnings.len(), 1, "{:?}", fake.warnings);
+        assert!(fake.warnings[0].contains("could not restore"));
+        assert!(fake.warnings[0].contains(&format!("{:#x}", m.base + 8)));
+        // The read-back and the flush still ran.
+        assert_eq!(fake.reads, 2);
+        assert_eq!(fake.flushes.len(), 1);
+    }
+
+    #[test]
+    fn a_read_back_mismatch_is_reported_and_the_pages_are_still_restored() {
+        let m = Mem::rw(PAGE);
+        let mut fake = FakeOs {
+            corrupt_second_read: true,
+            ..FakeOs::default()
+        };
+        let r = fake_write(&mut fake, &m, 8, 4);
+        assert_eq!(r, Err(PatchError::ReadBack));
+        // The bytes were written (only the read-back was made to disagree)...
+        assert_eq!(m.get(8, 4), vec![0x41, 0x42, 0x43, 0x44]);
+        // ...the protection was restored before the read-back, and the flush still ran.
+        let restore = fake.events.iter().position(|e| e.starts_with("restore"));
+        let second_read = fake.events.iter().rposition(|e| e == "read");
+        assert!(restore < second_read, "{:?}", fake.events);
+        assert_eq!(fake.flushes.len(), 1);
+    }
+
+    #[test]
+    fn a_failed_flush_is_only_a_warning() {
+        let m = Mem::rw(PAGE);
+        let mut fake = FakeOs {
+            fail_flush: true,
+            ..FakeOs::default()
+        };
+        assert!(fake_write(&mut fake, &m, 8, 4).is_ok());
+        assert_eq!(fake.warnings.len(), 1, "{:?}", fake.warnings);
+        assert!(fake.warnings[0].contains("FlushInstructionCache"));
+        assert_eq!(fake.flushes.len(), 1);
+    }
+
+    #[test]
+    fn a_protect_failure_on_the_second_page_writes_nothing_and_restores_the_first() {
+        // Two writable pages with different protection values (read-write, then execute-read-
+        // write), so VirtualQuery reports two regions and the range has two pieces.
+        let m = Mem::rw(2 * PAGE);
+        m.protect(PAGE, PAGE, PAGE_EXECUTE_READWRITE);
+        m.put(PAGE - 2, &[1, 2, 3, 4]);
+        let second = m.base + PAGE;
+        let mut fake = FakeOs {
+            fail_set_at: Some((second, 87)),
+            ..FakeOs::default()
+        };
+        // SAFETY: the range is inside `m`, two writable pages this test owns and no other thread
+        // uses; `FakeOs::set_writable` changes nothing; `expected` and `new` are literals.
+        let r = unsafe {
+            write_checked_with(&mut fake, m.base + PAGE - 2, &[1, 2, 3, 4], &[5, 6, 7, 8])
+        };
+        assert_eq!(r, Err(PatchError::Protect(87)));
+        assert_eq!(m.get(PAGE - 2, 4), vec![1, 2, 3, 4], "nothing was written");
+        let first = m.base + PAGE - 2;
+        let page = (first >> 12) as u32;
+        assert_eq!(
+            fake.events,
+            vec![
+                "read".to_string(),
+                format!("set_writable {first:#x}+2"),
+                format!("set_writable {second:#x}+2"),
+                format!("restore {first:#x} {:#x}", 0x20 + page),
+            ]
+        );
+        assert_eq!(fake.reads, 1);
+        assert!(fake.flushes.is_empty());
+    }
+
+    // ---- the page-protection rollback logic, without any memory ---------------------------
+
+    fn piece(addr: usize) -> Piece {
+        Piece { addr, len: 16 }
+    }
 
     #[test]
     fn a_failure_part_way_restores_the_pages_already_changed() {
-        let pieces = [
-            Piece {
-                addr: 0x1000,
-                len: 16,
-            },
-            Piece {
-                addr: 0x2000,
-                len: 16,
-            },
-            Piece {
-                addr: 0x3000,
-                len: 16,
-            },
-        ];
-        let mut log: Vec<String> = Vec::new();
-        let mut restored: Vec<(usize, u32)> = Vec::new();
-        let r = unprotect_all(
-            &pieces,
-            |p| {
-                log.push(format!("set {:#x}", p.addr));
-                match p.addr {
-                    0x1000 => Ok(PAGE_READONLY),
-                    0x2000 => Ok(PAGE_EXECUTE_READ),
-                    _ => Err(87),
-                }
-            },
-            |p, old| {
-                restored.push((p.addr, old));
-                true
-            },
-        );
+        let pieces = [piece(0x1000), piece(0x2000), piece(0x3000)];
+        let mut fake = FakeOs {
+            fail_set_at: Some((0x3000, 87)),
+            ..FakeOs::default()
+        };
+        let r = unprotect_all(&pieces, &mut fake);
         assert_eq!(r.map(|_| ()), Err(87));
-        restored.sort_unstable();
         assert_eq!(
-            restored,
-            vec![(0x1000, PAGE_READONLY), (0x2000, PAGE_EXECUTE_READ)]
+            fake.events,
+            vec![
+                "set_writable 0x1000+16".to_string(),
+                "set_writable 0x2000+16".to_string(),
+                "set_writable 0x3000+16".to_string(),
+                format!("restore 0x1000 {:#x}", 0x21),
+                format!("restore 0x2000 {:#x}", 0x22),
+            ]
         );
-        assert_eq!(log, ["set 0x1000", "set 0x2000", "set 0x3000"]);
+        assert!(fake.warnings.is_empty());
+    }
+
+    #[test]
+    fn a_rollback_that_cannot_restore_a_page_warns_and_still_reports_the_original_error() {
+        let pieces = [piece(0x1000), piece(0x2000)];
+        let mut fake = FakeOs {
+            fail_set_at: Some((0x2000, 87)),
+            fail_restore_at: Some(0x1000),
+            ..FakeOs::default()
+        };
+        assert_eq!(unprotect_all(&pieces, &mut fake).map(|_| ()), Err(87));
+        assert_eq!(fake.warnings.len(), 1, "{:?}", fake.warnings);
+        assert!(fake.warnings[0].contains("0x1000"));
     }
 
     #[test]
     fn restore_all_tries_every_page_and_reports_any_failure() {
         let changed = [
-            (
-                Piece {
-                    addr: 0x1000,
-                    len: 1,
-                },
-                PAGE_READONLY,
-            ),
-            (
-                Piece {
-                    addr: 0x2000,
-                    len: 1,
-                },
-                PAGE_READONLY,
-            ),
-            (
-                Piece {
-                    addr: 0x3000,
-                    len: 1,
-                },
-                PAGE_READONLY,
-            ),
+            (piece(0x1000), PAGE_READONLY),
+            (piece(0x2000), PAGE_READONLY),
+            (piece(0x3000), PAGE_READONLY),
         ];
-        let mut tried = Vec::new();
-        let all_ok = restore_all(&changed, &mut |p, _| {
-            tried.push(p.addr);
-            p.addr != 0x2000
-        });
-        assert!(!all_ok);
-        assert_eq!(tried, vec![0x1000, 0x2000, 0x3000]);
-        assert!(restore_all(&changed, &mut |_, _| true));
+        let mut fake = FakeOs {
+            fail_restore_at: Some(0x2000),
+            ..FakeOs::default()
+        };
+        assert!(!restore_all(&changed, &mut fake));
+        assert_eq!(
+            fake.events,
+            vec![
+                format!("restore 0x1000 {PAGE_READONLY:#x}"),
+                format!("restore 0x2000 {PAGE_READONLY:#x}"),
+                format!("restore 0x3000 {PAGE_READONLY:#x}"),
+            ]
+        );
+        assert_eq!(fake.warnings.len(), 1);
+        assert!(restore_all(&changed, &mut FakeOs::default()));
     }
 
     // ---- rel32 (hazard 6) ------------------------------------------------------------------
@@ -909,11 +1227,15 @@ mod tests {
             Map(regions)
         }
 
+        /// Answers like `VirtualQuery`: the region starts at the page that holds `a`, not at the
+        /// start of the allocation, and `alloc_base` is where the allocation starts (0 if free).
         fn query(&self, a: usize) -> Option<Region> {
             let &(s, e, free) = self.0.iter().find(|&&(s, e, _)| a >= s && a < e)?;
+            let base = a / PAGE * PAGE;
             Some(Region {
-                base: s,
-                size: e - s,
+                base,
+                alloc_base: if free { 0 } else { s },
+                size: e - base,
                 state: if free { MEM_FREE } else { MEM_RESERVE },
                 protect: 0,
             })
@@ -1062,6 +1384,52 @@ mod tests {
     }
 
     #[test]
+    fn a_big_occupied_allocation_is_jumped_not_crawled_through() {
+        // The target sits inside one 4 GiB allocation; the nearest free memory is below its start.
+        // VirtualQuery reports a region that starts at the queried page, so only `alloc_base` lets
+        // the downward cursor jump over the allocation in one query instead of one per granule.
+        let target = 0x1_4000_0000;
+        let map = Map::with_free(&[(0x1_0000_0000, 0x1_1000_0000)]);
+        let queries = std::cell::Cell::new(0usize);
+        let got = find_near(
+            target,
+            4096,
+            LIMITS,
+            &|a| {
+                queries.set(queries.get() + 1);
+                map.query(a)
+            },
+            &mut |_, _| true,
+        );
+        let a = got.expect("free memory below the allocation");
+        assert!((0x1_0000_0000..0x1_1000_0000).contains(&a), "{a:#x}");
+        assert!(queries.get() <= 6, "{} queries", queries.get());
+    }
+
+    #[test]
+    fn a_nonsense_allocation_base_falls_back_to_the_region_base() {
+        // A non-free region that reports alloc_base 0 (or one above its own base) is still walked
+        // past, a granule at a time. The occupied allocation is [0x1_8000, TOP); the free memory
+        // is below it.
+        let map = Map::with_free(&[(0x1_0000, 0x1_8000)]);
+        for bad in [0usize, usize::MAX] {
+            let got = find_near(
+                0x4_0000,
+                4096,
+                LIMITS,
+                &|a| {
+                    map.query(a).map(|r| Region {
+                        alloc_base: bad,
+                        ..r
+                    })
+                },
+                &mut |_, _| true,
+            );
+            assert_eq!(got, Some(0x1_0000), "alloc_base {bad:#x}");
+        }
+    }
+
+    #[test]
     fn nonsense_sizes_and_targets_give_none() {
         let map = Map::with_free(&[(0x1_0000, TOP)]);
         let target = 0x1_4000_0000;
@@ -1105,6 +1473,7 @@ mod tests {
                 queries.set(queries.get() + 1);
                 Some(Region {
                     base: a,
+                    alloc_base: 0,
                     size: 0,
                     state: MEM_FREE,
                     protect: 0,
@@ -1125,26 +1494,30 @@ mod tests {
     fn alloc_near_gives_zeroed_read_write_memory_in_reach() {
         let here = alloc_near_gives_zeroed_read_write_memory_in_reach as *const () as usize;
         let a = alloc_near(here, 5000).expect("block");
+        // SAFETY: `alloc_near` returns the base of a fresh VirtualAlloc block of at least 5000
+        // bytes, and nothing else frees it.
+        let block = unsafe { Mem::adopt(a, 5000) };
         assert_eq!(a % G, 0);
         assert!(reach_ok(here, a, 2 * PAGE), "{a:#x}");
         let i = info(a);
         assert_eq!((i.State, i.Protect), (MEM_COMMIT, PAGE_READWRITE));
         assert!(i.RegionSize >= 2 * PAGE);
-        let block = unsafe { std::slice::from_raw_parts_mut(a as *mut u8, 5000) };
-        assert!(block.iter().all(|&b| b == 0));
-        block.fill(0xab);
+        assert_eq!(block.get(0, 5000), vec![0u8; 5000]);
+        block.put(0, &[0xab; 5000]);
         let b = alloc_near(here, 5000).expect("second block");
+        // SAFETY: as above for the second block.
+        let _second = unsafe { Mem::adopt(b, 5000) };
         assert_ne!(a, b, "a second request must not get the same block");
-        release(a);
-        release(b);
     }
 
     #[test]
     fn alloc_near_a_target_in_the_low_2_gib_does_not_underflow() {
         // `target - 2 GiB` would wrap here.
         let a = alloc_near(0x2_0000, 4096).expect("block in the low 2 GiB");
+        // SAFETY: `alloc_near` returns the base of a fresh VirtualAlloc block of at least 4096
+        // bytes, and nothing else frees it.
+        let _block = unsafe { Mem::adopt(a, 4096) };
         assert!(a >= 0x1_0000 && reach_ok(0x2_0000, a, 4096), "{a:#x}");
-        release(a);
     }
 
     #[test]
