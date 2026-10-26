@@ -893,6 +893,8 @@ mod reflex_driver {
     static ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
     static CHANGED_OK: AtomicUsize = AtomicUsize::new(0);
     static RETRY_OK: AtomicUsize = AtomicUsize::new(0);
+    static A_DESTROYS: AtomicUsize = AtomicUsize::new(0);
+    static B_DESTROYS: AtomicUsize = AtomicUsize::new(0);
     static WRONG_GPU_QUERY: AtomicUsize = AtomicUsize::new(0);
     static QUERY_INSTANCE: AtomicUsize = AtomicUsize::new(0);
     static ENUM_RESULT: AtomicUsize = AtomicUsize::new(0);
@@ -1061,28 +1063,56 @@ mod reflex_driver {
         };
         guard(Feature::VkWrap, body, body)
     }
-    /// Fake lifetime endpoints; these cases create no live native device resources.
+    /// B's native destructor records every actual invocation, including after mod disable.
     unsafe extern "system" fn destroy_device(_: vk::Device, _: *const vk::AllocationCallbacks<'_>) {
-        guard(Feature::VkWrap, || (), || ());
+        let body = || {
+            B_DESTROYS.fetch_add(1, Ordering::Relaxed);
+        };
+        guard(Feature::VkWrap, body, body);
     }
-    /// A different instance-specific endpoint must not replace an already-issued function.
+    /// A's instance-specific destructor must never receive B's child device.
     unsafe extern "system" fn other_destroy_device(
         _: vk::Device,
         _: *const vk::AllocationCallbacks<'_>,
     ) {
-        guard(Feature::VkWrap, || (), || ());
+        let body = || {
+            A_DESTROYS.fetch_add(1, Ordering::Relaxed);
+        };
+        guard(Feature::VkWrap, body, body);
     }
-    /// Fake swapchain lifetime endpoint.
+    /// B's native swapchain destructor records actual invocation.
     unsafe extern "system" fn destroy_swapchain(
         _: vk::Device,
         _: vk::SwapchainKHR,
         _: *const vk::AllocationCallbacks<'_>,
     ) {
-        guard(Feature::VkWrap, || (), || ());
+        let body = || {
+            B_DESTROYS.fetch_add(1, Ordering::Relaxed);
+        };
+        guard(Feature::VkWrap, body, body);
     }
-    /// Missing optional native functions leave the fake runtime unavailable after creation.
-    unsafe extern "system" fn gdpa(_: vk::Device, _: *const c_char) -> vk::PFN_vkVoidFunction {
-        guard(Feature::VkWrap, || None, || None)
+    /// A's instance-specific swapchain destructor must never receive B's child device.
+    unsafe extern "system" fn other_destroy_swapchain(
+        _: vk::Device,
+        _: vk::SwapchainKHR,
+        _: *const vk::AllocationCallbacks<'_>,
+    ) {
+        let body = || {
+            A_DESTROYS.fetch_add(1, Ordering::Relaxed);
+        };
+        guard(Feature::VkWrap, body, body);
+    }
+    /// B's device-level dispatch returns its own destructors, regardless of the mod's flag.
+    unsafe extern "system" fn gdpa(_: vk::Device, name: *const c_char) -> vk::PFN_vkVoidFunction {
+        let body = || {
+            // SAFETY: every test lookup supplies a static terminated name.
+            to_void(match unsafe { CStr::from_ptr(name) }.to_bytes() {
+                b"vkDestroyDevice" => destroy_device as *const () as usize,
+                b"vkDestroySwapchainKHR" => destroy_swapchain as *const () as usize,
+                _ => 0,
+            })
+        };
+        guard(Feature::VkWrap, body, body)
     }
     /// The fake owns no native instance resources.
     unsafe extern "system" fn destroy_instance(
@@ -1097,37 +1127,46 @@ mod reflex_driver {
         instance: vk::Instance,
         name: *const c_char,
     ) -> vk::PFN_vkVoidFunction {
-        guard(
-            Feature::VkWrap,
-            || None,
-            || {
-                // SAFETY: every request uses a valid NUL-terminated name.
-                let name = unsafe { CStr::from_ptr(name) };
-                if matches!(
-                    name.to_bytes(),
-                    b"vkGetPhysicalDeviceProperties"
-                        | b"vkEnumerateDeviceExtensionProperties"
-                        | b"vkGetPhysicalDeviceFeatures2"
-                ) {
-                    QUERY_INSTANCE.store(instance.as_raw() as usize, Ordering::Relaxed);
+        let body = || {
+            // SAFETY: every request uses a valid NUL-terminated name.
+            let name = unsafe { CStr::from_ptr(name) };
+            if matches!(
+                name.to_bytes(),
+                b"vkGetPhysicalDeviceProperties"
+                    | b"vkEnumerateDeviceExtensionProperties"
+                    | b"vkGetPhysicalDeviceFeatures2"
+            ) {
+                QUERY_INSTANCE.store(instance.as_raw() as usize, Ordering::Relaxed);
+            }
+            to_void(match name.to_bytes() {
+                b"vkEnumeratePhysicalDeviceGroups" | b"vkEnumeratePhysicalDeviceGroupsKHR" => {
+                    enumerate_groups as *const () as usize
                 }
-                to_void(match name.to_bytes() {
-                    b"vkEnumeratePhysicalDeviceGroups" | b"vkEnumeratePhysicalDeviceGroupsKHR" => {
-                        enumerate_groups as *const () as usize
+                b"vkEnumeratePhysicalDevices" => enumerate_physical as *const () as usize,
+                b"vkDestroyInstance" => destroy_instance as *const () as usize,
+                b"vkDestroyDevice" => {
+                    if instance.as_raw() == INSTANCE {
+                        other_destroy_device as *const () as usize
+                    } else {
+                        destroy_device as *const () as usize
                     }
-                    b"vkEnumeratePhysicalDevices" => enumerate_physical as *const () as usize,
-                    b"vkDestroyInstance" => destroy_instance as *const () as usize,
-                    b"vkDestroyDevice" => destroy_device as *const () as usize,
-                    b"vkDestroySwapchainKHR" => destroy_swapchain as *const () as usize,
-                    b"vkGetDeviceProcAddr" => gdpa as *const () as usize,
-                    b"vkGetPhysicalDeviceMemoryProperties" => memory as *const () as usize,
-                    b"vkGetPhysicalDeviceProperties" => properties as *const () as usize,
-                    b"vkEnumerateDeviceExtensionProperties" => extensions as *const () as usize,
-                    b"vkGetPhysicalDeviceFeatures2" => features as *const () as usize,
-                    _ => 0,
-                })
-            },
-        )
+                }
+                b"vkDestroySwapchainKHR" => {
+                    if instance.as_raw() == INSTANCE {
+                        other_destroy_swapchain as *const () as usize
+                    } else {
+                        destroy_swapchain as *const () as usize
+                    }
+                }
+                b"vkGetDeviceProcAddr" => gdpa as *const () as usize,
+                b"vkGetPhysicalDeviceMemoryProperties" => memory as *const () as usize,
+                b"vkGetPhysicalDeviceProperties" => properties as *const () as usize,
+                b"vkEnumerateDeviceExtensionProperties" => extensions as *const () as usize,
+                b"vkGetPhysicalDeviceFeatures2" => features as *const () as usize,
+                _ => 0,
+            })
+        };
+        guard(Feature::VkWrap, body, body)
     }
     /// # Safety
     /// Vulkan device-create inputs and output remain live during this fake call.
@@ -1198,6 +1237,21 @@ mod reflex_driver {
         REAL_GIPA.store(gipa as *const () as usize, Ordering::Release);
         GAME_INSTANCE.store(INSTANCE as usize, Ordering::Release);
         REAL_CREATE_DEVICE.store(create as *const () as usize, Ordering::Release);
+        if case.starts_with("dispatch-conflict") {
+            // SAFETY: obtain distinct A-native destructors through the actual installed GIPA wrapper.
+            unsafe {
+                if !case.contains("-query-") {
+                    enshrouded_headroom::vk::wrap_gipa(
+                        vk::Instance::from_raw(INSTANCE),
+                        c"vkDestroyDevice".as_ptr(),
+                    );
+                }
+                enshrouded_headroom::vk::wrap_gipa(
+                    vk::Instance::from_raw(INSTANCE),
+                    c"vkDestroySwapchainKHR".as_ptr(),
+                );
+            }
+        }
         if case == "incomplete" {
             ENUM_RESULT.store(1, Ordering::Relaxed);
         }
@@ -1270,12 +1324,6 @@ mod reflex_driver {
             enshrouded_headroom::vk::REAL_GET_PROPERTIES
                 .store(wrong_properties as *const () as usize, Ordering::Release);
         }
-        if case == "dispatch-conflict" {
-            enshrouded_headroom::vk::REAL_DESTROY_DEVICE.store(
-                other_destroy_device as *const () as usize,
-                Ordering::Release,
-            );
-        }
         if case == "vendor" {
             VENDOR.store(0x1002, Ordering::Relaxed);
         }
@@ -1306,6 +1354,63 @@ mod reflex_driver {
         assert_eq!(v12.p_next, original_next);
         assert_eq!(v12.timeline_semaphore, vk::FALSE);
         assert_eq!(v12.buffer_device_address, vk::TRUE);
+        if case.starts_with("dispatch-conflict-") {
+            assert_eq!(
+                enshrouded_headroom::vk::with_game_device(|_, _, _| ()).is_some(),
+                case.contains("-query-")
+            );
+            assert_eq!(CHANGED_OK.load(Ordering::Relaxed), 0);
+            assert_eq!(RETRY_OK.load(Ordering::Relaxed), 1);
+            // SAFETY: B's actual GIPA supplies the fake device resolver before ordinary wrapping is disabled.
+            let get_device = unsafe {
+                let raw = enshrouded_headroom::vk::wrap_gipa(
+                    vk::Instance::from_raw(INSTANCE + 1),
+                    c"vkGetDeviceProcAddr".as_ptr(),
+                )
+                .unwrap();
+                std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkGetDeviceProcAddr>(raw)
+            };
+            if case.ends_with("disabled") {
+                enshrouded_headroom::guard::disable(Feature::VkWrap, "test");
+            }
+            let name = if case.contains("swapchain") {
+                c"vkDestroySwapchainKHR"
+            } else {
+                c"vkDestroyDevice"
+            };
+            // SAFETY: look up and invoke the actual signature for B's native object once.
+            unsafe {
+                let raw = if case.contains("-gipa-") {
+                    enshrouded_headroom::vk::wrap_gipa(
+                        vk::Instance::from_raw(INSTANCE + 1),
+                        name.as_ptr(),
+                    )
+                } else {
+                    get_device(device, name.as_ptr())
+                }
+                .unwrap();
+                if case.contains("swapchain") {
+                    std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkDestroySwapchainKHR>(
+                        raw,
+                    )(device, vk::SwapchainKHR::from_raw(44), std::ptr::null());
+                } else {
+                    std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkDestroyDevice>(
+                        raw,
+                    )(device, std::ptr::null());
+                }
+            }
+            assert_eq!(
+                A_DESTROYS.load(Ordering::Relaxed),
+                0,
+                "A dispatch must never destroy B's object"
+            );
+            assert_eq!(
+                B_DESTROYS.load(Ordering::Relaxed),
+                1,
+                "B's matched native destructor runs once"
+            );
+            return;
+        }
         match case {
             "unobserved" | "enum-failure" | "count-only" | "dispatch-conflict" => {
                 assert!(enshrouded_headroom::vk::with_game_device(|_, _, _| ()).is_none());
@@ -1387,6 +1492,18 @@ mod reflex_driver {
             return;
         }
         for case in [
+            "dispatch-conflict-query-gdpa-swapchain-enabled",
+            "dispatch-conflict-query-gdpa-swapchain-disabled",
+            "dispatch-conflict-query-gipa-swapchain-enabled",
+            "dispatch-conflict-query-gipa-swapchain-disabled",
+            "dispatch-conflict-gdpa-device-enabled",
+            "dispatch-conflict-gdpa-device-disabled",
+            "dispatch-conflict-gdpa-swapchain-enabled",
+            "dispatch-conflict-gdpa-swapchain-disabled",
+            "dispatch-conflict-gipa-device-enabled",
+            "dispatch-conflict-gipa-device-disabled",
+            "dispatch-conflict-gipa-swapchain-enabled",
+            "dispatch-conflict-gipa-swapchain-disabled",
             "dispatch-conflict",
             "parentage",
             "unobserved",

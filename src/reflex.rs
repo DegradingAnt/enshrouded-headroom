@@ -665,6 +665,15 @@ static FNS: OnceLock<Fns> = OnceLock::new();
 /// Invalidated before device destruction.
 static DEVICE_LIVE: AtomicBool = AtomicBool::new(false);
 
+/// A published live Reflex table proves both saved native destruction endpoints were checked
+/// against this device's enumerated parent before creation. Feature disable does not retire it.
+pub(crate) fn has_device_lifetime(device: usize) -> bool {
+    DEVICE_LIVE.load(Ordering::Acquire)
+        && FNS
+            .get()
+            .is_some_and(|fns| fns.device.as_raw() as usize == device)
+}
+
 impl Fns {
     /// Load every required function before publishing the table.
     /// # Safety
@@ -1172,24 +1181,58 @@ mod runtime_tests {
         };
         guard(Feature::VkWrap, body, body)
     }
+    /// A distinct same-device GDPA swapchain endpoint must not bypass an admitted Reflex record.
+    unsafe extern "system" fn destroy_swap_top(
+        _: vk::Device,
+        _: vk::SwapchainKHR,
+        _: *const vk::AllocationCallbacks<'_>,
+    ) {
+        let body = || note("unexpected-top-destroy".into());
+        guard(Feature::VkWrap, body, body);
+    }
+    /// The fake GDPA returns a different compatible address than the saved instance endpoint.
+    unsafe extern "system" fn teardown_gdpa(
+        _: vk::Device,
+        _: *const std::ffi::c_char,
+    ) -> vk::PFN_vkVoidFunction {
+        let body = || {
+            // SAFETY: erase the exact native swapchain destructor signature for lookup.
+            Some(unsafe {
+                std::mem::transmute::<vk::PFN_vkDestroySwapchainKHR, unsafe extern "system" fn()>(
+                    destroy_swap_top,
+                )
+            })
+        };
+        guard(Feature::VkWrap, body, body)
+    }
     /// Real disabled GIPA routing must retire the active record before destroying its swapchain.
     #[test]
     fn disabled_lookup_retires_reflex_semaphore_before_original_destroy() {
         const NAME: &str = "reflex::runtime_tests::disabled_lookup_retires_reflex_semaphore_before_original_destroy";
-        if std::env::var_os("W23_RUNTIME_DESTROY").is_none() {
-            let out = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", NAME, "--nocapture"])
-                .env("W23_RUNTIME_DESTROY", "1")
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "{}\n{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            );
+        let case = std::env::var("W23_RUNTIME_DESTROY");
+        if case.is_err() {
+            for route in ["gipa", "gdpa"] {
+                let out = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", NAME, "--nocapture"])
+                    .env("W23_RUNTIME_DESTROY", route)
+                    .output()
+                    .unwrap();
+                assert!(
+                    out.status.success(),
+                    "{}\n{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
             return;
         }
+        assert!(FNS.set(fns()).is_ok());
+        DEVICE_LIVE.store(true, Ordering::Release);
+        crate::vk::REAL_GDPA.store(teardown_gdpa as *const () as usize, Ordering::Release);
+        crate::vk::REAL_DESTROY_SWAPCHAIN.store(
+            destroy_swap_after_cleanup as *const () as usize,
+            Ordering::Release,
+        );
         // SAFETY: the owned record uses only this module's fake native table and live fake handles.
         let runtime =
             unsafe { Runtime::new(fns(), vk::SwapchainKHR::from_raw(2), ReflexMode::Auto, None) }
@@ -1200,9 +1243,12 @@ mod runtime_tests {
         crate::guard::disable(Feature::VkWrap, "test");
         // SAFETY: the fake lookup returns exactly the tested native swapchain destructor type.
         unsafe {
-            let raw =
+            let raw = if case.as_deref() == Ok("gdpa") {
+                crate::vk::wrap_gdpa(vk::Device::from_raw(1), c"vkDestroySwapchainKHR".as_ptr())
+            } else {
                 crate::vk::wrap_gipa(vk::Instance::from_raw(3), c"vkDestroySwapchainKHR".as_ptr())
-                    .unwrap();
+            }
+            .unwrap();
             let destroy = std::mem::transmute::<
                 unsafe extern "system" fn(),
                 vk::PFN_vkDestroySwapchainKHR,

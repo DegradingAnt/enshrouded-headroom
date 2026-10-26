@@ -780,12 +780,11 @@ fn unwrapped_line(name: &str, device: usize, game: usize) -> String {
 
 /// The part of [`wrap_gdpa`] after the real call returned `found`.
 ///
-/// All three names it wraps go through [`device_function`]. For `vkGetDeviceProcAddr` that is
-/// safe as for the other two: [`REAL_GDPA`] always holds what `vkGetInstanceProcAddr` gave (it is
-/// stored before `wrap_gdpa` is ever handed out, so this path never stores into it), which is the
-/// loader's trampoline and dispatches on the device it is given. Asked at device level, the
-/// Khronos loader gives the top of that device's chain instead, a different pointer, which is why
-/// the plain "same pointer" rule of [`hand_out`] would leave it unwrapped.
+/// Ordinary lookup/present/create names retain [`device_function`]. Destruction requires explicit
+/// lifetime admission before a different saved endpoint may be used. GDPA may return a distinct
+/// top-of-chain address for the same device: an admitted record still needs its retirement wrapper
+/// and may safely use the previously validated instance-compatible native endpoint. An unadmitted
+/// device has no such proof and receives its own original when the addresses differ.
 ///
 /// A name handed back unwrapped is logged once (one-time lookups, so the log is allowed; neither
 /// `hand_out` nor `wrap_present` logs).
@@ -843,7 +842,23 @@ unsafe fn gdpa_choose(
     };
     let device = device.as_raw() as usize;
     let game = game_device().map_or(0, |game| game.device);
-    let out = device_function(slot, found_addr, wrapper, device, game);
+    let out = match classify_gdpa(name) {
+        // Only admission proves that the saved instance endpoint is compatible with this device.
+        // Being the first GAME_DEVICE alone is not proof: optional admission may have failed.
+        Some(Wrap::DestroyDevice) => hand_out(
+            slot,
+            found_addr,
+            wrapper,
+            DEVICE_QUERIES.protects(device) || crate::reflex::has_device_lifetime(device),
+        ),
+        Some(Wrap::DestroySwapchain) => hand_out(
+            slot,
+            found_addr,
+            wrapper,
+            crate::reflex::has_device_lifetime(device),
+        ),
+        _ => device_function(slot, found_addr, wrapper, device, game),
+    };
     if out != wrapper && first_time(logged) {
         log::warn!("{}", unwrapped_line(what, device, game));
     }
@@ -1694,6 +1709,14 @@ impl DeviceQueries {
         context
             .parent
             .with(|gipa, instance| query(context.game, gipa, instance))
+    }
+    /// Only an admitted live context proves the saved device destructor matches this device.
+    fn protects(&self, device: usize) -> bool {
+        self.live.load(Ordering::SeqCst)
+            && self
+                .context
+                .get()
+                .is_some_and(|context| context.game.device == device)
     }
     /// Invalidate before native destruction, then wait outside the present path for existing readers.
     fn retire(&self, device: usize) {
@@ -2601,11 +2624,22 @@ mod device_lease_tests {
 #[cfg(test)]
 mod disabled_lifetime_tests {
     use super::*;
+    static TOP_DESTROYS: AtomicUsize = AtomicUsize::new(0);
     static DESTROYS: AtomicUsize = AtomicUsize::new(0);
     /// Fake device destruction records the one native invocation.
     unsafe extern "system" fn destroy_device(_: vk::Device, _: *const vk::AllocationCallbacks<'_>) {
         let body = || {
             DESTROYS.fetch_add(1, Ordering::SeqCst);
+        };
+        guard(Feature::VkWrap, body, body);
+    }
+    /// A distinct same-device top-of-chain pointer must not bypass an admitted lease's cleanup.
+    unsafe extern "system" fn destroy_device_top(
+        _: vk::Device,
+        _: *const vk::AllocationCallbacks<'_>,
+    ) {
+        let body = || {
+            TOP_DESTROYS.fetch_add(1, Ordering::SeqCst);
         };
         guard(Feature::VkWrap, body, body);
     }
@@ -2655,8 +2689,15 @@ mod disabled_lifetime_tests {
     }
     /// Fake GDPA has the native lookup contract.
     unsafe extern "system" fn gdpa(_: vk::Device, name: *const c_char) -> vk::PFN_vkVoidFunction {
-        // SAFETY: native lookup caller provides a static terminated name.
-        let body = || unsafe { lookup(name) };
+        let body = || {
+            // SAFETY: native lookup caller provides a static terminated name.
+            if unsafe { CStr::from_ptr(name) } == c"vkDestroyDevice" {
+                to_void(destroy_device_top as *const () as usize)
+            } else {
+                // SAFETY: same terminated name; this is the fake device's lookup table.
+                unsafe { lookup(name) }
+            }
+        };
         guard(Feature::VkWrap, body, body)
     }
     /// Isolated real-wrapper regression: disabling ordinary wrapping cannot sever retirement.
@@ -2695,6 +2736,8 @@ mod disabled_lifetime_tests {
         parent.observe(std::iter::once(vk::PhysicalDevice::from_raw(22)));
         INSTANCES.lock().unwrap().push(parent.clone());
         DEVICE_QUERIES.publish(game, parent);
+        // Admission has validated this instance-compatible endpoint, while GDPA returns a distinct top.
+        REAL_DESTROY_DEVICE.store(destroy_device as *const () as usize, Ordering::Release);
         REAL_GPA.store(gpa as *const () as usize, Ordering::Release);
         REAL_GIPA.store(gipa as *const () as usize, Ordering::Release);
         REAL_GDPA.store(gdpa as *const () as usize, Ordering::Release);
@@ -2825,5 +2868,6 @@ mod disabled_lifetime_tests {
             });
         }
         assert_eq!(DESTROYS.load(Ordering::SeqCst), 1);
+        assert_eq!(TOP_DESTROYS.load(Ordering::SeqCst), 0);
     }
 }
