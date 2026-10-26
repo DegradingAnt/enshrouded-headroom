@@ -289,19 +289,20 @@ pub fn start() {
     knobs::scatter_distance::init(&cfg.knobs);
 
     // 13. The scatter counter probe: a pre-hook on the grass pass that reads the game's grass GPU
-    // counters every 30th call. It hooks code, so it asks `code_patches_allowed`; it is installed
-    // with `EnableScatterDistance = 1`, or with `[Debug] ScatterProbe = 1` and `LogLevel = debug`,
-    // and logs its own line, including why it is off. It is only created and queued here: the
-    // last step enables it.
+    // counters at most once per 500 ms. It hooks code, so it asks `code_patches_allowed`. It is
+    // off by default: it is installed only with `[Debug] ScatterProbe = 1` and `LogLevel = debug`,
+    // or with `EnableScatterDistance = 1` once the grass ceiling allows a raise (design.md 7.2a).
+    // It logs its own line, including why it is off. It is only created and queued here: the last
+    // step enables it.
     features::scatter_probe::init(&cfg);
 
-    // Terrain detail distance: create and queue its checked pre-hook before the enable batch.
+    // 14. The terrain detail distance: a checked pre-hook on the terrain update function. It is
+    // only created and queued here: the last step enables it.
     knobs::terrain_distance::init(&cfg.knobs);
 
-    // Later code hooks (Task 14's terrain hook) are created and queued above this line, so they
-    // join the one batch below.
+    // Later code hooks are created and queued above this line, so they join the one batch below.
 
-    // 14. Enable every queued hook at once (MinHook's queued enable). This is the only place that
+    // 15. Enable every queued hook at once (MinHook's queued enable). This is the only place that
     // enables hooks. It logs one line if any hook was queued.
     knobs::enable_queued_hooks();
 }
