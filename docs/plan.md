@@ -317,7 +317,7 @@ C:\Modding\Enshrouded\
 - Produces:
   - `pub struct Patched { pub addr: usize, pub original: Vec<u8> }`
   - `pub enum PatchError { Mismatch { at: usize, found: Vec<u8> }, Protect(u32), ReadBack }`
-  - `pub unsafe fn write_checked(addr: usize, expected: &[u8], new: &[u8]) -> Result<Patched, PatchError>`. It makes each region writable (`PAGE_READWRITE` for non-executable regions and `PAGE_EXECUTE_READWRITE` for executable regions), writes, restores each region’s own protection, reads back and calls `FlushInstructionCache`.
+  - `pub unsafe fn write_checked(addr: usize, expected: &[u8], new: &[u8]) -> Result<Patched, PatchError>`. It makes each region writable (`PAGE_READWRITE` for non-executable regions and `PAGE_EXECUTE_READWRITE` for executable regions), writes, restores each region's own protection, reads back and calls `FlushInstructionCache`.
   - `pub unsafe fn write_u32_checked(addr: usize, expected: u32, new: u32) -> Result<Patched, PatchError>`
   - `pub fn alloc_near(target: usize, size: usize) -> Option<usize>`. It returns a `PAGE_READWRITE` allocation whose whole range is within ±2 GiB of `target`. It walks `VirtualQuery` free regions in 64 KiB steps.
   - `pub fn rel32(next_insn: usize, dest: usize) -> Option<i32>`
