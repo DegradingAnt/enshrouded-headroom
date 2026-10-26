@@ -1,9 +1,12 @@
 //! enshrouded-headroom: an ASI plugin for Enshrouded.
 //!
-//! For now the plugin loads, starts its log, writes one line to it, and does nothing else. The
-//! panic guard in [`guard`] is ready for the hooks that later tasks add.
+//! `InitializeASI` runs [`entry::start`], which reads the settings, starts the log, identifies the
+//! game build and decides whether code patches are allowed. The panic guard in [`guard`] is ready
+//! for the hooks that later tasks add to `entry::start`.
 
+pub mod build_id;
 pub mod config;
+pub mod entry;
 pub mod guard;
 pub mod iat;
 pub mod log;
@@ -23,6 +26,20 @@ use windows_sys::Win32::System::LibraryLoader::{
 };
 use windows_sys::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
 
+/// Full path of the file `module` was loaded from, or `None` if Windows cannot tell us. A null
+/// `module` means the exe of this process.
+fn module_path(module: HMODULE) -> Option<PathBuf> {
+    // 32768 UTF-16 units is the longest path Windows allows.
+    let mut buf = vec![0u16; 32768];
+    // SAFETY: `buf` is valid for `buf.len()` UTF-16 units. A null `module` is allowed and selects
+    // the process exe; any other `module` is a handle that the caller got from Windows.
+    let len = unsafe { GetModuleFileNameW(module, buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    if len == 0 || len >= buf.len() {
+        return None;
+    }
+    Some(PathBuf::from(OsString::from_wide(buf.get(..len)?)))
+}
+
 /// Directory that holds this module (the `.asi`), or `None` if Windows cannot tell us.
 fn module_dir() -> Option<PathBuf> {
     let mut module: HMODULE = std::ptr::null_mut();
@@ -38,32 +55,22 @@ fn module_dir() -> Option<PathBuf> {
     if found == 0 {
         return None;
     }
-    // 32768 UTF-16 units is the longest path Windows allows.
-    let mut buf = vec![0u16; 32768];
-    // SAFETY: `buf` is valid for `buf.len()` UTF-16 units.
-    let len = unsafe { GetModuleFileNameW(module, buf.as_mut_ptr(), buf.len() as u32) } as usize;
-    if len == 0 || len >= buf.len() {
-        return None;
-    }
-    let path = PathBuf::from(OsString::from_wide(&buf[..len]));
-    path.parent().map(PathBuf::from)
+    module_path(module)?.parent().map(PathBuf::from)
 }
 
-/// Start the log (next to the module, or in `%LOCALAPPDATA%` as a fallback) and write the
-/// "loaded" line through it.
-///
-/// `self::log` is this crate's logging module; the `log` crate is `::log` at the crate root.
-fn start() {
-    // No module folder (Windows could not tell us): an empty path sends `init` to the fallback.
-    let dir = module_dir().unwrap_or_default();
-    self::log::init(&dir, ::log::LevelFilter::Info);
-    ::log::info!("enshrouded-headroom {} loaded", env!("CARGO_PKG_VERSION"));
+/// Path of the game's exe (the image of this process), or `None` if Windows cannot tell us.
+fn exe_path() -> Option<PathBuf> {
+    module_path(std::ptr::null_mut())
 }
 
 /// Called by Ultimate ASI Loader once the game process is up. Must never unwind into the loader.
+///
+/// `entry::start` has no `guard::Feature` of its own (the enum is fixed at the nine features), so
+/// this `catch_unwind` is its guard: a panic in the start-up sequence stops it, and the game goes
+/// on without the rest of the mod.
 #[no_mangle]
 pub extern "C" fn InitializeASI() {
-    if let Err(payload) = std::panic::catch_unwind(start) {
+    if let Err(payload) = std::panic::catch_unwind(entry::start) {
         // Never drop the payload: `panic_any` can carry a value whose destructor panics, and a
         // panic here would unwind into the loader. Forgetting leaks a few bytes, once.
         std::mem::forget(payload);
