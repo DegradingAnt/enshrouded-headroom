@@ -1,47 +1,32 @@
-//! Scatter counter probe (design.md 7.2a): reads the game's own grass GPU counters, so the
-//! governor can tell how close the grass is to its fixed budget.
+//! Scatter counter probe (design.md 7.2a). The render hook only publishes the latest pass
+//! pointer and increments a call counter, then calls the original exactly once.
 //!
-//! The game keeps three GPU counters for detail scatter (grass). Its pool update reads each one
-//! back to the CPU and keeps the last and the peak value next to a warn level and a cap. Counter
-//! A counts the scattered objects of both grass passes against one budget of `0x14000`; the game
-//! sets its warn level at `0xf000` (75 %). RE facts and evidence ids: docs/re-notes.md, "Scatter
-//! counter probe".
+//! A detached `scatter-probe` thread wakes every 500 ms. When the call counter changed,
+//! it copies seven fixed-size game-memory blocks with ReadProcessMemory and parses only
+//! those local bytes. No game address is dereferenced by Rust. A failed or short copy, zero
+//! handle or ownership mismatch is a transient miss: nine are tolerated, the tenth latches
+//! FAILED. A good sample resets misses; a copied A.warn/A.cap layout mismatch fails at once.
+//! No incomplete sample is published. A panic stops the guarded worker and latches failure.
 //!
-//! [`install`] puts a MinHook pre-hook on `FUN_1400767a0(rcx, pass, f)` (found by
-//! `sigs::SCATTER_FRAME_FN`). The detour ([`scatter_frame_detour`]) runs inside
-//! `guard(Feature::ScatterDistance, ...)`. At most once per 500 ms of `QueryPerformanceCounter`
-//! time (the first call included), however often the grass pass runs, it follows the pointer
-//! chain from `pass` with [`read_counters`], checking each block it reads once with
-//! [`is_readable`] (7 checks per sample), and publishes the result to the atomics below. On every
-//! other call it reads the clock and one atomic, nothing more. Then it calls the original with
-//! the same arguments, exactly once. It never logs and never allocates.
-//!
-//! It is not installed by default: [`init`] installs it only for `[Debug] ScatterProbe = 1` with
-//! `LogLevel = debug`, or for `EnableScatterDistance = 1` once the grass ceiling [`R_MAX_M`]
-//! allows a raise. (An earlier version sampled every 30th call and checked every read, and it
-//! was on by default; in game that caused a stutter.)
-//!
-//! The self-check: counter A must show the warn level `0xf000` and the cap `0x14000`. If it does
-//! not, or any read is refused, the chain is wrong for this build. Then [`FAILED`] is set,
-//! [`PROBE_OK`] is cleared, and the probe stops reading for the rest of the session.
-//!
-//! Task 15's governor consumes this module: the grass knob may rise only while [`PROBE_OK`],
-//! [`ceiling_step`] and [`headroom_ok`] allow it.
+//! Installation remains opt-in until R_MAX_M allows a raise: Debug ScatterProbe with debug
+//! logging, or an enabled scatter knob whose measured ceiling permits at least one step.
+//! This removes sampling work from the game thread after the observed in-game pulse; its
+//! address-space-lock cause is a hypothesis. Not verified in game; the maintainer boot-tests
+//! it with the probe on. Counter offsets and ABI evidence are in docs/re-notes.md.
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use log::Level;
-use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
-use windows_sys::Win32::System::Performance::QueryPerformanceFrequency;
+use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 use crate::config::{Config, LogLevel};
 use crate::entry;
-use crate::frame_timer::qpc_now;
 use crate::guard::{guard, Feature};
 use crate::knobs::create_and_queue;
 use crate::knobs::SCATTER_STEPS;
-use crate::scan::{find_in_sections, main_module, protect_is_readable, Module, Pattern};
+use crate::scan::{find_in_sections, main_module, Module, Pattern};
 use crate::sigs::SCATTER_FRAME_FN;
 
 /// Counter A's warn level, as the game allocates it (`0x1400745eb`): 75 % of [`CAP_A`]. The
@@ -56,13 +41,8 @@ pub const CAP_A: u32 = 0x14000;
 /// 90 m until the author's measurement session sets it (plan Task 13b, Step 6).
 pub const R_MAX_M: f32 = 90.0;
 
-/// The hook reads the counters at most once per this many milliseconds of `QueryPerformanceCounter`
-/// time, however often the grass pass runs. The first call samples.
+/// The sampler sleeps this many milliseconds between opportunities, holding no lock.
 const SAMPLE_INTERVAL_MS: u64 = 500;
-
-/// [`SAMPLE_INTERVAL_MS`] in ticks of the usual 10 MHz `QueryPerformanceCounter`. [`hook_at`]
-/// replaces it with the value for the real frequency before the hook is enabled.
-const DEFAULT_INTERVAL_TICKS: u64 = 5_000_000;
 
 /// `[pass+0x8]`: the object that holds the counter pool.
 const PASS_POOL_OWNER: usize = 0x8;
@@ -90,7 +70,7 @@ const ENTRY_HANDLE: usize = 0x38;
 const HANDLE_INDEX_MASK: u32 = 0xffff;
 
 /// The bytes of `pass` a sample reads, as (start offset, length): the pool owner pointer (+0x8)
-/// through the scatter object pointer (+0x18..+0x20). One readability check covers both.
+/// through the scatter object pointer (+0x18..+0x20). One local copy covers both.
 const PASS_BLOCK: (usize, usize) = (PASS_POOL_OWNER, 0x18);
 /// The bytes of the scatter object a sample reads: the three handles, +0x8..+0x14.
 const HANDLES_BLOCK: (usize, usize) = (0x8, 0xc);
@@ -137,9 +117,9 @@ pub struct CounterSample {
 /// failure. Stored with `Release` after the values below, so a reader that loads it with
 /// `Acquire` and sees true also sees the values of that sample (or newer ones).
 pub static PROBE_OK: AtomicBool = AtomicBool::new(false);
-/// True once a sample failed (a refused read, a handle that does not match its entry, or a
-/// failed self-check). The probe stops reading then. Stored with `Release` after `PROBE_OK` was
-/// cleared.
+/// True after ten consecutive transient misses, an immediate copied-layout failure, or a
+/// sampler panic/start failure. The probe stops reading for the session. Stored with Release
+/// after PROBE_OK is cleared.
 pub static FAILED: AtomicBool = AtomicBool::new(false);
 /// Counter A's last value from the latest good sample. `Relaxed`; see [`PROBE_OK`].
 pub static LAST_A: AtomicU32 = AtomicU32::new(0);
@@ -154,179 +134,143 @@ pub static LAST_C: AtomicU32 = AtomicU32::new(0);
 /// Counter C's peak from the latest good sample (for the debug log). `Relaxed`.
 pub static PEAK_C: AtomicU32 = AtomicU32::new(0);
 
-/// The `QueryPerformanceCounter` time from which the next sample is due; 0 at start, so the first
-/// call samples. A call claims a sample by moving it on with a compare-exchange.
-static NEXT_DUE: AtomicU64 = AtomicU64::new(0);
-
-/// [`SAMPLE_INTERVAL_MS`] in `QueryPerformanceCounter` ticks. Set by [`hook_at`] before the hook
-/// is enabled; read only when a sample is due.
-static INTERVAL_TICKS: AtomicU64 = AtomicU64::new(DEFAULT_INTERVAL_TICKS);
+/// The latest grass-pass argument, published without reading the pointed-to object.
+static LAST_PASS: AtomicUsize = AtomicUsize::new(0);
+/// Number of hook publications; the sampler skips unchanged observations.
+static CALL_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// MinHook's trampoline for the game function, or 0. Stored by [`install`] before the hook is
 /// enabled; read by the detour.
 static TRAMPOLINE: AtomicUsize = AtomicUsize::new(0);
 
-/// Test only: makes the hook's sample panic, so a test can drive the real detour's panic path.
+/// Test only: panic after publication to exercise the detour's original-once fallback.
 /// Not in a non-test build.
 #[cfg(test)]
-static PANIC_IN_SAMPLE: AtomicBool = AtomicBool::new(false);
+static PANIC_IN_PUBLISH: AtomicBool = AtomicBool::new(false);
+
+/// Test only: count actual OS-reader calls in isolated native-hook tests.
+#[cfg(test)]
+static READ_CALLS: AtomicUsize = AtomicUsize::new(0);
+/// Test only: any OS-reader call panics, proving the hook never reaches it.
+#[cfg(test)]
+static PANIC_IN_READ: AtomicBool = AtomicBool::new(false);
 
 /// The type of the game function and of its detour: RCX, RDX and an `f32` in XMM2, no stack
 /// argument, no return value (docs/re-notes.md, "Scatter counter probe").
 pub type ScatterFrameFn = unsafe extern "system" fn(rcx: *mut u8, pass: *const u8, f: f32);
 
-/// Can the `len` bytes at `addr` be read now? `VirtualQuery` must report committed memory with a
-/// readable protection that is not a guard page (the rule of `scan::protect_is_readable`), and
-/// the whole range must lie in that one region. An overflowing range gives false.
-///
-/// This is a check, not a lock: another thread can free the memory after it. The probe reads
-/// game objects that the call it hooks is using, so they stay alive during that call.
-pub fn is_readable(addr: usize, len: usize) -> bool {
-    let Some(end) = addr.checked_add(len) else {
+/// Copy a complete process-memory block into an owned local buffer.
+fn read_process(addr: usize, bytes: &mut [u8]) -> bool {
+    #[cfg(test)]
+    {
+        READ_CALLS.fetch_add(1, Ordering::Relaxed);
+        if PANIC_IN_READ.load(Ordering::Relaxed) {
+            panic!("reader reached on hook");
+        }
+    }
+    if addr == 0 || addr.checked_add(bytes.len()).is_none() {
         return false;
-    };
-    let mut info = MEMORY_BASIC_INFORMATION::default();
-    // SAFETY: `info` is a valid buffer of exactly the size passed. VirtualQuery accepts any
-    // address, reads no memory at it, and reports failure by returning 0.
-    let written = unsafe {
-        VirtualQuery(
+    }
+    let mut copied = 0;
+    // SAFETY: the destination is the live mutable slice and has the supplied size. Windows
+    // validates the source range; no Rust reference or dereference is made from that address.
+    let result = unsafe {
+        ReadProcessMemory(
+            GetCurrentProcess(),
             addr as *const c_void,
-            &mut info,
-            size_of::<MEMORY_BASIC_INFORMATION>(),
+            bytes.as_mut_ptr().cast(),
+            bytes.len(),
+            &mut copied,
         )
     };
-    if written < size_of::<MEMORY_BASIC_INFORMATION>()
-        || info.State != MEM_COMMIT
-        || !protect_is_readable(info.Protect)
-    {
-        return false;
-    }
-    let region = info.BaseAddress as usize;
-    region <= addr && end <= region.saturating_add(info.RegionSize)
+    complete_read(result, copied, bytes.len())
 }
 
-/// A range of memory that a `readable` check accepted. The probe reads only through it, and only
-/// inside it, so it never reads a byte that was not checked.
-struct Checked {
-    /// The first byte of the range.
-    addr: usize,
-    /// The length of the range in bytes.
-    len: usize,
+/// Accept an OS copy only when it succeeds and reports every requested byte.
+fn complete_read(result: i32, copied: usize, wanted: usize) -> bool {
+    result != 0 && copied == wanted
 }
 
-impl Checked {
-    /// Ask `readable` about `len` bytes at `addr`; the range if it says yes.
-    fn new(addr: usize, len: usize, readable: &impl Fn(usize, usize) -> bool) -> Option<Checked> {
-        readable(addr, len).then_some(Checked { addr, len })
-    }
-
-    /// The address of the `size` bytes at `off` in the range, or `None` if they do not all lie
-    /// in it.
-    fn place(&self, off: usize, size: usize) -> Option<usize> {
-        let end = off.checked_add(size)?;
-        if end > self.len {
-            return None;
-        }
-        self.addr.checked_add(off)
-    }
-
-    /// The `u32` at `off` in the range, or `None` (and no read) if it does not fit in it.
-    ///
-    /// # Safety
-    ///
-    /// The `readable` check that made this range is still true (the contract of
-    /// [`read_counters`]).
-    unsafe fn u32_at(&self, off: usize) -> Option<u32> {
-        let at = self.place(off, size_of::<u32>())?;
-        // SAFETY: the 4 bytes lie in the range that `readable` accepted (`place`), and that is
-        // still true (this function's contract).
-        Some(unsafe { std::ptr::read_unaligned(at as *const u32) })
-    }
-
-    /// The `u64` at `off` in the range as an address, or `None` (and no read) if it does not fit
-    /// in it.
-    ///
-    /// # Safety
-    ///
-    /// As for [`Checked::u32_at`].
-    unsafe fn ptr_at(&self, off: usize) -> Option<usize> {
-        let at = self.place(off, size_of::<u64>())?;
-        // SAFETY: as in `u32_at`, for 8 bytes.
-        let value = unsafe { std::ptr::read_unaligned(at as *const u64) };
-        usize::try_from(value).ok()
-    }
+/// Why a sampler could not accept a copied counter chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadError {
+    /// An object disappeared, a copy failed, or its handle no longer owns the entry.
+    Miss,
+    /// Counter A was read correctly but its warn/cap metadata disagrees with the layout.
+    Layout,
 }
 
-/// Follow the counter chain from `pass` and return counters A, B and C. `None` if any read is
-/// refused, a handle is 0 or does not match its entry, or counter A fails the self-check (warn
-/// [`WARN_A`], cap [`CAP_A`]).
-///
-/// The chain (docs/re-notes.md): obj = `[pass+0x18]`; pool = `[[pass+0x8]+0x20]`; base =
-/// `[pool+0x48]`; for each handle h at `[obj+0x8]` (A), `[obj+0xc]` (B), `[obj+0x10]` (C), the
-/// entry is base + (h & 0xffff) × 0x40, and `[entry+0x38]` must equal h. Each sample is last
-/// (entry+0x14), peak (+0x1c), warn (+0x20) and cap (+0x24).
-///
-/// It checks each block it reads once, with `readable(addr, len)`, before it reads from it, and
-/// reads only inside a checked block (`Checked`); it reads nothing after a refusal. The blocks,
-/// 7 per sample: `pass` +0x8..+0x20, owner +0x20..+0x28, pool +0x48..+0x50, obj +0x8..+0x14, and
-/// for each counter its entry +0x14..+0x3c. It reads with `read_unaligned`, so it needs no
-/// alignment.
-///
-/// # Safety
-///
-/// `readable(addr, len)` returns true only if the `len` bytes at `addr` can be read when the
-/// reads that follow the call happen ([`is_readable`], for memory that no other thread frees
-/// meanwhile).
-pub unsafe fn read_counters(
+/// Copy and parse the seven counter blocks without dereferencing a game address.
+pub fn read_counters(
     pass: usize,
-    readable: impl Fn(usize, usize) -> bool,
-) -> Option<[CounterSample; 3]> {
-    // Read the field at object offset `off` from a block that starts at object offset `start`.
-    // SAFETY (both helpers): the block was accepted by `readable` just before (`Checked`),
-    // and this function's contract keeps that true for the reads.
-    let ptr_in = |block: &Checked, start: usize, off: usize| unsafe {
-        block.ptr_at(off.checked_sub(start)?)
-    };
-    let u32_in = |block: &Checked, start: usize, off: usize| unsafe {
-        block.u32_at(off.checked_sub(start)?)
-    };
-    let (pass_start, pass_len) = PASS_BLOCK;
-    let pass_block = Checked::new(pass.checked_add(pass_start)?, pass_len, &readable)?;
-    let owner = ptr_in(&pass_block, pass_start, PASS_POOL_OWNER)?;
-    let obj = ptr_in(&pass_block, pass_start, PASS_SCATTER_OBJ)?;
-    let owner_block = Checked::new(owner.checked_add(OWNER_POOL)?, size_of::<u64>(), &readable)?;
-    let pool = ptr_in(&owner_block, OWNER_POOL, OWNER_POOL)?;
-    let pool_block = Checked::new(pool.checked_add(POOL_ENTRIES)?, size_of::<u64>(), &readable)?;
-    let entries = ptr_in(&pool_block, POOL_ENTRIES, POOL_ENTRIES)?;
-    let (handles_start, handles_len) = HANDLES_BLOCK;
-    let handles = Checked::new(obj.checked_add(handles_start)?, handles_len, &readable)?;
-    let (entry_start, entry_len) = ENTRY_BLOCK;
-    let counter = |handle_at: usize| -> Option<CounterSample> {
-        let handle = u32_in(&handles, handles_start, handle_at)?;
+    mut read: impl FnMut(usize, &mut [u8]) -> bool,
+) -> Result<[CounterSample; 3], ReadError> {
+    let pass_bytes = copy_block::<0x18>(pass, PASS_BLOCK.0, &mut read).ok_or(ReadError::Miss)?;
+    let owner = pointer_field(&pass_bytes, PASS_BLOCK.0, PASS_POOL_OWNER).ok_or(ReadError::Miss)?;
+    let obj = pointer_field(&pass_bytes, PASS_BLOCK.0, PASS_SCATTER_OBJ).ok_or(ReadError::Miss)?;
+    let owner_bytes = copy_block::<8>(owner, OWNER_POOL, &mut read).ok_or(ReadError::Miss)?;
+    let pool = pointer_field(&owner_bytes, OWNER_POOL, OWNER_POOL).ok_or(ReadError::Miss)?;
+    let pool_bytes = copy_block::<8>(pool, POOL_ENTRIES, &mut read).ok_or(ReadError::Miss)?;
+    let entries = pointer_field(&pool_bytes, POOL_ENTRIES, POOL_ENTRIES).ok_or(ReadError::Miss)?;
+    let handles = copy_block::<0xc>(obj, HANDLES_BLOCK.0, &mut read).ok_or(ReadError::Miss)?;
+    let mut counter = |offset| -> Result<CounterSample, ReadError> {
+        let handle = u32_field(&handles, HANDLES_BLOCK.0, offset).ok_or(ReadError::Miss)?;
         if handle == 0 {
-            return None;
+            return Err(ReadError::Miss);
         }
-        let index = usize::try_from(handle & HANDLE_INDEX_MASK).ok()?;
-        let entry = entries.checked_add(index.checked_mul(ENTRY_SIZE)?)?;
-        let block = Checked::new(entry.checked_add(entry_start)?, entry_len, &readable)?;
-        // The game's own accessor makes this check (docs/re-notes.md): the entry must belong to
-        // this handle.
-        if u32_in(&block, entry_start, ENTRY_HANDLE)? != handle {
-            return None;
+        let index = usize::try_from(handle & HANDLE_INDEX_MASK).map_err(|_| ReadError::Miss)?;
+        let entry = index
+            .checked_mul(ENTRY_SIZE)
+            .and_then(|offset| entries.checked_add(offset))
+            .ok_or(ReadError::Miss)?;
+        let bytes = copy_block::<0x28>(entry, ENTRY_BLOCK.0, &mut read).ok_or(ReadError::Miss)?;
+        if u32_field(&bytes, ENTRY_BLOCK.0, ENTRY_HANDLE) != Some(handle) {
+            return Err(ReadError::Miss);
         }
-        Some(CounterSample {
-            last: u32_in(&block, entry_start, ENTRY_LAST)?,
-            peak: u32_in(&block, entry_start, ENTRY_PEAK)?,
-            warn: u32_in(&block, entry_start, ENTRY_WARN)?,
-            cap: u32_in(&block, entry_start, ENTRY_CAP)?,
+        Ok(CounterSample {
+            last: u32_field(&bytes, ENTRY_BLOCK.0, ENTRY_LAST).ok_or(ReadError::Miss)?,
+            peak: u32_field(&bytes, ENTRY_BLOCK.0, ENTRY_PEAK).ok_or(ReadError::Miss)?,
+            warn: u32_field(&bytes, ENTRY_BLOCK.0, ENTRY_WARN).ok_or(ReadError::Miss)?,
+            cap: u32_field(&bytes, ENTRY_BLOCK.0, ENTRY_CAP).ok_or(ReadError::Miss)?,
         })
     };
     let [at_a, at_b, at_c] = COUNTER_HANDLES;
     let a = counter(at_a)?;
     if a.warn != WARN_A || a.cap != CAP_A {
+        return Err(ReadError::Layout);
+    }
+    Ok([a, counter(at_b)?, counter(at_c)?])
+}
+
+/// Copy one fixed-size block, rejecting null bases and all address arithmetic overflow.
+fn copy_block<const N: usize>(
+    base: usize,
+    offset: usize,
+    read: &mut impl FnMut(usize, &mut [u8]) -> bool,
+) -> Option<[u8; N]> {
+    if base == 0 {
         return None;
     }
-    Some([a, counter(at_b)?, counter(at_c)?])
+    let address = base.checked_add(offset)?;
+    address.checked_add(N)?;
+    let mut bytes = [0; N];
+    read(address, &mut bytes).then_some(bytes)
+}
+
+/// Extract a field only from the local copied block, with checked range arithmetic.
+fn field<const N: usize>(bytes: &[u8], block_start: usize, offset: usize) -> Option<[u8; N]> {
+    let start = offset.checked_sub(block_start)?;
+    bytes.get(start..start.checked_add(N)?)?.try_into().ok()
+}
+
+/// Parse one copied little-endian u32.
+fn u32_field(bytes: &[u8], block_start: usize, offset: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(field(bytes, block_start, offset)?))
+}
+
+/// Parse one copied little-endian 64-bit address.
+fn pointer_field(bytes: &[u8], block_start: usize, offset: usize) -> Option<usize> {
+    usize::try_from(u64::from_le_bytes(field(bytes, block_start, offset)?)).ok()
 }
 
 /// The live headroom rule (design.md 7.2): may the grass distance go from `r_now` to `r_next`
@@ -411,77 +355,55 @@ fn public() -> Outputs<'static> {
     }
 }
 
-/// [`SAMPLE_INTERVAL_MS`] in ticks of a counter with this `frequency` (ticks per second). Never 0,
-/// so a due sample always moves the due time on.
-fn interval_ticks(frequency: u64) -> u64 {
-    // In u128, so no frequency can overflow.
-    let ticks = u128::from(frequency) * u128::from(SAMPLE_INTERVAL_MS) / 1000;
-    u64::try_from(ticks).unwrap_or(u64::MAX).max(1)
+/// The sampler's local state, independent of threads and sleeping.
+#[derive(Default)]
+struct Sampler {
+    /// The last observed hook call count.
+    last_calls: u64,
+    /// Consecutive samples whose objects could not be copied or owned.
+    misses: u8,
 }
 
-/// One hook call at `QueryPerformanceCounter` time `now`. When a sample is due (`now` has reached
-/// `next_due`), claim it by moving `next_due` on by `interval` with a compare-exchange; only the
-/// call whose exchange succeeds samples, so two threads never take the same sample. Then, while
-/// the probe has not failed, take a sample with `read` and publish it to `out`.
-///
-/// When no sample is due, it loads `next_due` and returns: nothing else.
-fn tick(
-    now: u64,
-    next_due: &AtomicU64,
-    interval: &AtomicU64,
-    out: &Outputs<'_>,
-    read: impl FnOnce() -> Option<[CounterSample; 3]>,
-) {
-    let due = next_due.load(Ordering::Relaxed);
-    if now < due {
-        return;
+impl Sampler {
+    /// One sampling opportunity with injected pointer and memory readers.
+    fn step(
+        &mut self,
+        calls: u64,
+        pass: impl FnOnce() -> usize,
+        out: &Outputs<'_>,
+        read: &mut impl FnMut(usize, &mut [u8]) -> bool,
+    ) {
+        if out.failed.load(Ordering::Acquire) || calls == self.last_calls {
+            return;
+        }
+        self.last_calls = calls;
+        match read_counters(pass(), read) {
+            Ok(sample) => {
+                self.misses = 0;
+                out.publish(Some(sample));
+            }
+            Err(ReadError::Layout) => out.publish(None),
+            Err(ReadError::Miss) => {
+                self.misses = self.misses.saturating_add(1);
+                if self.misses >= 10 {
+                    out.publish(None);
+                }
+            }
+        }
     }
-    // Claim this sample. A call that loses the exchange (another thread claimed it, or moved it
-    // on) does nothing.
-    let next = now.saturating_add(interval.load(Ordering::Relaxed));
-    if next_due
-        .compare_exchange(due, next, Ordering::Relaxed, Ordering::Relaxed)
-        .is_err()
-    {
-        return;
-    }
-    if out.failed.load(Ordering::Relaxed) {
-        return;
-    }
-    out.publish(read());
 }
 
-/// The hook's sample: [`tick`] on the public statics at the current time, reading the chain from
-/// `pass`.
-fn sample(pass: usize) {
-    #[cfg(test)]
-    if PANIC_IN_SAMPLE.load(Ordering::Relaxed) {
-        panic!("PANIC_IN_SAMPLE is set");
-    }
-    // SAFETY: `is_readable` checks each range with VirtualQuery. The chain's objects belong to
-    // the grass pass that is running this very call, so the game does not free them meanwhile.
-    tick(
-        qpc_now(),
-        &NEXT_DUE,
-        &INTERVAL_TICKS,
-        &public(),
-        || unsafe { read_counters(pass, is_readable) },
-    );
+/// Stop and latch failure if the sampler panics or its feature was already disabled.
+fn guarded_sampler(out: &Outputs<'_>, body: impl FnOnce()) {
+    guard(Feature::ScatterDistance, || out.publish(None), body);
 }
 
-/// The detour's shape: `sample` in a guard of its own, then `original` exactly once.
-///
-/// - `Feature::ScatterDistance` off: only `original` runs (the outer guard's fallback).
-/// - `sample` panics: the inner guard catches it and switches the feature off; then `original`
-///   runs. The outer guard sees no panic, so it does not run `original` a second time.
-///
-/// `original` itself never panics (it only calls the trampoline), so the outer fallback can only
-/// run when the feature is already off.
-fn run_before_original(sample: impl FnOnce(), original: impl Fn()) {
+/// Publish in an inner guard, then call the native original exactly once.
+/// A publication panic is caught by the inner guard, so it cannot reach the outer fallback
+/// and call the original twice. An already disabled feature uses only the outer fallback.
+fn run_before_original(publish: impl FnOnce(), original: impl Fn()) {
     guard(Feature::ScatterDistance, &original, || {
-        // A panic in the sample stops in this inner guard, whose fallback does nothing. So the
-        // outer guard never sees one and never runs the original a second time.
-        guard(Feature::ScatterDistance, || (), sample);
+        guard(Feature::ScatterDistance, || (), publish);
         original();
     });
 }
@@ -503,11 +425,8 @@ unsafe fn call_original(trampoline: usize, rcx: *mut u8, pass: *const u8, f: f32
     unsafe { original(rcx, pass, f) }
 }
 
-/// Stands in for the game's grass pass function: samples the counters (at most once per 500 ms),
-/// then runs the original with the same arguments. See the module docs.
-///
-/// It runs on the game's render path, so it only touches the clock, atomics and (in a sample)
-/// `VirtualQuery`: no lock, no allocation, no log.
+/// Publish the pass pointer (Release), bump the call counter (Relaxed), then call the original.
+/// No clock, game-memory read, allocation, lock or log is added to the render path.
 ///
 /// # Safety
 ///
@@ -518,7 +437,17 @@ pub unsafe extern "system" fn scatter_frame_detour(rcx: *mut u8, pass: *const u8
     // SAFETY: `trampoline` is 0 or the trampoline for the game function; the arguments are the
     // game's own, passed on unchanged.
     let original = move || unsafe { call_original(trampoline, rcx, pass, f) };
-    run_before_original(move || sample(pass as usize), original);
+    run_before_original(
+        move || {
+            LAST_PASS.store(pass as usize, Ordering::Release);
+            CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+            #[cfg(test)]
+            if PANIC_IN_PUBLISH.load(Ordering::Relaxed) {
+                panic!("publication panic");
+            }
+        },
+        original,
+    );
 }
 
 const _: ScatterFrameFn = scatter_frame_detour;
@@ -535,16 +464,7 @@ unsafe fn hook_at(target: usize) -> Result<(), String> {
     // SAFETY: the caller's contract; the detour has the target's type (`const _` above).
     let trampoline = unsafe { create_and_queue(target, detour) }?;
     TRAMPOLINE.store(trampoline, Ordering::Release);
-    INTERVAL_TICKS.store(interval_ticks(qpc_frequency()), Ordering::Release);
     Ok(())
-}
-
-/// `QueryPerformanceFrequency`, or 0 if Windows reports none (it does since Windows XP).
-fn qpc_frequency() -> u64 {
-    let mut frequency = 0i64;
-    // SAFETY: `frequency` is a valid place for the one i64 the call writes; on failure it stays 0.
-    unsafe { QueryPerformanceFrequency(&mut frequency) };
-    u64::try_from(frequency).unwrap_or(0)
 }
 
 /// Find `SCATTER_FRAME_FN` in `m` and create the pre-hook on it, queued;
@@ -592,48 +512,97 @@ fn wanted_with(cfg: &Config, r_max: f32) -> bool {
     debug_key || knob_can_rise
 }
 
-/// The body of [`init`], with the decision, the code-patch answer and the install passed in.
-/// `install` runs only when code patches are allowed and the probe is wanted. Returns the log
-/// level and the one line to log.
+/// Name both failed halves of the consumer rule, without guessing why the ceiling is low.
+fn not_wanted_reason(cfg: &Config, r_max: f32) -> String {
+    let debug = if !cfg.debug.scatter_probe {
+        "[Debug] ScatterProbe = 0"
+    } else {
+        "LogLevel is not debug"
+    };
+    let knob = if !cfg.knobs.enable_scatter_distance {
+        "EnableScatterDistance = 0".to_owned()
+    } else {
+        format!("the grass ceiling r_max = {r_max} m allows no raise")
+    };
+    format!("scatter probe: off: no consumer ({debug}; {knob})")
+}
+
+/// Start only after the wanted hook was installed; both effects are injectable.
 fn start_up(
-    wanted: bool,
+    cfg: &Config,
     code_patches: bool,
     install: impl FnOnce() -> Result<(), String>,
+    start_sampler: impl FnOnce() -> Result<(), String>,
 ) -> (Level, String) {
     if !code_patches {
         return (
             Level::Info,
-            "scatter probe: off: code patches are off on this build".to_owned(),
+            "scatter probe: off: code patches are off on this build".into(),
         );
     }
-    if !wanted {
-        return (
-            Level::Info,
-            "scatter probe: off: no consumer (the grass ceiling r_max is not measured yet, and no \
-             [Debug] ScatterProbe = 1 with LogLevel = debug)"
-                .to_owned(),
-        );
+    if !wanted(cfg) {
+        return (Level::Info, not_wanted_reason(cfg, R_MAX_M));
     }
-    match install() {
+    match install().and_then(|()| start_sampler()) {
         Ok(()) => (
             Level::Info,
-            "scatter probe: on (grass pass hook queued; it reads the GPU counters at most every \
-             500 ms)"
-                .to_owned(),
+            "scatter probe: on (grass pass hook queued; sampler thread copies GPU counters every 500 ms)".into(),
         ),
         Err(why) => (Level::Warn, format!("scatter probe: off: {why}")),
     }
 }
 
-/// The start-up step: decide, install the hook (queued) if it is right to, and log one line.
+/// Run the worker under the feature guard; it holds only local state while sleeping.
+fn sampler_main() {
+    let out = public();
+    guarded_sampler(&out, || {
+        let mut state = Sampler::default();
+        let mut reader = read_process;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(SAMPLE_INTERVAL_MS));
+            if crate::guard::is_disabled(Feature::ScatterDistance) {
+                out.publish(None);
+                return;
+            }
+            if out.failed.load(Ordering::Acquire) {
+                return;
+            }
+            state.step(
+                CALL_COUNT.load(Ordering::Relaxed),
+                || LAST_PASS.load(Ordering::Acquire),
+                &out,
+                &mut reader,
+            );
+        }
+    });
+}
+
+/// Start one named, detached sampler only after installation succeeded.
+fn start_sampler_thread() -> Result<(), String> {
+    std::thread::Builder::new()
+        .name("scatter-probe".into())
+        .spawn(sampler_main)
+        .map(|_| ())
+        .map_err(|error| {
+            public().publish(None);
+            format!("cannot start sampler thread: {error}")
+        })
+}
+
+/// Decide, install the queued hook, start its detached sampler, and log one outcome line.
 /// Called once, from `entry::start`, after `code_patches_allowed` is set and before
 /// `knobs::enable_queued_hooks`.
 pub fn init(cfg: &Config) {
-    let (level, line) = start_up(wanted(cfg), entry::code_patches_allowed(), || {
-        // SAFETY: `init` runs from `entry::start`, in `InitializeASI`, before the game's
-        // `WinMain`: one thread. `main_module()` is the running exe.
-        unsafe { install(&main_module()) }
-    });
+    let (level, line) = start_up(
+        cfg,
+        entry::code_patches_allowed(),
+        || {
+            // SAFETY: `init` runs from `entry::start`, in `InitializeASI`, before the game's
+            // `WinMain`: one thread. `main_module()` is the running exe.
+            unsafe { install(&main_module()) }
+        },
+        start_sampler_thread,
+    );
     log::log!(level, "{line}");
 }
 
@@ -780,6 +749,21 @@ mod tests {
             self.mem[at..at + 4].copy_from_slice(&v.to_le_bytes());
         }
 
+        /// Copy only from this fixture's owned buffer, without dereferencing its fake links.
+        fn copy(&self, address: usize, bytes: &mut [u8]) -> bool {
+            let Some(start) = address.checked_sub(self.base()) else {
+                return false;
+            };
+            let Some(end) = start.checked_add(bytes.len()) else {
+                return false;
+            };
+            let Some(source) = self.mem.get(start..end) else {
+                return false;
+            };
+            bytes.copy_from_slice(source);
+            true
+        }
+
         /// Every `(address, length)` the reader must check, in order, for a good chain: one
         /// block per object, not one check per read (ruling 3 of the stutter fix).
         fn expected_checks(&self) -> Vec<(usize, usize)> {
@@ -801,47 +785,43 @@ mod tests {
     }
 
     #[test]
-    fn a_sample_checks_7_blocks_instead_of_22_single_reads() {
+    fn copied_chain_reads_seven_exact_blocks_and_parses_all_counters() {
         let chain = Chain::new();
-        let asked = Cell::new(0u32);
-        // SAFETY: every address the chain holds lies in its live buffer.
-        let got = unsafe {
-            read_counters(chain.pass(), |_, _| {
-                asked.set(asked.get() + 1);
-                true
-            })
-        };
-        assert_eq!(got, Some([A, B, C]));
-        assert_eq!(asked.get(), 7);
+        let asked = RefCell::new(Vec::new());
+        let result = read_counters(chain.pass(), |address, bytes| {
+            asked.borrow_mut().push((address, bytes.len()));
+            chain.copy(address, bytes)
+        });
+        assert_eq!(result, Ok([A, B, C]));
+        assert_eq!(*asked.borrow(), chain.expected_checks());
     }
 
     #[test]
-    fn a_checked_range_never_reads_past_its_end() {
-        let bytes: [u8; 12] = [1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0];
-        let at = bytes.as_ptr() as usize;
-        let asked = RefCell::new(Vec::new());
-        let record = |addr, len| {
-            asked.borrow_mut().push((addr, len));
-            true
-        };
-        let range = Checked::new(at, 12, &record).expect("accepted");
-        assert_eq!(*asked.borrow(), [(at, 12)]);
-        // SAFETY: the range is `bytes`, which lives to the end of the test.
-        unsafe {
-            assert_eq!(range.u32_at(0), Some(1));
-            assert_eq!(range.u32_at(8), Some(3));
-            assert_eq!(range.u32_at(9), None, "would end past the range");
-            assert_eq!(range.u32_at(usize::MAX), None);
-            assert_eq!(range.ptr_at(0), Some(0x0000_0002_0000_0001));
-            assert_eq!(range.ptr_at(4), Some(0x0000_0003_0000_0002));
-            assert_eq!(range.ptr_at(5), None, "would end past the range");
-        }
-        let refuse = |_, _| false;
-        assert!(Checked::new(at, 12, &refuse).is_none());
+    fn rpm_requires_success_and_exact_byte_count() {
+        assert!(complete_read(1, 8, 8));
+        assert!(complete_read(-1, 8, 8));
+        assert!(!complete_read(0, 8, 8));
+        assert!(!complete_read(1, 7, 8));
+        assert!(!complete_read(1, 9, 8));
+        assert!(!complete_read(0, 0, 8));
+    }
+
+    #[test]
+    fn rpm_copies_full_block_and_refuses_noaccess_boundary() {
+        let pages = Mem::new(2 * PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        pages.put(PAGE - 8, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        pages.protect(PAGE, PAGE, PAGE_NOACCESS);
+        let mut bytes = [0; 8];
+        assert!(read_process(pages.base + PAGE - 8, &mut bytes));
+        assert_eq!(bytes, [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert!(!read_process(pages.base + PAGE - 8, &mut [0; 16]));
+        assert!(!read_process(pages.base + PAGE, &mut [0; 8]));
+        assert!(!read_process(0, &mut [0; 8]));
+        assert!(!read_process(usize::MAX - 2, &mut [0; 8]));
     }
 
     /// A chain whose every checked block ends exactly at the end of a readable page, with a
-    /// no-access page right after it: a read past any block faults, and fails the test.
+    /// no-access page right after it: a copy past a block must fail safely.
     #[test]
     fn reads_stay_inside_the_checked_blocks_at_a_page_edge() {
         let pages: Vec<Mem> = (0..5)
@@ -873,66 +853,58 @@ mod tests {
         for m in &pages {
             m.protect(PAGE, PAGE, PAGE_NOACCESS);
         }
-        // SAFETY: `is_readable` checks every block; the pages live to the end of the test.
-        let got = unsafe { read_counters(pass, is_readable) };
-        assert_eq!(got, Some([A, B, C]));
+        let got = read_counters(pass, read_process);
+        assert_eq!(got, Ok([A, B, C]));
     }
 
     #[test]
-    fn a_good_chain_gives_all_three_counters() {
-        let chain = Chain::new();
-        // SAFETY: `is_readable` checks every read, and the chain's buffer lives to the end.
-        let got = unsafe { read_counters(chain.pass(), is_readable) };
-        assert_eq!(got, Some([A, B, C]));
-    }
-
-    #[test]
-    fn every_read_is_checked_first_with_its_address_and_length() {
-        let chain = Chain::new();
-        let asked = RefCell::new(Vec::new());
-        // SAFETY: the closure allows only addresses inside the chain's live buffer (asserted).
-        let got = unsafe {
-            read_counters(chain.pass(), |addr, len| {
-                assert!(addr >= chain.base() && addr + len <= chain.base() + chain.mem.len());
-                asked.borrow_mut().push((addr, len));
-                true
-            })
-        };
-        assert_eq!(got, Some([A, B, C]));
-        assert_eq!(*asked.borrow(), chain.expected_checks());
-    }
-
-    #[test]
-    fn a_refused_check_gives_none_and_that_link_and_everything_after_it_are_never_read() {
-        let chain = Chain::new();
+    fn every_refused_copy_stops_at_that_block_and_publishes_no_partial_sample() {
+        let mut chain = Chain::new();
+        chain.set(HANDLES[0], CounterSample { last: 99, ..A });
         let all = chain.expected_checks();
-        assert_eq!(all.len(), 7);
         for (i, &refused) in all.iter().enumerate() {
             let asked = RefCell::new(Vec::new());
-            // SAFETY: as above; the one refused address is never read (that is the point).
-            let got = unsafe {
-                read_counters(chain.pass(), |addr, len| {
-                    asked.borrow_mut().push((addr, len));
-                    (addr, len) != refused
-                })
+            let own = Own::default();
+            own.outputs().publish(Some([A, B, C]));
+            let mut state = Sampler::default();
+            let mut reader = |address, bytes: &mut [u8]| {
+                asked.borrow_mut().push((address, bytes.len()));
+                // Even a refusing reader fills valid bytes: ignoring its status must fail.
+                chain.copy(address, bytes) && (address, bytes.len()) != refused
             };
-            // Every link holds a good value, so reading the refused one anyway would succeed.
-            assert_eq!(got, None, "refusing check {i} {refused:x?}");
-            assert_eq!(*asked.borrow(), all[..=i], "refusing check {i}");
+            state.step(1, || chain.pass(), &own.outputs(), &mut reader);
+            assert_eq!(*asked.borrow(), all[..=i], "refused copy {i}");
+            assert_eq!(state.misses, 1);
+            assert!(!own.failed.load(Relaxed));
+            assert!(own.ok.load(Relaxed));
+            assert_eq!(own.vals(), [A.last, A.peak, B.last, B.peak, C.last, C.peak]);
         }
     }
 
     #[test]
-    fn the_self_check_needs_counter_a_warn_and_cap() {
+    fn zero_and_mismatched_handles_are_transient_and_stop_before_later_entries() {
+        for (i, handle) in HANDLES.into_iter().enumerate() {
+            for zero in [false, true] {
+                let mut chain = Chain::new();
+                if zero {
+                    chain.put_u32(OBJ_AT + 0x8 + 4 * i, 0);
+                } else {
+                    chain.put_u32(Chain::entry_at(handle) + 0x38, handle ^ 0x2_0000);
+                }
+                let asked = Cell::new(0);
+                let result = read_counters(chain.pass(), |a, b| {
+                    asked.set(asked.get() + 1);
+                    chain.copy(a, b)
+                });
+                assert_eq!(result, Err(ReadError::Miss));
+                assert_eq!(asked.get(), 4 + i + usize::from(!zero));
+            }
+        }
+    }
+
+    #[test]
+    fn only_counter_a_warn_and_cap_are_the_layout_self_check() {
         let mut chain = Chain::new();
-        chain.set(HANDLES[0], CounterSample { warn: 0xe000, ..A });
-        // SAFETY: `is_readable` checks every read; the buffer is live.
-        assert_eq!(unsafe { read_counters(chain.pass(), is_readable) }, None);
-        chain.set(HANDLES[0], CounterSample { cap: 0x28000, ..A });
-        // SAFETY: as above.
-        assert_eq!(unsafe { read_counters(chain.pass(), is_readable) }, None);
-        // B and C are not part of the self-check.
-        chain.set(HANDLES[0], A);
         chain.set(
             HANDLES[1],
             CounterSample {
@@ -941,97 +913,72 @@ mod tests {
                 ..B
             },
         );
-        // SAFETY: as above.
-        let got = unsafe { read_counters(chain.pass(), is_readable) };
-        assert_eq!(got.map(|[a, _, _]| a), Some(A));
+        assert_eq!(
+            read_counters(chain.pass(), |a, b| chain.copy(a, b)),
+            Ok([
+                A,
+                CounterSample {
+                    warn: 1,
+                    cap: 2,
+                    ..B
+                },
+                C
+            ])
+        );
     }
 
     #[test]
-    fn a_handle_that_does_not_own_its_entry_or_is_0_gives_none() {
-        for (i, h) in HANDLES.into_iter().enumerate() {
-            let mut chain = Chain::new();
-            chain.put_u32(Chain::entry_at(h) + 0x38, h ^ 0x2_0000);
-            // SAFETY: `is_readable` checks every read; the buffer is live.
+    fn local_fields_and_addresses_use_checked_bounds_and_never_read_invalid_links() {
+        let bytes = [1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0];
+        assert_eq!(u32_field(&bytes, 0, 8), Some(3));
+        assert_eq!(u32_field(&bytes, 0, 9), None);
+        assert_eq!(u32_field(&bytes, 8, 7), None);
+        assert_eq!(u32_field(&bytes, 0, usize::MAX), None);
+        assert_eq!(pointer_field(&bytes, 0, 4), Some(0x0000_0003_0000_0002));
+        assert_eq!(pointer_field(&bytes, 0, 5), None);
+        for pass in [0, usize::MAX - 4] {
             assert_eq!(
-                unsafe { read_counters(chain.pass(), is_readable) },
-                None,
-                "{i}"
+                read_counters(pass, |_, _| panic!("invalid address reached reader")),
+                Err(ReadError::Miss)
             );
-
-            // Handle 0, with an entry 0 whose owner field is 0 too.
+        }
+        for (offset, value, expected) in [
+            (PASS_AT + 0x8, 0, 1),
+            (PASS_AT + 0x8, usize::MAX - 4, 1),
+            (PASS_AT + 0x18, usize::MAX - 4, 3),
+            (POOL_AT + 0x48, usize::MAX - 4, 4),
+        ] {
             let mut chain = Chain::new();
-            chain.put_u32(OBJ_AT + 0x8 + 4 * i, 0);
-            // SAFETY: as above.
+            chain.put_u64(offset, value as u64);
+            let calls = Cell::new(0);
             assert_eq!(
-                unsafe { read_counters(chain.pass(), is_readable) },
-                None,
-                "{i}"
+                read_counters(chain.pass(), |a, b| {
+                    calls.set(calls.get() + 1);
+                    chain.copy(a, b)
+                }),
+                Err(ReadError::Miss)
             );
+            assert_eq!(calls.get(), expected);
         }
     }
 
     #[test]
-    fn unreadable_memory_in_the_chain_gives_none_without_a_fault() {
-        let none = Mem::new(PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS);
-        // SAFETY: `is_readable` refuses the no-access page before any read.
-        assert_eq!(unsafe { read_counters(none.base, is_readable) }, None);
-        let mut chain = Chain::new();
-        chain.put_u64(PASS_AT + 0x18, none.base as u64);
-        // SAFETY: as above.
-        assert_eq!(unsafe { read_counters(chain.pass(), is_readable) }, None);
-        let mut chain = Chain::new();
-        chain.put_u64(POOL_AT + 0x48, 0);
-        // SAFETY: as above; address 0 is never committed.
-        assert_eq!(unsafe { read_counters(chain.pass(), is_readable) }, None);
-        // SAFETY: as above.
-        assert_eq!(unsafe { read_counters(0, is_readable) }, None);
-        // SAFETY: as above; the address arithmetic must not overflow.
-        assert_eq!(unsafe { read_counters(usize::MAX - 4, |_, _| true) }, None);
-    }
-
-    // ---- is_readable --------------------------------------------------------------------------
-
-    #[test]
-    fn is_readable_follows_the_page_protection() {
-        let none = Mem::new(PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS);
-        assert!(!is_readable(none.base, 4));
-        let rw = Mem::new(PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-        assert!(is_readable(rw.base, 4));
-        assert!(is_readable(rw.base, PAGE));
-        assert!(is_readable(rw.base + PAGE - 4, 4));
-        let ro = Mem::new(PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READONLY);
-        assert!(is_readable(ro.base + 8, 8));
-        let guard = Mem::new(PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE | PAGE_GUARD);
-        assert!(!is_readable(guard.base, 4));
+    fn rpm_refuses_bad_pages_and_reads_readonly_memory() {
+        let ro = Mem::new(PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        ro.put(8, &[11, 12, 13, 14]);
+        ro.protect(0, PAGE, PAGE_READONLY);
+        let mut bytes = [0; 4];
+        assert!(read_process(ro.base + 8, &mut bytes));
+        assert_eq!(bytes, [11, 12, 13, 14]);
+        for flags in [PAGE_NOACCESS, PAGE_READWRITE | PAGE_GUARD] {
+            let memory = Mem::new(PAGE, MEM_RESERVE | MEM_COMMIT, flags);
+            assert!(!read_process(memory.base, &mut bytes));
+        }
         let reserved = Mem::new(PAGE, MEM_RESERVE, PAGE_READWRITE);
-        assert!(!is_readable(reserved.base, 4));
+        assert!(!read_process(reserved.base, &mut bytes));
     }
 
-    #[test]
-    fn is_readable_needs_the_whole_range_in_one_readable_region() {
-        let two = Mem::new(2 * PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-        assert!(
-            is_readable(two.base + PAGE - 4, 8),
-            "two like pages are one region"
-        );
-        two.protect(PAGE, PAGE, PAGE_NOACCESS);
-        assert!(is_readable(two.base + PAGE - 4, 4));
-        assert!(
-            !is_readable(two.base + PAGE - 4, 8),
-            "runs into the no-access page"
-        );
-        assert!(!is_readable(two.base + PAGE, 4));
-    }
-
-    #[test]
-    fn is_readable_refuses_null_and_an_overflowing_range() {
-        assert!(!is_readable(0, 8));
-        let rw = Mem::new(PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-        assert!(!is_readable(rw.base, usize::MAX));
-        assert!(!is_readable(usize::MAX - 2, 8));
-    }
-
-    // ---- publishing and the 30-call rhythm ------------------------------------------------------
+    // ---- publishing and the pure sampler ------------------------------------------------------
 
     /// A test's own set of output atomics.
     #[derive(Default)]
@@ -1058,6 +1005,144 @@ mod tests {
         fn vals(&self) -> [u32; 6] {
             self.vals.each_ref().map(|v| v.load(Relaxed))
         }
+    }
+
+    #[test]
+    fn a_good_sample_resets_misses_and_preserves_values_during_later_misses() {
+        let own = Own::default();
+        let chain = Chain::new();
+        let mut state = Sampler::default();
+        for calls in 1..=9 {
+            state.step(calls, || 0, &own.outputs(), &mut |_, _| false);
+        }
+        state.step(10, || chain.pass(), &own.outputs(), &mut |a, b| {
+            chain.copy(a, b)
+        });
+        assert_eq!(state.misses, 0);
+        assert!(own.ok.load(Relaxed));
+        let values = [A.last, A.peak, B.last, B.peak, C.last, C.peak];
+        assert_eq!(own.vals(), values);
+        for calls in 11..=19 {
+            state.step(calls, || 0, &own.outputs(), &mut |_, _| false);
+            assert!(!own.failed.load(Relaxed));
+            assert!(own.ok.load(Relaxed));
+            assert_eq!(own.vals(), values);
+        }
+        state.step(20, || 0, &own.outputs(), &mut |_, _| false);
+        assert!(own.failed.load(Relaxed));
+        assert!(!own.ok.load(Relaxed));
+        assert_eq!(own.vals(), values);
+    }
+
+    #[test]
+    fn copied_bad_warn_or_cap_fails_immediately_without_publishing() {
+        for bad in [
+            CounterSample {
+                warn: WARN_A - 1,
+                ..A
+            },
+            CounterSample {
+                cap: CAP_A + 1,
+                ..A
+            },
+        ] {
+            let mut chain = Chain::new();
+            chain.set(HANDLES[0], bad);
+            let own = Own::default();
+            let mut state = Sampler::default();
+            state.step(1, || chain.pass(), &own.outputs(), &mut |a, b| {
+                chain.copy(a, b)
+            });
+            assert!(own.failed.load(Relaxed));
+            assert!(!own.ok.load(Relaxed));
+            assert_eq!(own.vals(), [0; 6]);
+        }
+    }
+
+    #[test]
+    fn unchanged_counter_skips_pointer_and_memory_reads_and_miss_counting() {
+        let own = Own::default();
+        let mut state = Sampler::default();
+        state.step(
+            0,
+            || panic!("no pass read before any call"),
+            &own.outputs(),
+            &mut |_, _| panic!("no memory read"),
+        );
+        let chain = Chain::new();
+        state.step(5, || chain.pass(), &own.outputs(), &mut |a, b| {
+            chain.copy(a, b)
+        });
+        let values = own.vals();
+        state.step(
+            5,
+            || panic!("unchanged pass"),
+            &own.outputs(),
+            &mut |_, _| panic!("unchanged read"),
+        );
+        assert_eq!(own.vals(), values);
+        state.step(6, || 0, &own.outputs(), &mut |_, _| false);
+        assert_eq!(state.misses, 1);
+        state.step(
+            6,
+            || panic!("unchanged miss"),
+            &own.outputs(),
+            &mut |_, _| panic!("unchanged read"),
+        );
+        assert_eq!(state.misses, 1);
+        state.last_calls = u64::MAX;
+        state.step(0, || chain.pass(), &own.outputs(), &mut |a, b| {
+            chain.copy(a, b)
+        });
+        assert_eq!(state.misses, 0, "a wrapped counter still changed");
+    }
+
+    #[test]
+    fn a_latched_failure_never_reads_or_recovers() {
+        let own = Own::default();
+        own.outputs().publish(None);
+        let mut state = Sampler::default();
+        state.step(
+            1,
+            || panic!("failed pointer"),
+            &own.outputs(),
+            &mut |_, _| panic!("failed read"),
+        );
+        assert!(own.failed.load(Relaxed));
+        assert!(!own.ok.load(Relaxed));
+        assert_eq!(own.vals(), [0; 6]);
+    }
+
+    #[test]
+    fn a_sampler_panic_stops_work_and_latches_failed() {
+        in_child("a_sampler_panic_stops_work_and_latches_failed", || {
+            let own = Own::default();
+            own.outputs().publish(Some([A, B, C]));
+            let reached = Cell::new(false);
+            guarded_sampler(&own.outputs(), || {
+                panic!("sampler reader panic");
+            });
+            assert!(own.failed.load(Relaxed));
+            assert!(!own.ok.load(Relaxed));
+            assert!(is_disabled(Feature::ScatterDistance));
+            guarded_sampler(&own.outputs(), || reached.set(true));
+            assert!(!reached.get());
+        });
+    }
+
+    #[test]
+    fn sampler_retries_nine_misses_then_latches_the_tenth() {
+        let own = Own::default();
+        let mut state = Sampler::default();
+        for calls in 1..=9 {
+            state.step(calls, || 0, &own.outputs(), &mut |_, _| false);
+            assert!(!own.failed.load(Relaxed), "miss {calls} is transient");
+        }
+        assert_eq!(state.misses, 9);
+        state.step(10, || 0, &own.outputs(), &mut |_, _| false);
+        assert!(own.failed.load(Relaxed));
+        assert!(!own.ok.load(Relaxed));
+        assert_eq!(own.vals(), [0; 6]);
     }
 
     #[test]
@@ -1096,147 +1181,6 @@ mod tests {
         assert!(!own.ok.load(Relaxed));
         assert!(own.failed.load(Relaxed));
         assert_eq!(own.vals(), [0; 6]);
-    }
-
-    /// Run [`tick`] at each time in `times` on `own`, with an interval of 500 ticks; the times at
-    /// which it took a sample, and the due time after each call.
-    fn ticks_at(own: &Own, times: &[u64]) -> (Vec<u64>, Vec<u64>) {
-        let next_due = AtomicU64::new(0);
-        let interval = AtomicU64::new(500);
-        let mut sampled = Vec::new();
-        let mut due = Vec::new();
-        for &now in times {
-            tick(now, &next_due, &interval, &own.outputs(), || {
-                sampled.push(now);
-                Some([
-                    CounterSample {
-                        last: now as u32,
-                        ..A
-                    },
-                    B,
-                    C,
-                ])
-            });
-            due.push(next_due.load(Relaxed));
-        }
-        (sampled, due)
-    }
-
-    #[test]
-    fn tick_samples_the_first_call_then_at_most_once_per_interval() {
-        let own = Own::default();
-        let times = [1000, 1001, 1200, 1499, 1500, 1501, 1999, 2000, 9000, 9001];
-        let (sampled, due) = ticks_at(&own, &times);
-        assert_eq!(sampled, [1000, 1500, 2000, 9000]);
-        assert_eq!(
-            due,
-            [1500, 1500, 1500, 1500, 2000, 2000, 2000, 2500, 9500, 9500]
-        );
-        assert_eq!(own.vals()[0], 9000);
-        assert!(own.ok.load(Relaxed));
-    }
-
-    #[test]
-    fn tick_samples_by_time_not_by_how_often_it_is_called() {
-        // 10000 calls inside one interval: one sample, however often the grass pass runs.
-        let own = Own::default();
-        let times: Vec<u64> = (0..10_000).map(|i| 100 + i / 100).collect();
-        let (sampled, _) = ticks_at(&own, &times);
-        assert_eq!(sampled, [100]);
-    }
-
-    #[test]
-    fn tick_reads_nothing_more_after_a_failure() {
-        let own = Own::default();
-        let next_due = AtomicU64::new(0);
-        let interval = AtomicU64::new(500);
-        let reads = Cell::new(0u32);
-        for i in 0..100u64 {
-            // Every call is due: one interval apart.
-            tick(i * 500, &next_due, &interval, &own.outputs(), || {
-                reads.set(reads.get() + 1);
-                None
-            });
-        }
-        assert_eq!(reads.get(), 1, "only the first sample ran");
-        assert!(own.failed.load(Relaxed));
-        assert!(!own.ok.load(Relaxed));
-    }
-
-    #[test]
-    fn tick_with_no_sample_due_changes_nothing() {
-        // A due time in the future: no sample, no publish, and the due time stays (the interval,
-        // a value that would move it if it were used, is not used).
-        let own = Own::default();
-        let next_due = AtomicU64::new(10_000);
-        let interval = AtomicU64::new(u64::MAX);
-        let reads = Cell::new(0u32);
-        for now in [0, 1, 9_999] {
-            tick(now, &next_due, &interval, &own.outputs(), || {
-                reads.set(reads.get() + 1);
-                Some([A, B, C])
-            });
-        }
-        assert_eq!(reads.get(), 0);
-        assert_eq!(next_due.load(Relaxed), 10_000);
-        assert!(!own.ok.load(Relaxed));
-    }
-
-    #[test]
-    fn of_many_threads_at_the_same_due_time_exactly_one_samples() {
-        let own = Own::default();
-        let next_due = AtomicU64::new(1000);
-        let interval = AtomicU64::new(500);
-        let reads = AtomicU32::new(0);
-        let start = std::sync::Barrier::new(8);
-        std::thread::scope(|s| {
-            for _ in 0..8 {
-                s.spawn(|| {
-                    start.wait();
-                    for _ in 0..1000 {
-                        tick(1200, &next_due, &interval, &own.outputs(), || {
-                            reads.fetch_add(1, Relaxed);
-                            Some([A, B, C])
-                        });
-                    }
-                });
-            }
-        });
-        assert_eq!(reads.load(Relaxed), 1, "one claim per due time");
-        assert_eq!(next_due.load(Relaxed), 1700);
-    }
-
-    #[test]
-    fn the_due_time_saturates_at_the_end_of_the_clock() {
-        let own = Own::default();
-        let next_due = AtomicU64::new(0);
-        let interval = AtomicU64::new(500);
-        let reads = Cell::new(0u32);
-        for now in [u64::MAX - 10, u64::MAX - 1, u64::MAX] {
-            tick(now, &next_due, &interval, &own.outputs(), || {
-                reads.set(reads.get() + 1);
-                Some([A, B, C])
-            });
-        }
-        // The first samples and moves the due time to u64::MAX; the clock reaches it once more.
-        assert_eq!(reads.get(), 2);
-        assert_eq!(next_due.load(Relaxed), u64::MAX);
-    }
-
-    #[test]
-    fn the_interval_is_500_ms_of_counter_ticks_and_never_0() {
-        assert_eq!(SAMPLE_INTERVAL_MS, 500);
-        assert_eq!(interval_ticks(10_000_000), 5_000_000);
-        assert_eq!(interval_ticks(10_000_000), DEFAULT_INTERVAL_TICKS);
-        assert_eq!(interval_ticks(3_000), 1_500);
-        assert_eq!(interval_ticks(1), 1, "never 0");
-        assert_eq!(interval_ticks(0), 1, "never 0");
-        assert_eq!(interval_ticks(u64::MAX), u64::MAX / 2, "no overflow");
-        assert_eq!(interval_ticks(qpc_frequency()), {
-            let f = qpc_frequency();
-            assert!(f > 0, "this PC has a performance counter");
-            f / 2
-        });
     }
 
     // ---- the start-up decision ------------------------------------------------------------------
@@ -1282,57 +1226,86 @@ mod tests {
     }
 
     #[test]
-    fn no_code_patches_means_no_hook_and_says_so() {
-        let called = Cell::new(false);
-        let (level, line) = start_up(true, false, || {
-            called.set(true);
-            Ok(())
-        });
-        assert!(!called.get(), "install must not run");
+    fn sampler_starts_once_only_after_a_wanted_hook_installs() {
+        let effects = RefCell::new(Vec::new());
+        let wanted_cfg = cfg(false, true, LogLevel::Debug);
+        let (level, _) = start_up(
+            &wanted_cfg,
+            true,
+            || {
+                effects.borrow_mut().push("install");
+                Ok(())
+            },
+            || {
+                effects.borrow_mut().push("sampler");
+                Ok(())
+            },
+        );
+        assert_eq!(level, Level::Info);
+        assert_eq!(*effects.borrow(), ["install", "sampler"]);
+        for (config, patches, installation) in [
+            (wanted_cfg, false, Ok(())),
+            (Config::default(), true, Ok(())),
+            (wanted_cfg, true, Err("missing signature".to_owned())),
+        ] {
+            effects.borrow_mut().clear();
+            let (_, line) = start_up(
+                &config,
+                patches,
+                || {
+                    effects.borrow_mut().push("install");
+                    installation
+                },
+                || {
+                    effects.borrow_mut().push("sampler");
+                    Ok(())
+                },
+            );
+            assert!(!effects.borrow().contains(&"sampler"), "{line}");
+        }
+        let (level, line) = start_up(
+            &wanted_cfg,
+            true,
+            || Ok(()),
+            || Err("cannot start worker".into()),
+        );
+        assert_eq!(level, Level::Warn);
+        assert!(line.contains("cannot start worker"));
+    }
+
+    #[test]
+    fn startup_reasons_name_the_actual_failed_halves() {
+        let (level, line) = start_up(
+            &cfg(true, true, LogLevel::Debug),
+            false,
+            || panic!("no install"),
+            || panic!("no sampler"),
+        );
         assert_eq!(level, Level::Info);
         assert_eq!(
             line,
             "scatter probe: off: code patches are off on this build"
         );
-    }
-
-    #[test]
-    fn not_wanted_means_no_hook_and_says_so() {
-        let called = Cell::new(false);
-        let (level, line) = start_up(false, true, || {
-            called.set(true);
-            Ok(())
-        });
-        assert!(!called.get(), "install must not run");
-        assert_eq!(level, Level::Info);
-        assert_eq!(
-            line,
-            "scatter probe: off: no consumer (the grass ceiling r_max is not measured yet, and no \
-             [Debug] ScatterProbe = 1 with LogLevel = debug)"
+        let (_, line) = start_up(
+            &Config::default(),
+            true,
+            || panic!("no install"),
+            || panic!("no sampler"),
         );
-    }
-
-    #[test]
-    fn a_wanted_probe_installs_and_says_so() {
-        let called = Cell::new(false);
-        let (level, line) = start_up(true, true, || {
-            called.set(true);
-            Ok(())
-        });
-        assert!(called.get());
-        assert_eq!(level, Level::Info);
-        assert_eq!(
-            line,
-            "scatter probe: on (grass pass hook queued; it reads the GPU counters at most every \
-             500 ms)"
+        assert!(line.contains("ScatterProbe = 0"));
+        assert!(line.contains("r_max = 90 m allows no raise"));
+        let line = not_wanted_reason(&cfg(false, true, LogLevel::Info), 127.0);
+        assert!(line.contains("LogLevel is not debug"));
+        assert!(line.contains("EnableScatterDistance = 0"));
+        assert!(!line.contains("not measured"));
+        let (level, line) = start_up(
+            &cfg(false, true, LogLevel::Debug),
+            true,
+            || Err("missing signature".into()),
+            || panic!("no worker"),
         );
-    }
-
-    #[test]
-    fn an_install_failure_is_a_warning_with_the_reason() {
-        let (level, line) = start_up(true, true, || Err("the game code was not found".into()));
         assert_eq!(level, Level::Warn);
-        assert_eq!(line, "scatter probe: off: the game code was not found");
+        assert_eq!(line, "scatter probe: off: missing signature");
     }
 
     // ---- the real hook, on a stand-in for the game function -----------------------------------
@@ -1352,8 +1325,8 @@ mod tests {
     /// `install` never finds it in this test binary. MinHook moves the same 5-byte first
     /// instruction as in the game.
     ///
-    /// It records RCX, RDX, XMM2 and `PROBE_OK` (so a test can see that the sample ran before
-    /// it), then counts the call.
+    /// It records RCX, RDX, XMM2 and PROBE_OK, then counts the call. Plain and hooked
+    /// measurements use exactly the same original side effects.
     #[unsafe(naked)]
     unsafe extern "system" fn fake_scatter_frame(_rcx: *mut u8, _pass: *const u8, _f: f32) {
         core::arch::naked_asm!(
@@ -1389,8 +1362,8 @@ mod tests {
     /// Call the fake through its address, as the game's caller does.
     fn call_fake(rcx: usize, pass: usize, f: f32) {
         let fake: ScatterFrameFn = std::hint::black_box(fake_scatter_frame);
-        // SAFETY: the fake only records its arguments; the hook (if any) reads `pass` only after
-        // `is_readable` accepted each address.
+        // SAFETY: the fake only records its arguments; the detour only publishes the numeric
+        // pointer, so even an invalid pass value is never dereferenced.
         unsafe { fake(rcx as *mut u8, pass as *const u8, f) };
     }
 
@@ -1465,102 +1438,43 @@ mod tests {
     }
 
     #[test]
-    fn real_hook_samples_before_the_original_and_passes_every_argument_on() {
+    fn real_hook_only_publishes_and_passes_every_argument_on() {
         in_child(
-            "real_hook_samples_before_the_original_and_passes_every_argument_on",
+            "real_hook_only_publishes_and_passes_every_argument_on",
             || {
-                assert!(!is_disabled(Feature::ScatterDistance), "a fresh process");
-                let mut chain = Chain::new();
-                // Unhooked, the fake records its arguments and nothing is published.
-                call_fake(0x1234, chain.pass(), 1.5);
-                assert_eq!(FAKE_CALLS.load(Relaxed), 1);
-                assert!(!PROBE_OK.load(Relaxed));
-
-                hook_the_fake();
-                call_fake(0x5678, chain.pass(), 2.25);
-                assert_eq!(FAKE_CALLS.load(Relaxed), 2, "the original ran exactly once");
-                assert_eq!(FAKE_RCX.load(Relaxed), 0x5678, "RCX passed on");
-                assert_eq!(FAKE_RDX.load(Relaxed), chain.pass(), "RDX passed on");
-                assert_eq!(f32::from_bits(FAKE_F.load(Relaxed)), 2.25, "XMM2 passed on");
-                assert_eq!(
-                    FAKE_SAW_OK.load(Relaxed),
-                    1,
-                    "the sample ran before the original"
-                );
-                assert!(PROBE_OK.load(Relaxed));
-                assert!(!FAILED.load(Relaxed));
-                let published =
-                    [&LAST_A, &PEAK_A, &LAST_B, &PEAK_B, &LAST_C, &PEAK_C].map(|v| v.load(Relaxed));
-                assert_eq!(published, [A.last, A.peak, B.last, B.peak, C.last, C.peak]);
-
-                // `hook_at` set the interval for this PC's counter: 500 ms.
-                assert_eq!(INTERVAL_TICKS.load(Relaxed), qpc_frequency() / 2);
-                // Calls right after the first do not sample, however many there are.
-                chain.set(HANDLES[0], CounterSample { last: 0x8000, ..A });
-                for _ in 0..1000 {
-                    call_fake(0x5678, chain.pass(), 2.25);
-                }
-                assert_eq!(FAKE_CALLS.load(Relaxed), 1002);
-                assert_eq!(LAST_A.load(Relaxed), A.last, "no sample within 500 ms");
-                // The first call after 500 ms samples.
-                std::thread::sleep(std::time::Duration::from_millis(600));
-                call_fake(0x5678, chain.pass(), 2.25);
-                assert_eq!(FAKE_CALLS.load(Relaxed), 1003);
-                assert_eq!(LAST_A.load(Relaxed), 0x8000, "a sample after 500 ms");
-
-                // Take the hook out: the fake runs alone again.
-                unhook_the_fake();
-                chain.set(HANDLES[0], CounterSample { last: 0x9000, ..A });
-                std::thread::sleep(std::time::Duration::from_millis(600));
-                for _ in 0..30 {
-                    call_fake(0x5678, chain.pass(), 2.25);
-                }
-                assert_eq!(FAKE_CALLS.load(Relaxed), 1033);
-                assert_eq!(LAST_A.load(Relaxed), 0x8000, "the detour did not run");
-            },
-        );
-    }
-
-    #[test]
-    fn a_bad_chain_turns_the_probe_off_for_good_and_the_original_still_runs_once() {
-        in_child(
-            "a_bad_chain_turns_the_probe_off_for_good_and_the_original_still_runs_once",
-            || {
-                assert!(!is_disabled(Feature::ScatterDistance), "a fresh process");
-                hook_the_fake();
-                // `pass` points at a no-access page: the probe must refuse it, not fault.
-                let none = Mem::new(PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS);
-                call_fake(1, none.base, 0.5);
-                assert_eq!(FAKE_CALLS.load(Relaxed), 1, "the original ran exactly once");
-                assert_eq!(FAKE_RDX.load(Relaxed), none.base);
-                assert!(FAILED.load(Relaxed));
-                assert!(!PROBE_OK.load(Relaxed));
-                assert!(
-                    !is_disabled(Feature::ScatterDistance),
-                    "a failure is not a panic"
-                );
-
-                // A good chain later, when a sample is due again, does not turn it back on: off
-                // for the session.
                 let chain = Chain::new();
-                for _ in 0..60 {
-                    call_fake(1, chain.pass(), 0.5);
+                hook_the_fake();
+                PANIC_IN_READ.store(true, Relaxed);
+                for (i, (pass, float)) in [
+                    (chain.pass(), 2.25),
+                    (usize::MAX - 8, f32::from_bits(0x7fc12345)),
+                    (0, -0.0),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    call_fake(0x5678 + i, pass, float);
+                    assert_eq!(FAKE_CALLS.load(Relaxed), i as u32 + 1);
+                    assert_eq!(FAKE_RCX.load(Relaxed), 0x5678 + i);
+                    assert_eq!(FAKE_RDX.load(Relaxed), pass);
+                    assert_eq!(FAKE_F.load(Relaxed), float.to_bits());
+                    assert_eq!(LAST_PASS.load(Ordering::Acquire), pass);
+                    assert_eq!(CALL_COUNT.load(Relaxed), i as u64 + 1);
+                    assert!(!PROBE_OK.load(Relaxed));
+                    assert!(!FAILED.load(Relaxed));
+                    assert_eq!(LAST_A.load(Relaxed), 0);
+                    assert_eq!(READ_CALLS.load(Relaxed), 0);
+                    assert!(!is_disabled(Feature::ScatterDistance));
                 }
-                std::thread::sleep(std::time::Duration::from_millis(600));
-                call_fake(1, chain.pass(), 0.5);
-                assert_eq!(FAKE_CALLS.load(Relaxed), 62);
-                assert!(FAILED.load(Relaxed));
-                assert!(!PROBE_OK.load(Relaxed));
-                assert_eq!(LAST_A.load(Relaxed), 0);
                 unhook_the_fake();
             },
         );
     }
 
     #[test]
-    fn the_original_runs_exactly_once_when_the_sample_panics() {
+    fn the_original_runs_exactly_once_when_publication_panics() {
         in_child(
-            "the_original_runs_exactly_once_when_the_sample_panics",
+            "the_original_runs_exactly_once_when_publication_panics",
             || {
                 assert!(!is_disabled(Feature::ScatterDistance), "a fresh process");
                 let order = RefCell::new(Vec::new());
@@ -1600,14 +1514,14 @@ mod tests {
     }
 
     #[test]
-    fn the_real_detour_runs_the_original_once_when_its_sample_panics() {
+    fn the_real_detour_runs_the_original_once_when_publication_panics() {
         in_child(
-            "the_real_detour_runs_the_original_once_when_its_sample_panics",
+            "the_real_detour_runs_the_original_once_when_publication_panics",
             || {
                 assert!(!is_disabled(Feature::ScatterDistance), "a fresh process");
                 let chain = Chain::new();
                 hook_the_fake();
-                PANIC_IN_SAMPLE.store(true, Relaxed);
+                PANIC_IN_PUBLISH.store(true, Relaxed);
                 call_fake(7, chain.pass(), 3.0);
                 assert_eq!(FAKE_CALLS.load(Relaxed), 1, "the original ran exactly once");
                 assert_eq!(f32::from_bits(FAKE_F.load(Relaxed)), 3.0);
@@ -1619,7 +1533,7 @@ mod tests {
                 assert!(!FAILED.load(Relaxed), "a panic is not a failed sample");
 
                 // From now on the detour only runs the original, once a call.
-                PANIC_IN_SAMPLE.store(false, Relaxed);
+                PANIC_IN_PUBLISH.store(false, Relaxed);
                 call_fake(7, chain.pass(), 3.0);
                 assert_eq!(FAKE_CALLS.load(Relaxed), 2);
                 assert!(!PROBE_OK.load(Relaxed), "still nothing published");
@@ -1628,82 +1542,64 @@ mod tests {
         );
     }
 
-    // ---- measurements (ruling 4 of the stutter fix; numbers show with --nocapture) -----------
-    //
-    // The bounds are loose on purpose, for a slow debug build on a busy CI machine. The goal on
-    // a release build is well under 1 us per call and well under 100 us per sample.
-
-    /// Run `f` `n` times and return the mean time per run in nanoseconds.
-    fn mean_ns(n: u32, mut f: impl FnMut()) -> f64 {
+    /// Measure fixed batches without imposing a wall-clock assertion on CI.
+    fn mean_ns(n: u32, mut call: impl FnMut()) -> f64 {
         let start = std::time::Instant::now();
         for _ in 0..n {
-            f();
+            call();
         }
-        start.elapsed().as_nanos() as f64 / f64::from(n)
+        start.elapsed().as_secs_f64() * 1e9 / f64::from(n)
     }
 
     #[test]
-    fn measure_the_per_call_cost_when_no_sample_is_due() {
-        let own = Own::default();
-        // Due far in the future, as on every call between two samples.
-        let next_due = AtomicU64::new(u64::MAX);
-        let interval = AtomicU64::new(DEFAULT_INTERVAL_TICKS);
-        let reads = Cell::new(0u32);
-        let per_call = mean_ns(200_000, || {
-            tick(qpc_now(), &next_due, &interval, &own.outputs(), || {
-                reads.set(reads.get() + 1);
-                Some([A, B, C])
-            })
-        });
-        println!("probe cost: no sample due: {per_call:.1} ns per call (QPC read + one load)");
-        assert_eq!(reads.get(), 0);
-        assert!(per_call < 5_000.0, "{per_call} ns per call");
-    }
-
-    #[test]
-    fn measure_the_cost_of_one_sample_on_the_fake_chain() {
-        let chain = Chain::new();
-        let own = Own::default();
-        let per_check = mean_ns(2_000, || {
-            assert!(is_readable(chain.pass(), 8));
-        });
-        let per_sample = mean_ns(2_000, || {
-            // SAFETY: `is_readable` checks every block; the chain's buffer is live.
-            own.outputs()
-                .publish(unsafe { read_counters(chain.pass(), is_readable) });
-        });
-        println!(
-            "probe cost: one sample on the fake chain: {:.2} us (7 VirtualQuery checks at {:.2} us \
-             each; 22 checks were {:.2} us)",
-            per_sample / 1000.0,
-            per_check / 1000.0,
-            22.0 * per_check / 1000.0
-        );
-        assert!(own.ok.load(Relaxed), "the samples were good");
-        assert!(per_sample < 1_000_000.0, "{per_sample} ns per sample");
-    }
-
-    #[test]
-    fn measure_the_hooked_call_overhead_when_no_sample_is_due() {
+    fn measure_the_hooked_call_overhead_against_the_same_plain_fake() {
         in_child(
-            "measure_the_hooked_call_overhead_when_no_sample_is_due",
+            "measure_the_hooked_call_overhead_against_the_same_plain_fake",
             || {
-                let chain = Chain::new();
-                const N: u32 = 100_000;
-                let plain = mean_ns(N, || call_fake(1, chain.pass(), 1.0));
-                hook_the_fake();
-                // The first hooked call samples; the next one is due 500 ms later.
-                call_fake(1, chain.pass(), 1.0);
-                assert!(PROBE_OK.load(Relaxed));
-                let hooked = mean_ns(N, || call_fake(1, chain.pass(), 1.0));
-                let overhead = hooked - plain;
-                println!(
-                    "probe cost: hooked call, no sample due: {overhead:.1} ns per call over the \
-                     plain call ({hooked:.1} ns hooked, {plain:.1} ns plain)"
-                );
-                assert_eq!(FAKE_CALLS.load(Relaxed), 2 * N + 1);
-                assert!(overhead < 10_000.0, "{overhead} ns per call");
-                unhook_the_fake();
+                let n = if cfg!(debug_assertions) {
+                    10_000
+                } else {
+                    1_000_000
+                };
+                let batches = if cfg!(debug_assertions) { 2 } else { 7 };
+                let mut calls = 0u32;
+                for batch in 0..batches {
+                    let mut measure = |hooked| {
+                        if hooked {
+                            hook_the_fake();
+                        }
+                        for _ in 0..10_000 {
+                            call_fake(
+                                std::hint::black_box(1),
+                                std::hint::black_box(0),
+                                std::hint::black_box(1.0),
+                            );
+                        }
+                        let result = mean_ns(n, || {
+                            call_fake(
+                                std::hint::black_box(1),
+                                std::hint::black_box(0),
+                                std::hint::black_box(1.0),
+                            )
+                        });
+                        calls += n + 10_000;
+                        if hooked {
+                            unhook_the_fake();
+                        }
+                        result
+                    };
+                    let (plain, hooked) = if batch % 2 == 0 {
+                        let plain = measure(false);
+                        (plain, measure(true))
+                    } else {
+                        let hooked = measure(true);
+                        (measure(false), hooked)
+                    };
+                    println!("probe cost: batch {batch}: {plain:.3} ns plain, {hooked:.3} ns hooked, {:.3} ns overhead",hooked-plain);
+                }
+                assert_eq!(FAKE_CALLS.load(Relaxed), calls);
+                assert_eq!(READ_CALLS.load(Relaxed), 0);
+                assert!(!PROBE_OK.load(Relaxed));
             },
         );
     }
