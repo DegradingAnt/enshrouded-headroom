@@ -79,10 +79,27 @@ pub enum Priority {
 /// `[General] Reflex`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReflexMode {
+    /// Follow the saved menu value; an unknown value uses `Auto`.
     Game,
+    /// Enable on NVIDIA when the driver lists the extension.
+    Auto,
+    /// Disable Reflex.
     Off,
+    /// Enable Reflex without boost when supported.
     On,
+    /// Enable Reflex with boost when supported.
     Boost,
+}
+
+/// `[General] AntiLag`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AntiLagMode {
+    /// Enable on AMD when the extension and feature are supported.
+    Auto,
+    /// Disable Anti-Lag.
+    Off,
+    /// Enable on any vendor that supports the extension and feature.
+    On,
 }
 
 /// The `[General]` section.
@@ -95,6 +112,8 @@ pub struct General {
     /// The priority change made after renderer creation.
     pub priority: Priority,
     pub reflex: ReflexMode,
+    /// The requested AMD Anti-Lag mode.
+    pub anti_lag: AntiLagMode,
     pub allow_unknown_build: bool,
     pub log_level: LogLevel,
 }
@@ -167,7 +186,8 @@ const BUILTIN: Config = Config {
         texture_reserve_gib: 11.0,
         async_compute: AsyncCompute::On,
         priority: Priority::AboveNormal,
-        reflex: ReflexMode::Game,
+        reflex: ReflexMode::Auto,
+        anti_lag: AntiLagMode::Auto,
         allow_unknown_build: false,
         log_level: LogLevel::Info,
     },
@@ -254,9 +274,20 @@ pub fn parse(text: &str) -> (Config, Vec<String>) {
             d.general.reflex,
             &[
                 ("game", ReflexMode::Game),
+                ("auto", ReflexMode::Auto),
                 ("off", ReflexMode::Off),
                 ("on", ReflexMode::On),
                 ("boost", ReflexMode::Boost),
+            ],
+        ),
+        anti_lag: r.choice(
+            "General",
+            "AntiLag",
+            d.general.anti_lag,
+            &[
+                ("auto", AntiLagMode::Auto),
+                ("off", AntiLagMode::Off),
+                ("on", AntiLagMode::On),
             ],
         ),
         allow_unknown_build: r.boolean(
@@ -802,7 +833,8 @@ mod tests {
         assert!(w.is_empty());
         assert_eq!(c.governor.target_fps, 75);
         assert!(matches!(c.general.async_compute, AsyncCompute::On));
-        assert!(matches!(c.general.reflex, ReflexMode::Game));
+        assert!(matches!(c.general.reflex, ReflexMode::Auto));
+        assert_eq!(c.general.anti_lag, AntiLagMode::Auto);
         assert_eq!(c.governor.raise_below, 0.90);
         assert_eq!(c.governor.lower_hold_seconds, 0.3);
         assert_eq!(c.governor.min_vram_free_mib, 1024);
@@ -861,7 +893,8 @@ mod tests {
         assert_eq!(g.texture_reserve_gib, 11.0);
         assert_eq!(g.async_compute, AsyncCompute::On);
         assert_eq!(g.priority, Priority::AboveNormal);
-        assert_eq!(g.reflex, ReflexMode::Game);
+        assert_eq!(g.reflex, ReflexMode::Auto);
+        assert_eq!(g.anti_lag, AntiLagMode::Auto);
         assert!(!g.allow_unknown_build);
         assert_eq!(g.log_level, LogLevel::Info);
         let v = c.governor;
@@ -1091,6 +1124,48 @@ mod tests {
                 expected
             );
         }
+    }
+
+    /// W19 latency choices share the parser's default and warning contract.
+    #[test]
+    fn latency_choices_defaults_and_bad_values() {
+        for (given, expected) in [
+            ("auto", ReflexMode::Auto),
+            ("AUTO", ReflexMode::Auto),
+            ("game", ReflexMode::Game),
+            ("off", ReflexMode::Off),
+            ("on", ReflexMode::On),
+            ("boost", ReflexMode::Boost),
+        ] {
+            let (c, w) = one("General", "Reflex", given);
+            assert_eq!(c.general.reflex, expected);
+            assert!(w.is_empty(), "{w:?}");
+        }
+        for (given, expected) in [
+            ("auto", AntiLagMode::Auto),
+            ("AUTO", AntiLagMode::Auto),
+            ("off", AntiLagMode::Off),
+            ("on", AntiLagMode::On),
+        ] {
+            let (c, w) = one("General", "AntiLag", given);
+            assert_eq!(c.general.anti_lag, expected);
+            assert!(w.is_empty(), "{w:?}");
+        }
+        for key in ["Reflex", "AntiLag"] {
+            for given in ["", "turbo", "1", "boosted"] {
+                let (c, w) = one("General", key, given);
+                assert_eq!(c, Config::default());
+                assert_eq!(w.len(), 1, "{key}={given}: {w:?}");
+                assert!(w[0].contains(key) && w[0].contains("default auto"));
+            }
+        }
+        assert_eq!(
+            DEFAULT_INI
+                .lines()
+                .filter(|line| !line.starts_with(';') && line.contains('='))
+                .count(),
+            28
+        );
     }
 
     #[test]

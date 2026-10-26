@@ -6,7 +6,7 @@
 //! `SwapchainLatencyCreateInfoNV`, `OutOfBandQueueTypeInfoNV`, `LatencySurfaceCapabilitiesNV`), and
 //! `VK_KHR_present_id` (`PresentIdKHR`, `PhysicalDevicePresentIdFeaturesKHR`); their layouts match
 //! the current header. It does not have `VK_KHR_present_id2`, which is newer, so that is defined
-//! here.
+//! here, together with `VK_AMD_anti_lag` (first in header 291).
 //!
 //! Source: Vulkan-Headers `include/vulkan/vulkan_core.h`, `VK_HEADER_VERSION 366` (tag v1.4.366,
 //! commit 73814d006638aa00bd553215b054f0f02e457e22),
@@ -15,6 +15,9 @@
 //! The header gives the fields, not the sizes. The sizes in the tests follow from the fields under
 //! the C layout rules of x86-64 Windows (pointers 8 bytes and 8-aligned, `VkStructureType`,
 //! `uint32_t` and `VkBool32` 4 bytes).
+
+//! AMD declarations follow extension 477, spec version 1, in the pinned Khronos registry:
+//! <https://github.com/KhronosGroup/Vulkan-Headers/blob/73814d006638aa00bd553215b054f0f02e457e22/registry/vk.xml>.
 
 use std::ffi::{c_void, CStr};
 
@@ -51,6 +54,106 @@ pub struct PhysicalDevicePresentId2FeaturesKHR {
     pub p_next: *mut c_void,
     pub present_id2: vk::Bool32,
 }
+
+/// `VK_AMD_ANTI_LAG_EXTENSION_NAME` from the pinned Khronos registry.
+pub const AMD_ANTI_LAG_NAME: &CStr = c"VK_AMD_anti_lag";
+/// `VK_AMD_ANTI_LAG_SPEC_VERSION`.
+pub const AMD_ANTI_LAG_SPEC_VERSION: u32 = 1;
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ANTI_LAG_FEATURES_AMD`.
+pub const PHYSICAL_DEVICE_ANTI_LAG_FEATURES_AMD: vk::StructureType =
+    vk::StructureType::from_raw(1_000_476_000);
+/// `VK_STRUCTURE_TYPE_ANTI_LAG_DATA_AMD`.
+pub const ANTI_LAG_DATA_AMD: vk::StructureType = vk::StructureType::from_raw(1_000_476_001);
+/// `VK_STRUCTURE_TYPE_ANTI_LAG_PRESENTATION_INFO_AMD`.
+pub const ANTI_LAG_PRESENTATION_INFO_AMD: vk::StructureType =
+    vk::StructureType::from_raw(1_000_476_002);
+
+/// `VkAntiLagModeAMD`, represented as the registry's 32-bit C enum.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AntiLagModeAMD(i32);
+
+impl AntiLagModeAMD {
+    /// Let the driver select the mode.
+    pub const DRIVER_CONTROL: Self = Self(0);
+    /// Enable Anti-Lag.
+    pub const ON: Self = Self(1);
+    /// Disable Anti-Lag.
+    pub const OFF: Self = Self(2);
+
+    /// The numeric Vulkan value.
+    pub const fn as_raw(self) -> i32 {
+        self.0
+    }
+}
+
+/// `VkAntiLagStageAMD`, represented as the registry's 32-bit C enum.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AntiLagStageAMD(i32);
+
+impl AntiLagStageAMD {
+    /// The input stage.
+    pub const INPUT: Self = Self(0);
+    /// The presentation stage.
+    pub const PRESENT: Self = Self(1);
+
+    /// The numeric Vulkan value.
+    pub const fn as_raw(self) -> i32 {
+        self.0
+    }
+}
+
+/// `VkPhysicalDeviceAntiLagFeaturesAMD`: query or enable the `antiLag` feature.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PhysicalDeviceAntiLagFeaturesAMD {
+    /// `PHYSICAL_DEVICE_ANTI_LAG_FEATURES_AMD`.
+    pub s_type: vk::StructureType,
+    /// The next feature struct, or null.
+    pub p_next: *mut c_void,
+    /// Whether Anti-Lag is supported or enabled.
+    pub anti_lag: vk::Bool32,
+}
+
+/// `VkAntiLagPresentationInfoAMD`: a stage and its frame identifier.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct AntiLagPresentationInfoAMD {
+    /// `ANTI_LAG_PRESENTATION_INFO_AMD`.
+    pub s_type: vk::StructureType,
+    /// The next struct, or null.
+    pub p_next: *mut c_void,
+    /// The input or presentation stage.
+    pub stage: AntiLagStageAMD,
+    /// A monotonically increasing frame identifier.
+    pub frame_index: u64,
+}
+
+/// `VkAntiLagDataAMD`: the arguments for one Anti-Lag update.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct AntiLagDataAMD {
+    /// `ANTI_LAG_DATA_AMD`.
+    pub s_type: vk::StructureType,
+    /// The next struct, or null.
+    pub p_next: *const c_void,
+    /// The requested Anti-Lag mode.
+    pub mode: AntiLagModeAMD,
+    /// A frame-rate limit, or zero for no limit.
+    pub max_fps: u32,
+    /// The stage and frame identifier, or null.
+    pub p_presentation_info: *const AntiLagPresentationInfoAMD,
+}
+
+/// `vkAntiLagUpdateAMD` from the pinned registry; this alias has no function body.
+///
+/// # Safety
+///
+/// The caller must use a live device with the extension and feature enabled. The data and all
+/// chained pointers must stay valid for the call and satisfy the Vulkan command's requirements.
+#[allow(non_camel_case_types)]
+pub type PFN_vkAntiLagUpdateAMD = unsafe extern "system" fn(vk::Device, *const AntiLagDataAMD);
 
 #[cfg(test)]
 mod tests {
@@ -93,5 +196,50 @@ mod tests {
     fn present_id2_extension_name_and_version() {
         assert_eq!(KHR_PRESENT_ID_2_NAME, c"VK_KHR_present_id2");
         assert_eq!(KHR_PRESENT_ID_2_SPEC_VERSION, 1);
+    }
+
+    /// The pinned registry's AMD structs under the Windows x64 C ABI.
+    #[test]
+    fn anti_lag_layout_matches_registry() {
+        assert_eq!(size_of::<PhysicalDeviceAntiLagFeaturesAMD>(), 24);
+        assert_eq!(align_of::<PhysicalDeviceAntiLagFeaturesAMD>(), 8);
+        assert_eq!(offset_of!(PhysicalDeviceAntiLagFeaturesAMD, s_type), 0);
+        assert_eq!(offset_of!(PhysicalDeviceAntiLagFeaturesAMD, p_next), 8);
+        assert_eq!(offset_of!(PhysicalDeviceAntiLagFeaturesAMD, anti_lag), 16);
+        assert_eq!(size_of::<AntiLagPresentationInfoAMD>(), 32);
+        assert_eq!(align_of::<AntiLagPresentationInfoAMD>(), 8);
+        assert_eq!(offset_of!(AntiLagPresentationInfoAMD, s_type), 0);
+        assert_eq!(offset_of!(AntiLagPresentationInfoAMD, p_next), 8);
+        assert_eq!(offset_of!(AntiLagPresentationInfoAMD, stage), 16);
+        assert_eq!(offset_of!(AntiLagPresentationInfoAMD, frame_index), 24);
+        assert_eq!(size_of::<AntiLagDataAMD>(), 32);
+        assert_eq!(align_of::<AntiLagDataAMD>(), 8);
+        assert_eq!(offset_of!(AntiLagDataAMD, s_type), 0);
+        assert_eq!(offset_of!(AntiLagDataAMD, p_next), 8);
+        assert_eq!(offset_of!(AntiLagDataAMD, mode), 16);
+        assert_eq!(offset_of!(AntiLagDataAMD, max_fps), 20);
+        assert_eq!(offset_of!(AntiLagDataAMD, p_presentation_info), 24);
+    }
+
+    /// Extension 477 and its offsets define these exact numbers.
+    #[test]
+    fn anti_lag_values_match_registry() {
+        assert_eq!(AMD_ANTI_LAG_NAME, c"VK_AMD_anti_lag");
+        assert_eq!(AMD_ANTI_LAG_SPEC_VERSION, 1);
+        assert_eq!(
+            PHYSICAL_DEVICE_ANTI_LAG_FEATURES_AMD.as_raw(),
+            1_000_476_000
+        );
+        assert_eq!(ANTI_LAG_DATA_AMD.as_raw(), 1_000_476_001);
+        assert_eq!(ANTI_LAG_PRESENTATION_INFO_AMD.as_raw(), 1_000_476_002);
+        assert_eq!(size_of::<AntiLagModeAMD>(), 4);
+        assert_eq!(align_of::<AntiLagModeAMD>(), 4);
+        assert_eq!(size_of::<AntiLagStageAMD>(), 4);
+        assert_eq!(align_of::<AntiLagStageAMD>(), 4);
+        assert_eq!(AntiLagModeAMD::DRIVER_CONTROL.as_raw(), 0);
+        assert_eq!(AntiLagModeAMD::ON.as_raw(), 1);
+        assert_eq!(AntiLagModeAMD::OFF.as_raw(), 2);
+        assert_eq!(AntiLagStageAMD::INPUT.as_raw(), 0);
+        assert_eq!(AntiLagStageAMD::PRESENT.as_raw(), 1);
     }
 }
