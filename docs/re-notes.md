@@ -85,6 +85,19 @@ Enum types: `keen::pc::RenderDistantObjectsSetting` and similar; member tables a
 | async compute override | 0x1408490d2 | `88 4d 3e 44 38 b6 89 52 03 00 74 ??` |
 | terrain update fn (pre-hook) | 0x1401e2e80 | `48 89 5c 24 10 4c 89 44 24 18 55 56 57 41 54 41 55 41 56 41 57 48 8d ac 24 50 e0 ff ff` (prologue only; unique in this build, but fragile across updates, so prefer pairing with a body check) |
 
+### Terrain update argument layout: VERIFIED (PR #29 review)
+
+REA disassembly of `FUN_1401e2e80` in Steam build f68140a3 verifies these facts:
+
+- The original copies 40 bytes (0x28) from `params` into `mgr+0xc478`:
+  - `0x1401e2eed` `MOVUPS XMM0, [RBX]` and `0x1401e2ef0` `MOVUPS [RSI+0xc478], XMM0`;
+  - `0x1401e2ef7` `MOVUPS XMM1, [RBX+0x10]` and `0x1401e2efb` `MOVUPS [RSI+0xc488], XMM1`;
+  - `0x1401e2f02` `MOVSD XMM0, [RBX+0x20]` and `0x1401e2f0c` `MOVSD [RSI+0xc498], XMM0`.
+- The caller builds a 10-dword buffer (caller code `0x14012a427`..`0x14012a4ad`).
+- The camera argument (RDX, kept in R14) points at three i64 values, not floats: `0x1401e2f45` `CVTSI2SS XMM3, [R14]`, `0x1401e2f21` `CVTSI2SS XMM1, [R14+0x8]`, `0x1401e2f3f` `CVTSI2SS XMM2, [R14+0x10]`.
+
+The hook reads and writes only the first 32 bytes of the params buffer. It never reads the camera argument. Its `*const f32` camera type remains an opaque pointer forwarded unchanged.
+
 Several signatures include the original constant, so a match also proves the expected original bytes are present.
 
 **Extended patterns (controller, 2026-10-25, for plan Task 4).** Two rows above stop before their patch sites, so a match proved nothing about the bytes to be patched. Both were extended to cover every patch byte, and each was re-checked against `enshrouded.exe` (sha256 b28b448a…): exactly 1 match each.

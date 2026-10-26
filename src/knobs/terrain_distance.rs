@@ -11,6 +11,8 @@ use log::Level;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Four register arguments, no return value. R9 is forwarded even if unused by the game.
+/// The camera points at three i64 values; the hook never reads it. Its type stays opaque.
+/// The params buffer has at least 40 bytes; the hook reads and writes only the first 32.
 pub type TerrainUpdateFn = unsafe extern "system" fn(*mut u8, *const f32, *mut [f32; 8], usize);
 /// MinHook's trampoline, stored before queued hooks can be enabled.
 static TRAMPOLINE: AtomicUsize = AtomicUsize::new(0);
@@ -42,7 +44,8 @@ unsafe fn call_original(
 
 /// Publish the menu value, then scale the temporary caller buffer.
 /// # Safety
-/// params is null or an aligned, uniquely accessed live array of eight floats.
+/// params is null or an aligned, uniquely accessed live buffer of at least 40 bytes;
+/// the hook reads and writes only the first 32.
 unsafe fn pre_work(params: *mut [f32; 8]) {
     #[cfg(test)]
     if PANIC_IN_PRE.load(Ordering::Relaxed) == 1 {
@@ -61,15 +64,16 @@ unsafe fn pre_work(params: *mut [f32; 8]) {
     }
 }
 
-/// Publish and scale before the original; restore the caller's complete 32-byte copy afterward.
+/// Publish and scale before the original; restore the caller's 32-byte hook prefix afterward.
 /// The pre-work and all fallible post-work have nested guards, so the outer fallback can never
 /// call the original again after it ran. Restoration is a plain nonpanicking raw copy and runs
 /// even when a nested guard switched the feature off. The original is native and cannot unwind.
 /// No allocation, lock or log occurs on the normal render path.
 /// # Safety
 /// The game's four-argument contract: params is null or an aligned, exclusively accessed,
-/// readable and writable array of eight floats. All four arguments also satisfy the original's
-/// full buffer contract; the hook changes only the first 32 bytes. mgr and cam remain unchanged.
+/// readable and writable buffer of at least 40 bytes; the hook reads and writes only the first 32.
+/// cam points at three i64 values; the hook never reads it. mgr and cam remain unchanged.
+/// All four arguments also satisfy the original's full buffer contract.
 /// The original does not free params, which remains live until this detour returns.
 pub unsafe extern "system" fn terrain_update_detour(
     mgr: *mut u8,

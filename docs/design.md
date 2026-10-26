@@ -321,7 +321,7 @@ Each knob states:
 ### 7.3 Terrain detail distance (`TerrainDistance`): priority 3
 
 - **What it changes:** `dist0`, the base distance of the voxel-terrain LOD octree. A node refines while `dist × 0.969 ≤ cell × R`, where cell = 32/2^level and R = dist0 × min(2·scale, 1) (agent knob-terrain). With dist0 = 32, full detail reaches about 33 m and each coarser band doubles.
-- **Where it lives:** `FUN_1401e2e80(mgr, camPos, params)` copies 32 bytes from `params` into `mgr+0xc478` on every call (verified at `0x1401e2eed`–`0x1401e2efb`). The defaults are 32 / 128 / 256 (verified at `0x1400fa623`–`0x1400fa631`). A minhook pre-hook multiplies `params[0]` by the knob factor before calling the original.
+- **Where it lives:** `FUN_1401e2e80(mgr, camPos, params)` copies 40 bytes (0x28) from `params` into `mgr+0xc478` on every call (verified at `0x1401e2eed`–`0x1401e2f0c`). `camPos` points at three i64 values. The defaults are 32 / 128 / 256 (verified at `0x1400fa623`–`0x1400fa631`). A minhook pre-hook multiplies `params[0]` by the knob factor before calling the original. It reads and writes only the first 32 bytes of the params buffer; the conditional change to `params[1]` is described under Steps below.
 - **Not used:** `fullyMeshedRange` (`mgr+0xc444`). It is a per-frame measurement, rolled over at `0x1401e2ee4`.
 - **Baseline:** the incoming `params[0]`, published to an atomic.
 - **Steps:** factor 1.0 → 1.25 → 1.5 → 1.75 → 2.0. If dist1 < dist0 × factor, dist1 is raised by the same factor, so that the order holds. dist2 is unchanged.
