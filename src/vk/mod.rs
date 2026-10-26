@@ -76,6 +76,10 @@ pub static REAL_CREATE_DEVICE: AtomicUsize = AtomicUsize::new(0);
 pub static REAL_CREATE_SWAPCHAIN: AtomicUsize = AtomicUsize::new(0);
 /// The real `vkQueuePresentKHR`.
 pub static REAL_PRESENT: AtomicUsize = AtomicUsize::new(0);
+/// Real lifetime endpoints; teardown retires Reflex resources even after Reflex is disabled.
+pub static REAL_DESTROY_DEVICE: AtomicUsize = AtomicUsize::new(0);
+/// Real swapchain destruction endpoint.
+pub static REAL_DESTROY_SWAPCHAIN: AtomicUsize = AtomicUsize::new(0);
 /// `vkGetPhysicalDeviceMemoryProperties`, looked up when `vkCreateDevice` is handed out.
 pub static REAL_GET_MEMORY_PROPERTIES: AtomicUsize = AtomicUsize::new(0);
 /// `vkGetPhysicalDeviceProperties`, looked up when `vkCreateDevice` is handed out.
@@ -157,6 +161,8 @@ pub enum Wrap {
     Gdpa,
     CreateDevice,
     CreateSwapchain,
+    DestroyDevice,
+    DestroySwapchain,
     Present,
 }
 
@@ -180,6 +186,8 @@ pub fn classify_gipa(name: &[u8]) -> Option<Wrap> {
         b"vkGetDeviceProcAddr" => Some(Wrap::Gdpa),
         b"vkCreateDevice" => Some(Wrap::CreateDevice),
         b"vkCreateSwapchainKHR" => Some(Wrap::CreateSwapchain),
+        b"vkDestroyDevice" => Some(Wrap::DestroyDevice),
+        b"vkDestroySwapchainKHR" => Some(Wrap::DestroySwapchain),
         b"vkQueuePresentKHR" => Some(Wrap::Present),
         _ => None,
     }
@@ -194,6 +202,8 @@ pub fn classify_gdpa(name: &[u8]) -> Option<Wrap> {
     match name {
         b"vkGetDeviceProcAddr" => Some(Wrap::Gdpa),
         b"vkCreateSwapchainKHR" => Some(Wrap::CreateSwapchain),
+        b"vkDestroyDevice" => Some(Wrap::DestroyDevice),
+        b"vkDestroySwapchainKHR" => Some(Wrap::DestroySwapchain),
         b"vkQueuePresentKHR" => Some(Wrap::Present),
         _ => None,
     }
@@ -619,6 +629,18 @@ unsafe fn gipa_choose(
             wrap_create_swapchain as *const () as usize,
             false,
         ),
+        Some(Wrap::DestroyDevice) => hand_out(
+            &REAL_DESTROY_DEVICE,
+            found_addr,
+            wrap_destroy_device as *const () as usize,
+            false,
+        ),
+        Some(Wrap::DestroySwapchain) => hand_out(
+            &REAL_DESTROY_SWAPCHAIN,
+            found_addr,
+            wrap_destroy_swapchain as *const () as usize,
+            false,
+        ),
         Some(Wrap::Present) => hand_out(
             &REAL_PRESENT,
             found_addr,
@@ -661,6 +683,10 @@ pub unsafe extern "system" fn wrap_gdpa(
 static UNWRAPPED_GDPA: AtomicBool = AtomicBool::new(false);
 static UNWRAPPED_PRESENT: AtomicBool = AtomicBool::new(false);
 static UNWRAPPED_CREATE_SWAPCHAIN: AtomicBool = AtomicBool::new(false);
+/// One-time diagnostics for lifetime wrappers.
+static UNWRAPPED_DESTROY_DEVICE: AtomicBool = AtomicBool::new(false);
+/// One-time diagnostics for swapchain teardown.
+static UNWRAPPED_DESTROY_SWAPCHAIN: AtomicBool = AtomicBool::new(false);
 
 /// `true` for the first call on `flag`, `false` for every later one.
 fn first_time(flag: &AtomicBool) -> bool {
@@ -721,6 +747,18 @@ unsafe fn gdpa_choose(
             &UNWRAPPED_CREATE_SWAPCHAIN,
             "vkCreateSwapchainKHR",
         ),
+        Some(Wrap::DestroyDevice) => (
+            &REAL_DESTROY_DEVICE,
+            wrap_destroy_device as *const () as usize,
+            &UNWRAPPED_DESTROY_DEVICE,
+            "vkDestroyDevice",
+        ),
+        Some(Wrap::DestroySwapchain) => (
+            &REAL_DESTROY_SWAPCHAIN,
+            wrap_destroy_swapchain as *const () as usize,
+            &UNWRAPPED_DESTROY_SWAPCHAIN,
+            "vkDestroySwapchainKHR",
+        ),
         // `classify_gdpa` gives no other variant.
         None | Some(Wrap::Gipa | Wrap::CreateDevice) => return found,
     };
@@ -759,7 +797,16 @@ pub unsafe extern "system" fn wrap_create_device(
             warn_null_once(&NULL_CREATE_DEVICE, "vkCreateDevice");
             return vk::Result::ERROR_INITIALIZATION_FAILED;
         }
-        let result = original();
+        // SAFETY: nonzero real is the saved vkCreateDevice; arguments retain the native contract.
+        let result = unsafe {
+            crate::reflex::create_device(
+                std::mem::transmute::<usize, vk::PFN_vkCreateDevice>(real),
+                phys,
+                info,
+                allocator,
+                device,
+            )
+        };
         // The device exists now. A panic from here on must not make the outer guard create a
         // second one, so the rest runs in its own guard, whose fallback does nothing.
         guard(
@@ -798,6 +845,14 @@ unsafe fn after_create_device(
     ) {
         return;
     }
+    DEVICE_QUERIES.publish(
+        GameDevice {
+            device,
+            phys: phys.as_raw() as usize,
+        },
+        REAL_GIPA.load(Ordering::Acquire),
+        GAME_INSTANCE.load(Ordering::Acquire),
+    );
     // SAFETY: `phys` is the physical device the first device was just created on.
     unsafe { on_first_device(phys) };
 }
@@ -861,7 +916,16 @@ pub unsafe extern "system" fn wrap_create_swapchain(
             warn_null_once(&NULL_CREATE_SWAPCHAIN, "vkCreateSwapchainKHR");
             return vk::Result::ERROR_INITIALIZATION_FAILED;
         }
-        original()
+        // SAFETY: saved native function and unchanged Vulkan caller arguments.
+        unsafe {
+            crate::reflex::create_swapchain(
+                std::mem::transmute::<usize, vk::PFN_vkCreateSwapchainKHR>(real),
+                device,
+                info,
+                allocator,
+                swapchain,
+            )
+        }
     })
 }
 
@@ -1187,6 +1251,149 @@ pub fn init(texture: TextureSettings, priority: Priority) {
         Err(why) => log::warn!("vk wrapper: off: {why}"),
     }
 }
+
+/// Frozen lookup context for the first created device, independent of GPU vendor or Reflex mode.
+#[derive(Clone, Copy)]
+struct QueryContext {
+    game: GameDevice,
+    gipa: usize,
+    instance: usize,
+}
+
+/// A read-only native-device lease. All cross-atomic lifetime operations use SeqCst ordering.
+struct DeviceQueries {
+    context: OnceLock<QueryContext>,
+    live: AtomicBool,
+    readers: AtomicUsize,
+}
+impl DeviceQueries {
+    /// Empty until the first device is published.
+    const fn new() -> Self {
+        Self {
+            context: OnceLock::new(),
+            live: AtomicBool::new(false),
+            readers: AtomicUsize::new(0),
+        }
+    }
+    /// Publish exactly one paired context. A retired context can never be reactivated.
+    fn publish(&self, game: GameDevice, gipa: usize, instance: usize) {
+        if gipa != 0
+            && instance != 0
+            && self
+                .context
+                .set(QueryContext {
+                    game,
+                    gipa,
+                    instance,
+                })
+                .is_ok()
+        {
+            self.live.store(true, Ordering::SeqCst);
+        }
+    }
+    /// Run only while the first device remains live; callback panics still release the lease.
+    fn with<T>(&self, query: impl FnOnce(GameDevice, usize, usize) -> T) -> Option<T> {
+        self.readers.fetch_add(1, Ordering::SeqCst);
+        let _reader = DeviceQueryReader(&self.readers);
+        if !self.live.load(Ordering::SeqCst) {
+            return None;
+        }
+        let context = self.context.get()?;
+        Some(query(context.game, context.gipa, context.instance))
+    }
+    /// Invalidate before native destruction, then wait outside the present path for existing readers.
+    fn retire(&self, device: usize) {
+        if !self
+            .context
+            .get()
+            .is_some_and(|context| context.game.device == device)
+        {
+            return;
+        }
+        self.live.store(false, Ordering::SeqCst);
+        while self.readers.load(Ordering::SeqCst) != 0 {
+            std::thread::yield_now();
+        }
+    }
+}
+/// A read lease releases even if the Rust query panics.
+struct DeviceQueryReader<'a>(&'a AtomicUsize);
+impl Drop for DeviceQueryReader<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+/// First-device query state, valid for every GPU and for Reflex off/unavailable.
+static DEVICE_QUERIES: DeviceQueries = DeviceQueries::new();
+
+/// Run a read-only physical-device query under a lifetime lease. The arguments are the first
+/// device/physical-device pair, its frozen real GIPA address, and its instance handle.
+/// Returns None before publication and permanently after that first device's teardown.
+///
+/// The callback must not destroy this device (that would wait for its own lease), keep native
+/// references past its return, or launch asynchronous queries using these handles. Vulkan requires
+/// child devices destroyed before their instance, so draining the device lease also protects its
+/// physical device and instance. The game must obey that Vulkan lifetime contract and fetch its
+/// destroy entry points through the installed wrapper chain.
+pub fn with_game_device<T>(query: impl FnOnce(GameDevice, usize, usize) -> T) -> Option<T> {
+    DEVICE_QUERIES.with(query)
+}
+/// Destroy a device only after retiring its Reflex resources.
+/// # Safety
+/// The contract of vkDestroyDevice. The game must externally synchronize teardown.
+pub unsafe extern "system" fn wrap_destroy_device(
+    device: vk::Device,
+    allocator: *const vk::AllocationCallbacks<'_>,
+) {
+    let finished = std::cell::Cell::new(false);
+    let original = || {
+        if finished.replace(true) {
+            return;
+        }
+        // SAFETY: called before native destruction, including the disabled-feature fallback.
+        DEVICE_QUERIES.retire(device.as_raw() as usize);
+        unsafe { crate::reflex::before_destroy(device, None) };
+        let real = REAL_DESTROY_DEVICE.load(Ordering::Acquire);
+        if real != 0 {
+            // SAFETY: the saved function matches this signature; original caller arguments.
+            unsafe {
+                std::mem::transmute::<usize, vk::PFN_vkDestroyDevice>(real)(device, allocator)
+            };
+        }
+    };
+    guard(Feature::Reflex, original, original);
+}
+
+/// Destroy a swapchain only after its active Reflex record has no readers.
+/// # Safety
+/// The contract of vkDestroySwapchainKHR. The game must externally synchronize teardown.
+pub unsafe extern "system" fn wrap_destroy_swapchain(
+    device: vk::Device,
+    swapchain: vk::SwapchainKHR,
+    allocator: *const vk::AllocationCallbacks<'_>,
+) {
+    let finished = std::cell::Cell::new(false);
+    let original = || {
+        if finished.replace(true) {
+            return;
+        }
+        // SAFETY: native swapchain remains live until the call below.
+        unsafe { crate::reflex::before_destroy(device, Some(swapchain)) };
+        let real = REAL_DESTROY_SWAPCHAIN.load(Ordering::Acquire);
+        if real != 0 {
+            // SAFETY: the saved function has this signature and receives original arguments.
+            unsafe {
+                std::mem::transmute::<usize, vk::PFN_vkDestroySwapchainKHR>(real)(
+                    device, swapchain, allocator,
+                )
+            };
+        }
+    };
+    guard(Feature::Reflex, original, original);
+}
+
+const _: vk::PFN_vkDestroyDevice = wrap_destroy_device;
+const _: vk::PFN_vkDestroySwapchainKHR = wrap_destroy_swapchain;
 
 #[cfg(test)]
 mod tests {
@@ -1922,5 +2129,66 @@ mod tests {
             assert!(query_gpu(0, 1, vk::PhysicalDevice::null()).is_none());
             assert!(query_gpu(1, 0, vk::PhysicalDevice::null()).is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod device_lease_tests {
+    use super::*;
+    /// The lease protects AMD/off devices as well, refuses new readers at teardown, and drains the last reader.
+    #[test]
+    fn device_queries_are_paired_and_teardown_drains_readers() {
+        let state = DeviceQueries::new();
+        state.publish(GameDevice { device: 1, phys: 2 }, 3, 4);
+        assert_eq!(
+            state.with(|d, g, i| (d.device, d.phys, g, i)),
+            Some((1, 2, 3, 4))
+        );
+        std::thread::scope(|scope| {
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let state_ref = &state;
+            let worker = scope.spawn(move || {
+                state_ref.with(|_, _, _| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+            });
+            entered_rx.recv().unwrap();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let state_ref = &state;
+            let destroy = scope.spawn(move || {
+                state_ref.retire(1);
+                done_tx.send(()).unwrap();
+            });
+            while state.live.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            assert!(state
+                .with(|_, _, _| panic!("must not query after detach"))
+                .is_none());
+            assert!(
+                done_rx.try_recv().is_err(),
+                "teardown cannot finish while the query is live"
+            );
+            release_tx.send(()).unwrap();
+            worker.join().unwrap();
+            destroy.join().unwrap();
+            done_rx.recv().unwrap();
+        });
+        state.publish(GameDevice { device: 5, phys: 6 }, 7, 8);
+        assert!(
+            state.with(|_, _, _| ()).is_none(),
+            "the first-device-only context never reactivates"
+        );
+    }
+    /// A Rust query panic releases its lease so teardown cannot hang on a leaked reader count.
+    #[test]
+    fn device_query_panic_releases_reader() {
+        let state = DeviceQueries::new();
+        state.publish(GameDevice { device: 1, phys: 2 }, 3, 4);
+        assert!(std::panic::catch_unwind(|| state.with(|_, _, _| panic!("query"))).is_err());
+        assert_eq!(state.readers.load(Ordering::SeqCst), 0);
+        state.retire(1);
     }
 }

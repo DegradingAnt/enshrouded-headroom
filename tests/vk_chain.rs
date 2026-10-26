@@ -843,3 +843,271 @@ fn the_wrapper_chain_works_end_to_end() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Isolated fake-driver cases exercise the real create wrappers, including exact-pointer retries.
+mod reflex_driver {
+    use super::*;
+    use enshrouded_headroom::config::ReflexMode;
+    use enshrouded_headroom::{
+        guard::{guard, Feature},
+        reflex,
+    };
+    static ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+    static ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+    static CHANGED_OK: AtomicUsize = AtomicUsize::new(0);
+    static RETRY_OK: AtomicUsize = AtomicUsize::new(0);
+    static VENDOR: AtomicUsize = AtomicUsize::new(0x10de);
+    static REFUSE: AtomicUsize = AtomicUsize::new(0);
+
+    /// # Safety
+    /// The test passes a writable physical-properties output.
+    unsafe extern "system" fn properties(
+        _: vk::PhysicalDevice,
+        out: *mut vk::PhysicalDeviceProperties,
+    ) {
+        guard(
+            Feature::VkWrap,
+            || (),
+            || {
+                // SAFETY: the query supplies this live output object.
+                unsafe {
+                    (*out).vendor_id = VENDOR.load(Ordering::Relaxed) as u32;
+                }
+            },
+        );
+    }
+    /// # Safety
+    /// Vulkan's extension-query contract, supplied by the wrapper under test.
+    unsafe extern "system" fn extensions(
+        _: vk::PhysicalDevice,
+        _: *const c_char,
+        count: *mut u32,
+        out: *mut vk::ExtensionProperties,
+    ) -> vk::Result {
+        guard(
+            Feature::VkWrap,
+            || vk::Result::ERROR_UNKNOWN,
+            || {
+                let names = [
+                    c"VK_NV_low_latency2",
+                    c"VK_KHR_timeline_semaphore",
+                    c"VK_KHR_present_id",
+                ];
+                // SAFETY: query output capacity is at least the count previously advertised.
+                unsafe {
+                    if !out.is_null() {
+                        for (index, name) in names.iter().enumerate() {
+                            let mut entry = vk::ExtensionProperties {
+                                spec_version: 3,
+                                ..Default::default()
+                            };
+                            for (dst, byte) in entry
+                                .extension_name
+                                .iter_mut()
+                                .zip(name.to_bytes_with_nul())
+                            {
+                                *dst = *byte as c_char;
+                            }
+                            out.add(index).write(entry);
+                        }
+                    }
+                    count.write(3);
+                }
+                vk::Result::SUCCESS
+            },
+        )
+    }
+    /// # Safety
+    /// The wrapper supplies a writable Features2 chain with the queried feature layouts.
+    unsafe extern "system" fn features(
+        _: vk::PhysicalDevice,
+        out: *mut vk::PhysicalDeviceFeatures2<'_>,
+    ) {
+        guard(
+            Feature::VkWrap,
+            || (),
+            || {
+                // SAFETY: the query's output chain consists of these live feature structs.
+                unsafe {
+                    let mut node = (*out).p_next.cast::<vk::BaseOutStructure<'_>>();
+                    while !node.is_null() {
+                        match (*node).s_type {
+                            vk::StructureType::PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES => {
+                                (*node.cast::<vk::PhysicalDeviceTimelineSemaphoreFeatures<'_>>())
+                                    .timeline_semaphore = vk::TRUE
+                            }
+                            vk::StructureType::PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR => {
+                                (*node.cast::<vk::PhysicalDevicePresentIdFeaturesKHR<'_>>())
+                                    .present_id = vk::TRUE
+                            }
+                            _ => (),
+                        }
+                        node = (*node).p_next;
+                    }
+                }
+            },
+        );
+    }
+    /// # Safety
+    /// Called with a terminated function name.
+    unsafe extern "system" fn gipa(_: vk::Instance, name: *const c_char) -> vk::PFN_vkVoidFunction {
+        guard(
+            Feature::VkWrap,
+            || None,
+            || {
+                // SAFETY: every request uses a valid NUL-terminated name.
+                let name = unsafe { CStr::from_ptr(name) };
+                to_void(match name.to_bytes() {
+                    b"vkGetPhysicalDeviceProperties" => properties as *const () as usize,
+                    b"vkEnumerateDeviceExtensionProperties" => extensions as *const () as usize,
+                    b"vkGetPhysicalDeviceFeatures2" => features as *const () as usize,
+                    _ => 0,
+                })
+            },
+        )
+    }
+    /// # Safety
+    /// Vulkan device-create inputs and output remain live during this fake call.
+    unsafe extern "system" fn create(
+        _: vk::PhysicalDevice,
+        info: *const vk::DeviceCreateInfo<'_>,
+        _: *const vk::AllocationCallbacks<'_>,
+        out: *mut vk::Device,
+    ) -> vk::Result {
+        guard(
+            Feature::VkWrap,
+            || vk::Result::ERROR_UNKNOWN,
+            || {
+                let attempt = ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+                if info as usize == ORIGINAL.load(Ordering::Relaxed) {
+                    RETRY_OK.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    // SAFETY: the wrapper's owned create-info/chain/list remain live during the driver call.
+                    unsafe {
+                        let info = &*info;
+                        let names = std::slice::from_raw_parts(
+                            info.pp_enabled_extension_names,
+                            info.enabled_extension_count as usize,
+                        );
+                        let low = names
+                            .iter()
+                            .any(|n| CStr::from_ptr(*n) == c"VK_NV_low_latency2");
+                        let mut timeline = false;
+                        let mut present = false;
+                        let mut address_preserved = false;
+                        let mut node = info.p_next.cast::<vk::BaseInStructure<'_>>();
+                        while !node.is_null() {
+                            if (*node).s_type
+                                == vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_2_FEATURES
+                            {
+                                let f = &*node.cast::<vk::PhysicalDeviceVulkan12Features<'_>>();
+                                timeline = f.timeline_semaphore == vk::TRUE;
+                                address_preserved = f.buffer_device_address == vk::TRUE;
+                            }
+                            if (*node).s_type
+                                == vk::StructureType::PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR
+                            {
+                                present = (*node
+                                    .cast::<vk::PhysicalDevicePresentIdFeaturesKHR<'_>>())
+                                .present_id
+                                    == vk::TRUE;
+                            }
+                            node = (*node).p_next;
+                        }
+                        if low && timeline && present && address_preserved {
+                            CHANGED_OK.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+                if REFUSE.load(Ordering::Relaxed) != 0 && attempt == 0 {
+                    return vk::Result::ERROR_EXTENSION_NOT_PRESENT;
+                }
+                // SAFETY: caller output storage is writable.
+                unsafe {
+                    out.write(vk::Device::from_raw(DEVICE));
+                }
+                vk::Result::SUCCESS
+            },
+        )
+    }
+    fn child(case: &str) {
+        reflex::init(ReflexMode::Auto);
+        REAL_GIPA.store(gipa as *const () as usize, Ordering::Release);
+        GAME_INSTANCE.store(INSTANCE as usize, Ordering::Release);
+        REAL_CREATE_DEVICE.store(create as *const () as usize, Ordering::Release);
+        if case == "vendor" {
+            VENDOR.store(0x1002, Ordering::Relaxed);
+        }
+        if case == "refusal" {
+            REFUSE.store(1, Ordering::Relaxed);
+        }
+        let mut tail = vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true);
+        let mut v12 = vk::PhysicalDeviceVulkan12Features::default().buffer_device_address(true);
+        v12.p_next = (&mut tail as *mut vk::PhysicalDeviceVulkan13Features<'_>).cast();
+        let original_next = v12.p_next;
+        let names = [c"VK_KHR_swapchain".as_ptr()];
+        let mut info = vk::DeviceCreateInfo::default().enabled_extension_names(&names);
+        info.p_next = (&v12 as *const vk::PhysicalDeviceVulkan12Features<'_>).cast();
+        let original_chain = info.p_next;
+        ORIGINAL.store(&info as *const _ as usize, Ordering::Relaxed);
+        let mut device = vk::Device::null();
+        // SAFETY: live fake inputs/outputs and fake function table for the made-up physical device.
+        let result = unsafe {
+            wrap_create_device(
+                vk::PhysicalDevice::from_raw(PHYS),
+                &info,
+                std::ptr::null(),
+                &mut device,
+            )
+        };
+        assert_eq!(result, vk::Result::SUCCESS);
+        assert_eq!(info.p_next, original_chain);
+        assert_eq!(v12.p_next, original_next);
+        assert_eq!(v12.timeline_semaphore, vk::FALSE);
+        assert_eq!(v12.buffer_device_address, vk::TRUE);
+        match case {
+            "extension" => {
+                assert_eq!(ATTEMPTS.load(Ordering::Relaxed), 1);
+                assert_eq!(CHANGED_OK.load(Ordering::Relaxed), 1);
+                assert_eq!(RETRY_OK.load(Ordering::Relaxed), 0);
+            }
+            "refusal" => {
+                assert_eq!(ATTEMPTS.load(Ordering::Relaxed), 2);
+                assert_eq!(CHANGED_OK.load(Ordering::Relaxed), 1);
+                assert_eq!(RETRY_OK.load(Ordering::Relaxed), 1);
+                assert!(enshrouded_headroom::guard::is_disabled(Feature::Reflex));
+            }
+            "vendor" => {
+                assert_eq!(ATTEMPTS.load(Ordering::Relaxed), 1);
+                assert_eq!(CHANGED_OK.load(Ordering::Relaxed), 0);
+                assert_eq!(RETRY_OK.load(Ordering::Relaxed), 1);
+                assert!(!enshrouded_headroom::guard::is_disabled(Feature::Reflex));
+            }
+            _ => unreachable!(),
+        }
+    }
+    #[test]
+    fn listed_extension_original_retry_and_vendor_gate() {
+        if let Ok(case) = std::env::var("W23_FAKE_DRIVER") {
+            child(&case);
+            return;
+        }
+        for case in ["extension", "refusal", "vendor"] {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "reflex_driver::listed_extension_original_retry_and_vendor_gate",
+                    "--nocapture",
+                ])
+                .env("W23_FAKE_DRIVER", case)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{case}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}

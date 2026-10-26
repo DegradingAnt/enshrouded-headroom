@@ -245,6 +245,9 @@ pub unsafe extern "system" fn scene_settings_detour(
     // game's own, passed on unchanged.
     let original = move || unsafe { call_original(trampoline, scene, settings, extra) };
     run_after_original(original, move || {
+        // SAFETY: these are the original caller's settings and preferences pointers; the reader
+        // checks their verified relationship before reading the options prefix.
+        crate::reflex::publish_menu(unsafe { crate::reflex::read_menu(settings, extra.cast()) });
         let apply = APPLY_FACTOR.load(Ordering::Acquire);
         // SAFETY: `post` runs right after the original wrote the struct at `scene`, on the game's
         // thread, which owns that struct (a stack local of the caller).
@@ -967,5 +970,38 @@ mod tests {
                 unsafe { MinHook::remove_hook(target as *mut c_void) }.unwrap();
             },
         );
+    }
+    /// The native detour publishes the guarded saved value and clears it on malformed inputs.
+    #[test]
+    fn native_post_hook_publishes_guarded_reflex_menu() {
+        in_child("native_post_hook_publishes_guarded_reflex_menu", || {
+            let target = fake_scene_settings as *const () as usize;
+            // SAFETY: this isolated process owns the documented fake function and hook.
+            unsafe { hook_at(target) }.unwrap();
+            assert_eq!(apply_queued(), Ok(1));
+            let mut scene = vec![0u8; 0x400];
+            let mut options = [0u64; 32];
+            let base = options.as_mut_ptr().cast::<u8>();
+            // SAFETY: the aligned fake options allocation contains all accesses made by the native fake
+            // and by the post-hook, including the negative settings offsets and preferences.
+            unsafe {
+                let render = base.add(16);
+                let prefs = render.add(0x54).cast::<u32>();
+                render.sub(8).cast::<u32>().write(2);
+                render.sub(11).write(1);
+                let f: SceneSettingsFn = std::hint::black_box(fake_scene_settings);
+                f(scene.as_mut_ptr(), render, prefs);
+                assert_eq!(crate::reflex::game_menu(), Some(2));
+                assert_eq!(FAKE_CALLS.load(Relaxed), 1);
+                render.sub(8).cast::<u32>().write(9);
+                f(scene.as_mut_ptr(), render, prefs);
+                assert_eq!(crate::reflex::game_menu(), None);
+                render.sub(8).cast::<u32>().write(1);
+                f(scene.as_mut_ptr(), render, prefs.add(1));
+                assert_eq!(crate::reflex::game_menu(), None);
+                assert_eq!(FAKE_CALLS.load(Relaxed), 3);
+                MinHook::remove_hook(target as *mut c_void).unwrap();
+            }
+        });
     }
 }
