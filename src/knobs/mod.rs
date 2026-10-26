@@ -12,13 +12,24 @@
 //! This module also holds the MinHook helpers: `create_and_queue` creates a hook and queues it,
 //! and [`enable_queued_hooks`] enables every queued hook at once. `entry::start` calls that once,
 //! as its last step, so every code hook goes live in one batch.
+//!
+//! # Loom models
+//!
+//! Run `RUSTFLAGS="--cfg loom" cargo test --release --lib knobs::loom`.
+//! Local model knobs instrument every field and execute these same methods and orderings.
+//! Existing const globals stay standard-backed in the model build; normal builds use only the
+//! exact standard atomic types. The models cover two publishes and one concurrent reader, not
+//! sequence-counter wraparound or the native hooks. Loom has its documented relaxed-order limits:
+//! <https://docs.rs/loom/0.7.2/loom/>.
 
 pub mod object_distance;
 pub mod scatter_distance;
+mod sync;
 pub mod terrain_distance;
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::AtomicU32;
+use sync::{AtomicU32 as SharedAtomicU32, AtomicU64 as SharedAtomicU64, Ordering};
 
 use log::Level;
 use minhook::{MinHook, MH_STATUS};
@@ -43,24 +54,24 @@ use crate::guard::catch;
 ///   time of a publish or a seen also sees what that call (and its caller, before it) stored.
 pub struct KnobShared {
     /// The value the hook applies (a factor, or metres for the scatter knob), as `f32` bits.
-    value_bits: AtomicU32,
+    value_bits: SharedAtomicU32,
     /// The game's own value from the last publish, as `f32` bits; 0 (0.0) before the first.
-    baseline_bits: AtomicU32,
+    baseline_bits: SharedAtomicU32,
     /// How many times the baseline has changed (wraps). 0 before the first change.
-    baseline_seq: AtomicU32,
+    baseline_seq: SharedAtomicU32,
     /// `QueryPerformanceCounter` time passed to the last call of publish or seen; 0 before the
     /// first such call.
-    last_seen_qpc: AtomicU64,
+    last_seen_qpc: SharedAtomicU64,
 }
 
 impl KnobShared {
     /// A knob with value `v` and no baseline yet: `baseline()` is `(0.0, 0)`, `last_seen()` is 0.
     pub const fn new(v: f32) -> Self {
         KnobShared {
-            value_bits: AtomicU32::new(v.to_bits()),
-            baseline_bits: AtomicU32::new(0),
-            baseline_seq: AtomicU32::new(0),
-            last_seen_qpc: AtomicU64::new(0),
+            value_bits: SharedAtomicU32::new(v.to_bits()),
+            baseline_bits: SharedAtomicU32::new(0),
+            baseline_seq: SharedAtomicU32::new(0),
+            last_seen_qpc: SharedAtomicU64::new(0),
         }
     }
 
@@ -344,5 +355,103 @@ mod tests {
         assert_eq!(k.last_seen(), 9);
         assert_eq!(k.baseline(), (2.0, 1), "no baseline, no change counted");
         assert_eq!(k.value(), 1.0);
+    }
+}
+
+/// Model only local knobs; runtime globals retain const standard-atomic construction.
+#[cfg(all(test, loom))]
+mod loom {
+    use super::{sync, KnobShared};
+    use ::loom::sync::Arc;
+    use ::loom::thread;
+
+    /// Every field of this local knob is instrumented; no runtime-global constructor is modeled.
+    fn model_knob(value: f32) -> KnobShared {
+        KnobShared {
+            value_bits: sync::AtomicU32::modeled(value.to_bits()),
+            baseline_bits: sync::AtomicU32::modeled(0),
+            baseline_seq: sync::AtomicU32::modeled(0),
+            last_seen_qpc: sync::AtomicU64::modeled(0),
+        }
+    }
+    /// Check every two-thread execution without permutation, duration or preemption sampling.
+    fn check(model: impl Fn() + Send + Sync + 'static) {
+        let mut builder = ::loom::model::Builder::new();
+        builder.max_threads = 2;
+        builder.max_permutations = None;
+        builder.max_duration = None;
+        builder.preemption_bound = None;
+        builder.check(model);
+    }
+
+    #[test]
+    fn counter_never_publishes_an_older_baseline() {
+        check(|| {
+            let knob = Arc::new(model_knob(1.0));
+            let writer_knob = Arc::clone(&knob);
+            let writer = thread::spawn(move || {
+                writer_knob.publish(1.0, 10);
+                writer_knob.publish(2.0, 20);
+            });
+            let (baseline, counter) = knob.baseline();
+            assert!(counter <= 2);
+            assert!(
+                baseline >= counter as f32,
+                "counter {counter} exposed older baseline {baseline}"
+            );
+            writer.join().unwrap();
+            assert_eq!(knob.baseline(), (2.0, 2));
+        });
+    }
+    #[test]
+    fn publishing_identical_bits_twice_moves_the_counter_only_once() {
+        check(|| {
+            let knob = Arc::new(model_knob(1.0));
+            let writer_knob = Arc::clone(&knob);
+            let writer = thread::spawn(move || {
+                // Negative zero differs from the initial baseline bits, then repeats exactly.
+                writer_knob.publish(-0.0, 10);
+                let first_counter = writer_knob.baseline().1;
+                writer_knob.publish(-0.0, 20);
+                assert_eq!(writer_knob.baseline().1, first_counter);
+            });
+            let (baseline, counter) = knob.baseline();
+            assert!(counter <= 1, "identical bits counted as {counter} changes");
+            if counter == 1 {
+                assert_eq!(baseline.to_bits(), (-0.0f32).to_bits());
+            }
+            writer.join().unwrap();
+            assert_eq!(knob.baseline().0.to_bits(), (-0.0f32).to_bits());
+            assert_eq!(knob.baseline().1, 1);
+            assert_eq!(knob.last_seen(), 20);
+        });
+    }
+
+    #[test]
+    fn seeing_a_publish_time_orders_its_counter_or_a_later_one() {
+        check(|| {
+            let knob = Arc::new(model_knob(1.0));
+            let writer_knob = Arc::clone(&knob);
+            let writer = thread::spawn(move || {
+                writer_knob.publish(1.0, 10);
+                writer_knob.publish(2.0, 20);
+            });
+            let seen = knob.last_seen();
+            let (_, counter) = knob.baseline();
+            let minimum = match seen {
+                0 => 0,
+                10 => 1,
+                20 => 2,
+                other => panic!("unexpected time {other}"),
+            };
+            assert!(
+                counter >= minimum,
+                "time {seen} exposed earlier counter {counter}"
+            );
+            // A newer counter with an older time is allowed: there is no reverse promise.
+            writer.join().unwrap();
+            assert_eq!(knob.last_seen(), 20);
+            assert_eq!(knob.baseline(), (2.0, 2));
+        });
     }
 }

@@ -57,6 +57,11 @@ jobs:
           Get-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
           exit $testExitCode
 
+      - name: Loom knob memory orderings
+        env:
+          RUSTFLAGS: --cfg loom
+        run: cargo test --release --lib knobs::loom
+
       - name: Build the .asi
         run: cargo asi
 
