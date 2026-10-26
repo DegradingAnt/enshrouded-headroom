@@ -58,7 +58,7 @@ pub fn to_hex(hash: &[u8; 32]) -> String {
     hash.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// SHA-256 of the file at `path`, read in one pass in chunks of [`CHUNK`] bytes, so the file
+/// SHA-256 of the file at `path`, read in one pass in chunks of `CHUNK` bytes, so the file
 /// (the game exe is 35 MB) is never held in memory. The hash is BCrypt's (`bcrypt.dll`, part of
 /// Windows).
 pub fn sha256_file(path: &Path) -> io::Result<[u8; 32]> {
