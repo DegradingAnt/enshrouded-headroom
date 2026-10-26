@@ -28,7 +28,7 @@ Out of scope for version 1:
 - An in-game menu or overlay.
 - Any setting below the player's menu choice.
 
-Test-environment note: the test machine is the Steam install of the game (`C:\Program Files (x86)\Steam\steamapps\common\Enshrouded`). Its exe starts in Steam's DRM stub, the `.bind` section, and the folder has no `winmm.dll`: one loader (Ultimate ASI Loader), and nothing else that could change what sits in the import slots. (The old install, which is being deleted, had an unexplained `winmm.dll`, 577,024 bytes, "ACME Corporation".) Ultimate ASI Loader handles `.bind`: it ignores calls from that section as triggers (from loader source v10.0.0, unconfirmed in game). The first in-game run uses the loader's `DebugLog=1`.
+Test-environment note: the test machine is the Steam install of the game (`C:\Program Files (x86)\Steam\steamapps\common\Enshrouded`). Its exe starts in Steam's DRM stub, the `.bind` section, and the folder has no `winmm.dll`. After the loader install step in plan Task 17, the folder holds one loader (Ultimate ASI Loader) and nothing else that could change what sits in the import slots. (The old install, which is being deleted, had an unexplained `winmm.dll`, 577,024 bytes, "ACME Corporation".) Ultimate ASI Loader handles `.bind`: it ignores calls from that section as triggers (from loader source v10.0.0, unconfirmed in game). The first in-game run uses the loader's `DebugLog=1`.
 
 ## 3. Constraints
 
@@ -119,7 +119,7 @@ Fact (bytes at `0x1408490cb`–`0x1408490e8`):
 Method: patch the 16 bytes at `0x1408490d5`–`0x1408490e4` to `b0 01` (`mov al, 1`) followed by 14 bytes of NOPs. The following `mov [rbp+0x3e], al` then stores 1. This is exactly what `--enable-async-compute` produces, and the automatic byte stays untouched.
 
 The patch is skipped if:
-- the command line already has `--enable-async-compute` or `--disable-async-compute`, because the player chose;
+- any command-line argument contains `async-compute` after quotes are removed and ASCII case is ignored (this covers the game's `--enable-async-compute` and `--disable-async-compute`), because the player chose;
 - the `.ini` has `AsyncCompute = game`;
 - the build is unknown (section 9).
 

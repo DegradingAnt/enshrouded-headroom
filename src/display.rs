@@ -5,7 +5,8 @@
 //! They keep no state between calls, take no lock, touch no game memory and do not log (the caller
 //! logs; the one exception is the panic guard around the `EnumWindows` callback, which logs once if
 //! the callback ever panics). Each call asks Windows afresh, so a change of display mode, or of the
-//! monitor the window is on, shows up on the next call.
+//! monitor the window is on, shows up on the next call. If the callback panics, the process-wide
+//! guard disables the governor, so `game_window` returns `None` on later calls.
 
 use crate::guard::{self, guard, Feature};
 use windows_sys::core::BOOL;
