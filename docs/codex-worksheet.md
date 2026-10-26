@@ -180,6 +180,77 @@ Add a final section `## About AI assistance` that contains only the line `TODO: 
 
 ---
 
+# Part 2 (W8-W12)
+
+Start these only after the PR for the task they depend on is merged. The dependency is noted on each task. As before, do one task per PR, from a fresh branch off the current `feat/v1`, into `feat/v1`.
+
+## W8. Property tests for the settings parser (after W5, PR #6, is merged)
+
+**Why:** the `.ini` is hand-edited by players. The parser must never panic and must always fall back sanely, whatever the input.
+
+**Do:** add `proptest` as a **dev-dependency** (the current release; give the reason in the PR). Then add property tests in `src/config.rs`'s test module:
+- `config::parse` on any random string (including invalid UTF-8 turned into U+FFFD, very long lines, NUL bytes and `\r`) never panics. Every returned value is inside its documented range.
+- `parse(DEFAULT_INI)` gives `Config::default()` with no warnings.
+- For every numeric key: a random value outside its range gives the default or the clamped value, plus exactly one warning that names the key.
+- A decimal comma (`0,9`) is read like `0.9` wherever the docs say so.
+- Keep each property's case count low enough that `cargo test` stays under about 10 s more on CI.
+
+**Done when:** CI passes; removing any range check in the parser makes at least one property fail. Say in the PR which check you removed to show it.
+
+## W9. Property tests for the byte-pattern scanner (after W4, PR #5, is merged)
+
+**Why:** `src/scan.rs` runs inside the game at start-up. A wrong match patches the wrong bytes.
+
+**Do:** with the same `proptest` dev-dependency, add property tests:
+- Pattern parsing on random strings never panics. A valid pattern string round-trips (bytes plus wildcards).
+- `find_unique` (or the current equivalent) on random byte buffers with random patterns, some of them planted, always agrees with a naive reference search written inside the test:
+  - zero matches → none;
+  - exactly one → that offset;
+  - two or more → the "not unique" error.
+- It never panics, including on an empty buffer, an empty pattern and an all-wildcard pattern.
+
+**Done when:** CI passes; a deliberately broken `find_unique` (an off-by-one at the buffer end) fails a property. Say how you checked that.
+
+## W10. CI improvements (any time)
+
+**Do:** in `.github/workflows/ci.yml`:
+- add `Swatinem/rust-cache@v2` after checkout;
+- add a `cargo doc --no-deps` step with `RUSTDOCFLAGS: -D warnings` (fix any broken intra-doc links it finds; doc text only);
+- write the test summary lines (`test result:`) to `$GITHUB_STEP_SUMMARY`.
+
+Keep the job under about 5 minutes.
+
+**Done when:** CI passes on the PR and the summary shows the test counts.
+
+## W11. Troubleshooting guide (after W6, PR #7, is merged)
+
+**Why:** players will send the plugin log. Each line in it should be explainable.
+
+**Do:** create `docs/troubleshooting.md`:
+- For every message the plugin can log (grep the `log::info!`, `log::warn!` and `log::error!` format strings in `src/`), say what it means and what the player should do.
+- Group the messages by feature: start-up and build check, settings, texture budget, async compute, Vulkan hooks, display.
+- Quote each message's fixed text exactly. Do not invent messages that are not in the code.
+- Link the guide from the README's troubleshooting section.
+
+**Done when:** a check you describe in the PR shows that every `info!`, `warn!` and `error!` format string in `src/` (outside tests) appears in the guide.
+
+## W12. Issue template and changelog (after W6, PR #7, is merged)
+
+**Do:**
+- Add `.github/ISSUE_TEMPLATE/bug_report.yml`. It is a form that asks for:
+  - the plugin log (`enshrouded-headroom.log`, attached);
+  - the "game build:" line from that log;
+  - the GPU and driver;
+  - the `.ini` changes;
+  - steps to reproduce;
+  - what happened and what was expected.
+- Add `.github/ISSUE_TEMPLATE/config.yml` with `blank_issues_enabled: false`.
+- Add `CHANGELOG.md` (Keep a Changelog format) with an `Unreleased` section that summarises what is on `feat/v1`, from `git log` and the merged PRs. Use plain words and no personal names.
+
+**Done when:** the issue form renders on GitHub (YAML is valid) and the changelog matches the merged work.
+
+---
+
 ## Appendix: text for `docs/perf-findings.md` (W2)
 
 > # Enshrouded performance findings (2026-10-23)
