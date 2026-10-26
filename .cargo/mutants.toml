@@ -1,0 +1,19 @@
+# W16 pure-module audit. Run on Windows with cargo-mutants 27.1.0.
+# cargo mutants --timeout 30 --build-timeout 180 --jobs 4
+# Per-module counts: use --no-config --file <path> --cargo-arg=--lib
+# with the same timeouts/jobs; config and CLI file lists are additive.
+examine_globs = [
+    "src/config.rs",
+    "src/scan.rs",
+    "src/frame_timer.rs",
+    "src/governor/**",
+]
+additional_cargo_args = ["--lib"]
+# No functions are excluded: the unit suite exercises these modules without the game.
+# src/knobs is absent at the W16 base; add it only after its implementation lands.
+exclude_re = []
+# Keep the tool's default with_capacity call exclusion: capacity is not observable behavior.
+# Other crates/modules and cfg(test) bodies are outside the generated population.
+timeout_multiplier = 5.0
+minimum_test_timeout = 30.0
+build_timeout_multiplier = 15.0

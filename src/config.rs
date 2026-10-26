@@ -1443,4 +1443,21 @@ mod tests {
         assert_eq!(w.len(), 1, "{w:?}");
         assert!(path.is_dir());
     }
+
+    #[test]
+    fn invalid_choices_name_the_default_that_is_used_in_the_warning() {
+        for (key, default) in [
+            ("AsyncCompute", "on"),
+            ("Reflex", "game"),
+            ("LogLevel", "info"),
+        ] {
+            let (config, warnings) = one("General", key, "invalid");
+            assert_eq!(config, Config::default());
+            assert_eq!(warnings.len(), 1);
+            assert!(
+                warnings[0].ends_with(&format!("using the default {default}")),
+                "{key}: {warnings:?}"
+            );
+        }
+    }
 }

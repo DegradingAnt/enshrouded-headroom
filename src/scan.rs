@@ -1563,4 +1563,222 @@ mod tests {
         assert!(failures.is_empty(), "not exactly once: {failures:?}");
         assert!(drift.is_empty(), "match differs from its anchor: {drift:?}");
     }
+
+    #[test]
+    fn scan_errors_explain_the_failure_and_match_count() {
+        assert_eq!(
+            ScanError::BadPattern("bad token".into()).to_string(),
+            "bad pattern: bad token"
+        );
+        assert_eq!(
+            ScanError::NotFound.to_string(),
+            "no match (or the section could not be read)"
+        );
+        assert_eq!(
+            ScanError::Multiple(3).to_string(),
+            "3 matches, expected exactly one"
+        );
+    }
+
+    #[test]
+    fn an_empty_pattern_reports_empty_before_it_is_validated() {
+        assert!(Pattern(Vec::new()).is_empty());
+        assert!(!pat("aa").is_empty());
+    }
+
+    #[test]
+    fn the_smallest_optional_header_is_accepted() {
+        let mut bytes = synth_pe(&[(".text", 0x1000, 0x1000, 0x200, 0x400)], 0x2000);
+        bytes.copy_within(
+            OPT + 240..OPT + 240 + SECTION_HEADER_LEN,
+            OPT + MIN_OPTIONAL_HEADER,
+        );
+        bytes[0x94..0x96].copy_from_slice(&(MIN_OPTIONAL_HEADER as u16).to_le_bytes());
+        let pe = parse_pe(&bytes).expect("112 optional-header bytes are sufficient");
+        assert_eq!(pe.sections.len(), 1);
+        assert!(pe.sections[0].is_named(".text"));
+    }
+
+    #[test]
+    fn the_section_count_limit_accepts_96_and_rejects_larger_complete_tables() {
+        let table = OPT + 240;
+        for count in [96u16, 97, 98] {
+            let end = table + usize::from(count) * SECTION_HEADER_LEN;
+            let mut bytes = synth_pe(&[(".text", 0, 0, 0, 0)], end as u32);
+            bytes.resize(end, 0);
+            bytes[0x86..0x88].copy_from_slice(&count.to_le_bytes());
+            assert_eq!(
+                parse_pe(&bytes).is_some(),
+                count == 96,
+                "{count} complete headers"
+            );
+        }
+    }
+
+    #[test]
+    fn the_whole_section_table_must_fit_exactly_inside_the_image() {
+        let table_end = OPT + 240 + 2 * SECTION_HEADER_LEN;
+        let mut bytes = synth_pe(
+            &[(".text", 0, 0, 0, 0), (".rdata", 0, 0, 0, 0)],
+            table_end as u32,
+        );
+        assert_eq!(parse_pe(&bytes).unwrap().sections.len(), 2);
+        bytes[OPT + 56..OPT + 60].copy_from_slice(&((table_end - 1) as u32).to_le_bytes());
+        assert!(
+            parse_pe(&bytes).is_none(),
+            "the last header byte is outside SizeOfImage"
+        );
+    }
+
+    #[test]
+    fn header_copy_requires_64_bytes_and_accepts_exactly_64() {
+        let pages = Pages::new(1);
+        let bytes: Vec<u8> = (0..64).collect();
+        poke(&pages, 0, &bytes);
+        for limit in [0, 1, 63] {
+            assert!(read_headers(pages.addr(), limit).is_none(), "limit {limit}");
+        }
+        assert_eq!(read_headers(pages.addr(), 64), Some(bytes));
+    }
+
+    /// A VirtualQuery stub used only by the isolated child below.
+    mod query_stub {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// The original import, captured before the slot changes.
+        pub(super) static REAL: AtomicUsize = AtomicUsize::new(0);
+        /// The one owned region whose query is synthetic.
+        pub(super) static TARGET: AtomicUsize = AtomicUsize::new(0);
+        /// 1 reports reserved pages; 2 reports a short information prefix.
+        pub(super) static MODE: AtomicUsize = AtomicUsize::new(0);
+        /// Number of synthetic queries, so an uninstalled stub cannot pass.
+        pub(super) static CALLS: AtomicUsize = AtomicUsize::new(0);
+
+        /// Query one synthetic region; delegate every other address to Windows.
+        ///
+        /// # Safety
+        /// The caller must pass VirtualQuery's writable buffer and its length.
+        /// REAL must hold the captured VirtualQuery import while this is installed.
+        pub(super) unsafe extern "system" fn query(
+            address: *const c_void,
+            buffer: *mut MEMORY_BASIC_INFORMATION,
+            length: usize,
+        ) -> usize {
+            crate::guard::guard(
+                crate::guard::Feature::VkWrap,
+                || 0,
+                || {
+                    let target = TARGET.load(Ordering::Acquire);
+                    if target != 0
+                        && address as usize == target
+                        && length >= size_of::<MEMORY_BASIC_INFORMATION>()
+                    {
+                        let mode = MODE.load(Ordering::Acquire);
+                        let info = MEMORY_BASIC_INFORMATION {
+                            BaseAddress: target as *mut c_void,
+                            AllocationBase: target as *mut c_void,
+                            RegionSize: 0x1000,
+                            State: if mode == 1 { MEM_RESERVE } else { MEM_COMMIT },
+                            Protect: PAGE_READWRITE,
+                            ..MEMORY_BASIC_INFORMATION::default()
+                        };
+                        // A short result includes State and Protect, but not the tail of the struct.
+                        let written = if mode == 1 {
+                            size_of::<MEMORY_BASIC_INFORMATION>()
+                        } else {
+                            std::mem::offset_of!(MEMORY_BASIC_INFORMATION, Protect)
+                                + size_of::<u32>()
+                        };
+                        // SAFETY: the VirtualQuery caller supplied a full writable struct. The
+                        // source is a local struct, and written never exceeds either buffer.
+                        unsafe {
+                            ptr::copy_nonoverlapping(
+                                ptr::from_ref(&info).cast::<u8>(),
+                                buffer.cast::<u8>(),
+                                written,
+                            )
+                        };
+                        CALLS.fetch_add(1, Ordering::Relaxed);
+                        return written;
+                    }
+                    type Query = unsafe extern "system" fn(
+                        *const c_void,
+                        *mut MEMORY_BASIC_INFORMATION,
+                        usize,
+                    ) -> usize;
+                    // SAFETY: REAL was read from this exact VirtualQuery import before replacement.
+                    let real: Query = unsafe { std::mem::transmute(REAL.load(Ordering::Acquire)) };
+                    // SAFETY: this passes the original caller's arguments through unchanged.
+                    unsafe { real(address, buffer, length) }
+                },
+            )
+        }
+    }
+
+    #[test]
+    fn unreadable_query_states_are_refused_even_when_protection_bits_look_readable() {
+        const CHILD: &str = "HEADROOM_QUERY_GUARD_CHILD";
+        // An inherited environment marker alone must never enable a hook in a parallel suite.
+        let isolated = std::env::var_os(CHILD).is_some_and(|value| value == "1")
+            && std::env::args().skip(1).eq([
+                "--exact",
+                "scan::tests::unreadable_query_states_are_refused_even_when_protection_bits_look_readable",
+                "--nocapture",
+            ]);
+        if !isolated {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "scan::tests::unreadable_query_states_are_refused_even_when_protection_bits_look_readable", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        use std::sync::atomic::Ordering;
+        // Only this exact test runs in this child; the parent and its parallel tests keep the
+        // real import. Reserve an owned range, without committing or reading any of its bytes.
+        // SAFETY: a fresh anonymous reservation, released after the import is restored.
+        let region = unsafe { VirtualAlloc(null(), 0x1000, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!region.is_null());
+        let module = main_module();
+        // SAFETY: this is the test child's stable image; no code patches run in this child.
+        let slot =
+            unsafe { crate::iat::find_slot(&module, "kernel32.dll", "VirtualQuery") }.unwrap();
+        // SAFETY: find_slot returned a readable pointer-sized bound import in our own image.
+        let real = unsafe { slot.read() };
+        assert_ne!(real, 0);
+        query_stub::REAL.store(real, Ordering::Release);
+        query_stub::TARGET.store(region as usize, Ordering::Release);
+        let stub = query_stub::query as *const () as usize;
+        // SAFETY: only this test runs in the child, the slot is owned by its image, and the
+        // replacement has VirtualQuery's exact ABI. All other queries delegate to real.
+        assert_eq!(unsafe { crate::iat::swap(slot, stub) }, real);
+        query_stub::MODE.store(1, Ordering::Release);
+        let reserved = readable_run(region as usize, region as usize);
+        query_stub::MODE.store(2, Ordering::Release);
+        let short = readable_run(region as usize, region as usize);
+        // Restore the import before any outcome assertion or cleanup can panic.
+        // SAFETY: the same isolated slot, restored to the exact function captured above.
+        let previous = unsafe { crate::iat::swap(slot, real) };
+        // SAFETY: region is the base of this child's reservation and no reference borrows it.
+        let freed = unsafe { VirtualFree(region, 0, MEM_RELEASE) };
+        assert_eq!(previous, stub);
+        assert_ne!(freed, 0);
+        assert_eq!(query_stub::CALLS.load(Ordering::Acquire), 2);
+        assert_eq!(
+            reserved, 0,
+            "Protect is undefined for reserved pages and cannot prove commitment"
+        );
+        assert_eq!(
+            short, 0,
+            "a partial information struct cannot prove readability"
+        );
+    }
 }
