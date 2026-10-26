@@ -1495,7 +1495,7 @@ mod tests {
     ];
 
     #[test]
-    #[ignore = "reads the game exe (ENSHROUDED_EXE, else the Steam install) from disk"]
+    #[ignore = "reads the game exe (ENSHROUDED_EXE, else the Steam path); a skip shows only with -- --ignored --nocapture"]
     fn sigs_unique_in_game_exe() {
         use crate::build_id::test_support::game_exe_or_skip;
         let Some(path) = game_exe_or_skip("sigs_unique_in_game_exe") else {

@@ -305,7 +305,7 @@ C:\Modding\Enshrouded\
 - [ ] **Step 2:** Run `cargo test scan::` and expect FAIL.
 - [ ] **Step 3:** Implement a naive scan, anchored on the first non-wildcard byte with `memchr`-style `position`. Read the section bounds from the in-memory PE headers.
 - [ ] **Step 4:** Run `cargo test scan::` and expect PASS.
-- [ ] **Step 5: Cross-check against the real exe.** Write a test-only helper `#[ignore] fn sigs_unique_in_game_exe()`. It reads the game exe from disk (the path in `ENSHROUDED_EXE` if set, else `C:\Program Files (x86)\Steam\steamapps\common\Enshrouded\enshrouded.exe`; it skips with a printed reason if there is no file), maps the sections by file offset, and asserts that every `sigs::ALL` entry is unique. Run `cargo test -- --ignored sigs_unique_in_game_exe` and expect PASS.
+- [ ] **Step 5: Cross-check against the real exe.** Write a test-only helper `#[ignore] fn sigs_unique_in_game_exe()`. It reads the game exe from disk (the path in `ENSHROUDED_EXE` if set, else `C:\Program Files (x86)\Steam\steamapps\common\Enshrouded\enshrouded.exe`; a path that is set must be a readable file, or the test panics; only a missing file at the default Steam path skips), maps the sections by file offset, and asserts that every `sigs::ALL` entry is unique. Run `cargo test --lib -- --ignored --nocapture sigs_unique_in_game_exe` and expect PASS. **Run ignored tests with `-- --ignored --nocapture`:** a skip prints a `SKIPPED ...` line and the harness still reports `ok`, and without `--nocapture` the line is hidden, so a green run alone does not show that an exe was read. Look for the real output lines. This is the run recipe for every ignored real-exe test in this plan.
 - [ ] **Step 6:** Commit: `feat(scan): exactly-once signature scanning + signature table`.
 
 ### Task 5: Patching primitives and import slots
@@ -438,7 +438,7 @@ const GIB: u64 = 1 << 30;
   `prepare_in(hay: &[u8]) -> Result<usize, TbError>` is the pure inner part of `prepare`.
 - [ ] **Step 2:** Run `cargo test texture_budget::` and expect FAIL.
 - [ ] **Step 3:** Implement. In `entry::start`, call `prepare` and store `Prepared` in a `OnceLock`. `apply` is called from `vk::wrap_create_device` (Task 9). This is a data patch, so the spec allows it on unknown builds when the full 80-byte table matches.
-- [ ] **Step 4:** Run the tests and expect PASS. Run the ignored test `texture_table_unique_in_game_exe`, which reads the real exe, and expect PASS.
+- [ ] **Step 4:** Run the tests and expect PASS. Run the ignored test with `cargo test --lib -- --ignored --nocapture texture_table_unique_in_game_exe` (it reads the real exe; see the run recipe in Task 4 Step 5) and expect PASS.
 - [ ] **Step 5:** Commit: `feat: VRAM-sized texture budget`.
 
 ### Task 8: Async compute
@@ -727,7 +727,7 @@ fn gov() -> Governor { Governor::new(Config::default().governor, vec![KnobSpec{e
 
 - [ ] **Step 3:** Run `cargo test scatter_distance::` and expect FAIL.
 - [ ] **Step 4:** Implement. The disp32 locations are signature match +30 (instance) and +9 (brick). The instruction end is the disp location + 4. Call it from `entry::start` if `code_patches_allowed()` and `knobs.enable_scatter_distance`. It must run before the scene is built, which is guaranteed because `InitializeASI` runs before WinMain.
-- [ ] **Step 5:** Run `cargo test scatter_distance::` and expect PASS. Run the ignored test `scatter_sigs_unique_in_game_exe` and expect PASS.
+- [ ] **Step 5:** Run `cargo test scatter_distance::` and expect PASS. Run the ignored test with `cargo test --lib -- --ignored --nocapture scatter_sigs_unique_in_game_exe` (see the run recipe in Task 4 Step 5) and expect PASS.
 - [ ] **Step 6:** Commit: `feat(knobs): grass distance redirect with audited capacity`.
 
 ### Task 13b: Scatter counter probe (added 2026-10-25; the author: "Add it to v1")
@@ -762,7 +762,7 @@ Spec: `docs/design.md` sections 7.2 ("Capacity") and 7.2a. Evidence: `(the autho
   - Config: `[Debug]\nScatterProbe=1\nForceStepScatterDistance=7` gives scatter_probe true, force_step_scatter Some(4) and one warning; the default file has no `[Debug]` and gives DebugCfg::default().
 - [ ] **Step 2:** Run `cargo test --lib -- scatter_probe:: sigs:: config::` and expect FAIL.
 - [ ] **Step 3:** Implement. `read_counters` uses `core::ptr::read_unaligned` on each checked address.
-- [ ] **Step 4:** Run the tests and the ignored exe test; expect PASS.
+- [ ] **Step 4:** Run the tests and the ignored exe test (`-- --ignored --nocapture`, see the run recipe in Task 4 Step 5); expect PASS.
 - [ ] **Step 5:** Commit: `feat(scatter): GPU counter probe with self-check and headroom rule`.
 - [ ] **Step 6 (the author, after Task 17's install):** the measurement session from spec 7.2a. The controller computes r_max = 90 × sqrt(0xf000 / peak_A), rounds it DOWN to a whole metre, sets `R_MAX_M`, records the measurement in RE-NOTES, and commits it as `chore(scatter): measured ceiling r_max = N m`.
 

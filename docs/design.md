@@ -24,12 +24,11 @@ In scope:
 - Discrete GPUs from NVIDIA, AMD and Intel. On integrated GPUs, the texture budget is left unchanged (section 6.1). Reflex is NVIDIA only.
 
 Out of scope for version 1:
-- The Steam build. It is tested when the author has it.
 - The `--enable-dxgi` swapchain path.
 - An in-game menu or overlay.
 - Any setting below the player's menu choice.
 
-Test-environment note: the author's install has an exe with a `.bind` section and an unexplained `winmm.dll` (577,024 bytes, "ACME Corporation") plus `steamclient64.dll` in the game folder. Ultimate ASI Loader handles `.bind` (it ignores calls from that section as triggers). The `winmm.dll` could change what sits in import slots. The first in-game test therefore runs with the loader's `DebugLog=1`, and the final test runs on the Steam build.
+Test-environment note: the test machine is the Steam install of the game (`C:\Program Files (x86)\Steam\steamapps\common\Enshrouded`). Its exe starts in Steam's DRM stub, the `.bind` section, and the folder has no `winmm.dll`: one loader (Ultimate ASI Loader), and nothing else that could change what sits in the import slots. (The old install, which is being deleted, had an unexplained `winmm.dll`, 577,024 bytes, "ACME Corporation".) Ultimate ASI Loader handles `.bind`: it ignores calls from that section as triggers (from loader source v10.0.0, unconfirmed in game). The first in-game run uses the loader's `DebugLog=1`.
 
 ## 3. Constraints
 

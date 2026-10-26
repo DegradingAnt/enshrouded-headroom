@@ -187,39 +187,116 @@ impl Drop for Hash<'_> {
     }
 }
 
-/// Where the `#[ignore]` tests that read the real game exe find it. One path for all of them.
+/// Where the `#[ignore]` tests that read the real game exe find it.
+///
+/// Two rules, the same for every path here:
+/// - An environment variable that is set (and not empty) is an explicit request. If it does not
+///   name a readable file, the test **panics**. It is never skipped.
+/// - Only the default, the Steam path, may be skipped, and only if there is no file there (a PC
+///   without the game). Any other problem with it (a directory, no access) panics too.
+///
+/// A skip prints a line and the test returns, so the harness still reports it as `ok`. The line
+/// is captured: it shows only with `-- --ignored --nocapture`. A green `--ignored` run without
+/// `--nocapture` therefore does not show that a game exe was read.
 #[cfg(test)]
 pub(crate) mod test_support {
-    use std::path::PathBuf;
+    use std::ffi::OsString;
+    use std::io::ErrorKind;
+    use std::path::{Path, PathBuf};
 
-    /// The environment variable that overrides [`STEAM_EXE`].
+    /// The environment variable that names the exe for the real-exe tests.
     pub const EXE_ENV: &str = "ENSHROUDED_EXE";
+
+    /// The environment variable that names the Steam exe for the Steam-against-old-build test,
+    /// which must have the Steam exe whatever `ENSHROUDED_EXE` says.
+    pub const STEAM_EXE_ENV: &str = "ENSHROUDED_STEAM_EXE";
 
     /// The exe of the Steam install of the game (Steam buildid 26082781).
     pub const STEAM_EXE: &str =
         r"C:\Program Files (x86)\Steam\steamapps\common\Enshrouded\enshrouded.exe";
 
-    /// The exe the real-exe tests read: `ENSHROUDED_EXE` if it is set and not empty, else
-    /// [`STEAM_EXE`].
-    pub fn game_exe_path() -> PathBuf {
-        match std::env::var_os(EXE_ENV) {
-            Some(path) if !path.is_empty() => PathBuf::from(path),
-            _ => PathBuf::from(STEAM_EXE),
-        }
+    /// The exe for the real-exe tests: `ENSHROUDED_EXE` if set (panics if it is not a readable
+    /// file), else [`STEAM_EXE`] (`None`, after a printed reason, if there is no file there).
+    pub fn game_exe_or_skip(test: &str) -> Option<PathBuf> {
+        locate(
+            test,
+            EXE_ENV,
+            std::env::var_os(EXE_ENV),
+            Path::new(STEAM_EXE),
+        )
     }
 
-    /// [`game_exe_path`] if there is a file there. If not, print why `test` is skipped and give
-    /// `None`; the test then returns, so a PC without the game does not fail it.
-    pub fn game_exe_or_skip(test: &str) -> Option<PathBuf> {
-        let path = game_exe_path();
-        if path.is_file() {
-            Some(path)
-        } else {
-            println!(
-                "SKIPPED {test}: no game exe at {} (set {EXE_ENV} to the exe to test)",
-                path.display()
-            );
-            None
+    /// The Steam exe: `ENSHROUDED_STEAM_EXE` if set (panics if it is not a readable file), else
+    /// [`STEAM_EXE`] (`None`, after a printed reason, if there is no file there).
+    pub fn steam_exe_or_skip(test: &str) -> Option<PathBuf> {
+        locate(
+            test,
+            STEAM_EXE_ENV,
+            std::env::var_os(STEAM_EXE_ENV),
+            Path::new(STEAM_EXE),
+        )
+    }
+
+    /// Why a path is not a file the tests can read.
+    enum Unusable {
+        /// There is nothing at that path.
+        Missing,
+        /// There is something, but not a readable file; the text says what.
+        Other(String),
+    }
+
+    fn check_file(path: &Path) -> Result<(), Unusable> {
+        match std::fs::metadata(path) {
+            Ok(meta) if meta.is_file() => {}
+            Ok(_) => return Err(Unusable::Other("it is not a file".to_owned())),
+            Err(error) if error.kind() == ErrorKind::NotFound => return Err(Unusable::Missing),
+            Err(error) => return Err(Unusable::Other(format!("it cannot be read: {error}"))),
+        }
+        std::fs::File::open(path)
+            .map(drop)
+            .map_err(|error| Unusable::Other(format!("it cannot be opened: {error}")))
+    }
+
+    /// The rules in the module docs, with the environment value passed in (`explicit`), so a
+    /// test can run them without touching the process environment.
+    pub(super) fn locate(
+        test: &str,
+        env_name: &str,
+        explicit: Option<OsString>,
+        default: &Path,
+    ) -> Option<PathBuf> {
+        if let Some(value) = explicit.filter(|value| !value.is_empty()) {
+            let path = PathBuf::from(value);
+            return match check_file(&path) {
+                Ok(()) => Some(path),
+                Err(why) => {
+                    let why = match why {
+                        Unusable::Missing => "there is no file there".to_owned(),
+                        Unusable::Other(text) => text,
+                    };
+                    panic!(
+                        "{test}: {env_name} is set to {}, but {why}. A path that is set is never \
+                         skipped: fix it, or unset {env_name}.",
+                        path.display()
+                    )
+                }
+            };
+        }
+        match check_file(default) {
+            Ok(()) => Some(default.to_path_buf()),
+            Err(Unusable::Missing) => {
+                println!(
+                    "SKIPPED {test}: no game exe at {} (the default Steam path; set {env_name} \
+                     to the exe to test)",
+                    default.display()
+                );
+                None
+            }
+            Err(Unusable::Other(why)) => panic!(
+                "{test}: the default exe {} is there, but {why}. Set {env_name} to the exe to \
+                 test.",
+                default.display()
+            ),
         }
     }
 }
@@ -227,6 +304,7 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -360,6 +438,7 @@ mod tests {
     // ---- the Steam exe against the reference copy of the old exe (ignored: reads both) -------
 
     /// A section of a PE file, as the section table gives it.
+    #[derive(Debug)]
     struct Section {
         name: String,
         virtual_size: u32,
@@ -369,6 +448,7 @@ mod tests {
     }
 
     /// The parts of a PE32+ file that the comparison needs.
+    #[derive(Debug)]
     struct Pe {
         entry_rva: u32,
         section_alignment: u32,
@@ -461,23 +541,30 @@ mod tests {
             .join("enshrouded.exe")
     }
 
+    /// The bytes of the reference copy. It must be there: no copy is a failure, not a skip.
+    fn read_reference(path: &Path) -> Vec<u8> {
+        std::fs::read(path).unwrap_or_else(|error| {
+            panic!(
+                "the reference copy of the old exe is not readable at {} ({error}). It is not in \
+                 git: put the old build's exe there.",
+                path.display()
+            )
+        })
+    }
+
     #[test]
-    #[ignore = "reads the Steam exe and reference/old-build/enshrouded.exe from disk"]
+    #[ignore = "reads the Steam exe (ENSHROUDED_STEAM_EXE, else the Steam path) and \
+                reference/old-build/enshrouded.exe; a skip shows only with -- --ignored --nocapture"]
     fn steam_exe_matches_the_old_build_except_the_stub() {
-        let Some(steam_path) = test_support::game_exe_or_skip("steam_exe_matches_the_old_build")
+        // Its own Steam path: `ENSHROUDED_EXE` may name any exe, and that must not fail this.
+        let Some(steam_path) = test_support::steam_exe_or_skip("steam_exe_matches_the_old_build")
         else {
             return;
         };
+        // With the Steam exe in hand, the reference copy is required: a missing one fails.
         let old_path = reference_exe();
-        if !old_path.is_file() {
-            println!(
-                "SKIPPED steam_exe_matches_the_old_build: no reference copy of the old exe at {}",
-                old_path.display()
-            );
-            return;
-        }
+        let old_file = read_reference(&old_path);
         let steam_file = std::fs::read(&steam_path).expect("read the Steam exe");
-        let old_file = std::fs::read(&old_path).expect("read the reference exe");
         let steam = parse_pe(&steam_file).expect("PE headers of the Steam exe");
         let old = parse_pe(&old_file).expect("PE headers of the reference exe");
 
@@ -529,6 +616,236 @@ mod tests {
         file[0x3c] = 0x40;
         file[0x40..0x44].copy_from_slice(b"PE\0\0");
         assert!(parse_pe(&file).is_err());
+    }
+
+    // ---- the PE reader, on files made here (always run) --------------------------------------
+
+    /// Where `tiny_pe` puts things: `e_lfanew`, the optional header and the section table.
+    const NT: usize = 0x40;
+    const OPTIONAL: usize = NT + 24;
+    const OPTIONAL_SIZE: usize = 0xf0;
+    const TABLE: usize = OPTIONAL + OPTIONAL_SIZE;
+
+    /// A PE32+ file of 0x600 bytes with the given sections `(name, virtual size, rva, raw size,
+    /// raw pointer)`, `SectionAlignment` 0x1000 and the entry point `entry`. Byte `i` of the file
+    /// is `i as u8` from 0x200 on, so a slice of it can be told by its first and last byte.
+    fn tiny_pe(entry: u32, sections: &[(&str, u32, u32, u32, u32)]) -> Vec<u8> {
+        let mut file = vec![0u8; 0x600];
+        for (i, byte) in file.iter_mut().enumerate().skip(0x200) {
+            *byte = i as u8;
+        }
+        let mut put32 = |at: usize, value: u32| {
+            file[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        };
+        put32(0x3c, NT as u32);
+        put32(OPTIONAL + 16, entry);
+        put32(OPTIONAL + 32, 0x1000);
+        for (i, (_, vsize, rva, raw_size, raw_ptr)) in sections.iter().enumerate() {
+            let at = TABLE + i * 40;
+            put32(at + 8, *vsize);
+            put32(at + 12, *rva);
+            put32(at + 16, *raw_size);
+            put32(at + 20, *raw_ptr);
+        }
+        file[NT..NT + 4].copy_from_slice(b"PE\0\0");
+        file[NT + 6..NT + 8].copy_from_slice(&(sections.len() as u16).to_le_bytes());
+        file[NT + 20..NT + 22].copy_from_slice(&(OPTIONAL_SIZE as u16).to_le_bytes());
+        file[OPTIONAL..OPTIONAL + 2].copy_from_slice(&0x20bu16.to_le_bytes());
+        for (i, (name, ..)) in sections.iter().enumerate() {
+            let at = TABLE + i * 40;
+            file[at..at + name.len()].copy_from_slice(name.as_bytes());
+        }
+        file
+    }
+
+    /// `.text` is rva 0x1000..0x2234 (virtual size 0x1234, raw 0x200 bytes at 0x200) and `.bind`
+    /// is 0x3000..0x3100 (raw 0x100 bytes at 0x400); the entry point is in `.bind`.
+    fn two_section_pe() -> Vec<u8> {
+        tiny_pe(
+            0x3010,
+            &[
+                (".text", 0x1234, 0x1000, 0x200, 0x200),
+                (".bind", 0x100, 0x3000, 0x100, 0x400),
+            ],
+        )
+    }
+
+    #[test]
+    fn parse_pe_reads_the_headers_of_a_two_section_file() {
+        let file = two_section_pe();
+        let pe = parse_pe(&file).unwrap();
+        assert_eq!((pe.entry_rva, pe.section_alignment), (0x3010, 0x1000));
+        let names: Vec<&str> = pe.sections.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, [".text", ".bind"]);
+        let bind = pe.section(".bind").unwrap();
+        assert_eq!(
+            (bind.virtual_size, bind.rva, bind.raw_size, bind.raw_ptr),
+            (0x100, 0x3000, 0x100, 0x400)
+        );
+        assert!(pe.section(".gone").unwrap_err().contains(".gone"));
+        // A name that fills all 8 bytes has no NUL; the next field must not run into it.
+        let long = tiny_pe(0, &[("abcdefgh", 1, 0x1000, 0, 0)]);
+        assert_eq!(parse_pe(&long).unwrap().sections[0].name, "abcdefgh");
+    }
+
+    #[test]
+    fn pages_of_rounds_the_virtual_size_up_to_whole_pages() {
+        let file = two_section_pe();
+        let pe = parse_pe(&file).unwrap();
+        assert_eq!(pe.pages_of(pe.section(".text").unwrap()), 0x2000);
+        assert_eq!(pe.pages_of(pe.section(".bind").unwrap()), 0x1000);
+        // Zero, one page less one byte, exactly one page, one page and one byte.
+        let sizes = [(0, 0), (0xfff, 0x1000), (0x1000, 0x1000), (0x1001, 0x2000)];
+        for (virtual_size, pages) in sizes {
+            let file = tiny_pe(0, &[("a", virtual_size, 0x1000, 0, 0)]);
+            let pe = parse_pe(&file).unwrap();
+            assert_eq!(
+                pe.pages_of(&pe.sections[0]),
+                pages,
+                "size {virtual_size:#x}"
+            );
+        }
+        // The Steam header (exact size) and the old header (rounded) are the same pages.
+        let file = tiny_pe(
+            0,
+            &[
+                ("steam", 0x13b0730, 0x1000, 0, 0),
+                ("old", 0x13b1000, 0x1000, 0, 0),
+            ],
+        );
+        let pe = parse_pe(&file).unwrap();
+        assert_eq!(pe.pages_of(&pe.sections[0]), 0x13b1000);
+        assert_eq!(pe.pages_of(&pe.sections[0]), pe.pages_of(&pe.sections[1]));
+        // A zero alignment must not divide by zero: sizes are then taken as they are.
+        let mut file = two_section_pe();
+        file[OPTIONAL + 32..OPTIONAL + 36].fill(0);
+        let pe = parse_pe(&file).unwrap();
+        assert_eq!(pe.pages_of(pe.section(".text").unwrap()), 0x1234);
+    }
+
+    #[test]
+    fn section_of_is_exact_at_the_edges_of_a_section() {
+        let file = two_section_pe();
+        let pe = parse_pe(&file).unwrap();
+        let cases = [
+            (0x0fff, None),
+            (0x1000, Some(".text")),
+            (0x2233, Some(".text")),
+            (0x2234, None),
+            (0x2fff, None),
+            (0x3000, Some(".bind")),
+            (0x30ff, Some(".bind")),
+            (0x3100, None),
+            (u32::MAX, None),
+        ];
+        for (rva, want) in cases {
+            assert_eq!(pe.section_of(rva), want, "rva {rva:#x}");
+        }
+        assert_eq!(pe.section_of(pe.entry_rva), Some(".bind"));
+    }
+
+    #[test]
+    fn raw_gives_the_bytes_of_a_section_and_an_error_when_the_file_is_too_short() {
+        let file = two_section_pe();
+        let pe = parse_pe(&file).unwrap();
+        let (text, bind) = (pe.section(".text").unwrap(), pe.section(".bind").unwrap());
+        let got = pe.raw(&file, text).unwrap();
+        assert_eq!((got.len(), got[0], got[0x1ff]), (0x200, 0x00, 0xff));
+        let got = pe.raw(&file, bind).unwrap();
+        assert_eq!((got.len(), got[0], got[0xff]), (0x100, 0x00, 0xff));
+        // The file ends exactly where `.text` ends: enough. One byte earlier: not.
+        assert!(pe.raw(file.get(..0x400).unwrap(), text).is_ok());
+        let error = pe.raw(file.get(..0x3ff).unwrap(), text).unwrap_err();
+        assert!(
+            error.contains(".text") && error.contains("past the end"),
+            "{error}"
+        );
+        // `.bind` starts past the end of a file of 0x300 bytes.
+        assert!(pe.raw(file.get(..0x300).unwrap(), bind).is_err());
+        assert!(pe.raw(&[], text).is_err());
+    }
+
+    #[test]
+    fn a_truncated_or_wrong_pe_is_an_error_not_a_panic() {
+        let file = two_section_pe();
+        // The section table starts at TABLE; its two headers end at TABLE + 80.
+        assert_eq!(TABLE, 0x148);
+        assert!(parse_pe(file.get(..TABLE + 80).unwrap()).is_ok());
+        let error = parse_pe(file.get(..TABLE + 79).unwrap()).unwrap_err();
+        assert!(error.contains("section header 1"), "{error}");
+        let error = parse_pe(file.get(..TABLE + 40).unwrap()).unwrap_err();
+        assert!(error.contains("section header 1"), "{error}");
+        let error = parse_pe(file.get(..TABLE).unwrap()).unwrap_err();
+        assert!(error.contains("section header 0"), "{error}");
+        // Cut inside the optional header.
+        assert!(parse_pe(file.get(..OPTIONAL + 20).unwrap()).is_err());
+        // A PE32 (magic 0x10b) file is refused.
+        let mut pe32 = two_section_pe();
+        pe32[OPTIONAL..OPTIONAL + 2].copy_from_slice(&0x10bu16.to_le_bytes());
+        assert!(parse_pe(&pe32).unwrap_err().contains("PE32+"));
+        // No signature.
+        let mut unsigned = two_section_pe();
+        unsigned[NT] = b'X';
+        assert!(parse_pe(&unsigned).unwrap_err().contains("signature"));
+    }
+
+    // ---- finding the exe for the real-exe tests (always run) -----------------------------------
+
+    #[test]
+    #[should_panic(expected = "C:/nope.exe, but there is no file there")]
+    fn a_path_that_is_set_but_missing_panics_instead_of_skipping() {
+        let default = tempfile_with(b"x");
+        let set = Some(OsString::from("C:/nope.exe"));
+        test_support::locate("t", "ENSHROUDED_EXE", set, &default.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "it is not a file")]
+    fn a_path_that_is_set_to_a_directory_panics() {
+        let set = Some(std::env::temp_dir().into_os_string());
+        test_support::locate("t", "ENSHROUDED_EXE", set, std::path::Path::new("unused"));
+    }
+
+    #[test]
+    fn a_path_that_is_set_to_a_file_is_used_and_the_default_is_not_looked_at() {
+        let file = tempfile_with(b"x");
+        let set = Some(file.0.clone().into_os_string());
+        let got = test_support::locate("t", "ENSHROUDED_EXE", set, std::path::Path::new("C:/no"));
+        assert_eq!(got, Some(file.0.clone()));
+    }
+
+    #[test]
+    fn an_empty_value_or_none_means_the_default() {
+        let file = tempfile_with(b"x");
+        for set in [None, Some(OsString::new())] {
+            let got = test_support::locate("t", "ENSHROUDED_EXE", set, &file.0);
+            assert_eq!(got, Some(file.0.clone()));
+        }
+    }
+
+    #[test]
+    fn a_missing_default_is_the_one_case_that_skips() {
+        let gone = tempfile_with(b"x").0.with_extension("missing");
+        for set in [None, Some(OsString::new())] {
+            assert_eq!(
+                test_support::locate("t", "ENSHROUDED_EXE", set, &gone),
+                None
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "the reference copy of the old exe is not readable at")]
+    fn a_missing_reference_copy_fails_instead_of_skipping() {
+        let gone = tempfile_with(b"x").0.with_extension("missing");
+        read_reference(&gone);
+    }
+
+    #[test]
+    #[should_panic(expected = "is there, but it is not a file")]
+    fn a_default_that_is_not_a_file_panics_instead_of_skipping() {
+        let dir = std::env::temp_dir();
+        test_support::locate("t", "ENSHROUDED_EXE", None, &dir);
     }
 
     #[test]

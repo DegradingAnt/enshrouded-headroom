@@ -920,7 +920,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "reads the game exe (ENSHROUDED_EXE, else the Steam install) from disk"]
+    #[ignore = "reads the game exe (ENSHROUDED_EXE, else the Steam path); a skip shows only with -- --ignored --nocapture"]
     fn original_bytes_are_in_the_game_exe_and_apply_patches_a_copy_of_its_code() {
         use crate::build_id::test_support::game_exe_or_skip;
         use crate::build_id::{classify, sha256_file, Build};
