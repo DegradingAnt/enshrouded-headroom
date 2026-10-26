@@ -1884,7 +1884,12 @@ mod tests {
                         distant_objects_scale,
                         terrain_ring_scale,
                     },
-                hdr: HdrCfg { paper_white_nits },
+                hdr:
+                    HdrCfg {
+                        paper_white_nits,
+                        fix_peak: _,
+                        display_peak_nits,
+                    },
                 debug:
                     DebugCfg {
                         scatter_probe: _,
@@ -1928,6 +1933,9 @@ mod tests {
             if let PaperWhiteNits::Nits(value) = paper_white_nits {
                 assert!((40.0..=400.0).contains(&value));
             }
+            if let Some(value) = display_peak_nits {
+                assert!((80..=10000).contains(&value));
+            }
             for step in [force_step_object, force_step_scatter, force_step_terrain]
                 .into_iter()
                 .flatten()
@@ -1943,6 +1951,7 @@ mod tests {
             Whole,
             Target,
             PaperWhite,
+            DisplayPeak,
             ForceStep,
             Boolean,
         }
@@ -2092,6 +2101,13 @@ mod tests {
                 kind: Kind::PaperWhite,
             },
             NumericKey {
+                section: "Hdr",
+                key: "DisplayPeakNits",
+                low: 80.0,
+                high: 10000.0,
+                kind: Kind::DisplayPeak,
+            },
+            NumericKey {
                 section: "Debug",
                 key: "ForceStepObjectDistance",
                 low: 0.0,
@@ -2177,6 +2193,7 @@ mod tests {
                     PaperWhiteNits::Nits(value) => f64::from(value),
                     PaperWhiteNits::Game => return None,
                 },
+                "DisplayPeakNits" => f64::from(config.hdr.display_peak_nits?),
                 "ForceStepObjectDistance" => f64::from(config.debug.force_step_object?),
                 "ForceStepScatterDistance" => f64::from(config.debug.force_step_scatter?),
                 "ForceStepTerrainDistance" => f64::from(config.debug.force_step_terrain?),
@@ -2235,7 +2252,7 @@ mod tests {
                     for value in [below, key.high + f64::from(delta)] {
                         let config = warned_parse(key, &value.to_string());
                         let expected = match key.kind {
-                            Kind::PaperWhite => None,
+                            Kind::PaperWhite | Kind::DisplayPeak => None,
                             Kind::Boolean => numeric_value(&Config::default(), key.key),
                             _ => Some(value.clamp(key.low, key.high)),
                         };
@@ -2245,15 +2262,15 @@ mod tests {
             }
 
             #[test]
-            fn decimal_comma_matches_dot_for_every_numeric_key(sample in 0u32..=1_000) {
+            fn decimal_comma_matches_dot_for_every_numeric_key(sample in any::<u32>()) {
                 let (zero, warnings) = parse("[Governor]\nTargetFps=0");
                 assert_eq!(zero.governor.target_fps, 0);
                 assert!(warnings.is_empty());
                 assert_ranges(&zero);
                 for key in NUMERIC_KEYS.iter().filter(|key| key.kind != Kind::Boolean) {
                     let value = match key.kind {
-                        Kind::Whole | Kind::Target | Kind::ForceStep => key.low + f64::from(sample) % (key.high - key.low + 1.0),
-                        _ => key.low + (key.high - key.low) * f64::from(sample) / 1_000.0,
+                        Kind::Whole | Kind::Target | Kind::ForceStep | Kind::DisplayPeak => key.low + f64::from(sample) % (key.high - key.low + 1.0),
+                        _ => key.low + (key.high - key.low) * f64::from(sample % 1_001) / 1_000.0,
                     };
                     let dot = format!("{value:.6}");
                     let comma = dot.replace('.', ",");
@@ -2278,7 +2295,7 @@ mod tests {
 
             #[test]
             fn fractional_integers_warn_and_use_the_default(sample in 0u32..1_000) {
-                for key in NUMERIC_KEYS.iter().filter(|key| matches!(key.kind, Kind::Whole | Kind::Target | Kind::ForceStep)) {
+                for key in NUMERIC_KEYS.iter().filter(|key| matches!(key.kind, Kind::Whole | Kind::Target | Kind::ForceStep | Kind::DisplayPeak)) {
                     let value = key.low + f64::from(sample) % (key.high - key.low) + 0.5;
                     let config = warned_parse(key, &value.to_string());
                     assert_eq!(numeric_value(&config, key.key), numeric_value(&Config::default(), key.key), "{}={value}", key.key);
