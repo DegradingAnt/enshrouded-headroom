@@ -360,7 +360,7 @@ This section confirms the "Reflex menu option location" section with static evid
   - dword `+0x9ec` = `0x10101` (`0x140e24f5c`), so the byte at `+0x9ed` (vsync) is 1;
   - qword `+0x9f0` = 1 (`0x140e24f66`), so nvidiaReflex = 1 (On) and nvidiaReflexDefaultOff = 0 (Off);
   - dword `+0x9f8` = 2 (`0x140e24f71`), the first render-settings field.
-  
+
   So `+0x9ed` and `+0x9f0` lie well inside the allocation, and `+0x9f0` is naturally aligned. The only xref to `0x140e24e90` is in `FUN_140e27e20` (`0x140e27e5a`). `FUN_140e27e20` returns the new object, and `FUN_14084f070` stores it at `param_1+0x128`.
 - **Field offsets (VERIFIED, ev_a32dc9eb, ev_0b962658, ev_332cfd41, ev_3635889c).** Reflection descriptor rows have stride 0x30 and the layout {name pointer, length, type pointer, offset}:
   - `0x14177a460` renderScale +0x24; `0x14177a490` automaticRenderScale +0x28;
@@ -369,7 +369,7 @@ This section confirms the "Reflex menu option location" section with static evid
   - `0x14177a520` `nvidiaReflex` (name string `0x141c21ca0`, type `0x141779da0`) +0x2c;
   - `0x14177a550` `nvidiaReflexDefaultOff` (same type) +0x30;
   - `0x14177a580` render +0x34; `0x14177a5b0` renderPreferences +0x88. The earlier rows are windowMode +0 and windowPosition +4.
-  
+
   The name strings have no Ghidra xrefs. A raw 8-byte pointer search found the rows. The machine struct starts at options+0x9c4. Three facts agree: render at 0x9c4 + 0x34 = 0x9f8 (the getter), renderPreferences at 0x9c4 + 0x88 = 0xa4c (above), and the windowMode default byte at `0x9c4` is 1. So, at the hook:
   - `nvidiaReflex` = `*(u32*)(RDX - 0x8)` (options+0x9f0);
   - `vsync` = `*(u8*)(RDX - 0xb)` (options+0x9ed);
