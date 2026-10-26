@@ -4,6 +4,7 @@
 //! game build and decides whether code patches are allowed. The panic guard in [`guard`] is ready
 //! for the hooks that later tasks add to `entry::start`.
 
+pub mod antilag;
 pub mod build_id;
 pub mod config;
 pub mod display;
@@ -16,6 +17,7 @@ pub mod iat;
 pub mod knobs;
 pub mod log;
 pub mod patch;
+pub mod reflex;
 pub mod scan;
 pub mod sigs;
 pub mod vk;
