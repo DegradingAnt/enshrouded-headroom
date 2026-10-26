@@ -301,6 +301,14 @@ pub fn start() {
     // only created and queued here: the last step enables it.
     knobs::terrain_distance::init(&cfg.knobs);
 
+    // 14b. EXPERIMENTAL climb anything (branch exp/climb-anything only; never merged): checked
+    // writes to the game's wall probe (two mask immediates, two tolerance loads redirected to a
+    // float in the mod's own page, and the optional voxel-hold and clearance bytes). It patches
+    // code (no hook), so it asks `code_patches_allowed`; it runs only with `[Experimental]
+    // ClimbAnything = 1`, and logs one line, including why it is off. It must run before the game
+    // runs the climb code, which holds here: `InitializeASI` runs before `WinMain`.
+    features::climb::init(&cfg.experimental);
+
     // Later code hooks are created and queued above this line, so they join the one batch below.
 
     // 15. Enable every queued hook at once (MinHook's queued enable). This is the only place that

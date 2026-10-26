@@ -380,6 +380,13 @@ The governor raises 7.1, then 7.2, then 7.3. The order is re-checked after the i
 - `ScatterProbe = 0 | 1` (default 0): enable the publish-only hook and its 500 ms sampler thread, and log the scatter counters (7.2a). Until r_max is measured, this key with `LogLevel = debug` is the only reason to install them.
 - `ForceStepObjectDistance`, `ForceStepScatterDistance`, `ForceStepTerrainDistance = 0..=4` (default: absent, the knob is not held): hold that knob at a fixed step for testing (pre-flight ruling for Task 17). A whole number outside 0..=4 is clamped with a warning. Other text warns and counts as absent.
 
+`[Experimental]` (branch `exp/climb-anything` only; never merged; one in-game test of climbing on any rock or wall; see `src/features/climb.rs` and `docs/re-notes.md`, "Climb anything (experimental)"). Every key is read at start-up only:
+- `ClimbAnything = 0 | 1` (default 0): with code patches allowed, patch the game's wall probe at start-up.
+- `ClimbMask = <hex>` (default `0x124` = ClimbingWall, Walkable and WorldNormalsNotDisplaced): the collider mask of the probe's forward and corner rays. `0x` and 1 to 8 hex digits, non-zero, inside the 23 ColliderFlags bits (`0x7fffff`). Anything else warns and uses the default.
+- `ClimbPlaneTolerance = 0.001..=0.5` (default 0.05): how much each normal component of a corner ray may differ from the forward ray's. The game's value is 0.001.
+- `ClimbVoxelHold = 0 | 1` (default 0): a probe hit with EntityId 0 (a voxel wall) keeps the climb going instead of counting as "wall lost".
+- `ClimbClearance = game | solid_walkable | solid` (default `game`): the bit list of the probe's clearance ray. `game` = {1, 3, 5}, `solid_walkable` = {3, 3, 5}, `solid` = {3, 3, 3}.
+
 Unknown keys and invalid values are logged. Invalid choices use their defaults.
 Out-of-range numeric values are clamped, except `PaperWhiteNits` and `DisplayPeakNits`, which fall back to `game`.
 

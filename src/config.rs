@@ -185,6 +185,40 @@ pub struct DebugCfg {
     pub force_step_terrain: Option<u8>,
 }
 
+/// The bits `[Experimental] ClimbMask` may use: the 23 `ColliderFlags` bits (0 World to 22
+/// PushOthers; docs/re-notes.md, "Climb anything (experimental)").
+pub const CLIMB_MASK_BITS: u32 = 0x007f_ffff;
+
+/// `[Experimental] ClimbClearance`: the bit list of the wall probe's clearance ray, which must
+/// hit nothing between a corner ray's start and its hit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClimbClearance {
+    /// The game's list {1, 3, 5}: WorldNotDisplaced, Solid, Walkable.
+    Game,
+    /// {3, 3, 5}: Solid and Walkable. The undisplaced voxel surface no longer blocks the probe.
+    SolidWalkable,
+    /// {3, 3, 3}: Solid only.
+    Solid,
+}
+
+/// The `[Experimental]` section (branch `exp/climb-anything` only; never merged). Climbing on
+/// any rock or wall, for one in-game test (`features::climb`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ExperimentalCfg {
+    /// `ClimbAnything`: patch the game's wall probe at start-up.
+    pub climb_anything: bool,
+    /// `ClimbMask`: the collider mask of the wall probe's forward and corner rays (the game's is
+    /// 0x100, ClimbingWall). A non-zero mask of [`CLIMB_MASK_BITS`].
+    pub climb_mask: u32,
+    /// `ClimbPlaneTolerance`: how much each component of a corner ray's normal may differ from
+    /// the forward ray's (the game's is 0.001). 0.001 to 0.5.
+    pub climb_plane_tolerance: f64,
+    /// `ClimbVoxelHold`: a voxel wall (hit EntityId 0) is not "wall lost" during the climb.
+    pub climb_voxel_hold: bool,
+    /// `ClimbClearance`: the clearance ray's bit list.
+    pub climb_clearance: ClimbClearance,
+}
+
 /// All settings.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Config {
@@ -194,6 +228,8 @@ pub struct Config {
     pub hdr: HdrCfg,
     /// The `[Debug]` keys; all off by default.
     pub debug: DebugCfg,
+    /// The `[Experimental]` keys; climbing is off by default.
+    pub experimental: ExperimentalCfg,
 }
 
 /// The default settings. `parse` falls back to these values, and `DEFAULT_INI` repeats them (a test
@@ -244,6 +280,13 @@ const BUILTIN: Config = Config {
         force_step_scatter: None,
         force_step_terrain: None,
     },
+    experimental: ExperimentalCfg {
+        climb_anything: false,
+        climb_mask: 0x124,
+        climb_plane_tolerance: 0.05,
+        climb_voxel_hold: false,
+        climb_clearance: ClimbClearance::Game,
+    },
 };
 
 impl Default for Config {
@@ -254,7 +297,14 @@ impl Default for Config {
 
 /// The sections this version knows, spelled as the spec spells them. A section that is not here is
 /// unknown.
-const SECTIONS: [&str; 5] = ["General", "Governor", "Knobs", "Hdr", "Debug"];
+const SECTIONS: [&str; 6] = [
+    "General",
+    "Governor",
+    "Knobs",
+    "Hdr",
+    "Debug",
+    "Experimental",
+];
 
 /// Parse the text of a settings file. The `Vec` holds one warning per problem found.
 pub fn parse(text: &str) -> (Config, Vec<String>) {
@@ -427,6 +477,29 @@ pub fn parse(text: &str) -> (Config, Vec<String>) {
         force_step_scatter: r.force_step("ForceStepScatterDistance"),
         force_step_terrain: r.force_step("ForceStepTerrainDistance"),
     };
+    let x = d.experimental;
+    let experimental = ExperimentalCfg {
+        climb_anything: r.boolean("Experimental", "ClimbAnything", x.climb_anything),
+        climb_mask: r.climb_mask(x.climb_mask),
+        climb_plane_tolerance: r.float(
+            "Experimental",
+            "ClimbPlaneTolerance",
+            x.climb_plane_tolerance,
+            0.001,
+            0.5,
+        ),
+        climb_voxel_hold: r.boolean("Experimental", "ClimbVoxelHold", x.climb_voxel_hold),
+        climb_clearance: r.choice(
+            "Experimental",
+            "ClimbClearance",
+            x.climb_clearance,
+            &[
+                ("game", ClimbClearance::Game),
+                ("solid_walkable", ClimbClearance::SolidWalkable),
+                ("solid", ClimbClearance::Solid),
+            ],
+        ),
+    };
 
     r.report_unknown();
     (
@@ -436,6 +509,7 @@ pub fn parse(text: &str) -> (Config, Vec<String>) {
             knobs,
             hdr,
             debug,
+            experimental,
         },
         r.warnings,
     )
@@ -731,6 +805,35 @@ impl Reader {
         None
     }
 
+    /// `[Experimental] ClimbMask`: `0x` and one to eight hex digits, for a non-zero mask inside
+    /// [`CLIMB_MASK_BITS`]. Anything else (also a number without `0x`, which could be meant as
+    /// decimal) warns and uses the default.
+    fn climb_mask(&mut self, default: u32) -> u32 {
+        let Some(text) = self.raw("Experimental", "ClimbMask") else {
+            return default;
+        };
+        let trimmed = text.trim();
+        let mask = trimmed
+            .strip_prefix("0x")
+            .or_else(|| trimmed.strip_prefix("0X"))
+            .filter(|digits| {
+                (1..=8).contains(&digits.len()) && digits.bytes().all(|b| b.is_ascii_hexdigit())
+            })
+            .and_then(|digits| u32::from_str_radix(digits, 16).ok())
+            .filter(|mask| *mask != 0 && mask & !CLIMB_MASK_BITS == 0);
+        if let Some(mask) = mask {
+            return mask;
+        }
+        self.not_valid(
+            "Experimental",
+            "ClimbMask",
+            &text,
+            "a hex mask from 0x1 to 0x7fffff (for example 0x124)",
+            &format!("{default:#x}"),
+        );
+        default
+    }
+
     /// Warn about each section and key that no getter asked for.
     fn report_unknown(&mut self) {
         let mut unknown = Vec::new();
@@ -807,6 +910,9 @@ mod tests {
         assert!((0.5..=1.0).contains(&k.deco_distance_scale));
         assert!((0.5..=1.0).contains(&k.distant_objects_scale));
         assert!((1.0..=1.6).contains(&k.terrain_ring_scale));
+        let x = &c.experimental;
+        assert!(x.climb_mask != 0 && x.climb_mask & !CLIMB_MASK_BITS == 0);
+        assert!((0.001..=0.5).contains(&x.climb_plane_tolerance));
     }
 
     /// The numeric value of a key, by its `.ini` name, for the range tables.
@@ -829,6 +935,7 @@ mod tests {
             "DecoDistanceScale" => c.knobs.deco_distance_scale,
             "DistantObjectsScale" => c.knobs.distant_objects_scale,
             "TerrainRingScale" => c.knobs.terrain_ring_scale,
+            "ClimbPlaneTolerance" => c.experimental.climb_plane_tolerance,
             _ => panic!("no such numeric key {key}"),
         }
     }
@@ -1070,6 +1177,7 @@ mod tests {
         ("Knobs", "DecoDistanceScale", 0.5, 1.0),
         ("Knobs", "DistantObjectsScale", 0.5, 1.0),
         ("Knobs", "TerrainRingScale", 1.0, 1.6),
+        ("Experimental", "ClimbPlaneTolerance", 0.001, 0.5),
     ];
 
     #[test]
@@ -1271,12 +1379,13 @@ mod tests {
                 assert!(w[0].contains(key) && w[0].contains("default auto"));
             }
         }
+        // 31 keys, plus the five `[Experimental]` keys of the climb experiment.
         assert_eq!(
             DEFAULT_INI
                 .lines()
                 .filter(|line| !line.starts_with(';') && line.contains('='))
                 .count(),
-            31
+            36
         );
     }
 
@@ -1839,6 +1948,134 @@ mod tests {
         assert_eq!(w, ["[Debug] nope: unknown key, ignored"], "{w:?}");
     }
 
+    // ---- [Experimental] (branch exp/climb-anything) ----
+
+    #[test]
+    fn experimental_defaults_keep_climbing_off_and_name_the_proposed_mask() {
+        let x = Config::default().experimental;
+        assert_eq!(
+            x,
+            ExperimentalCfg {
+                climb_anything: false,
+                climb_mask: 0x124,
+                climb_plane_tolerance: 0.05,
+                climb_voxel_hold: false,
+                climb_clearance: ClimbClearance::Game,
+            }
+        );
+        // 0x124 = ClimbingWall (8) | Walkable (5) | WorldNormalsNotDisplaced (2).
+        assert_eq!(x.climb_mask, (1 << 8) | (1 << 5) | (1 << 2));
+        assert_eq!(CLIMB_MASK_BITS, (1 << 23) - 1);
+    }
+
+    #[test]
+    fn the_default_file_has_the_experimental_section_with_climbing_off() {
+        let lower = DEFAULT_INI.to_ascii_lowercase();
+        assert!(lower.contains("[experimental]"));
+        for line in [
+            "ClimbAnything=0",
+            "ClimbMask=0x124",
+            "ClimbPlaneTolerance=0.05",
+            "ClimbVoxelHold=0",
+            "ClimbClearance=game",
+        ] {
+            assert!(
+                DEFAULT_INI.lines().any(|l| l == line),
+                "{line} is not in the default file"
+            );
+        }
+        let (c, w) = parse(DEFAULT_INI);
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(c.experimental, Config::default().experimental);
+    }
+
+    #[test]
+    fn experimental_keys_are_read() {
+        let (c, w) = parse(
+            "[Experimental]\nClimbAnything=1\nClimbMask=0x121\nClimbPlaneTolerance=0,2\n\
+             ClimbVoxelHold=true\nClimbClearance=Solid_Walkable\n",
+        );
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(
+            c.experimental,
+            ExperimentalCfg {
+                climb_anything: true,
+                climb_mask: 0x121,
+                climb_plane_tolerance: 0.2,
+                climb_voxel_hold: true,
+                climb_clearance: ClimbClearance::SolidWalkable,
+            }
+        );
+        let (c, w) = one("Experimental", "ClimbClearance", "solid");
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(c.experimental.climb_clearance, ClimbClearance::Solid);
+    }
+
+    #[test]
+    fn climb_mask_takes_0x_and_one_to_eight_hex_digits() {
+        for (text, want) in [
+            ("0x124", 0x124),
+            ("0X121", 0x121),
+            ("0x100", 0x100),
+            ("0x1", 0x1),
+            ("0x7fffff", 0x7f_ffff),
+            ("0x007FFFFF", 0x7f_ffff),
+            (" 0x2a ", 0x2a),
+        ] {
+            let (c, w) = one("Experimental", "ClimbMask", text);
+            assert!(w.is_empty(), "{text:?}: {w:?}");
+            assert_eq!(c.experimental.climb_mask, want, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_bad_climb_mask_warns_once_and_uses_the_default() {
+        for text in [
+            "124",
+            "292",
+            "0x",
+            "0x0",
+            "0x00000000",
+            "0x800000",
+            "0xffffffff",
+            "0x1ffffffff",
+            "0x+124",
+            "0x-1",
+            "0xg1",
+            "0x 124",
+            "x124",
+            "",
+            "auto",
+        ] {
+            let (c, w) = one("Experimental", "ClimbMask", text);
+            assert_eq!(c.experimental.climb_mask, 0x124, "{text:?}");
+            assert_eq!(w.len(), 1, "{text:?}: {w:?}");
+            assert!(
+                w[0].starts_with("[Experimental] ClimbMask: ")
+                    && w[0].ends_with("using the default 0x124"),
+                "{text:?}: {w:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bad_climb_clearance_or_switch_warns_and_uses_the_default() {
+        let (c, w) = one("Experimental", "ClimbClearance", "none");
+        assert_eq!(c.experimental.climb_clearance, ClimbClearance::Game);
+        assert_eq!(
+            w,
+            ["[Experimental] ClimbClearance: \"none\" is not one of game, solid_walkable, solid, \
+              using the default game"]
+        );
+        for key in ["ClimbAnything", "ClimbVoxelHold"] {
+            let (c, w) = one("Experimental", key, "yes");
+            assert_eq!(c.experimental, Config::default().experimental, "{key}");
+            assert_eq!(w.len(), 1, "{key}: {w:?}");
+        }
+        let (_, w) = parse("[experimental]\nclimbanything=0\nClimbHarder=1\n");
+        assert_eq!(w, ["[Experimental] climbharder: unknown key, ignored"]);
+    }
+
     /// Properties exercise the public parser, independently of its range constants.
     mod properties {
         use super::*;
@@ -1897,7 +2134,17 @@ mod tests {
                         force_step_scatter,
                         force_step_terrain,
                     },
+                experimental:
+                    ExperimentalCfg {
+                        climb_anything: _,
+                        climb_mask,
+                        climb_plane_tolerance,
+                        climb_voxel_hold: _,
+                        climb_clearance: _,
+                    },
             } = *config;
+            assert!(climb_mask != 0 && climb_mask & !CLIMB_MASK_BITS == 0);
+            assert!((0.001..=0.5).contains(&climb_plane_tolerance));
             assert!(target_fps == 0 || (30..=360).contains(&target_fps));
             assert!((4.0..=16.0).contains(&texture_reserve_gib));
             if let TextureBudget::Gib(value) = texture_budget {
@@ -2170,6 +2417,27 @@ mod tests {
                 high: 1.0,
                 kind: Kind::Boolean,
             },
+            NumericKey {
+                section: "Experimental",
+                key: "ClimbPlaneTolerance",
+                low: 0.001,
+                high: 0.5,
+                kind: Kind::Float,
+            },
+            NumericKey {
+                section: "Experimental",
+                key: "ClimbAnything",
+                low: 0.0,
+                high: 1.0,
+                kind: Kind::Boolean,
+            },
+            NumericKey {
+                section: "Experimental",
+                key: "ClimbVoxelHold",
+                low: 0.0,
+                high: 1.0,
+                kind: Kind::Boolean,
+            },
         ];
 
         /// Set one key without causing an unrelated threshold-order warning.
@@ -2203,6 +2471,8 @@ mod tests {
                 "EnableScatterDistance" => f64::from(config.knobs.enable_scatter_distance),
                 "EnableTerrainDistance" => f64::from(config.knobs.enable_terrain_distance),
                 "ScatterProbe" => f64::from(config.debug.scatter_probe),
+                "ClimbAnything" => f64::from(config.experimental.climb_anything),
+                "ClimbVoxelHold" => f64::from(config.experimental.climb_voxel_hold),
                 _ => number(config, key),
             })
         }
