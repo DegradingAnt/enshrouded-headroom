@@ -1164,7 +1164,7 @@ mod tests {
                 .lines()
                 .filter(|line| !line.starts_with(';') && line.contains('='))
                 .count(),
-            28
+            29
         );
     }
 
