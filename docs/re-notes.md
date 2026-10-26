@@ -4,7 +4,7 @@ Target: `enshrouded.exe`, sha256 `b28b448a8dbf48c932b717f035031f5a89712a7cccfcc2
 Tools: REA 6.3.0 + Ghidra 12.1.4, and capstone/pefile scratch probes (`xref.py`, `callers.py`, `func.py`, `stores.py` in the session scratchpad).
 Evidence labels: **VERIFIED** = read from bytes, decompile, or game log. **HYPOTHESIS** = inferred from names or neighbours.
 
-## Shipped in the launcher (old install; a copy is in `reference\old-build\_perf`)
+## Shipped in the launcher ([performance findings](perf-findings.md), 2026-10-23)
 
 - Texture-streaming budget. `FUN_1400f82c0` picks the budget from table `0x1413b86d0`: 5 rows of (VRAM threshold, budget). The top row is ≥10 GiB → 2 GiB. **VERIFIED** (decompile and log).
 - `--enable-async-compute`. The parse at `0x14084f711` sets an optional bool (value at `+0x2a3`, has-value at `+0x2a4`). The renderer create call at `0x14084912f` uses it in place of the auto value from `0x1404b14d0`. **VERIFIED** (bytes and log).

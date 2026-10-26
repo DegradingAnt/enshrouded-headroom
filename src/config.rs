@@ -67,6 +67,15 @@ pub enum AsyncCompute {
     Game,
 }
 
+/// `[General] Priority`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Priority {
+    /// Raise the process priority after the first device is created.
+    AboveNormal,
+    /// Leave the current process priority unchanged.
+    Normal,
+}
+
 /// `[General] Reflex`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReflexMode {
@@ -83,6 +92,8 @@ pub struct General {
     pub texture_budget: TextureBudget,
     pub texture_reserve_gib: f64,
     pub async_compute: AsyncCompute,
+    /// The priority change made after renderer creation.
+    pub priority: Priority,
     pub reflex: ReflexMode,
     pub allow_unknown_build: bool,
     pub log_level: LogLevel,
@@ -135,6 +146,7 @@ const BUILTIN: Config = Config {
         texture_budget: TextureBudget::Auto,
         texture_reserve_gib: 11.0,
         async_compute: AsyncCompute::On,
+        priority: Priority::AboveNormal,
         reflex: ReflexMode::Game,
         allow_unknown_build: false,
         log_level: LogLevel::Info,
@@ -206,6 +218,15 @@ pub fn parse(text: &str) -> (Config, Vec<String>) {
             "AsyncCompute",
             d.general.async_compute,
             &[("on", AsyncCompute::On), ("game", AsyncCompute::Game)],
+        ),
+        priority: r.choice(
+            "General",
+            "Priority",
+            d.general.priority,
+            &[
+                ("above_normal", Priority::AboveNormal),
+                ("normal", Priority::Normal),
+            ],
         ),
         reflex: r.choice(
             "General",
@@ -682,6 +703,52 @@ mod tests {
         }
     }
 
+    // ---- Priority ----
+
+    #[test]
+    fn priority_defaults_to_above_normal() {
+        let (cfg, warnings) = parse("");
+        assert_eq!(cfg.general.priority, Priority::AboveNormal);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(Config::default().general.priority, Priority::AboveNormal);
+    }
+
+    #[test]
+    fn priority_accepts_both_settings() {
+        for (value, expected) in [
+            ("above_normal", Priority::AboveNormal),
+            ("normal", Priority::Normal),
+        ] {
+            let (cfg, warnings) = one("General", "Priority", value);
+            assert_eq!(cfg.general.priority, expected, "{value}");
+            assert!(warnings.is_empty(), "{warnings:?}");
+        }
+    }
+
+    #[test]
+    fn priority_bad_value_warns_and_uses_above_normal() {
+        let (cfg, warnings) = one("General", "Priority", "high");
+        assert_eq!(cfg.general.priority, Priority::AboveNormal);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("[General] Priority"), "{warnings:?}");
+        assert!(
+            warnings[0].contains("using the default above_normal"),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn priority_accepts_upper_case() {
+        for (value, expected) in [
+            ("ABOVE_NORMAL", Priority::AboveNormal),
+            ("NORMAL", Priority::Normal),
+        ] {
+            let (cfg, warnings) = one("GENERAL", "PRIORITY", value);
+            assert_eq!(cfg.general.priority, expected, "{value}");
+            assert!(warnings.is_empty(), "{warnings:?}");
+        }
+    }
+
     // ---- The four tests from the task brief ----
 
     #[test]
@@ -745,6 +812,7 @@ mod tests {
         assert_eq!(g.texture_budget, TextureBudget::Auto);
         assert_eq!(g.texture_reserve_gib, 11.0);
         assert_eq!(g.async_compute, AsyncCompute::On);
+        assert_eq!(g.priority, Priority::AboveNormal);
         assert_eq!(g.reflex, ReflexMode::Game);
         assert!(!g.allow_unknown_build);
         assert_eq!(g.log_level, LogLevel::Info);
