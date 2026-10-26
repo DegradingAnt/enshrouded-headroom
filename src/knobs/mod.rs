@@ -240,7 +240,9 @@ fn hooks_line(result: &Result<u32, String>) -> Option<(Level, String)> {
 /// The last start-up step: enable every hook queued before it, and log one line if any was.
 /// Called once, from the end of `entry::start`.
 pub fn enable_queued_hooks() {
-    if let Some((level, line)) = hooks_line(&apply_queued()) {
+    let result = apply_queued();
+    object_distance::complete_hook_batch(&result);
+    if let Some((level, line)) = hooks_line(&result) {
         log::log!(level, "{line}");
     }
 }

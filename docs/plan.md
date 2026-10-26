@@ -825,15 +825,15 @@ Task 15 consumes this module. The governor's knob 1 is enabled only while `SCATT
     - distant High (2.5) × `distant_objects_scale`;
     - voxel High (32, 128, 160) × `terrain_ring_scale`.
     - Each goes through `write_u32_checked` with the original f32 bits as the expected value. A scale of 1.0 means no write.
-- Produces from `vram_budget`: `pub unsafe fn free_mib(gipa, instance, phys) -> Option<u64>`. It uses `vkGetPhysicalDeviceMemoryProperties2` with `VkPhysicalDeviceMemoryBudgetPropertiesEXT` and returns `budget − usage` of the largest `DEVICE_LOCAL` heap. It returns `None` when the driver does not list `VK_EXT_memory_budget`.
-- Produces from `governor_thread`: `pub fn spawn(cfg: GovernorCfg, knobs: KnobsCfg, scatter_cap_ok: bool)`. Every 50 ms it:
+- Produces from `vram_budget`: `pub unsafe fn free_mib(gipa, instance, phys, route: QueryRoute) -> Option<u64>`. The caller proves either core Vulkan 1.1 support for the observed instance and physical device, or an explicitly enabled KHR properties2 route. It queries `VkPhysicalDeviceMemoryBudgetPropertiesEXT` and returns `budget − usage` of the largest `DEVICE_LOCAL` heap. Unknown facts, missing selected commands, retirement or an unlisted `VK_EXT_memory_budget` return `None`; a non-null alias is not capability proof.
+- Produces from `governor_thread`: `pub fn spawn(cfg: Config)`. Every 50 ms it:
   1. reads new frames from `FRAMES` and converts them to intervals in ms;
   2. sets `world_active = qpc_now() - OBJECT.last_seen() < 250 ms`;
   3. reads `period_ms` from `display` (refreshed every 5 s) and `free_mib` (every 2 s);
   4. works out `baseline_changed` from each knob's `baseline_seq`;
-  5. runs `Governor::tick`;
+  5. runs the equivalent `Governor::tick_with` with preallocated scratch;
   6. maps each `Action::Set{knob, step}`: knob 0 → `OBJECT.set(OBJECT_STEPS[step])`; knob 1 → `scatter_distance::set_distance(SCATTER_STEPS[step])`; knob 2 → `TERRAIN.set(TERRAIN_STEPS[step])`. Knob 1's `KnobSpec.enabled` is true only while `SCATTER_LEVEL == 3`, `scatter_cap_ok` and `enable_scatter_distance`; when that turns false, the step is reset to 0 first;
-  7. logs each step change (this thread may log).
+  7. logs each step change (this thread may log). It reports status every 30 s, available Reflex timings every 5 s at debug level, and configured scatter counters every 2 s. The VRAM query uses W23's live capability-aware lease.
 
 - [ ] **Step 1: Write the failing tests:** `assert_eq!(scaled(1.5, 0.5), 0.75)`, and `apply` with all scales at 1.0 returns a `Vec` of `"unchanged"` notes. Plus a glue test, `actions_map_to_knob_values`: given `Action::Set{knob:2, step:4}`, the mapping function `knob_value(2, 4)` returns `2.0`.
 - [ ] **Step 2:** Run `cargo test startup_scales:: governor_thread::` and expect FAIL.
