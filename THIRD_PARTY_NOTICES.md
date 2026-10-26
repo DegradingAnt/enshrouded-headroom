@@ -160,9 +160,13 @@ $metadata.packages |
 - fern 0.7.1: MIT
 - find-msvc-tools 0.1.15: MIT OR Apache-2.0
 - getrandom 0.4.3: MIT OR Apache-2.0
+- iced-x86 1.21.0: MIT
+- lazy_static 1.5.1: MIT OR Apache-2.0
 - log 0.4.34: MIT OR Apache-2.0
+- memchr 2.8.3: Unlicense OR MIT
 - minhook 0.9.0: MIT
 - num-traits 0.2.19: MIT OR Apache-2.0
+- object 0.40.0: Apache-2.0 OR MIT
 - once_cell 1.21.4: MIT OR Apache-2.0
 - pin-project-lite 0.2.17: Apache-2.0 OR MIT
 - proc-macro2 1.0.107: MIT OR Apache-2.0

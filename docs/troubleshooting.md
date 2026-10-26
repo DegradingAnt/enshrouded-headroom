@@ -136,14 +136,19 @@ Detailed distance and hook reasons:
 
 ## Scatter counter probe
 
-The probe is off by default. The debug request requires both ScatterProbe=1 and LogLevel=debug. The ordinary consumer needs a measured grass ceiling above the stock distance.
+The probe is off by default. A debug request requires both `ScatterProbe=1` and `LogLevel=debug`. The ordinary consumer requires `EnableScatterDistance=1` and a grass ceiling that permits at least one higher step. The current 90 m ceiling permits no raise.
 
 | Message template | Meaning and action |
 |---|---|
 | `scatter probe: off: code patches are off on this build` | Build protection skipped the probe. Check the build line. |
-| `scatter probe: off: no consumer (the grass ceiling r_max is not measured yet, and no [Debug] ScatterProbe = 1 with LogLevel = debug)` | No permitted consumer requested it. This is the normal default while the ceiling is unmeasured. |
-| `scatter probe: on (grass pass hook queued; it reads the GPU counters at most every 500 ms)` | The probe hook was queued with time-limited sampling. Check the final hook-enable line. This is not a capacity measurement result. |
-| `scatter probe: off: {why}` | Preparing the hook failed. Use the same signature and MinHook reasons as the distance hooks. |
+| `scatter probe: off: no consumer ({debug}; {knob})` | Neither consumer requested the probe. The two printed reasons identify the debug and grass conditions below. This is the normal default; no repair is needed. |
+| `scatter probe: on (grass pass hook queued; sampler thread copies GPU counters every 500 ms)` | The detached sampler thread started and the grass-pass hook was queued. Check the later `hooks:` line for batch enablement. This does not prove successful samples or capacity headroom. |
+| `scatter probe: off: {why}` | Preparing the hook or starting the sampler failed. Read the reason below or the shared signature/MinHook reasons. Keep the final `hooks:` line too: the hook may already have been queued. |
+| `cannot start sampler thread: {error}` | The background sampler could not be started. Include the printed error and full startup log when reporting it. Hook preparation may already have succeeded. |
+
+In the no-consumer line, `{debug}` is `[Debug] ScatterProbe = 0` or `LogLevel is not debug`. `{knob}` is `EnableScatterDistance = 0` or `the grass ceiling r_max = {r_max} m allows no raise`. The line reports the actual unmet conditions; it does not diagnose why a ceiling is low.
+
+The background sampler checks every 500 ms and reads counters only after new hook calls. It does not sample on the game thread. A good sample resets the transient-miss count. Ten consecutive transient misses while calls continue, or one copied counter-layout mismatch, latch sampling off for the session. Those checks update internal state without a dedicated runtime failure log. A sampler panic also latches failure; see the generic panic messages below. Restart to begin a new session, and retain the startup and hook-enable lines when reporting missing probe data. No sample or startup line proves a measured grass ceiling or an in-game result.
 
 ## HDR paper white and peak
 
