@@ -164,10 +164,32 @@ unsafe extern "system" fn fake_gipa(
     to_void(match n.as_str() {
         "vkGetDeviceProcAddr" => addr(fake_gdpa as *const ()),
         "vkCreateDevice" => addr(fake_create_device as *const ()),
+        "vkEnumeratePhysicalDevices" => addr(fake_enumerate_physical as *const ()),
         "vkGetPhysicalDeviceMemoryProperties" => addr(fake_memory_properties as *const ()),
         "vkGetPhysicalDeviceProperties" => addr(fake_properties as *const ()),
         _ => addr(other_vk as *const ()),
     })
+}
+
+/// Actual enumeration output establishes the fake device's native parent.
+/// # Safety
+/// The test passes one writable physical handle and count storage, or a count-only query.
+unsafe extern "system" fn fake_enumerate_physical(
+    _: vk::Instance,
+    count: *mut u32,
+    out: *mut vk::PhysicalDevice,
+) -> vk::Result {
+    let body = || {
+        // SAFETY: caller provides the described storage; exactly one output is written.
+        unsafe {
+            if !out.is_null() {
+                out.write(vk::PhysicalDevice::from_raw(PHYS));
+            }
+            count.write(1);
+        }
+        vk::Result::SUCCESS
+    };
+    enshrouded_headroom::guard::guard(enshrouded_headroom::guard::Feature::VkWrap, body, body)
 }
 
 /// The fake `vkGetDeviceProcAddr`.
@@ -551,7 +573,19 @@ fn scenario(dir: &Path) {
         );
 
         let got = gipa(instance, c"vkEnumeratePhysicalDevices".as_ptr());
-        assert_eq!(void_addr(got), other_vk as *const () as usize);
+        assert_ne!(
+            void_addr(got),
+            fake_enumerate_physical as *const () as usize
+        );
+        let enumerate =
+            std::mem::transmute::<vk::PFN_vkVoidFunction, vk::PFN_vkEnumeratePhysicalDevices>(got);
+        let mut count = 1;
+        let mut physical = vk::PhysicalDevice::null();
+        assert_eq!(
+            enumerate(instance, &mut count, &mut physical),
+            vk::Result::SUCCESS
+        );
+        assert_eq!(physical.as_raw(), PHYS);
         assert_eq!(
             take_calls(),
             [
@@ -593,6 +627,9 @@ fn scenario(dir: &Path) {
                     &allocator as *const _ as usize,
                     &mut device as *mut _ as usize
                 ),
+                "gipa(0x11110000, vkDestroyDevice)".to_owned(),
+                "gipa(0x11110000, vkGetPhysicalDeviceMemoryProperties)".to_owned(),
+                "gipa(0x11110000, vkGetPhysicalDeviceProperties)".to_owned(),
                 "memory_properties(0x22220000)".to_owned(),
                 "properties(0x22220000)".to_owned(),
             ]
@@ -856,6 +893,9 @@ mod reflex_driver {
     static ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
     static CHANGED_OK: AtomicUsize = AtomicUsize::new(0);
     static RETRY_OK: AtomicUsize = AtomicUsize::new(0);
+    static WRONG_GPU_QUERY: AtomicUsize = AtomicUsize::new(0);
+    static QUERY_INSTANCE: AtomicUsize = AtomicUsize::new(0);
+    static ENUM_RESULT: AtomicUsize = AtomicUsize::new(0);
     static VENDOR: AtomicUsize = AtomicUsize::new(0x10de);
     static REFUSE: AtomicUsize = AtomicUsize::new(0);
 
@@ -875,6 +915,27 @@ mod reflex_driver {
                 }
             },
         );
+    }
+    /// Fake parent-specific memory query; the output belongs to the caller.
+    unsafe extern "system" fn memory(
+        _: vk::PhysicalDevice,
+        out: *mut vk::PhysicalDeviceMemoryProperties,
+    ) {
+        let body = || {
+            // SAFETY: caller supplies the exact writable Vulkan output type.
+            unsafe { out.write(vk::PhysicalDeviceMemoryProperties::default()) };
+        };
+        guard(Feature::VkWrap, body, body);
+    }
+    /// A stale instance A properties pointer must never be used for physical device B.
+    unsafe extern "system" fn wrong_properties(
+        _: vk::PhysicalDevice,
+        _: *mut vk::PhysicalDeviceProperties,
+    ) {
+        let body = || {
+            WRONG_GPU_QUERY.fetch_add(1, Ordering::Relaxed);
+        };
+        guard(Feature::VkWrap, body, body);
     }
     /// # Safety
     /// Vulkan's extension-query contract, supplied by the wrapper under test.
@@ -948,16 +1009,118 @@ mod reflex_driver {
             },
         );
     }
+    /// Enumerate distinct physical devices for two live fake instances.
+    unsafe extern "system" fn enumerate_physical(
+        instance: vk::Instance,
+        count: *mut u32,
+        out: *mut vk::PhysicalDevice,
+    ) -> vk::Result {
+        let body = || {
+            // SAFETY: the test provides one writable output or a count-only query.
+            unsafe {
+                if !out.is_null() {
+                    out.write(vk::PhysicalDevice::from_raw(
+                        if instance.as_raw() == INSTANCE {
+                            PHYS + 1
+                        } else {
+                            PHYS
+                        },
+                    ));
+                }
+                count.write(1);
+            }
+            match ENUM_RESULT.load(Ordering::Relaxed) {
+                1 => vk::Result::INCOMPLETE,
+                2 => vk::Result::ERROR_UNKNOWN,
+                _ => vk::Result::SUCCESS,
+            }
+        };
+        guard(Feature::VkWrap, body, body)
+    }
+    /// Actual group outputs have the same parentage contract for the core and KHR aliases.
+    unsafe extern "system" fn enumerate_groups(
+        instance: vk::Instance,
+        count: *mut u32,
+        out: *mut vk::PhysicalDeviceGroupProperties<'_>,
+    ) -> vk::Result {
+        let body = || {
+            // SAFETY: count and optional one-element initialized group storage are supplied by the test.
+            unsafe {
+                if !out.is_null() {
+                    (*out).physical_device_count = 1;
+                    (*out).physical_devices[0] =
+                        vk::PhysicalDevice::from_raw(if instance.as_raw() == INSTANCE {
+                            PHYS + 1
+                        } else {
+                            PHYS
+                        });
+                }
+                count.write(1);
+            }
+            vk::Result::SUCCESS
+        };
+        guard(Feature::VkWrap, body, body)
+    }
+    /// Fake lifetime endpoints; these cases create no live native device resources.
+    unsafe extern "system" fn destroy_device(_: vk::Device, _: *const vk::AllocationCallbacks<'_>) {
+        guard(Feature::VkWrap, || (), || ());
+    }
+    /// A different instance-specific endpoint must not replace an already-issued function.
+    unsafe extern "system" fn other_destroy_device(
+        _: vk::Device,
+        _: *const vk::AllocationCallbacks<'_>,
+    ) {
+        guard(Feature::VkWrap, || (), || ());
+    }
+    /// Fake swapchain lifetime endpoint.
+    unsafe extern "system" fn destroy_swapchain(
+        _: vk::Device,
+        _: vk::SwapchainKHR,
+        _: *const vk::AllocationCallbacks<'_>,
+    ) {
+        guard(Feature::VkWrap, || (), || ());
+    }
+    /// Missing optional native functions leave the fake runtime unavailable after creation.
+    unsafe extern "system" fn gdpa(_: vk::Device, _: *const c_char) -> vk::PFN_vkVoidFunction {
+        guard(Feature::VkWrap, || None, || None)
+    }
+    /// The fake owns no native instance resources.
+    unsafe extern "system" fn destroy_instance(
+        _: vk::Instance,
+        _: *const vk::AllocationCallbacks<'_>,
+    ) {
+        guard(Feature::VkWrap, || (), || ());
+    }
     /// # Safety
     /// Called with a terminated function name.
-    unsafe extern "system" fn gipa(_: vk::Instance, name: *const c_char) -> vk::PFN_vkVoidFunction {
+    unsafe extern "system" fn gipa(
+        instance: vk::Instance,
+        name: *const c_char,
+    ) -> vk::PFN_vkVoidFunction {
         guard(
             Feature::VkWrap,
             || None,
             || {
                 // SAFETY: every request uses a valid NUL-terminated name.
                 let name = unsafe { CStr::from_ptr(name) };
+                if matches!(
+                    name.to_bytes(),
+                    b"vkGetPhysicalDeviceProperties"
+                        | b"vkEnumerateDeviceExtensionProperties"
+                        | b"vkGetPhysicalDeviceFeatures2"
+                ) {
+                    QUERY_INSTANCE.store(instance.as_raw() as usize, Ordering::Relaxed);
+                }
                 to_void(match name.to_bytes() {
+                    b"vkEnumeratePhysicalDeviceGroups" | b"vkEnumeratePhysicalDeviceGroupsKHR" => {
+                        enumerate_groups as *const () as usize
+                    }
+                    b"vkEnumeratePhysicalDevices" => enumerate_physical as *const () as usize,
+                    b"vkDestroyInstance" => destroy_instance as *const () as usize,
+                    b"vkDestroyDevice" => destroy_device as *const () as usize,
+                    b"vkDestroySwapchainKHR" => destroy_swapchain as *const () as usize,
+                    b"vkGetDeviceProcAddr" => gdpa as *const () as usize,
+                    b"vkGetPhysicalDeviceMemoryProperties" => memory as *const () as usize,
                     b"vkGetPhysicalDeviceProperties" => properties as *const () as usize,
                     b"vkEnumerateDeviceExtensionProperties" => extensions as *const () as usize,
                     b"vkGetPhysicalDeviceFeatures2" => features as *const () as usize,
@@ -1035,6 +1198,84 @@ mod reflex_driver {
         REAL_GIPA.store(gipa as *const () as usize, Ordering::Release);
         GAME_INSTANCE.store(INSTANCE as usize, Ordering::Release);
         REAL_CREATE_DEVICE.store(create as *const () as usize, Ordering::Release);
+        if case == "incomplete" {
+            ENUM_RESULT.store(1, Ordering::Relaxed);
+        }
+        if case == "enum-failure" {
+            ENUM_RESULT.store(2, Ordering::Relaxed);
+        }
+        if case != "unobserved" {
+            // SAFETY: fake instances and initialized one-element outputs obey the exact fake APIs.
+            unsafe {
+                for instance in if case == "parentage" {
+                    vec![INSTANCE, INSTANCE + 1]
+                } else {
+                    vec![INSTANCE + 1]
+                } {
+                    let instance = vk::Instance::from_raw(instance);
+                    if matches!(case, "groups" | "groups-khr") {
+                        let name = if case == "groups" {
+                            c"vkEnumeratePhysicalDeviceGroups"
+                        } else {
+                            c"vkEnumeratePhysicalDeviceGroupsKHR"
+                        };
+                        let raw =
+                            enshrouded_headroom::vk::wrap_gipa(instance, name.as_ptr()).unwrap();
+                        let enumerate = std::mem::transmute::<
+                            unsafe extern "system" fn(),
+                            vk::PFN_vkEnumeratePhysicalDeviceGroups,
+                        >(raw);
+                        let mut count = 1;
+                        let mut group = vk::PhysicalDeviceGroupProperties::default();
+                        assert_eq!(
+                            enumerate(instance, &mut count, &mut group),
+                            vk::Result::SUCCESS
+                        );
+                        assert_eq!(group.physical_device_count, 1);
+                    } else {
+                        let raw = enshrouded_headroom::vk::wrap_gipa(
+                            instance,
+                            c"vkEnumeratePhysicalDevices".as_ptr(),
+                        )
+                        .unwrap();
+                        let enumerate = std::mem::transmute::<
+                            unsafe extern "system" fn(),
+                            vk::PFN_vkEnumeratePhysicalDevices,
+                        >(raw);
+                        let mut count = 1;
+                        let mut physical = vk::PhysicalDevice::null();
+                        let output = if case == "count-only" {
+                            std::ptr::null_mut()
+                        } else {
+                            &mut physical
+                        };
+                        let result = enumerate(instance, &mut count, output);
+                        assert_eq!(
+                            result,
+                            if case == "incomplete" {
+                                vk::Result::INCOMPLETE
+                            } else if case == "enum-failure" {
+                                vk::Result::ERROR_UNKNOWN
+                            } else {
+                                vk::Result::SUCCESS
+                            }
+                        );
+                    }
+                }
+            }
+        }
+        if case == "parentage" {
+            enshrouded_headroom::vk::REAL_GET_MEMORY_PROPERTIES
+                .store(memory as *const () as usize, Ordering::Release);
+            enshrouded_headroom::vk::REAL_GET_PROPERTIES
+                .store(wrong_properties as *const () as usize, Ordering::Release);
+        }
+        if case == "dispatch-conflict" {
+            enshrouded_headroom::vk::REAL_DESTROY_DEVICE.store(
+                other_destroy_device as *const () as usize,
+                Ordering::Release,
+            );
+        }
         if case == "vendor" {
             VENDOR.store(0x1002, Ordering::Relaxed);
         }
@@ -1066,7 +1307,60 @@ mod reflex_driver {
         assert_eq!(v12.timeline_semaphore, vk::FALSE);
         assert_eq!(v12.buffer_device_address, vk::TRUE);
         match case {
-            "extension" => {
+            "unobserved" | "enum-failure" | "count-only" | "dispatch-conflict" => {
+                assert!(enshrouded_headroom::vk::with_game_device(|_, _, _| ()).is_none());
+                assert_eq!(CHANGED_OK.load(Ordering::Relaxed), 0);
+                assert_eq!(RETRY_OK.load(Ordering::Relaxed), 1);
+                if case != "dispatch-conflict" {
+                    assert_eq!(QUERY_INSTANCE.load(Ordering::Relaxed), 0);
+                }
+            }
+            "parentage" => {
+                assert_eq!(
+                    WRONG_GPU_QUERY.load(Ordering::Relaxed),
+                    0,
+                    "instance A GPU dispatch must not query B"
+                );
+                assert_eq!(
+                    QUERY_INSTANCE.load(Ordering::Relaxed),
+                    (INSTANCE + 1) as usize
+                );
+                assert_eq!(
+                    enshrouded_headroom::vk::with_game_device(|d, _, i| (d.phys, i)),
+                    Some((PHYS as usize, (INSTANCE + 1) as usize))
+                );
+                // Destroying unrelated A cannot retire B's context; destroying B must.
+                for instance in [INSTANCE, INSTANCE + 1] {
+                    if instance == INSTANCE + 1 {
+                        // SAFETY: Vulkan requires the child device to be destroyed before its parent.
+                        unsafe {
+                            enshrouded_headroom::vk::wrap_destroy_device(device, std::ptr::null())
+                        };
+                    }
+                    // SAFETY: each live fake instance is destroyed exactly once through its lookup.
+                    unsafe {
+                        let raw = enshrouded_headroom::vk::wrap_gipa(
+                            vk::Instance::from_raw(instance),
+                            c"vkDestroyInstance".as_ptr(),
+                        )
+                        .unwrap();
+                        let destroy = std::mem::transmute::<
+                            unsafe extern "system" fn(),
+                            vk::PFN_vkDestroyInstance,
+                        >(raw);
+                        destroy(vk::Instance::from_raw(instance), std::ptr::null());
+                    }
+                    assert_eq!(
+                        enshrouded_headroom::vk::with_game_device(|_, _, i| i),
+                        if instance == INSTANCE {
+                            Some((INSTANCE + 1) as usize)
+                        } else {
+                            None
+                        }
+                    );
+                }
+            }
+            "extension" | "groups" | "groups-khr" | "incomplete" => {
                 assert_eq!(ATTEMPTS.load(Ordering::Relaxed), 1);
                 assert_eq!(CHANGED_OK.load(Ordering::Relaxed), 1);
                 assert_eq!(RETRY_OK.load(Ordering::Relaxed), 0);
@@ -1092,7 +1386,19 @@ mod reflex_driver {
             child(&case);
             return;
         }
-        for case in ["extension", "refusal", "vendor"] {
+        for case in [
+            "dispatch-conflict",
+            "parentage",
+            "unobserved",
+            "enum-failure",
+            "count-only",
+            "groups",
+            "groups-khr",
+            "incomplete",
+            "extension",
+            "refusal",
+            "vendor",
+        ] {
             let output = Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",

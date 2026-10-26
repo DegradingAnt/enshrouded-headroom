@@ -24,8 +24,9 @@
 //! - It is `extern "system"` with the exact signature of the function it stands in for; the
 //!   `const` checks below compare each one with ash's `PFN_*` type (and `wrap_gpa` with windows-sys's
 //!   `GetProcAddress`) at compile time.
-//! - Its body runs inside `guard(Feature::VkWrap, original, body)`, and the fallback only calls the
-//!   original. A body calls the original at most once, and nothing after that call can make the
+//! - Its body runs inside `guard(Feature::VkWrap, fallback, body)`. The fallback preserves required
+//!   lookup/lifetime routing after disable. Native creation/present/destruction run at most once;
+//!   nothing after a completed native call can make the
 //!   guard call it again: work after the call runs in an inner guard whose fallback does nothing.
 //! - It never calls a null real pointer: `wrap_gpa` returns null and the others
 //!   `VK_ERROR_INITIALIZATION_FAILED`, and the body logs that once. (The fallback does not log, so
@@ -41,7 +42,7 @@ pub mod types;
 
 use std::ffi::{c_char, CStr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use ash::vk::{self, Handle};
 use log::Level;
@@ -478,7 +479,22 @@ pub unsafe extern "system" fn wrap_gpa(module: HMODULE, name: PCSTR) -> FARPROC 
     // SAFETY: `real` is 0 or the pointer the import slot held, which has GetProcAddress's
     // signature; the arguments are the game's own, passed on unchanged.
     let original = move || unsafe { call_gpa(real, module, name) };
-    guard(Feature::VkWrap, original, || {
+    let fallback = || {
+        let found = original();
+        let known = REAL_GIPA.load(Ordering::Acquire);
+        if known != 0 && addr_of(found) == known && !is_ordinal(name as usize) {
+            let mut buf = [0u8; NAME_CAP];
+            // SAFETY: non-ordinal original GetProcAddress name remains readable and terminated.
+            if matches!(
+                unsafe { read_name(name, &mut buf) },
+                Some(b"vkGetInstanceProcAddr")
+            ) {
+                return to_farproc(wrap_gipa as *const () as usize);
+            }
+        }
+        found
+    };
+    guard(Feature::VkWrap, fallback, || {
         if real == 0 {
             warn_null_once(&NULL_GPA, "GetProcAddress");
             return None;
@@ -547,7 +563,12 @@ pub unsafe extern "system" fn wrap_gipa(
     // SAFETY: `real` is 0 or the vkGetInstanceProcAddr that GetProcAddress returned; the
     // arguments are the game's own, passed on unchanged.
     let original = move || unsafe { call_gipa(real, instance, name) };
-    guard(Feature::VkWrap, original, || {
+    let fallback = || {
+        let found = original();
+        // SAFETY: original live GIPA arguments and result; essential lifetime routing persists.
+        unsafe { gipa_lifetime_fallback(real, instance, name, found) }
+    };
+    guard(Feature::VkWrap, fallback, || {
         if real == 0 {
             warn_null_once(&NULL_GIPA, "vkGetInstanceProcAddr");
             return None;
@@ -581,6 +602,12 @@ unsafe fn gipa_choose(
     let Some(name) = (unsafe { read_name(name.cast(), &mut buf) }) else {
         return found;
     };
+    // SAFETY: original live lookup and result. This only recognizes instance lifetime names.
+    let lifetime =
+        unsafe { instance_lifetime_choose(real_gipa, instance, name.as_ptr().cast(), found) };
+    if void_addr(lifetime) != found_addr {
+        return lifetime;
+    }
     let out = match classify_gipa(name) {
         None => return found,
         Some(Wrap::Gipa) => hand_out(
@@ -600,8 +627,8 @@ unsafe fn gipa_choose(
             let out = hand_out(&REAL_CREATE_DEVICE, found_addr, wrapper, false);
             if out == wrapper {
                 // The instance is live: the game is calling with it right now. These are the
-                // loader's trampolines, which dispatch on the physical device, so they stay valid
-                // for the device `wrap_create_device` will see.
+                // instance-compatible functions. These legacy diagnostic slots do not establish
+                // parentage: native GPU queries resolve again through the enumerated parent lease.
                 // SAFETY: `real_gipa` is the real vkGetInstanceProcAddr and `instance` the
                 // game's live instance; the names are NUL-terminated literals.
                 let (memory, properties) = unsafe {
@@ -668,7 +695,17 @@ pub unsafe extern "system" fn wrap_gdpa(
     // SAFETY: `real` is 0 or the real vkGetDeviceProcAddr; the arguments are the game's own,
     // passed on unchanged.
     let original = move || unsafe { call_gdpa(real, device, name) };
-    guard(Feature::VkWrap, original, || {
+    let fallback = || {
+        let found = original();
+        // SAFETY: original GDPA arguments; only lookup-chain and destruction names are routed.
+        if unsafe { lifetime_device_name(name) } {
+            // SAFETY: original lookup result and name remain valid here.
+            unsafe { gdpa_choose(device, name, found) }
+        } else {
+            found
+        }
+    };
+    guard(Feature::VkWrap, fallback, || {
         if real == 0 {
             warn_null_once(&NULL_GDPA, "vkGetDeviceProcAddr");
             return None;
@@ -677,6 +714,48 @@ pub unsafe extern "system" fn wrap_gdpa(
         // SAFETY: `name` is the game's argument to vkGetDeviceProcAddr.
         unsafe { gdpa_choose(device, name, found) }
     })
+}
+
+/// Mandatory device lifetime routes, including GDPA itself so a subsequent lookup cannot escape.
+/// # Safety
+/// The native lookup name contract; null/ordinal inputs are forwarded without reading.
+unsafe fn lifetime_device_name(name: *const c_char) -> bool {
+    if is_ordinal(name as usize) {
+        return false;
+    }
+    let mut buf = [0u8; NAME_CAP];
+    // SAFETY: native lookup name is readable and terminated.
+    matches!(
+        unsafe { read_name(name.cast(), &mut buf) },
+        Some(
+            b"vkGetInstanceProcAddr"
+                | b"vkGetDeviceProcAddr"
+                | b"vkDestroyDevice"
+                | b"vkDestroySwapchainKHR"
+        )
+    )
+}
+/// Feature disable skips optional work but cannot hand out an escape from established lifetimes.
+/// # Safety
+/// Original live GIPA arguments and its result.
+unsafe fn gipa_lifetime_fallback(
+    real: usize,
+    instance: vk::Instance,
+    name: *const c_char,
+    found: vk::PFN_vkVoidFunction,
+) -> vk::PFN_vkVoidFunction {
+    // SAFETY: original lookup inputs satisfy both bounded classifiers.
+    unsafe {
+        let lifetime = instance_lifetime_choose(real, instance, name, found);
+        if void_addr(lifetime) != void_addr(found) {
+            return lifetime;
+        }
+        if lifetime_device_name(name) {
+            gipa_choose(real, instance, name, found)
+        } else {
+            found
+        }
+    }
 }
 
 /// One flag per device-level name: "an unwrapped hand-out has been logged".
@@ -845,14 +924,17 @@ unsafe fn after_create_device(
     ) {
         return;
     }
-    DEVICE_QUERIES.publish(
-        GameDevice {
-            device,
-            phys: phys.as_raw() as usize,
-        },
-        REAL_GIPA.load(Ordering::Acquire),
-        GAME_INSTANCE.load(Ordering::Acquire),
-    );
+    if let Some(parent) =
+        physical_parent(phys.as_raw() as usize).filter(|_| prepare_device_lifetime(phys, false))
+    {
+        DEVICE_QUERIES.publish(
+            GameDevice {
+                device,
+                phys: phys.as_raw() as usize,
+            },
+            parent,
+        );
+    }
     // SAFETY: `phys` is the physical device the first device was just created on.
     unsafe { on_first_device(phys) };
 }
@@ -863,15 +945,25 @@ unsafe fn after_create_device(
 ///
 /// `phys` is a live physical device.
 unsafe fn on_first_device(phys: vk::PhysicalDevice) {
-    // SAFETY: the two pointers are 0 or the loader's functions for these names, and `phys` is
-    // live (this function's contract).
-    let gpu = unsafe {
-        query_gpu(
-            REAL_GET_MEMORY_PROPERTIES.load(Ordering::Acquire),
-            REAL_GET_PROPERTIES.load(Ordering::Acquire),
-            phys,
-        )
-    };
+    let gpu = with_physical_device(phys, |gipa, instance| {
+        // SAFETY: enumeration proved this parent; its lease protects both dispatch and physical
+        // device for the complete synchronous query. Unknown parentage never enters this closure.
+        unsafe {
+            let instance = vk::Instance::from_raw(instance as u64);
+            let memory = void_addr(call_gipa(
+                gipa,
+                instance,
+                c"vkGetPhysicalDeviceMemoryProperties".as_ptr(),
+            ));
+            let properties = void_addr(call_gipa(
+                gipa,
+                instance,
+                c"vkGetPhysicalDeviceProperties".as_ptr(),
+            ));
+            query_gpu(memory, properties, phys)
+        }
+    })
+    .flatten();
     log::info!("{}", engaged_line(gpu.as_ref()));
     let step = texture_step(
         texture_budget::prepared(),
@@ -1252,12 +1344,322 @@ pub fn init(texture: TextureSettings, priority: Priority) {
     }
 }
 
+/// Observed parentage and dispatch for one instance generation. Enumeration is the only source
+/// of physical-device membership. Retired generations remain invalid even if handles are reused.
+struct InstanceContext {
+    instance: usize,
+    gipa: usize,
+    live: AtomicBool,
+    readers: AtomicUsize,
+    physical: Mutex<Vec<usize>>,
+    enumerate: AtomicUsize,
+    groups: AtomicUsize,
+    groups_khr: AtomicUsize,
+    destroy: AtomicUsize,
+}
+impl InstanceContext {
+    /// An observed live lookup does not yet establish any physical-device parentage.
+    fn new(instance: usize, gipa: usize) -> Self {
+        Self {
+            instance,
+            gipa,
+            live: AtomicBool::new(true),
+            readers: AtomicUsize::new(0),
+            physical: Mutex::new(Vec::new()),
+            enumerate: AtomicUsize::new(0),
+            groups: AtomicUsize::new(0),
+            groups_khr: AtomicUsize::new(0),
+            destroy: AtomicUsize::new(0),
+        }
+    }
+    /// Count before checking liveness, paired with retirement's SeqCst invalidation and drain.
+    fn with<T>(&self, query: impl FnOnce(usize, usize) -> T) -> Option<T> {
+        self.readers.fetch_add(1, Ordering::SeqCst);
+        let _reader = DeviceQueryReader(&self.readers);
+        self.live
+            .load(Ordering::SeqCst)
+            .then(|| query(self.gipa, self.instance))
+    }
+    /// Record bounded, non-null actual enumeration output only.
+    fn observe(&self, physical: impl Iterator<Item = vk::PhysicalDevice>) {
+        let mut known = self.physical.lock().unwrap_or_else(|e| e.into_inner());
+        for physical in physical {
+            let raw = physical.as_raw() as usize;
+            if raw != 0 && !known.contains(&raw) && known.len() < 256 {
+                known.push(raw);
+            }
+        }
+    }
+    /// Reject new queries before draining every admitted query, including unwinding callbacks.
+    fn retire(&self) {
+        self.live.store(false, Ordering::SeqCst);
+        while self.readers.load(Ordering::SeqCst) != 0 {
+            std::thread::yield_now();
+        }
+    }
+}
+/// Bounded instance generations. This lock is never used on the present path.
+static INSTANCES: Mutex<Vec<Arc<InstanceContext>>> = Mutex::new(Vec::new());
+/// Find an observed live generation. Null or unknown instances have no inferred parentage.
+fn instance_context(instance: usize) -> Option<Arc<InstanceContext>> {
+    INSTANCES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|context| context.instance == instance)
+        .cloned()
+}
+/// Find the unique observed parent. Ambiguous or unobserved physical handles fail closed.
+fn physical_parent(phys: usize) -> Option<Arc<InstanceContext>> {
+    let instances = INSTANCES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut matches = instances.iter().filter(|context| {
+        context.live.load(Ordering::SeqCst)
+            && context
+                .physical
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&phys)
+    });
+    let first = matches.next()?.clone();
+    if matches.next().is_some() {
+        None
+    } else {
+        Some(first)
+    }
+}
+/// Query only through a parent proven by enumeration. The closure must obey the same synchronous
+/// handle-use rules as with_game_device; no unobserved instance is ever dispatched here.
+pub(crate) fn with_physical_device<T>(
+    phys: vk::PhysicalDevice,
+    query: impl FnOnce(usize, usize) -> T,
+) -> Option<T> {
+    physical_parent(phys.as_raw() as usize)?.with(query)
+}
+/// Bind required lifetime endpoints to the observed parent before exposing a query/runtime.
+/// Existing first-wins pointers may already have been handed to another instance. A conflicting
+/// pointer cannot be overwritten safely, so this instance remains ineligible instead.
+pub(crate) fn prepare_device_lifetime(phys: vk::PhysicalDevice, reflex: bool) -> bool {
+    with_physical_device(phys, |gipa, instance| {
+        let bind = |slot: &AtomicUsize, name: &CStr| {
+            // SAFETY: the enumeration-derived parent is protected by the surrounding lease.
+            let raw = void_addr(unsafe {
+                call_gipa(gipa, vk::Instance::from_raw(instance as u64), name.as_ptr())
+            });
+            raw != 0 && first_wins(slot, raw) == raw
+        };
+        bind(&REAL_DESTROY_DEVICE, c"vkDestroyDevice")
+            && (!reflex
+                || (bind(&REAL_DESTROY_SWAPCHAIN, c"vkDestroySwapchainKHR")
+                    && bind(&REAL_GDPA, c"vkGetDeviceProcAddr")))
+    })
+    .unwrap_or(false)
+}
+
+/// Keep instance enumeration and retirement in the installed chain, even when ordinary wrapping
+/// is disabled. Unknown names pass through. A full registry refuses new observations safely.
+/// # Safety
+/// The original live GIPA instance/name and its returned function are supplied unchanged.
+unsafe fn instance_lifetime_choose(
+    real: usize,
+    instance: vk::Instance,
+    name: *const c_char,
+    found: vk::PFN_vkVoidFunction,
+) -> vk::PFN_vkVoidFunction {
+    if instance == vk::Instance::null() || found.is_none() || is_ordinal(name as usize) {
+        return found;
+    }
+    let mut buf = [0u8; NAME_CAP];
+    // SAFETY: the original GIPA name is NUL-terminated by its native contract.
+    let Some(name) = (unsafe { read_name(name.cast(), &mut buf) }) else {
+        return found;
+    };
+    let wrapper = match name {
+        b"vkEnumeratePhysicalDevices" => wrap_enumerate_physical as *const () as usize,
+        b"vkEnumeratePhysicalDeviceGroups" => wrap_enumerate_groups as *const () as usize,
+        b"vkEnumeratePhysicalDeviceGroupsKHR" => wrap_enumerate_groups_khr as *const () as usize,
+        b"vkDestroyInstance" => wrap_destroy_instance as *const () as usize,
+        _ => return found,
+    };
+    let mut instances = INSTANCES.lock().unwrap_or_else(|e| e.into_inner());
+    let context = if let Some(context) = instances
+        .iter()
+        .find(|c| c.instance == instance.as_raw() as usize)
+    {
+        context.clone()
+    } else {
+        if instances.len() >= 64 {
+            return found;
+        }
+        let context = Arc::new(InstanceContext::new(instance.as_raw() as usize, real));
+        instances.push(context.clone());
+        context
+    };
+    let slot = match name {
+        b"vkEnumeratePhysicalDevices" => &context.enumerate,
+        b"vkEnumeratePhysicalDeviceGroups" => &context.groups,
+        b"vkEnumeratePhysicalDeviceGroupsKHR" => &context.groups_khr,
+        _ => &context.destroy,
+    };
+    slot.store(void_addr(found), Ordering::Release);
+    to_void(wrapper)
+}
+/// Observe actual outputs without altering the application's enumeration.
+/// # Safety
+/// The contract of vkEnumeratePhysicalDevices, obtained through the installed GIPA chain.
+unsafe extern "system" fn wrap_enumerate_physical(
+    instance: vk::Instance,
+    count: *mut u32,
+    out: *mut vk::PhysicalDevice,
+) -> vk::Result {
+    let completed = std::cell::Cell::new(None);
+    let original = || {
+        if let Some(result) = completed.get() {
+            return result;
+        }
+        let Some(context) = instance_context(instance.as_raw() as usize) else {
+            return vk::Result::ERROR_INITIALIZATION_FAILED;
+        };
+        let raw = context.enumerate.load(Ordering::Acquire);
+        if raw == 0 {
+            return vk::Result::ERROR_INITIALIZATION_FAILED;
+        }
+        // SAFETY: this entry was resolved for this same live instance; original arguments.
+        let result = unsafe {
+            std::mem::transmute::<usize, vk::PFN_vkEnumeratePhysicalDevices>(raw)(
+                instance, count, out,
+            )
+        };
+        completed.set(Some(result));
+        if matches!(result, vk::Result::SUCCESS | vk::Result::INCOMPLETE)
+            && !out.is_null()
+            && !count.is_null()
+        {
+            // SAFETY: successful enumeration initializes exactly count output handles.
+            let physical = unsafe { std::slice::from_raw_parts(out, count.read() as usize) };
+            context.observe(physical.iter().copied());
+        }
+        result
+    };
+    guard(Feature::VkWrap, original, original)
+}
+/// Shared core/KHR group observation, preserving the exact entry point selected by the caller.
+/// # Safety
+/// The matching vkEnumeratePhysicalDeviceGroups[KHR] contract.
+unsafe fn enumerate_groups(
+    instance: vk::Instance,
+    count: *mut u32,
+    out: *mut vk::PhysicalDeviceGroupProperties<'_>,
+    khr: bool,
+    completed: &std::cell::Cell<Option<vk::Result>>,
+) -> vk::Result {
+    if let Some(result) = completed.get() {
+        return result;
+    }
+    let Some(context) = instance_context(instance.as_raw() as usize) else {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    };
+    let raw = if khr {
+        &context.groups_khr
+    } else {
+        &context.groups
+    }
+    .load(Ordering::Acquire);
+    if raw == 0 {
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    }
+    // SAFETY: matched instance and exact Vulkan core/KHR alias signature.
+    let result = unsafe {
+        std::mem::transmute::<usize, vk::PFN_vkEnumeratePhysicalDeviceGroups>(raw)(
+            instance, count, out,
+        )
+    };
+    completed.set(Some(result));
+    if matches!(result, vk::Result::SUCCESS | vk::Result::INCOMPLETE)
+        && !out.is_null()
+        && !count.is_null()
+    {
+        // SAFETY: SUCCESS/INCOMPLETE initialize count group records in the caller's storage.
+        for group in unsafe { std::slice::from_raw_parts(out, count.read() as usize) } {
+            if let Some(physical) = group
+                .physical_devices
+                .get(..group.physical_device_count as usize)
+            {
+                context.observe(physical.iter().copied());
+            }
+        }
+    }
+    result
+}
+/// Core group enumeration wrapper.
+/// # Safety
+/// The contract of vkEnumeratePhysicalDeviceGroups.
+unsafe extern "system" fn wrap_enumerate_groups(
+    instance: vk::Instance,
+    count: *mut u32,
+    out: *mut vk::PhysicalDeviceGroupProperties<'_>,
+) -> vk::Result {
+    let completed = std::cell::Cell::new(None);
+    // SAFETY: original group enumeration arguments; completed native calls are never repeated.
+    let original = || unsafe { enumerate_groups(instance, count, out, false, &completed) };
+    guard(Feature::VkWrap, original, original)
+}
+/// KHR group enumeration wrapper.
+/// # Safety
+/// The contract of vkEnumeratePhysicalDeviceGroupsKHR.
+unsafe extern "system" fn wrap_enumerate_groups_khr(
+    instance: vk::Instance,
+    count: *mut u32,
+    out: *mut vk::PhysicalDeviceGroupProperties<'_>,
+) -> vk::Result {
+    let completed = std::cell::Cell::new(None);
+    // SAFETY: original group enumeration arguments; completed native calls are never repeated.
+    let original = || unsafe { enumerate_groups(instance, count, out, true, &completed) };
+    guard(Feature::VkWrap, original, original)
+}
+/// Retire this generation before native instance destruction. Device teardown normally drained
+/// child queries already; the instance drain also protects capability queries before creation.
+/// # Safety
+/// The contract of vkDestroyInstance, with destruction obtained through the installed chain.
+unsafe extern "system" fn wrap_destroy_instance(
+    instance: vk::Instance,
+    allocator: *const vk::AllocationCallbacks<'_>,
+) {
+    let finished = std::cell::Cell::new(false);
+    let original = || {
+        if finished.replace(true) {
+            return;
+        }
+        let context = {
+            let mut instances = INSTANCES.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(index) = instances
+                .iter()
+                .position(|c| c.instance == instance.as_raw() as usize)
+            else {
+                return;
+            };
+            instances.remove(index)
+        };
+        context.retire();
+        let raw = context.destroy.load(Ordering::Acquire);
+        if raw != 0 {
+            // SAFETY: saved for this instance generation, still live until this original call.
+            unsafe {
+                std::mem::transmute::<usize, vk::PFN_vkDestroyInstance>(raw)(instance, allocator)
+            };
+        }
+    };
+    guard(Feature::VkWrap, original, original)
+}
+const _: vk::PFN_vkEnumeratePhysicalDevices = wrap_enumerate_physical;
+const _: vk::PFN_vkEnumeratePhysicalDeviceGroups = wrap_enumerate_groups;
+const _: vk::PFN_vkEnumeratePhysicalDeviceGroups = wrap_enumerate_groups_khr;
+const _: vk::PFN_vkDestroyInstance = wrap_destroy_instance;
+
 /// Frozen lookup context for the first created device, independent of GPU vendor or Reflex mode.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct QueryContext {
     game: GameDevice,
-    gipa: usize,
-    instance: usize,
+    parent: Arc<InstanceContext>,
 }
 
 /// A read-only native-device lease. All cross-atomic lifetime operations use SeqCst ordering.
@@ -1275,19 +1677,9 @@ impl DeviceQueries {
             readers: AtomicUsize::new(0),
         }
     }
-    /// Publish exactly one paired context. A retired context can never be reactivated.
-    fn publish(&self, game: GameDevice, gipa: usize, instance: usize) {
-        if gipa != 0
-            && instance != 0
-            && self
-                .context
-                .set(QueryContext {
-                    game,
-                    gipa,
-                    instance,
-                })
-                .is_ok()
-        {
+    /// Publish only an enumerated parent, with its generation retained for future leases.
+    fn publish(&self, game: GameDevice, parent: Arc<InstanceContext>) {
+        if self.context.set(QueryContext { game, parent }).is_ok() {
             self.live.store(true, Ordering::SeqCst);
         }
     }
@@ -1299,7 +1691,9 @@ impl DeviceQueries {
             return None;
         }
         let context = self.context.get()?;
-        Some(query(context.game, context.gipa, context.instance))
+        context
+            .parent
+            .with(|gipa, instance| query(context.game, gipa, instance))
     }
     /// Invalidate before native destruction, then wait outside the present path for existing readers.
     fn retire(&self, device: usize) {
@@ -1328,7 +1722,9 @@ static DEVICE_QUERIES: DeviceQueries = DeviceQueries::new();
 
 /// Run a read-only physical-device query under a lifetime lease. The arguments are the first
 /// device/physical-device pair, its frozen real GIPA address, and its instance handle.
-/// Returns None before publication and permanently after that first device's teardown.
+/// Parentage comes only from intercepted physical-device or group enumeration outputs. Unknown
+/// parentage returns None. Returns None before publication and permanently after that first
+/// device or its instance generation is retired.
 ///
 /// The callback must not destroy this device (that would wait for its own lease), keep native
 /// references past its return, or launch asynchronous queries using these handles. Vulkan requires
@@ -2139,7 +2535,10 @@ mod device_lease_tests {
     #[test]
     fn device_queries_are_paired_and_teardown_drains_readers() {
         let state = DeviceQueries::new();
-        state.publish(GameDevice { device: 1, phys: 2 }, 3, 4);
+        state.publish(
+            GameDevice { device: 1, phys: 2 },
+            Arc::new(InstanceContext::new(4, 3)),
+        );
         assert_eq!(
             state.with(|d, g, i| (d.device, d.phys, g, i)),
             Some((1, 2, 3, 4))
@@ -2176,7 +2575,10 @@ mod device_lease_tests {
             destroy.join().unwrap();
             done_rx.recv().unwrap();
         });
-        state.publish(GameDevice { device: 5, phys: 6 }, 7, 8);
+        state.publish(
+            GameDevice { device: 5, phys: 6 },
+            Arc::new(InstanceContext::new(8, 7)),
+        );
         assert!(
             state.with(|_, _, _| ()).is_none(),
             "the first-device-only context never reactivates"
@@ -2186,9 +2588,242 @@ mod device_lease_tests {
     #[test]
     fn device_query_panic_releases_reader() {
         let state = DeviceQueries::new();
-        state.publish(GameDevice { device: 1, phys: 2 }, 3, 4);
+        state.publish(
+            GameDevice { device: 1, phys: 2 },
+            Arc::new(InstanceContext::new(4, 3)),
+        );
         assert!(std::panic::catch_unwind(|| state.with(|_, _, _| panic!("query"))).is_err());
         assert_eq!(state.readers.load(Ordering::SeqCst), 0);
         state.retire(1);
+    }
+}
+
+#[cfg(test)]
+mod disabled_lifetime_tests {
+    use super::*;
+    static DESTROYS: AtomicUsize = AtomicUsize::new(0);
+    /// Fake device destruction records the one native invocation.
+    unsafe extern "system" fn destroy_device(_: vk::Device, _: *const vk::AllocationCallbacks<'_>) {
+        let body = || {
+            DESTROYS.fetch_add(1, Ordering::SeqCst);
+        };
+        guard(Feature::VkWrap, body, body);
+    }
+    /// Fake swapchain destruction records the one native invocation.
+    unsafe extern "system" fn destroy_swapchain(
+        _: vk::Device,
+        _: vk::SwapchainKHR,
+        _: *const vk::AllocationCallbacks<'_>,
+    ) {
+        let body = || {
+            DESTROYS.fetch_add(1, Ordering::SeqCst);
+        };
+        guard(Feature::VkWrap, body, body);
+    }
+    /// Fake instance destruction records the one native invocation.
+    unsafe extern "system" fn destroy_instance(
+        _: vk::Instance,
+        _: *const vk::AllocationCallbacks<'_>,
+    ) {
+        let body = || {
+            DESTROYS.fetch_add(1, Ordering::SeqCst);
+        };
+        guard(Feature::VkWrap, body, body);
+    }
+    /// Resolve fake lifetime functions regardless of the mod's feature mask.
+    unsafe fn lookup(name: *const c_char) -> vk::PFN_vkVoidFunction {
+        // SAFETY: the tests pass static terminated function names.
+        to_void(match unsafe { CStr::from_ptr(name) }.to_bytes() {
+            b"vkDestroyInstance" => destroy_instance as *const () as usize,
+            b"vkDestroyDevice" => destroy_device as *const () as usize,
+            b"vkDestroySwapchainKHR" => destroy_swapchain as *const () as usize,
+            b"vkGetInstanceProcAddr" => gipa as *const () as usize,
+            b"vkGetDeviceProcAddr" => gdpa as *const () as usize,
+            _ => 0,
+        })
+    }
+    /// Fake import resolver returns the already-established Vulkan GIPA function.
+    unsafe extern "system" fn gpa(_: HMODULE, _: PCSTR) -> FARPROC {
+        let body = || to_farproc(gipa as *const () as usize);
+        guard(Feature::VkWrap, body, body)
+    }
+    /// Fake GIPA has the native lookup contract.
+    unsafe extern "system" fn gipa(_: vk::Instance, name: *const c_char) -> vk::PFN_vkVoidFunction {
+        // SAFETY: native lookup caller provides a static terminated name.
+        let body = || unsafe { lookup(name) };
+        guard(Feature::VkWrap, body, body)
+    }
+    /// Fake GDPA has the native lookup contract.
+    unsafe extern "system" fn gdpa(_: vk::Device, name: *const c_char) -> vk::PFN_vkVoidFunction {
+        // SAFETY: native lookup caller provides a static terminated name.
+        let body = || unsafe { lookup(name) };
+        guard(Feature::VkWrap, body, body)
+    }
+    /// Isolated real-wrapper regression: disabling ordinary wrapping cannot sever retirement.
+    #[test]
+    fn disabled_lookup_keeps_teardown_and_drains_device_queries() {
+        const TEST: &str =
+            "vk::disabled_lifetime_tests::disabled_lookup_keeps_teardown_and_drains_device_queries";
+        let Ok(case) = std::env::var("W23_DISABLED_LOOKUP") else {
+            for case in [
+                "gipa-instance",
+                "gipa-device",
+                "gdpa-device",
+                "gipa-swapchain",
+                "gdpa-swapchain",
+            ] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", TEST, "--nocapture"])
+                    .env("W23_DISABLED_LOOKUP", case)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{case}: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+        let game = GameDevice {
+            device: 11,
+            phys: 22,
+        };
+        assert!(GAME_DEVICE.set(game).is_ok());
+        let parent = Arc::new(InstanceContext::new(33, gipa as *const () as usize));
+        parent.observe(std::iter::once(vk::PhysicalDevice::from_raw(22)));
+        INSTANCES.lock().unwrap().push(parent.clone());
+        DEVICE_QUERIES.publish(game, parent);
+        REAL_GPA.store(gpa as *const () as usize, Ordering::Release);
+        REAL_GIPA.store(gipa as *const () as usize, Ordering::Release);
+        REAL_GDPA.store(gdpa as *const () as usize, Ordering::Release);
+        crate::guard::disable(Feature::VkWrap, "test");
+        let device = vk::Device::from_raw(11);
+        let instance = vk::Instance::from_raw(33);
+        // SAFETY: fake live handles, functions and static names obey the native contracts.
+        let resolved = unsafe {
+            assert_eq!(
+                addr_of(wrap_gpa(
+                    1usize as HMODULE,
+                    c"vkGetInstanceProcAddr".as_ptr().cast()
+                )),
+                wrap_gipa as *const () as usize
+            );
+            assert_eq!(
+                void_addr(wrap_gipa(instance, c"vkGetInstanceProcAddr".as_ptr())),
+                wrap_gipa as *const () as usize
+            );
+            assert_eq!(
+                void_addr(wrap_gipa(instance, c"vkGetDeviceProcAddr".as_ptr())),
+                wrap_gdpa as *const () as usize
+            );
+            assert_eq!(
+                void_addr(wrap_gdpa(device, c"vkGetDeviceProcAddr".as_ptr())),
+                wrap_gdpa as *const () as usize
+            );
+            let name = if case.ends_with("device") {
+                c"vkDestroyDevice"
+            } else {
+                c"vkDestroySwapchainKHR"
+            };
+            if case.starts_with("gipa") {
+                wrap_gipa(instance, name.as_ptr())
+            } else {
+                wrap_gdpa(device, name.as_ptr())
+            }
+        };
+        if case == "gipa-instance" {
+            // SAFETY: known live fake instance and exact native destruction signature.
+            let raw = unsafe { wrap_gipa(instance, c"vkDestroyInstance".as_ptr()) };
+            assert_eq!(void_addr(raw), wrap_destroy_instance as *const () as usize);
+            std::thread::scope(|scope| {
+                let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+                let (release_tx, release_rx) = std::sync::mpsc::channel();
+                let reader = scope.spawn(move || {
+                    with_physical_device(vk::PhysicalDevice::from_raw(22), |_, i| {
+                        assert_eq!(i, 33);
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                    })
+                });
+                entered_rx.recv().unwrap();
+                let destroy =
+                    scope.spawn(move || {
+                        // SAFETY: no native device was created in this isolated capability-lease case.
+                        unsafe {
+                            std::mem::transmute::<
+                                unsafe extern "system" fn(),
+                                vk::PFN_vkDestroyInstance,
+                            >(raw.unwrap())(instance, std::ptr::null())
+                        };
+                    });
+                while instance_context(33).is_some() {
+                    std::thread::yield_now();
+                }
+                assert!(
+                    with_physical_device(vk::PhysicalDevice::from_raw(22), |_, _| panic!(
+                        "retired"
+                    ))
+                    .is_none()
+                );
+                assert_eq!(DESTROYS.load(Ordering::SeqCst), 0);
+                release_tx.send(()).unwrap();
+                reader.join().unwrap();
+                destroy.join().unwrap();
+            });
+            // Same handle, new generation: an old device lease must never borrow its resolver.
+            let replacement = Arc::new(InstanceContext::new(33, 999));
+            replacement.observe(std::iter::once(vk::PhysicalDevice::from_raw(22)));
+            INSTANCES.lock().unwrap().push(replacement);
+            assert!(with_game_device(|_, _, _| panic!("old generation")).is_none());
+            assert_eq!(DESTROYS.load(Ordering::SeqCst), 1);
+            return;
+        }
+        if case.ends_with("swapchain") {
+            assert_eq!(
+                void_addr(resolved),
+                wrap_destroy_swapchain as *const () as usize
+            );
+            // SAFETY: lookup resolved the exact fake swapchain destruction signature.
+            unsafe {
+                std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkDestroySwapchainKHR>(
+                    resolved.unwrap(),
+                )(device, vk::SwapchainKHR::from_raw(44), std::ptr::null())
+            };
+        } else {
+            assert_eq!(
+                void_addr(resolved),
+                wrap_destroy_device as *const () as usize
+            );
+            std::thread::scope(|scope| {
+                let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+                let (release_tx, release_rx) = std::sync::mpsc::channel();
+                let reader = scope.spawn(move || {
+                    with_game_device(|_, _, _| {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                    })
+                });
+                entered_rx.recv().unwrap();
+                let destroy = scope.spawn(move || {
+                    // SAFETY: this fake device stays live until its one native destructor call.
+                    unsafe {
+                        std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkDestroyDevice>(
+                            resolved.unwrap(),
+                        )(device, std::ptr::null())
+                    };
+                });
+                while DEVICE_QUERIES.live.load(Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+                assert!(with_game_device(|_, _, _| panic!("retired")).is_none());
+                assert_eq!(DESTROYS.load(Ordering::SeqCst), 0);
+                release_tx.send(()).unwrap();
+                reader.join().unwrap();
+                destroy.join().unwrap();
+            });
+        }
+        assert_eq!(DESTROYS.load(Ordering::SeqCst), 1);
     }
 }

@@ -552,14 +552,17 @@ impl DeviceCopy {
 
 /// Resolve a physical-device function through the saved instance trampoline.
 /// # Safety
-/// The recorded instance must remain live; the caller must use the returned address at its named type.
-unsafe fn instance_proc(name: &CStr) -> Option<unsafe extern "system" fn()> {
-    let raw = crate::vk::REAL_GIPA.load(Ordering::Acquire);
-    let instance = crate::vk::GAME_INSTANCE.load(Ordering::Acquire);
+/// `raw` is the real GIPA for the live, leased `instance`; use the result only for that
+/// instance or its children, at the named Vulkan type, before releasing the lease.
+unsafe fn instance_proc(
+    raw: usize,
+    instance: usize,
+    name: &CStr,
+) -> Option<unsafe extern "system" fn()> {
     if raw == 0 || instance == 0 {
         return None;
     }
-    // SAFETY: the wrapper stores only the actual loader trampoline at this slot.
+    // SAFETY: the caller supplies the real GIPA retained with its observed parent generation.
     let get = unsafe { std::mem::transmute::<usize, vk::PFN_vkGetInstanceProcAddr>(raw) };
     // SAFETY: the recorded live instance and a static NUL-terminated function name.
     unsafe { get(vk::Instance::from_raw(instance as u64), name.as_ptr()) }
@@ -568,19 +571,27 @@ unsafe fn instance_proc(name: &CStr) -> Option<unsafe extern "system" fn()> {
 /// Query only supported feature structures. No device is modified here.
 /// # Safety
 /// `phys` belongs to the recorded live instance.
-unsafe fn capabilities(phys: vk::PhysicalDevice) -> Option<Capabilities> {
+unsafe fn capabilities(
+    phys: vk::PhysicalDevice,
+    gipa: usize,
+    instance: usize,
+) -> Option<Capabilities> {
     // SAFETY: each entry is resolved by its precise Vulkan function name.
     let (properties, enumerate, features) = unsafe {
         (
             std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkGetPhysicalDeviceProperties>(
-                instance_proc(c"vkGetPhysicalDeviceProperties")?,
+                instance_proc(gipa, instance, c"vkGetPhysicalDeviceProperties")?,
             ),
             std::mem::transmute::<
                 unsafe extern "system" fn(),
                 vk::PFN_vkEnumerateDeviceExtensionProperties,
-            >(instance_proc(c"vkEnumerateDeviceExtensionProperties")?),
+            >(instance_proc(
+                gipa,
+                instance,
+                c"vkEnumerateDeviceExtensionProperties",
+            )?),
             std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkGetPhysicalDeviceFeatures2>(
-                instance_proc(c"vkGetPhysicalDeviceFeatures2")?,
+                instance_proc(gipa, instance, c"vkGetPhysicalDeviceFeatures2")?,
             ),
         )
     };
@@ -708,11 +719,18 @@ pub unsafe fn create_device(
         let Some(mode) = MODE.get() else {
             return original();
         };
-        if *mode == ReflexMode::Off || info.is_null() || FNS.get().is_some() {
+        if *mode == ReflexMode::Off
+            || info.is_null()
+            || FNS.get().is_some()
+            || !crate::vk::prepare_device_lifetime(phys, true)
+        {
             return original();
         }
         // SAFETY: the original Vulkan arguments and live physical device.
-        let Some(caps) = (unsafe { capabilities(phys) }) else {
+        let Some(caps) = crate::vk::with_physical_device(phys, |gipa, instance| unsafe {
+            capabilities(phys, gipa, instance)
+        })
+        .flatten() else {
             return original();
         };
         // SAFETY: info and its chain live until this call returns.
@@ -780,13 +798,8 @@ mod runtime_tests {
         _: vk::Semaphore,
         _: *const vk::AllocationCallbacks<'_>,
     ) {
-        guard(
-            Feature::VkWrap,
-            || (),
-            || {
-                note("destroy".into());
-            },
-        )
+        let body = || note("destroy".into());
+        guard(Feature::VkWrap, body, body)
     }
     unsafe extern "system" fn mode(
         _: vk::Device,
@@ -1134,6 +1147,74 @@ mod runtime_tests {
             assert_eq!(calls(), ["destroy"]);
             assert!(ACTIVE.load(Ordering::SeqCst).is_null());
         }
+    }
+    /// A native swapchain destructor observes semaphore cleanup before its one original call.
+    unsafe extern "system" fn destroy_swap_after_cleanup(
+        _: vk::Device,
+        _: vk::SwapchainKHR,
+        _: *const vk::AllocationCallbacks<'_>,
+    ) {
+        let body = || note("native-swap-destroy".into());
+        guard(Feature::VkWrap, body, body);
+    }
+    /// The fake native resolver remains usable after the mod's optional wrapper feature is off.
+    unsafe extern "system" fn teardown_gipa(
+        _: vk::Instance,
+        _: *const std::ffi::c_char,
+    ) -> vk::PFN_vkVoidFunction {
+        let body = || {
+            // SAFETY: erasing only this actual Vulkan function pointer for the fake lookup.
+            Some(unsafe {
+                std::mem::transmute::<vk::PFN_vkDestroySwapchainKHR, unsafe extern "system" fn()>(
+                    destroy_swap_after_cleanup,
+                )
+            })
+        };
+        guard(Feature::VkWrap, body, body)
+    }
+    /// Real disabled GIPA routing must retire the active record before destroying its swapchain.
+    #[test]
+    fn disabled_lookup_retires_reflex_semaphore_before_original_destroy() {
+        const NAME: &str = "reflex::runtime_tests::disabled_lookup_retires_reflex_semaphore_before_original_destroy";
+        if std::env::var_os("W23_RUNTIME_DESTROY").is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture"])
+                .env("W23_RUNTIME_DESTROY", "1")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        // SAFETY: the owned record uses only this module's fake native table and live fake handles.
+        let runtime =
+            unsafe { Runtime::new(fns(), vk::SwapchainKHR::from_raw(2), ReflexMode::Auto, None) }
+                .unwrap();
+        replace_runtime(Box::into_raw(Box::new(runtime)));
+        calls();
+        crate::vk::REAL_GIPA.store(teardown_gipa as *const () as usize, Ordering::Release);
+        crate::guard::disable(Feature::VkWrap, "test");
+        // SAFETY: the fake lookup returns exactly the tested native swapchain destructor type.
+        unsafe {
+            let raw =
+                crate::vk::wrap_gipa(vk::Instance::from_raw(3), c"vkDestroySwapchainKHR".as_ptr())
+                    .unwrap();
+            let destroy = std::mem::transmute::<
+                unsafe extern "system" fn(),
+                vk::PFN_vkDestroySwapchainKHR,
+            >(raw);
+            destroy(
+                vk::Device::from_raw(1),
+                vk::SwapchainKHR::from_raw(2),
+                std::ptr::null(),
+            );
+        }
+        assert!(ACTIVE.load(Ordering::SeqCst).is_null());
+        assert_eq!(calls(), ["destroy", "native-swap-destroy"]);
     }
     /// Each new swapchain gets a fresh sleep-mode command from the current decision.
     #[test]
