@@ -1,0 +1,1785 @@
+//! The fps governor (spec section 6.4): a pure state machine that raises draw-distance knobs one
+//! step at a time while the game has fps to spare, and undoes them when it has not.
+//!
+//! Task 15 calls [`Governor::tick`] every 50 ms on the governor thread, inside
+//! `guard(Feature::Governor, ..)`, and applies the [`Action`]s it returns. The governor reads no
+//! clock (time comes only from [`Inputs::now_s`]), does no I/O and knows no Windows types. It must
+//! not panic on any input: a panic turns it off for the session.
+//!
+//! The labels T1-T7 and R1-R11 in the comments are the items of the Task 11 dispatch notes
+//! (revision 4), which refine spec 6.4.
+//!
+//! # One tick (R1)
+//!
+//! - (o) Clamp the time (T5) and drop frame times that are not finite or not above 0.
+//! - (i) `TargetFps = 0`: do nothing.
+//! - (ii) Menu resets, then the display-period change check (R3).
+//! - (iii) The hitch undo (R7), else the stall undo (R8). At most one undo.
+//! - (iv) The inactive check (R2). While inactive, stop here.
+//! - (v) Add the frames to the window, unless a reset point in (ii)/(iii) or the undo grace (T2)
+//!   says skip.
+//! - (vi) Decide: an overload lower, else a raise. Not on a tick that already changed a step in
+//!   (iii).
+//!
+//! # Reset points (T1)
+//!
+//! Each change the governor makes, each menu or `set_enabled` reset, a display-period change, a
+//! time re-base and each change from inactive to active clears the window, restarts the hold
+//! timers and starts a quiet period of `SettleSeconds` (T3) with no raise and no overload lower.
+
+pub mod stats;
+
+use std::collections::VecDeque;
+
+use crate::config::GovernorCfg;
+
+/// Slack for values that sit exactly on a limit (T5): `x + EPS >= limit` for an at-least limit,
+/// `x > limit + EPS` for an over limit, `x < limit - EPS` for an under limit.
+const EPS: f64 = 1e-9;
+
+/// A frame longer than this (ms) is "long": kept in the window, but not in p95 or the
+/// quantised test (R4).
+const LONG_MS: f64 = 100.0;
+
+/// A frame longer than this (ms) is a gap (R2) and, in the world, a stall (R8). It never enters
+/// the window.
+const STALL_MS: f64 = 250.0;
+
+/// After a gap frame the governor is inactive for this long (R2).
+const GAP_PAUSE_S: f64 = 2.0;
+
+/// No frame for longer than this means presents stopped: inactive (R2).
+const PRESENTS_STOPPED_S: f64 = 0.25;
+
+/// After an undo, frames that arrive within this long are not added to the window (T2). In the
+/// game the undo takes effect with a lag. Tuned in Task 17.
+const UNDO_GRACE_S: f64 = 0.5;
+
+/// A second stall within this long of the first undoes the top of the stack (R8).
+const STALL_WINDOW_S: f64 = 10.0;
+
+/// The most frames the window holds; the oldest go first (T6).
+const MAX_WINDOW_FRAMES: usize = 4096;
+
+/// A step of `now_s` back by more than this is a re-base, not a clamp (T5).
+const REBASE_S: f64 = 1.0;
+
+/// A display period (ms) outside this range is no display period (R3): 20 to 1000 Hz.
+const MIN_PERIOD_MS: f64 = 1.0;
+const MAX_PERIOD_MS: f64 = 50.0;
+
+/// A change of more than this share in the display period is a reset point (R3).
+const PERIOD_CHANGE: f64 = 0.05;
+
+/// Quantised mode needs a display period of at least this share of the target (R5).
+const QUANTISED_MIN_PERIOD: f64 = 0.5;
+
+/// In quantised mode a frame is on time at or below `target × ON_TIME` (R6). The same factor
+/// widens the vsync multiple in the hitch threshold (R7).
+const ON_TIME: f64 = 1.05;
+
+/// Quantised headroom: at most this share of late frames (R6).
+const LATE_HEADROOM: f64 = 0.01;
+
+/// Quantised overload: more than this share of late frames (R6).
+const LATE_OVERLOAD: f64 = 0.02;
+
+/// Overload in both modes: more than this share of long frames (R4) ...
+const LONG_SHARE_OVERLOAD: f64 = 0.02;
+
+/// ... or at least this many long frames in the window (R4).
+const LONG_COUNT_OVERLOAD: usize = 2;
+
+/// One draw-distance knob. Knobs are in priority order: the governor raises the first one it can.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KnobSpec {
+    /// A disabled knob is never raised.
+    pub enabled: bool,
+    /// The highest step. Step 0 is the player's menu value.
+    pub max_step: u8,
+}
+
+/// What the governor sees on one tick.
+#[derive(Debug, Clone, Copy)]
+pub struct Inputs<'a> {
+    /// The time of this tick, in seconds, from any fixed origin.
+    pub now_s: f64,
+    /// The frame times (ms) that arrived since the last tick.
+    pub new_frames_ms: &'a [f64],
+    /// The 7.1 hook ran recently: the world is rendering.
+    pub world_active: bool,
+    /// The display's refresh period (ms), or 0.0 when it is not known.
+    pub period_ms: f64,
+    /// Free VRAM (budget − usage), or `None` without `VK_EXT_memory_budget`.
+    pub vram_free_mib: Option<u64>,
+    /// `baseline_changed[k]`: the player changed knob k's menu value since the last tick.
+    pub baseline_changed: &'a [bool],
+}
+
+/// A change for Task 15 to apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    /// Set `knob` to `step`.
+    Set { knob: usize, step: u8 },
+}
+
+/// How headroom and overload are judged (R5). Remembered between ticks, with its period.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Mode {
+    /// Free-running frames (VRR, or no vsync): the p95 thresholds.
+    P95,
+    /// Fixed-refresh vsync at display period `p` (ms, always a valid period).
+    Quantised { p: f64 },
+}
+
+/// One raise on the stack.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Raise {
+    knob: usize,
+    /// Tells this raise apart from later raises of the same knob (R7).
+    id: u64,
+    /// When it was made.
+    t: f64,
+}
+
+/// One frame in the window.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Frame {
+    /// The `now_s` of the tick it arrived on.
+    t: f64,
+    ms: f64,
+}
+
+/// A display period that can be trusted, or `None` (R3).
+fn valid_period(period_ms: f64) -> Option<f64> {
+    (period_ms.is_finite() && (MIN_PERIOD_MS..=MAX_PERIOD_MS).contains(&period_ms))
+        .then_some(period_ms)
+}
+
+/// The effective target frame time: the display period when the target fps is above the refresh
+/// rate (R3).
+fn effective_target(base_ms: f64, period: Option<f64>) -> f64 {
+    period.map_or(base_ms, |p| base_ms.max(p))
+}
+
+/// True if a timer started at `since` has run for at least `hold` seconds (T4).
+fn held(since: Option<f64>, now: f64, hold: f64) -> bool {
+    since.is_some_and(|since| now - since + EPS >= hold)
+}
+
+/// True while a knob blocked until `until` is still blocked.
+fn blocked(now: f64, until: f64) -> bool {
+    now + EPS < until
+}
+
+/// The block after the n-th undo of a knob, in BlockSeconds: 1, 2, 4, then 8 for ever (R9).
+fn backoff_factor(undos: u32) -> f64 {
+    match undos {
+        0 | 1 => 1.0,
+        2 => 2.0,
+        3 => 4.0,
+        _ => 8.0,
+    }
+}
+
+/// The governor's state. See the module documentation.
+#[derive(Debug, Clone)]
+pub struct Governor {
+    cfg: GovernorCfg,
+    knobs: Vec<KnobSpec>,
+    /// One per knob, in `0..=max_step`.
+    steps: Vec<u8>,
+    /// One per knob: the knob is not raised before this time (R9).
+    blocked_until: Vec<f64>,
+    /// One per knob: undos since the count last reset (R9).
+    undo_count: Vec<u32>,
+    /// The raises still in place, the most recent last (LIFO). Each knob's step equals the number
+    /// of its entries.
+    stack: Vec<Raise>,
+    next_id: u64,
+    /// The most recent raise while it is on the stack: (id, time). Its post-raise period is open
+    /// while this is `Some` (R7).
+    last_raise: Option<(u64, f64)>,
+    window: VecDeque<Frame>,
+    mode: Mode,
+    /// The clamped time of the last tick (T5).
+    last_now: Option<f64>,
+    /// The last tick that had a frame (R2).
+    last_frame_tick: f64,
+    /// The last tick that had a frame over STALL_MS (R2).
+    last_gap_frame: Option<f64>,
+    /// The last tick was active (R2).
+    active: bool,
+    /// The last reset point (T1, T3).
+    reset_at: f64,
+    headroom_since: Option<f64>,
+    overload_since: Option<f64>,
+    /// The last valid display period (R3).
+    last_valid_period: Option<f64>,
+    /// The last stall that did not cause an undo (R8).
+    last_stall: Option<f64>,
+    t_last_raise: Option<f64>,
+    t_last_undo: Option<f64>,
+}
+
+impl Governor {
+    /// A governor with all knobs at step 0.
+    pub fn new(cfg: GovernorCfg, knobs: Vec<KnobSpec>) -> Self {
+        let n = knobs.len();
+        Governor {
+            cfg,
+            knobs,
+            steps: vec![0; n],
+            blocked_until: vec![f64::NEG_INFINITY; n],
+            undo_count: vec![0; n],
+            stack: Vec::new(),
+            next_id: 0,
+            last_raise: None,
+            window: VecDeque::new(),
+            mode: Mode::P95,
+            last_now: None,
+            last_frame_tick: 0.0,
+            last_gap_frame: None,
+            active: false,
+            reset_at: f64::NEG_INFINITY,
+            headroom_since: None,
+            overload_since: None,
+            last_valid_period: None,
+            last_stall: None,
+            t_last_raise: None,
+            t_last_undo: None,
+        }
+    }
+
+    /// The current step of each knob.
+    pub fn steps(&self) -> &[u8] {
+        &self.steps
+    }
+
+    /// Turn a knob on or off. Disabling a knob that is above step 0 resets it to 0, removes all
+    /// its raises from the stack and is a reset point (T1) at the last tick's time; the returned
+    /// action says so. Every other call (enabling, disabling a knob at 0, the current value, a
+    /// knob out of range) returns `None`. A disabled knob is never raised.
+    pub fn set_enabled(&mut self, knob: usize, enabled: bool) -> Option<Action> {
+        let spec = self.knobs.get_mut(knob)?;
+        if spec.enabled == enabled {
+            return None;
+        }
+        spec.enabled = enabled;
+        if enabled {
+            return None;
+        }
+        let step = self.steps.get_mut(knob)?;
+        if *step == 0 {
+            return None;
+        }
+        *step = 0;
+        self.remove_raises_of(knob);
+        self.reset_point(self.last_now.unwrap_or(f64::NEG_INFINITY));
+        Some(Action::Set { knob, step: 0 })
+    }
+
+    /// One tick: take the inputs, return the knob changes to apply (in order).
+    pub fn tick(&mut self, i: &Inputs) -> Vec<Action> {
+        let mut actions = Vec::new();
+
+        // (o) The time and the frames.
+        let now = self.clamp_time(i.now_s);
+        let frames: Vec<f64> = i
+            .new_frames_ms
+            .iter()
+            .copied()
+            .filter(|ms| ms.is_finite() && *ms > 0.0)
+            .collect();
+        if !frames.is_empty() {
+            self.last_frame_tick = now;
+        }
+        let gap_frame = frames.iter().any(|&ms| ms > STALL_MS + EPS);
+        if gap_frame {
+            self.last_gap_frame = Some(now);
+        }
+
+        // (i)
+        if self.cfg.target_fps == 0 {
+            return actions;
+        }
+        let base_ms = 1000.0 / f64::from(self.cfg.target_fps);
+        let period = valid_period(i.period_ms);
+        self.reset_held_backoff(now);
+
+        // (ii) Menu resets, also while the world is inactive (the player is in a menu).
+        let mut skip_window = false;
+        for knob in 0..self.knobs.len() {
+            if i.baseline_changed.get(knob) == Some(&true) {
+                self.menu_reset(knob, now);
+                actions.push(Action::Set { knob, step: 0 });
+                skip_window = true;
+            }
+        }
+        if self.period_changed(period) {
+            self.reset_point(now);
+            skip_window = true;
+        }
+
+        // (iii) The hitch undo, else the stall undo. Nothing counts while the world is inactive.
+        let mut undone = None;
+        if i.world_active {
+            undone = self.hitch_undo(&frames, now, base_ms, period);
+            if undone.is_none() && gap_frame {
+                undone = self.stall(now);
+            }
+        }
+        if let Some(action) = undone {
+            actions.push(action);
+            skip_window = true;
+        }
+
+        // (iv) Inactive: hold the steps, decide nothing.
+        let recent_gap = self
+            .last_gap_frame
+            .is_some_and(|t| now - t <= GAP_PAUSE_S + EPS);
+        let presents_stopped = now - self.last_frame_tick > PRESENTS_STOPPED_S + EPS;
+        if !i.world_active || recent_gap || presents_stopped {
+            self.active = false;
+            self.headroom_since = None;
+            self.overload_since = None;
+            return actions;
+        }
+        if !self.active {
+            self.active = true;
+            self.reset_point(now);
+        }
+
+        // (v) The window. Frames measured under the old steps are not added.
+        let in_grace = self
+            .t_last_undo
+            .is_some_and(|t| now - t <= UNDO_GRACE_S + EPS);
+        if !skip_window && !in_grace {
+            self.window.extend(
+                frames
+                    .iter()
+                    .filter(|&&ms| ms <= STALL_MS + EPS)
+                    .map(|&ms| Frame { t: now, ms }),
+            );
+        }
+        self.evict(now);
+
+        // (vi)
+        if undone.is_none() {
+            if let Some(action) = self.decide(now, base_ms, period, i.vram_free_mib) {
+                actions.push(action);
+            }
+        }
+        actions
+    }
+
+    /// T5: the first tick starts the clock; a time that is not finite is the last tick's; a small
+    /// step back is clamped; a step back of more than REBASE_S is a re-base and a reset point.
+    fn clamp_time(&mut self, raw: f64) -> f64 {
+        let now = match self.last_now {
+            None => {
+                let now = if raw.is_finite() { raw } else { 0.0 };
+                self.last_frame_tick = now;
+                now
+            }
+            Some(last) if !raw.is_finite() => last,
+            Some(last) if raw >= last => raw,
+            Some(last) if last - raw <= REBASE_S + EPS => last,
+            Some(last) => {
+                self.rebase(raw - last);
+                self.reset_point(raw);
+                raw
+            }
+        };
+        self.last_now = Some(now);
+        now
+    }
+
+    /// Move every stored time by `delta`, so that the durations already running (blocks, the
+    /// probation, the stall record) carry over to the new time base.
+    fn rebase(&mut self, delta: f64) {
+        self.last_frame_tick += delta;
+        for until in &mut self.blocked_until {
+            *until += delta;
+        }
+        for raise in &mut self.stack {
+            raise.t += delta;
+        }
+        if let Some((_, t)) = self.last_raise.as_mut() {
+            *t += delta;
+        }
+        let times = [
+            &mut self.last_gap_frame,
+            &mut self.last_stall,
+            &mut self.t_last_raise,
+            &mut self.t_last_undo,
+        ];
+        for t in times.into_iter().flatten() {
+            *t += delta;
+        }
+    }
+
+    /// T1: clear the window, restart the hold timers, start the quiet period.
+    fn reset_point(&mut self, now: f64) {
+        self.window.clear();
+        self.headroom_since = None;
+        self.overload_since = None;
+        self.reset_at = now;
+    }
+
+    /// R9: a raise that has stayed on the stack for BlockSeconds resets its knob's undo count.
+    fn reset_held_backoff(&mut self, now: f64) {
+        for raise in &self.stack {
+            if now - raise.t + EPS >= self.cfg.block_seconds {
+                if let Some(count) = self.undo_count.get_mut(raise.knob) {
+                    *count = 0;
+                }
+            }
+        }
+    }
+
+    /// R1 (ii): the player changed knob `knob`'s menu value.
+    fn menu_reset(&mut self, knob: usize, now: f64) {
+        if let Some(step) = self.steps.get_mut(knob) {
+            *step = 0;
+        }
+        self.remove_raises_of(knob);
+        if let Some(until) = self.blocked_until.get_mut(knob) {
+            *until = f64::NEG_INFINITY;
+        }
+        if let Some(count) = self.undo_count.get_mut(knob) {
+            *count = 0;
+        }
+        self.reset_point(now);
+    }
+
+    /// Remove every stack entry of `knob`. If the most recent raise was one of them, its
+    /// post-raise period ends (R7).
+    fn remove_raises_of(&mut self, knob: usize) {
+        self.stack.retain(|raise| raise.knob != knob);
+        if let Some((id, _)) = self.last_raise {
+            if !self.stack.iter().any(|raise| raise.id == id) {
+                self.last_raise = None;
+            }
+        }
+    }
+
+    /// R3: true if `period` is valid and more than 5 % away from the last valid period.
+    fn period_changed(&mut self, period: Option<f64>) -> bool {
+        let Some(p) = period else {
+            return false;
+        };
+        let changed = self
+            .last_valid_period
+            .is_some_and(|last| (p - last).abs() > PERIOD_CHANGE * last + EPS);
+        self.last_valid_period = Some(p);
+        changed
+    }
+
+    /// R7: a frame over the hitch threshold in the post-raise period undoes that raise at once,
+    /// if it is still the top of the stack.
+    fn hitch_undo(
+        &mut self,
+        frames: &[f64],
+        now: f64,
+        base_ms: f64,
+        period: Option<f64>,
+    ) -> Option<Action> {
+        let (id, t_raise) = self.last_raise?;
+        let period_end = t_raise + self.cfg.settle_seconds + self.cfg.raise_hold_seconds;
+        if now > period_end + EPS {
+            return None;
+        }
+        let limit = self.hitch_limit(base_ms, period);
+        if !frames.iter().any(|&ms| ms > limit + EPS) {
+            return None;
+        }
+        if self.stack.last().map(|raise| raise.id) != Some(id) {
+            return None;
+        }
+        self.last_raise = None;
+        self.undo(now)
+    }
+
+    /// R7: the hitch threshold in the remembered mode (R5). In quantised mode the stored period
+    /// is used, so a tick whose own period is not valid still gets the quantised threshold.
+    fn hitch_limit(&self, base_ms: f64, period: Option<f64>) -> f64 {
+        match self.mode {
+            Mode::P95 => self.cfg.hitch_factor * effective_target(base_ms, period),
+            Mode::Quantised { p } => {
+                let target = base_ms.max(p);
+                // m: the vsync multiple that is on time. One more is one missed vsync, which is
+                // not a hitch.
+                let m = (target * ON_TIME / p).floor();
+                let m = if m.is_finite() {
+                    m.clamp(1.0, 4.0)
+                } else {
+                    1.0
+                };
+                (self.cfg.hitch_factor * target).max((m + 1.0) * p * ON_TIME)
+            }
+        }
+    }
+
+    /// R8: a stall (a frame over STALL_MS in the world while a knob is raised). The second stall
+    /// within STALL_WINDOW_S undoes the top of the stack and uses the record up.
+    fn stall(&mut self, now: f64) -> Option<Action> {
+        if self.steps.iter().all(|&step| step == 0) {
+            return None;
+        }
+        match self.last_stall {
+            Some(t) if now - t <= STALL_WINDOW_S + EPS => {
+                self.last_stall = None;
+                self.undo(now)
+            }
+            _ => {
+                self.last_stall = Some(now);
+                None
+            }
+        }
+    }
+
+    /// R9: undo the most recent raise and block its knob. A reset point; starts the undo grace
+    /// (T2) and the probation (R10). An empty stack gives `None`.
+    fn undo(&mut self, now: f64) -> Option<Action> {
+        while let Some(raise) = self.stack.pop() {
+            let Some(step) = self.steps.get_mut(raise.knob) else {
+                continue;
+            };
+            if *step == 0 {
+                continue;
+            }
+            *step = step.saturating_sub(1);
+            let step = *step;
+            if self.last_raise.is_some_and(|(id, _)| id == raise.id) {
+                self.last_raise = None;
+            }
+            let undos = match self.undo_count.get_mut(raise.knob) {
+                Some(count) => {
+                    *count = count.saturating_add(1);
+                    *count
+                }
+                None => 1,
+            };
+            if let Some(until) = self.blocked_until.get_mut(raise.knob) {
+                *until = now + self.cfg.block_seconds * backoff_factor(undos);
+            }
+            self.t_last_undo = Some(now);
+            self.reset_point(now);
+            return Some(Action::Set {
+                knob: raise.knob,
+                step,
+            });
+        }
+        None
+    }
+
+    /// T6: drop frames older than WindowSeconds, then the oldest beyond MAX_WINDOW_FRAMES.
+    fn evict(&mut self, now: f64) {
+        let keep_s = self.cfg.window_seconds + EPS;
+        while self.window.front().is_some_and(|f| now - f.t > keep_s) {
+            self.window.pop_front();
+        }
+        while self.window.len() > MAX_WINDOW_FRAMES {
+            self.window.pop_front();
+        }
+    }
+
+    /// R5 + R6: decide the mode and judge the window. Returns (headroom, overload); an empty
+    /// window gives (false, false) and keeps the remembered mode.
+    fn assess(&mut self, target: f64, period: Option<f64>) -> (bool, bool) {
+        let total = self.window.len();
+        if total == 0 {
+            return (false, false);
+        }
+        let non_long: Vec<f64> = self
+            .window
+            .iter()
+            .map(|f| f.ms)
+            .filter(|&ms| ms <= LONG_MS + EPS)
+            .collect();
+        let long_count = total.saturating_sub(non_long.len());
+        let long_share = long_count as f64 / total as f64;
+        let long_overload =
+            long_share > LONG_SHARE_OVERLOAD + EPS || long_count >= LONG_COUNT_OVERLOAD;
+        let no_long = long_count == 0;
+
+        self.mode = match period {
+            Some(p)
+                if p + EPS >= QUANTISED_MIN_PERIOD * target && stats::quantised(&non_long, p) =>
+            {
+                Mode::Quantised { p }
+            }
+            _ => Mode::P95,
+        };
+
+        match self.mode {
+            Mode::Quantised { .. } => {
+                let late = 1.0 - stats::share_at_or_below(&non_long, target * ON_TIME + EPS);
+                let headroom = late <= LATE_HEADROOM + EPS && no_long;
+                let overload = late > LATE_OVERLOAD + EPS || long_overload;
+                (headroom, overload)
+            }
+            Mode::P95 => {
+                if non_long.is_empty() {
+                    return (false, long_overload);
+                }
+                let p95 = stats::p95(&non_long);
+                let headroom = p95 < self.cfg.raise_below * target - EPS && no_long;
+                let overload = p95 > self.cfg.lower_above * target + EPS || long_overload;
+                (headroom, overload)
+            }
+        }
+    }
+
+    /// R1 (vi): an overload lower, else a raise.
+    fn decide(
+        &mut self,
+        now: f64,
+        base_ms: f64,
+        period: Option<f64>,
+        vram_free_mib: Option<u64>,
+    ) -> Option<Action> {
+        let target = effective_target(base_ms, period);
+        let (headroom, overload) = self.assess(target, period);
+        // T4: a timer starts on the first tick its condition is true and stops when it is false.
+        self.headroom_since = headroom.then(|| self.headroom_since.unwrap_or(now));
+        self.overload_since = overload.then(|| self.overload_since.unwrap_or(now));
+
+        // T3: the quiet period after a reset point.
+        if now - self.reset_at + EPS < self.cfg.settle_seconds {
+            return None;
+        }
+        if held(self.overload_since, now, self.cfg.lower_hold_seconds) {
+            if let Some(action) = self.undo(now) {
+                return Some(action);
+            }
+        }
+        let vram_ok =
+            vram_free_mib.is_none_or(|free| free >= u64::from(self.cfg.min_vram_free_mib));
+        if headroom
+            && !overload
+            && held(self.headroom_since, now, self.cfg.raise_hold_seconds)
+            && vram_ok
+            && self.raise_allowed(now)
+        {
+            return self.raise(now);
+        }
+        None
+    }
+
+    /// R10: after an undo the governor is on probation until BlockSeconds pass with no undo. On
+    /// probation a raise also needs BlockSeconds since the last raise.
+    fn raise_allowed(&self, now: f64) -> bool {
+        let block = self.cfg.block_seconds;
+        let on_probation = self.t_last_undo.is_some_and(|t| now - t + EPS < block);
+        !on_probation || self.t_last_raise.is_none_or(|t| now - t + EPS >= block)
+    }
+
+    /// R11: raise the first knob, in index order, that is enabled, below its maximum and not
+    /// blocked. A reset point; opens the raise's post-raise period (R7).
+    fn raise(&mut self, now: f64) -> Option<Action> {
+        let knob = self
+            .knobs
+            .iter()
+            .zip(&self.steps)
+            .zip(&self.blocked_until)
+            .position(|((spec, &step), &until)| {
+                spec.enabled && spec.max_step > 0 && step < spec.max_step && !blocked(now, until)
+            })?;
+        let step = self.steps.get_mut(knob)?;
+        *step = step.saturating_add(1);
+        let step = *step;
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.stack.push(Raise { knob, id, t: now });
+        self.last_raise = Some((id, now));
+        self.t_last_raise = Some(now);
+        self.reset_point(now);
+        Some(Action::Set { knob, step })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, GovernorCfg};
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    const P240: f64 = 1000.0 / 240.0;
+    const P144: f64 = 1000.0 / 144.0;
+    const P120: f64 = 1000.0 / 120.0;
+    const P60: f64 = 1000.0 / 60.0;
+    const TICK_S: f64 = 0.05;
+    const TICK_MS: f64 = 50.0;
+    /// The default BlockSeconds (20 s) in ticks.
+    const BLOCK_TICKS: u64 = 400;
+
+    fn gov() -> Governor {
+        Governor::new(
+            Config::default().governor,
+            vec![
+                KnobSpec {
+                    enabled: true,
+                    max_step: 4
+                };
+                3
+            ],
+        )
+    }
+
+    fn knob(max_step: u8) -> KnobSpec {
+        KnobSpec {
+            enabled: true,
+            max_step,
+        }
+    }
+
+    fn gov_with(knobs: Vec<KnobSpec>) -> Governor {
+        Governor::new(Config::default().governor, knobs)
+    }
+
+    fn with_target(target_fps: u32, knobs: Vec<KnobSpec>) -> Governor {
+        let cfg = GovernorCfg {
+            target_fps,
+            ..Config::default().governor
+        };
+        Governor::new(cfg, knobs)
+    }
+
+    // ---- Harness (pinned by the dispatch notes, "Tests") ----
+    //
+    // Tick n is at now = n × 0.05 s, from n = 1, and the counter continues across calls. A frame
+    // clock (ms) emits each frame on the first tick at which its cumulative end time ≤ n × 50.
+    // The counter and the clock belong to one governor (keyed by its address); a governor that
+    // has never ticked starts again from n = 1 and clock 0.
+
+    #[derive(Debug, Default)]
+    struct Sim {
+        n: u64,
+        clock_ms: f64,
+        period: f64,
+    }
+
+    thread_local! {
+        static SIMS: RefCell<HashMap<usize, Sim>> = RefCell::new(HashMap::new());
+    }
+
+    fn key(g: &Governor) -> usize {
+        std::ptr::from_ref(g) as usize
+    }
+
+    /// The next tick: returns (n, frame clock, period). `Some(period)` replaces the stored period.
+    fn advance(g: &Governor, period: Option<f64>) -> (u64, f64, f64) {
+        let fresh = g.last_now.is_none();
+        SIMS.with(|sims| {
+            let mut sims = sims.borrow_mut();
+            let sim = sims.entry(key(g)).or_default();
+            if fresh {
+                *sim = Sim::default();
+            }
+            sim.n += 1;
+            if let Some(p) = period {
+                sim.period = p;
+            }
+            (sim.n, sim.clock_ms, sim.period)
+        })
+    }
+
+    fn set_clock(g: &Governor, clock_ms: f64) {
+        SIMS.with(|sims| {
+            if let Some(sim) = sims.borrow_mut().get_mut(&key(g)) {
+                sim.clock_ms = clock_ms;
+            }
+        });
+    }
+
+    /// One action, with the tick it came on and whether it raised its knob.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    struct Ev {
+        n: u64,
+        knob: usize,
+        step: u8,
+        raise: bool,
+    }
+
+    /// One tick at n; each action is classed against the knob's step before it.
+    fn tick_ev(
+        g: &mut Governor,
+        n: u64,
+        frames: &[f64],
+        world_active: bool,
+        period_ms: f64,
+        vram_free_mib: Option<u64>,
+        baseline_changed: &[bool],
+    ) -> Vec<Ev> {
+        let mut prev = g.steps().to_vec();
+        let inputs = Inputs {
+            now_s: n as f64 * TICK_S,
+            new_frames_ms: frames,
+            world_active,
+            period_ms,
+            vram_free_mib,
+            baseline_changed,
+        };
+        g.tick(&inputs)
+            .into_iter()
+            .map(|Action::Set { knob, step }| {
+                let before = prev.get(knob).copied().unwrap_or(0);
+                if let Some(p) = prev.get_mut(knob) {
+                    *p = step;
+                }
+                Ev {
+                    n,
+                    knob,
+                    step,
+                    raise: step > before,
+                }
+            })
+            .collect()
+    }
+
+    /// EXACTLY round(secs / 0.05) ticks. `frame(clock_ms, steps, index)` gives the length of the
+    /// next frame; `index` counts the frames this call has emitted.
+    fn run_core(
+        g: &mut Governor,
+        secs: f64,
+        world_active: bool,
+        period: f64,
+        vram_free_mib: Option<u64>,
+        frame: &mut dyn FnMut(f64, &[u8], usize) -> f64,
+    ) -> Vec<Ev> {
+        let ticks = (secs / TICK_S).round() as u64;
+        let mut events = Vec::new();
+        let mut index = 0;
+        for _ in 0..ticks {
+            let (n, mut clock, _) = advance(g, Some(period));
+            let end = n as f64 * TICK_MS;
+            let mut frames = Vec::new();
+            while frames.len() < 100_000 {
+                let ms = frame(clock, g.steps(), index);
+                if clock + ms > end {
+                    break;
+                }
+                frames.push(ms);
+                clock += ms;
+                index += 1;
+            }
+            set_clock(g, clock);
+            let baseline = vec![false; g.steps().len()];
+            events.extend(tick_ev(
+                g,
+                n,
+                &frames,
+                world_active,
+                period,
+                vram_free_mib,
+                &baseline,
+            ));
+        }
+        events
+    }
+
+    fn actions(events: Vec<Ev>) -> Vec<Action> {
+        events
+            .into_iter()
+            .map(|e| Action::Set {
+                knob: e.knob,
+                step: e.step,
+            })
+            .collect()
+    }
+
+    /// `frame_ms` frames until `secs` have passed.
+    fn run(
+        g: &mut Governor,
+        secs: f64,
+        frame_ms: f64,
+        world_active: bool,
+        period: f64,
+    ) -> Vec<Action> {
+        actions(run_core(
+            g,
+            secs,
+            world_active,
+            period,
+            None,
+            &mut |_, _, _| frame_ms,
+        ))
+    }
+
+    /// Frames from `pattern`, repeated, until `secs` have passed.
+    fn run_pattern(
+        g: &mut Governor,
+        secs: f64,
+        pattern: &[f64],
+        world_active: bool,
+        period: f64,
+    ) -> Vec<Action> {
+        actions(run_core(
+            g,
+            secs,
+            world_active,
+            period,
+            None,
+            &mut |_, _, i| pattern[i % pattern.len()],
+        ))
+    }
+
+    /// ONE tick with exactly these frames: world active, the previous call's period, no VRAM
+    /// figure, no menu change. It does not advance the frame clock.
+    fn feed(g: &mut Governor, frames: &[f64]) -> Vec<Action> {
+        let (n, _, period) = advance(g, None);
+        let baseline = vec![false; g.steps().len()];
+        actions(tick_ev(g, n, frames, true, period, None, &baseline))
+    }
+
+    /// One tick with no frames and the world active.
+    fn empty_tick(g: &mut Governor) -> Vec<Action> {
+        feed(g, &[])
+    }
+
+    /// One tick with every input given. It does not advance the frame clock.
+    fn tick_with(
+        g: &mut Governor,
+        frames: &[f64],
+        world_active: bool,
+        period: f64,
+        vram_free_mib: Option<u64>,
+        baseline_changed: &[bool],
+    ) -> Vec<Action> {
+        let (n, _, _) = advance(g, Some(period));
+        actions(tick_ev(
+            g,
+            n,
+            frames,
+            world_active,
+            period,
+            vram_free_mib,
+            baseline_changed,
+        ))
+    }
+
+    /// Replays the actions from all-zero steps: a Set is a raise when its step is above that
+    /// knob's previous step.
+    fn count_raises(a: &[Action]) -> usize {
+        let mut prev: Vec<u8> = Vec::new();
+        let mut raises = 0;
+        for &Action::Set { knob, step } in a {
+            if prev.len() <= knob {
+                prev.resize(knob + 1, 0);
+            }
+            if step > prev[knob] {
+                raises += 1;
+            }
+            prev[knob] = step;
+        }
+        raises
+    }
+
+    /// One tick at an explicit time (no harness), 240 Hz, world active.
+    fn at(g: &mut Governor, now_s: f64, frames: &[f64]) -> Vec<Action> {
+        g.tick(&Inputs {
+            now_s,
+            new_frames_ms: frames,
+            world_active: true,
+            period_ms: P240,
+            vram_free_mib: None,
+            baseline_changed: &[],
+        })
+    }
+
+    /// Frames of 15 ms while knob 0 is raised, else 10 ms: frames that respond to the steps.
+    fn responds(_clock: f64, steps: &[u8], _i: usize) -> f64 {
+        if steps[0] > 0 {
+            15.0
+        } else {
+            10.0
+        }
+    }
+
+    // ---- The brief's 9 tests ----
+
+    #[test]
+    fn raises_one_step_per_settle_with_headroom() {
+        let mut g = gov();
+        let a = run(&mut g, 2.05, 10.0, true, 1000.0 / 240.0); // 100 fps vs 75 target, 240 Hz
+        assert_eq!(g.steps(), &[1, 0, 0]);
+        assert_eq!(a.len(), 1);
+    }
+
+    #[test]
+    fn lowers_after_hold_when_overloaded() {
+        let mut g = gov();
+        run(&mut g, 2.05, 10.0, true, 1000.0 / 240.0);
+        run(&mut g, 3.0, 15.0, true, 1000.0 / 240.0); // 66 fps
+        assert_eq!(g.steps(), &[0, 0, 0]);
+    }
+
+    #[test]
+    fn hitch_after_raise_undoes_it() {
+        let mut g = gov();
+        run(&mut g, 2.05, 10.0, true, 1000.0 / 240.0);
+        feed(&mut g, &[10.0, 10.0, 120.0, 10.0]); // 120 ms > 2x13.3 ms, within settle+hold
+        run(&mut g, 1.2, 10.0, true, 1000.0 / 240.0);
+        // The hitch undoes the raise at 2.10. No raise follows in run(1.2): the R10 raise limit
+        // and the T2 undo grace each prevent it on their own. With both off, k1 would be raised at
+        // 3.15 and the steps would be [0, 1, 0].
+        assert_eq!(g.steps(), &[0, 0, 0]);
+    }
+
+    #[test]
+    fn pauses_when_world_not_active() {
+        let mut g = gov();
+        let a = run(&mut g, 5.0, 10.0, false, 1000.0 / 240.0);
+        assert!(a.is_empty());
+        assert_eq!(g.steps(), &[0, 0, 0]);
+    }
+
+    #[test]
+    fn fifo_120hz_holds_refresh_without_flapping() {
+        let mut g = gov();
+        let p = 1000.0 / 120.0;
+        let a = run_pattern(&mut g, 20.0, &[p, p, p, p, p, p, p, p, p, 2.0 * p], true, p); // 10 % at 60 fps
+        assert!(a.len() <= 2); // no flapping
+    }
+
+    #[test]
+    fn target_above_refresh_uses_refresh() {
+        let mut g = Governor::new(
+            GovernorCfg {
+                target_fps: 144,
+                ..Config::default().governor
+            },
+            vec![KnobSpec {
+                enabled: true,
+                max_step: 4,
+            }],
+        );
+        run(&mut g, 2.05, 1000.0 / 120.0, true, 1000.0 / 120.0); // locked at 120 Hz = full headroom
+        assert_eq!(g.steps(), &[1]);
+    }
+
+    #[test]
+    fn no_raise_when_vram_low() {
+        // vram_free_mib Some(512) -> steps stay [0,0,0]
+        let mut g = gov();
+        run_core(&mut g, 5.0, true, P240, Some(512), &mut |_, _, _| 10.0);
+        assert_eq!(g.steps(), &[0, 0, 0]);
+        // Positive control: exactly MinVramFreeMiB free is enough.
+        let mut g = gov();
+        run_core(&mut g, 1.05, true, P240, Some(1024), &mut |_, _, _| 10.0);
+        assert_eq!(g.steps(), &[1, 0, 0]);
+    }
+
+    #[test]
+    fn menu_change_resets_knob() {
+        // raise knob 0 to 1, then baseline_changed=[true,false,false] -> Set{0,0}
+        let mut g = gov();
+        run(&mut g, 1.05, 10.0, true, P240);
+        assert_eq!(g.steps(), &[1, 0, 0]);
+        let a = tick_with(&mut g, &[10.0; 5], true, P240, None, &[true, false, false]);
+        assert_eq!(a, vec![Action::Set { knob: 0, step: 0 }]);
+        assert_eq!(g.steps(), &[0, 0, 0]);
+        assert!(g.stack.is_empty());
+    }
+
+    #[test]
+    fn runaway_guard_when_frames_do_not_respond() {
+        // frame time independent of steps but oscillating across thresholds -> at most 1 raise per BlockSeconds
+        // Under these rules this pattern makes no raise at all: every 2 s window holds 16 ms
+        // frames, so headroom never holds for RaiseHoldSeconds. The real guard test is
+        // `rate_limit_bounds_raises_after_an_undo`.
+        let mut g = gov();
+        let a = run_pattern(
+            &mut g,
+            60.0,
+            &[10.0; 30]
+                .iter()
+                .chain([16.0; 30].iter())
+                .copied()
+                .collect::<Vec<_>>(),
+            true,
+            1000.0 / 240.0,
+        );
+        let raises = count_raises(&a);
+        assert!(raises <= 60 / 20 + 1);
+        assert!(g.steps().iter().all(|&s| s <= 4));
+    }
+
+    // ---- Strengthening tests (dispatch notes) ----
+
+    /// An event: (tick, knob, step, raise).
+    fn ev(n: u64, knob: usize, step: u8, raise: bool) -> Ev {
+        Ev {
+            n,
+            knob,
+            step,
+            raise,
+        }
+    }
+
+    #[test]
+    fn t7_worked_check_times() {
+        // The tick-by-tick times of the dispatch notes' worked check (T7). n = now / 0.05.
+        let ten = &mut |_: f64, _: &[u8], _: usize| 10.0;
+        // raises_one_step_per_settle_with_headroom: a raise at 1.05; the next at 2.10.
+        let mut g = gov();
+        let a = run_core(&mut g, 2.05, true, P240, None, ten);
+        assert_eq!(a, vec![ev(21, 0, 1, true)]);
+        let a = run_core(&mut g, 0.05, true, P240, None, ten);
+        assert_eq!(a, vec![ev(42, 0, 2, true)]);
+        // lowers_after_hold_when_overloaded: a second raise at 2.10 on the first 15 ms tick, then
+        // an overload lower at the end of each quiet period (3.10 and 4.10).
+        let mut g = gov();
+        let mut a = run_core(&mut g, 2.05, true, P240, None, ten);
+        a.extend(run_core(&mut g, 3.0, true, P240, None, &mut |_, _, _| 15.0));
+        assert_eq!(
+            a,
+            vec![
+                ev(21, 0, 1, true),
+                ev(42, 0, 2, true),
+                ev(62, 0, 1, false),
+                ev(82, 0, 0, false)
+            ]
+        );
+        // hitch_after_raise_undoes_it: the feed tick at 2.10 undoes the raise at once.
+        let mut g = gov();
+        run(&mut g, 2.05, 10.0, true, P240);
+        let (n, _, period) = advance(&g, None);
+        let a = tick_ev(
+            &mut g,
+            n,
+            &[10.0, 10.0, 120.0, 10.0],
+            true,
+            period,
+            None,
+            &[],
+        );
+        assert_eq!(a, vec![ev(42, 0, 0, false)]);
+        assert!(run(&mut g, 1.2, 10.0, true, P240).is_empty());
+        // target_above_refresh_uses_refresh: a raise at 1.05, the next at 2.10.
+        let mut g = with_target(144, vec![knob(4)]);
+        let a = run_core(&mut g, 2.10, true, P120, None, &mut |_, _, _| P120);
+        assert_eq!(a, vec![ev(21, 0, 1, true), ev(42, 0, 2, true)]);
+    }
+
+    #[test]
+    fn no_cascade_after_an_undo() {
+        // T1: the window is cleared at every change.
+        let mut g = gov_with(vec![knob(1), knob(4), knob(4)]);
+        run(&mut g, 2.50, 10.0, true, P240);
+        assert_eq!(g.steps(), &[1, 1, 0]); // raises at 1.05 and 2.10
+        let slow = run_core(&mut g, 0.5, true, P240, None, &mut |_, _, _| 15.0); // 2.55-3.00
+        assert!(slow.is_empty());
+        let ev = run_core(&mut g, 2.0, true, P240, None, &mut |_, _, _| 10.0); // 3.05-5.00
+        assert_eq!(
+            ev,
+            vec![Ev {
+                n: 62,
+                knob: 1,
+                step: 0,
+                raise: false
+            }]
+        ); // the undo of k1 at 3.10, and only that
+        assert_eq!(g.steps(), &[1, 0, 0]);
+    }
+
+    #[test]
+    fn slow_frames_after_an_undo_do_not_cascade() {
+        // T2: frames in the UNDO_GRACE_S after an undo are not added to the window.
+        let mut g = gov_with(vec![knob(1), knob(4), knob(4)]);
+        run(&mut g, 2.50, 10.0, true, P240);
+        assert_eq!(g.steps(), &[1, 1, 0]);
+        let mut ev = run_core(&mut g, 0.9, true, P240, None, &mut |_, _, _| 15.0); // 2.55-3.40
+        ev.extend(run_core(&mut g, 2.0, true, P240, None, &mut |_, _, _| 10.0)); // 3.45-5.40
+        assert_eq!(
+            ev,
+            vec![Ev {
+                n: 62,
+                knob: 1,
+                step: 0,
+                raise: false
+            }]
+        );
+        assert_eq!(g.steps(), &[1, 0, 0]);
+    }
+
+    #[test]
+    fn rate_limit_tries_the_next_knob() {
+        // R10: after an undo, the next raise waits until BlockSeconds after the last raise. The
+        // knob that was undone is still blocked then, so the raise goes to the next knob.
+        let mut g = gov();
+        let ev = run_core(&mut g, 120.0, true, P240, None, &mut responds);
+        let k0_raise = ev.iter().find(|e| e.raise && e.knob == 0).copied().unwrap();
+        let undo = ev
+            .iter()
+            .find(|e| !e.raise && e.knob == 0)
+            .copied()
+            .unwrap();
+        let next = ev
+            .iter()
+            .find(|e| e.raise && e.n > undo.n)
+            .copied()
+            .unwrap();
+        assert!(
+            next.n - k0_raise.n >= BLOCK_TICKS,
+            "raise {k0_raise:?}, undo {undo:?}, next raise {next:?}"
+        );
+        assert_eq!(next.knob, 1, "{ev:?}");
+        // k1 and k2 climb later; k0 is undone each time it is retried.
+        assert_eq!(g.steps(), &[0, 4, 4], "{ev:?}");
+    }
+
+    #[test]
+    fn rate_limit_bounds_raises_after_an_undo() {
+        // R10 (spec rule 9): frames that do not respond to the steps.
+        for (good_ms, bad_ms) in [(3000.0, 1000.0), (5000.0, 1000.0)] {
+            let mut g = gov();
+            let cycle = good_ms + bad_ms;
+            let ev = run_core(&mut g, 60.0, true, P240, None, &mut |clock, _, _| {
+                if clock % cycle < good_ms {
+                    10.0
+                } else {
+                    16.0
+                }
+            });
+            let undos: Vec<u64> = ev.iter().filter(|e| !e.raise).map(|e| e.n).collect();
+            let raises: Vec<u64> = ev.iter().filter(|e| e.raise).map(|e| e.n).collect();
+            let first_undo = *undos.first().expect("an undo");
+            let mut checked = 0;
+            for pair in raises.windows(2) {
+                let (prev, next) = (pair[0], pair[1]);
+                let on_probation = undos.iter().any(|&u| u < next && next - u < BLOCK_TICKS);
+                if next > first_undo && on_probation {
+                    assert!(
+                        next - prev >= BLOCK_TICKS,
+                        "{good_ms}/{bad_ms}: raises at {prev} and {next}: {ev:?}"
+                    );
+                    checked += 1;
+                }
+            }
+            assert!(
+                checked >= 1,
+                "{good_ms}/{bad_ms}: no raise on probation: {ev:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn backoff_doubles_the_block() {
+        // R9: each undo of the same knob doubles its block, up to 8 × BlockSeconds.
+        let mut g = gov_with(vec![knob(4)]);
+        let ev = run_core(&mut g, 470.0, true, P240, None, &mut responds);
+        let waits: Vec<u64> = ev
+            .windows(2)
+            .filter(|w| !w[0].raise && w[1].raise)
+            .map(|w| w[1].n - w[0].n)
+            .collect();
+        assert_eq!(waits, vec![400, 800, 1600, 3200, 3200], "{ev:?}");
+    }
+
+    #[test]
+    fn backoff_count_resets_when_a_raise_holds() {
+        // R9: a raise that stays on the stack for BlockSeconds resets the knob's undo count.
+        let mut g = gov_with(vec![knob(1)]);
+        let ev = run_core(&mut g, 100.0, true, P240, None, &mut |clock, steps, _| {
+            if clock < 22_000.0 {
+                if steps[0] > 0 {
+                    15.0
+                } else {
+                    10.0
+                }
+            } else if (50_000.0..53_000.0).contains(&clock) {
+                15.0
+            } else {
+                10.0
+            }
+        });
+        let undos: Vec<Ev> = ev.iter().filter(|e| !e.raise).copied().collect();
+        assert_eq!(undos.len(), 2, "{ev:?}");
+        let second = undos[1];
+        let next = ev
+            .iter()
+            .find(|e| e.raise && e.n > second.n)
+            .copied()
+            .unwrap();
+        // The count was reset, so the block after the second undo is 20 s again, not 40 s.
+        assert_eq!(next.n - second.n, BLOCK_TICKS, "{ev:?}");
+    }
+
+    #[test]
+    fn hitch_after_raise_already_undone_does_nothing() {
+        // R7: a hitch only undoes its own raise.
+        let mut g = gov_with(vec![knob(1), knob(4), knob(4)]);
+        run(&mut g, 2.10, 10.0, true, P240);
+        assert_eq!(g.steps(), &[1, 1, 0]); // k0 at 1.05, k1 at 2.10
+        let mut a = feed(&mut g, &[40.0]);
+        a.extend(feed(&mut g, &[40.0]));
+        assert_eq!(a, vec![Action::Set { knob: 1, step: 0 }]);
+        assert_eq!(g.steps(), &[1, 0, 0]);
+    }
+
+    #[test]
+    fn menu_reset_ends_the_post_raise_period() {
+        // R7: the post-raise period ends when its entry leaves the stack by a menu reset.
+        let mut g = gov_with(vec![knob(1), knob(4), knob(4)]);
+        run(&mut g, 2.10, 10.0, true, P240);
+        assert_eq!(g.steps(), &[1, 1, 0]);
+        let a = tick_with(&mut g, &[], true, P240, None, &[false, true, false]);
+        assert_eq!(a, vec![Action::Set { knob: 1, step: 0 }]);
+        assert!(feed(&mut g, &[40.0]).is_empty());
+        assert_eq!(g.steps(), &[1, 0, 0]);
+    }
+
+    #[test]
+    fn one_missed_vsync_is_not_a_hitch() {
+        // R5 + R7: 120 Hz with target 144. The mode is remembered across the raise, and one
+        // missed vsync (17.0 ms, under 2 × 8.33 × 1.05 = 17.5 ms) is not a hitch.
+        let mut g = with_target(144, vec![knob(4)]);
+        run(&mut g, 1.05, P120, true, P120);
+        assert_eq!(g.steps(), &[1]);
+        assert!(g.window.is_empty());
+        assert!(feed(&mut g, &[17.0]).is_empty(), "no hitch undo");
+        assert_eq!(g.steps(), &[1]);
+        let a = run(&mut g, 2.0, P120, true, P120);
+        assert_eq!(count_raises(&a), a.len(), "nothing undone later: {a:?}");
+    }
+
+    #[test]
+    fn sustained_8fps_lowers() {
+        // R4: frames over 100 ms count as overload.
+        let mut g = gov_with(vec![knob(1)]);
+        run(&mut g, 3.10, 10.0, true, P240); // raise at 1.05; its post-raise period ends at 3.05
+        assert_eq!(g.steps(), &[1]);
+        let ev = run_core(&mut g, 5.0, true, P240, None, &mut |_, _, _| 125.0);
+        assert_eq!(ev.len(), 1, "{ev:?}");
+        assert_eq!((ev[0].knob, ev[0].step), (0, 0));
+        // The first 125 ms frame arrives at n = 65 (3.25). A hitch undo would act on that tick;
+        // an overload lower needs LowerHoldSeconds (6 ticks) of overload first.
+        assert!(ev[0].n >= 65 + 6, "{ev:?}");
+    }
+
+    #[test]
+    fn stutter_does_not_raise() {
+        // R4: headroom needs no long frames.
+        let mut g = gov();
+        let mut pattern = vec![10.0; 60];
+        pattern.push(150.0);
+        let a = run_pattern(&mut g, 10.0, &pattern, true, P240);
+        assert_eq!(count_raises(&a), 0, "{a:?}");
+    }
+
+    #[test]
+    fn two_hitches_in_a_window_undo_a_raise() {
+        // R4: two long frames in one window are overload, even under a 2 % long share.
+        let mut g = gov_with(vec![knob(1)]);
+        run(&mut g, 3.10, 10.0, true, P240);
+        assert_eq!(g.steps(), &[1]);
+        let mut pattern = vec![10.0; 75];
+        pattern.push(150.0); // one 150 ms frame every 0.9 s
+        let a = run_pattern(&mut g, 10.0, &pattern, true, P240);
+        assert_eq!(a, vec![Action::Set { knob: 0, step: 0 }]);
+    }
+
+    #[test]
+    fn menu_frames_after_raise_are_not_hitches() {
+        // R7: nothing counts as a hitch on a tick with the world inactive.
+        let mut g = gov();
+        run(&mut g, 1.05, 10.0, true, P240);
+        assert_eq!(g.steps(), &[1, 0, 0]);
+        let a = run(&mut g, 1.0, 33.0, false, P240);
+        assert!(a.is_empty(), "{a:?}");
+        assert_eq!(g.steps(), &[1, 0, 0]);
+    }
+
+    #[test]
+    fn recurring_stalls_after_settle_undo_a_raise() {
+        // R8: a second stall within STALL_WINDOW_S undoes the top of the stack.
+        let mut g = gov_with(vec![knob(1)]);
+        run(&mut g, 3.10, 10.0, true, P240); // post-raise period over at 3.05
+        assert_eq!(g.steps(), &[1]);
+        // Two stall frames on one tick are one stall.
+        assert!(feed(&mut g, &[300.0, 300.0]).is_empty());
+        assert!(g.last_stall.is_some());
+        // A stall frame while the world is inactive is not a stall.
+        assert!(tick_with(&mut g, &[300.0], false, P240, None, &[false]).is_empty());
+        assert!(run(&mut g, 3.0, 10.0, true, P240).is_empty());
+        assert_eq!(g.steps(), &[1]);
+        // The second stall, within 10 s of the first.
+        assert_eq!(
+            feed(&mut g, &[300.0]),
+            vec![Action::Set { knob: 0, step: 0 }]
+        );
+        // The undo used the record up.
+        assert!(g.last_stall.is_none());
+    }
+
+    #[test]
+    fn quantised_needs_99_percent_on_time() {
+        // R6: 120 Hz FIFO, target 75. Late frames are at 2 × 8.33 = 16.7 ms (> 14.0 ms).
+        let mut g = gov_with(vec![knob(1)]);
+        let mut late_1_5 = vec![P120; 65];
+        late_1_5.push(2.0 * P120); // 1 in 66 late: 1.5 %
+        let mut late_3 = vec![P120; 32];
+        late_3.push(2.0 * P120); // 1 in 33 late: 3 %
+
+        // 1.5 % late: no raise.
+        let a = run_pattern(&mut g, 10.0, &late_1_5, true, P120);
+        assert_eq!(count_raises(&a), 0, "{a:?}");
+        // All on time: a raise; then a full window of on-time frames.
+        run(&mut g, 6.0, P120, true, P120);
+        assert_eq!(g.steps(), &[1]);
+        // 1.5 % late: no lower either.
+        let a = run_pattern(&mut g, 10.0, &late_1_5, true, P120);
+        assert!(a.is_empty(), "{a:?}");
+        // 3 % late: a lower.
+        let a = run_pattern(&mut g, 5.0, &late_3, true, P120);
+        assert_eq!(a, vec![Action::Set { knob: 0, step: 0 }]);
+    }
+
+    #[test]
+    fn fifo_144hz_counts_72fps_as_on_time() {
+        // R6: c = target × 1.05, so 2 × 6.94 = 13.9 ms is on time for a 13.3 ms target.
+        let mut g = gov();
+        run(&mut g, 1.05, 2.0 * P144, true, P144);
+        assert_eq!(g.steps(), &[1, 0, 0]);
+    }
+
+    #[test]
+    fn high_refresh_uses_p95_not_quantised() {
+        // R5 guard: at 240 Hz, 12.9 ms frames sit within 5 % of 3 × 4.17 ms by chance.
+        let mut g = gov();
+        let a = run(&mut g, 5.0, 12.9, true, P240);
+        assert_eq!(count_raises(&a), 0, "{a:?}");
+    }
+
+    #[test]
+    fn bogus_period_is_ignored() {
+        // R3: a period outside 1..=50 ms, or not finite, is no display period.
+        for period in [0.0, -8.0, f64::NAN, f64::INFINITY, 0.5, 60.0, 1e6] {
+            let mut g = with_target(144, vec![knob(4)]);
+            // 120 fps against a 144 target: overload, unless the bogus period raised the target.
+            let a = run(&mut g, 3.0, P120, true, period);
+            assert!(a.is_empty(), "period {period}: {a:?}");
+        }
+    }
+
+    #[test]
+    fn period_change_is_a_reset_point() {
+        // R3.
+        let mut g = gov_with(vec![knob(1), knob(4), knob(4)]);
+        // The first valid period is not a change: the raise comes at 1.05 as usual.
+        run(&mut g, 0.5, 10.0, true, 0.0);
+        run(&mut g, 0.55, 10.0, true, P120);
+        assert_eq!(g.steps(), &[1, 0, 0]);
+        // An invalid period in between is not a change: 120 Hz, 0.0, 120 Hz gives no reset, so
+        // the raise comes at 2.10.
+        run(&mut g, 0.05, 10.0, true, 0.0);
+        run(&mut g, 1.0, 10.0, true, P120);
+        assert_eq!(g.steps(), &[1, 1, 0]);
+        // Nor does it clear the last valid period: 120 Hz, 0.0 at 2.55, then 60 Hz at 2.60 is a
+        // change from 120 Hz, so a reset point, and there is no raise at 3.15.
+        run(&mut g, 0.40, 10.0, true, P120);
+        run(&mut g, 0.05, 10.0, true, 0.0);
+        run(&mut g, 1.0, 10.0, true, P60);
+        assert_eq!(g.steps(), &[1, 1, 0]);
+        // The quiet period after the change ends at 3.60; the raise follows at 3.65.
+        let a = run(&mut g, 0.1, 10.0, true, P60);
+        assert_eq!(a, vec![Action::Set { knob: 1, step: 2 }]);
+    }
+
+    #[test]
+    fn menu_change_while_inactive_is_not_lost() {
+        // R1 (ii): menu resets run before the inactive check.
+        let mut g = gov();
+        run(&mut g, 1.05, 10.0, true, P240);
+        assert_eq!(g.steps(), &[1, 0, 0]);
+        let a = tick_with(&mut g, &[], false, P240, None, &[true, false, false]);
+        assert_eq!(a, vec![Action::Set { knob: 0, step: 0 }]);
+        assert_eq!(g.steps(), &[0, 0, 0]);
+    }
+
+    #[test]
+    fn menu_change_clears_the_block_and_backoff() {
+        // R1 (ii): a menu reset clears the knob's block and undo count, and always emits Set.
+        let mut g = gov();
+        let ev = run_core(&mut g, 3.0, true, P240, None, &mut responds);
+        assert_eq!(ev.len(), 2, "{ev:?}"); // raise k0 at 1.05, undo at 2.05
+        assert!(g.blocked_until[0] > 3.0);
+        assert_eq!(g.undo_count[0], 1);
+        let a = tick_with(&mut g, &[10.0; 5], true, P240, None, &[true, false, false]);
+        assert_eq!(a, vec![Action::Set { knob: 0, step: 0 }]); // even at step 0
+        assert_eq!(g.blocked_until[0], f64::NEG_INFINITY);
+        assert_eq!(g.undo_count[0], 0);
+    }
+
+    #[test]
+    fn set_enabled_false_resets_a_raised_knob() {
+        let mut g = gov();
+        run(&mut g, 1.05, 10.0, true, P240);
+        assert_eq!(g.steps(), &[1, 0, 0]);
+        assert_eq!(
+            g.set_enabled(0, false),
+            Some(Action::Set { knob: 0, step: 0 })
+        );
+        assert_eq!(g.steps(), &[0, 0, 0]);
+        assert!(g.stack.is_empty());
+        assert!(g.last_raise.is_none());
+        // Repeated calls, calls at step 0 and out-of-range knobs do nothing.
+        assert_eq!(g.set_enabled(0, false), None);
+        assert_eq!(g.set_enabled(2, false), None);
+        assert_eq!(g.set_enabled(2, true), None);
+        assert_eq!(g.set_enabled(2, true), None);
+        assert_eq!(g.set_enabled(7, false), None);
+        // A disabled knob is never raised: the next raise (2.10, a quiet period after the reset
+        // at 1.05) goes to k1.
+        let a = run(&mut g, 1.05, 10.0, true, P240);
+        assert_eq!(a, vec![Action::Set { knob: 1, step: 1 }]);
+        // Enabling is not a reset and returns None.
+        assert_eq!(g.set_enabled(0, true), None);
+        assert_eq!(g.steps(), &[0, 1, 0]);
+    }
+
+    #[test]
+    fn disabled_and_zero_max_knobs_are_never_raised() {
+        // R11.
+        let off = KnobSpec {
+            enabled: false,
+            max_step: 4,
+        };
+        let mut g = gov_with(vec![off, knob(0), knob(2)]);
+        let a = run(&mut g, 10.0, 10.0, true, P240);
+        assert_eq!(g.steps(), &[0, 0, 2], "{a:?}");
+        assert_eq!(count_raises(&a), 2);
+    }
+
+    #[test]
+    fn stalled_presents_pause_the_governor() {
+        // R2: no present for over 250 ms is inactive.
+        let mut g = gov();
+        run(&mut g, 1.80, 10.0, true, P240);
+        assert_eq!(g.steps(), &[1, 0, 0]);
+        let mut a = Vec::new();
+        for _ in 0..6 {
+            a.extend(empty_tick(&mut g)); // 1.85-2.10
+        }
+        // 2.10 would be the next raise; it is 300 ms after the last frame.
+        assert!(a.is_empty(), "{a:?}");
+        assert_eq!(g.steps(), &[1, 0, 0]);
+    }
+
+    #[test]
+    fn long_gap_pauses_for_two_seconds() {
+        // R2: a frame over 250 ms makes the governor inactive for 2 s.
+        let mut g = gov();
+        run(&mut g, 0.5, 10.0, true, P240);
+        // 0.55. All steps are 0, so it is not a stall.
+        assert!(feed(&mut g, &[300.0]).is_empty());
+        // Inactive to 2.55, active (a reset point) at 2.60, so no raise before 3.60.
+        let a = run(&mut g, 3.0, 10.0, true, P240); // 0.60-3.55
+        assert!(a.is_empty(), "{a:?}");
+        let a = run(&mut g, 0.05, 10.0, true, P240); // 3.60
+        assert_eq!(a, vec![Action::Set { knob: 0, step: 1 }]);
+    }
+
+    #[test]
+    fn nan_and_negative_inputs_do_not_panic() {
+        let mut g = gov();
+        // Frames that are not finite or not above 0 are dropped before anything else.
+        let weird = [f64::NAN, f64::NEG_INFINITY, -5.0, 0.0, -0.0];
+        assert!(at(&mut g, 0.05, &weird).is_empty());
+        assert!(g.window.is_empty());
+        // So an infinite frame is not a gap frame either.
+        assert!(at(&mut g, 0.10, &[f64::INFINITY, 10.0]).is_empty());
+        assert!(g.last_gap_frame.is_none());
+        for n in 3..=30 {
+            at(
+                &mut g,
+                f64::from(n) * TICK_S,
+                &[10.0, f64::NAN, 10.0, -1.0, 10.0],
+            );
+        }
+        assert!(!g.window.is_empty());
+        assert!(g.window.iter().all(|f| f.ms == 10.0));
+        // A now_s that is not finite is the last tick's; a small step back is clamped.
+        at(&mut g, f64::NAN, &[10.0]);
+        at(&mut g, f64::INFINITY, &[10.0]);
+        at(&mut g, f64::NEG_INFINITY, &[10.0]);
+        assert_eq!(g.last_now, Some(1.5));
+        at(&mut g, 1.0, &[10.0]);
+        assert_eq!(g.last_now, Some(1.5));
+        // Odd periods, VRAM figures and menu flags.
+        for period in [f64::NAN, -1.0, 0.0, f64::INFINITY, 1e300] {
+            g.tick(&Inputs {
+                now_s: 1.55,
+                new_frames_ms: &[10.0, 1e300, f64::MIN_POSITIVE],
+                world_active: true,
+                period_ms: period,
+                vram_free_mib: Some(0),
+                baseline_changed: &[false; 9],
+            });
+        }
+        assert!(g.steps().iter().all(|&s| s <= 4));
+        // A first tick whose time is not finite starts the clock at 0.
+        let mut g = gov();
+        at(&mut g, f64::NAN, &[10.0]);
+        assert_eq!(g.last_now, Some(0.0));
+    }
+
+    #[test]
+    fn a_bogus_future_time_does_not_freeze_the_clock() {
+        // T5: a jump back of more than 1 s is a re-base, not a clamp.
+        let mut g = gov();
+        for n in 1..=10 {
+            at(&mut g, f64::from(n) * TICK_S, &[10.0; 5]);
+        }
+        at(&mut g, 1e9, &[10.0; 5]); // one bad timestamp
+        let mut raised = false;
+        for n in 11..=70 {
+            let before = g.steps().to_vec();
+            let a = at(&mut g, f64::from(n) * TICK_S, &[10.0; 5]);
+            raised |= a
+                .iter()
+                .any(|&Action::Set { knob, step }| step > before[knob]);
+        }
+        assert!(raised, "the governor still decides after the bad timestamp");
+        // Old frames are evicted: about 2 s of frames, not all of them.
+        assert!(g.window.len() <= 205, "{}", g.window.len());
+    }
+
+    #[test]
+    fn window_holds_at_most_4096_frames() {
+        // T6.
+        let mut g = gov();
+        at(&mut g, 0.05, &[0.5; 10_000]);
+        assert_eq!(g.window.len(), 4096);
+    }
+
+    #[test]
+    fn undo_skips_a_stack_entry_whose_knob_is_at_zero() {
+        // R9 (defensive: the public API cannot produce such an entry).
+        let mut g = gov();
+        run(&mut g, 1.05, 10.0, true, P240);
+        assert_eq!(g.steps(), &[1, 0, 0]);
+        g.stack.push(Raise {
+            knob: 1,
+            id: 1000,
+            t: 1.05,
+        });
+        g.stack.push(Raise {
+            knob: 9,
+            id: 1001,
+            t: 1.05,
+        });
+        assert_eq!(g.undo(1.10), Some(Action::Set { knob: 0, step: 0 }));
+        assert!(g.stack.is_empty());
+        assert_eq!(g.undo(1.15), None); // an empty stack: nothing to do
+    }
+
+    #[test]
+    fn target_fps_zero_never_acts() {
+        let mut g = with_target(0, vec![knob(4); 3]);
+        let mut a = run(&mut g, 5.0, 5.0, true, P240);
+        a.extend(tick_with(
+            &mut g,
+            &[5.0],
+            true,
+            P240,
+            None,
+            &[true, true, true],
+        ));
+        assert!(a.is_empty(), "{a:?}");
+        assert_eq!(g.steps(), &[0, 0, 0]);
+    }
+
+    #[test]
+    fn baseline_changed_of_wrong_length_does_not_panic() {
+        let mut g = gov();
+        run(&mut g, 1.05, 10.0, true, P240);
+        assert_eq!(g.steps(), &[1, 0, 0]);
+        assert!(tick_with(&mut g, &[10.0], true, P240, None, &[]).is_empty());
+        assert!(tick_with(&mut g, &[10.0], true, P240, None, &[false]).is_empty());
+        let a = tick_with(&mut g, &[10.0], true, P240, None, &[true; 10]);
+        assert_eq!(
+            a,
+            vec![
+                Action::Set { knob: 0, step: 0 },
+                Action::Set { knob: 1, step: 0 },
+                Action::Set { knob: 2, step: 0 },
+            ]
+        );
+    }
+
+    #[test]
+    fn fifo_raises_when_on_time() {
+        // POSITIVE CONTROL (exempt from RED): 120 Hz FIFO with target 120, every frame on time.
+        // p95 mode would not raise here (8.33 ms is not under 0.9 × 8.33 ms); quantised mode does.
+        let mut g = with_target(120, vec![knob(4); 3]);
+        run(&mut g, 1.05, P120, true, P120);
+        assert_eq!(g.steps(), &[1, 0, 0]);
+    }
+
+    #[test]
+    fn empty_knobs_is_a_no_op() {
+        // R11 guard.
+        let mut g = gov_with(Vec::new());
+        let mut a = run(&mut g, 5.0, 10.0, true, P240);
+        a.extend(tick_with(&mut g, &[300.0], true, P240, None, &[true]));
+        a.extend(run(&mut g, 3.0, 15.0, true, P240));
+        assert!(a.is_empty());
+        assert!(g.steps().is_empty());
+        assert_eq!(g.set_enabled(0, false), None);
+    }
+
+    #[test]
+    fn odd_configs_do_not_panic() {
+        // R11 guard: the governor does not trust the parser's ranges.
+        let d = Config::default().governor;
+        let configs = [
+            GovernorCfg {
+                window_seconds: 0.0,
+                raise_hold_seconds: 0.0,
+                lower_hold_seconds: 0.0,
+                settle_seconds: 0.0,
+                block_seconds: 0.0,
+                ..d
+            },
+            GovernorCfg {
+                window_seconds: f64::NAN,
+                raise_below: f64::NAN,
+                lower_above: f64::NAN,
+                hitch_factor: f64::NAN,
+                block_seconds: f64::NAN,
+                ..d
+            },
+            GovernorCfg {
+                window_seconds: -1.0,
+                raise_hold_seconds: f64::INFINITY,
+                settle_seconds: -5.0,
+                block_seconds: f64::INFINITY,
+                hitch_factor: -1.0,
+                min_vram_free_mib: u32::MAX,
+                ..d
+            },
+            GovernorCfg {
+                target_fps: u32::MAX,
+                ..d
+            },
+            GovernorCfg { target_fps: 1, ..d },
+        ];
+        for cfg in configs {
+            let mut g = Governor::new(cfg, vec![knob(4), knob(255), knob(0)]);
+            run_core(&mut g, 30.0, true, P240, Some(4096), &mut responds);
+            run(&mut g, 2.0, 400.0, true, P240);
+            run(&mut g, 2.0, 10.0, true, P120);
+            let max = [4, 255, 0];
+            assert!(
+                g.steps().iter().zip(max).all(|(&s, m)| s <= m),
+                "{cfg:?}: {:?}",
+                g.steps()
+            );
+        }
+    }
+}
