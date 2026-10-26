@@ -473,11 +473,15 @@ mod tests {
             let ini = write_ini(&fallback, 120);
             let (cfg, warnings, file) = load_settings(&[module.clone(), fallback]);
             assert_eq!(cfg.governor.target_fps, 120);
-            assert_eq!(file, Some(ini));
+            assert_eq!(file, Some(ini.clone()));
             assert!(warnings.is_empty(), "{warnings:?}");
             assert!(
                 !module.join(INI_FILE_NAME).exists(),
                 "the module folder must stay empty"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&ini).unwrap(),
+                "[Governor]\nTargetFps=120\n"
             );
         });
     }
