@@ -40,4 +40,6 @@ opt-level = 3
 debug = "line-tables-only"
 
 [dev-dependencies]
+iced-x86 = { version = "=1.21.0", default-features = false, features = ["std", "decoder", "intel"] }
+object = { version = "=0.40.0", default-features = false, features = ["read_core", "pe"] }
 proptest = { version = "=1.12.0", default-features = false, features = ["handle-panics", "std"] }
