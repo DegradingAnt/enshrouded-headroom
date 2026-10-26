@@ -179,7 +179,7 @@ Full write-ups: `research-2026-10-25-reflex.md` and `research-2026-10-25-scatter
 
 ## The Steam exe (build f68140a3, Steam buildid 26082781), 2026-10-26
 
-The author moved from the old install (`C:\Games\Enshrouded`, being deleted) to Steam (`C:\Program Files (x86)\Steam\steamapps\common\Enshrouded`). The old exe is kept for reference at `reference\old-build\enshrouded.exe` (not in git).
+The author moved from a standalone install to the Steam version (default Steam library). The old exe is kept for reference at `reference\old-build\enshrouded.exe` (not in git).
 
 | | sha256 | bytes | mod label |
 |---|---|---|---|
@@ -200,3 +200,10 @@ The author moved from the old install (`C:\Games\Enshrouded`, being deleted) to 
 **Task 17 risk (Steam only)**: SteamStub runs before the game's entry. Check in game:
 1. Which caller fired the loader's trigger, and whether the stub had already handed over to `.text` by then. The loader fires on the exe's first kernel32 import call. `docs/design.md` (test-environment note) says the loader "ignores calls from that section [`.bind`] as triggers": from loader source v10.0.0, **unconfirmed in game**. If that holds, the trigger comes from the first call out of `.text`, after the stub. If it does not, `InitializeASI` may run while the stub is still working. Read what fired the trigger in `dinput8.log` (`DebugLog=1`), and compare it with the `.bind` range (`0x029e4000`..`0x02a1d248`). If the log names no caller, compare its time stamps with the mod log's first line. The `GetProcAddress` slot swap (`vk::install`) and the signature scans need the final image, so they must not run before the stub has handed over.
 2. Whether the stub checks `.text` in memory. The async-compute patch (16 bytes at `0x1408490d5`) and the minhook detours are in `.text`. If the game exits or restarts through Steam after the code patches, find which feature does it (`AsyncCompute=off`, then `Enable<Knob>=0`); the texture budget is a write to `.rdata`, not `.text`.
+
+## HDR paper white (controller, 2026-10-26; plan route B1, worksheet W13)
+
+- **The problem.** In HDR mode the composite pass (`cs_main_composite_frame`) multiplies the whole frame, scene and UI, by a paper-white value before the PQ encode. The exe hard-codes that value as 250.0. The tonemapper's output is in 80-nit units. So the HDR picture is about 3.1 times too bright, and highlights clip at the panel's peak. The scale mismatch is read from the shader; its visible effect is a strong hypothesis until the in-game A/B test (plan Task 17).
+- **The site (VERIFIED, bytes, Steam exe sha256 `d64966e2...`, 2026-10-26).** The instruction `c7 45 88 00 00 7a 43` (`mov dword [rbp-0x78], 0x437a0000`, which is 250.0f) occurs exactly once in the file. It is in `.text` at file offset `0x8f7cbc`, VA `0x1408f88bc`. The 4-byte immediate is at VA `0x1408f88bf`.
+- **Context bytes:** `48 89 45 80 45 33 e4 8b c3 | c7 45 88 00 00 7a 43 | 49 8b 16 c7 45 8c 9a 99 19 3f`. The block starts at `[rbp-0x80]`. Paper white is at `+8`. The next store, `+12`, is 0.6f, the luminance clamp factor. This matches the shader's uniform layout (paper white at +8, clamp at +12).
+- **Patch rule.** Replace the immediate with the f32 bits of the setting, little-endian. Expected old bytes: `00 00 7a 43`. The function runs every frame, so the new value applies from the first HDR frame. From the shader analysis, the SDR path does not use this value (a hypothesis until the in-game A/B test).
