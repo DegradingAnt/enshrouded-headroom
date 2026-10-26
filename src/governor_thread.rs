@@ -494,14 +494,55 @@ impl Runtime {
     }
 }
 
-/// W23's lifetime-protected provider is not merged yet. Unknown memory blocks every costly
-/// raise. Replace this hook only after the provider is legitimately available on feat/v1.
+/// Query only during the first device's live lease, using facts from its exact instance generation.
+/// Unknown capabilities and missing selected commands leave every costly raise blocked.
 fn query_vram_free_mib() -> Option<u64> {
-    None
+    use ash::vk::{self, Handle};
+    crate::vk::with_game_device_capabilities(|game, gipa, instance, api| {
+        let api = api?;
+        if gipa == 0 {
+            return None;
+        }
+        // SAFETY: the lease supplies this exact parent's real loader and matching live handles.
+        let gipa: vk::PFN_vkGetInstanceProcAddr = unsafe { std::mem::transmute(gipa) };
+        let instance = vk::Instance::from_raw(instance as u64);
+        let physical = vk::PhysicalDevice::from_raw(game.phys as u64);
+        // SAFETY: this command is legal in Vulkan1.0; the lease protects its parent and output.
+        let properties = unsafe { gipa(instance, c"vkGetPhysicalDeviceProperties".as_ptr()) }?;
+        // SAFETY: the exact command name specifies this native signature.
+        let properties: vk::PFN_vkGetPhysicalDeviceProperties =
+            unsafe { std::mem::transmute(properties) };
+        let mut output = vk::PhysicalDeviceProperties::default();
+        // SAFETY: the matching physical device and initialized output stay live under the lease.
+        unsafe { properties(physical, &mut output) };
+        let route = if api.requested_api_version >= vk::API_VERSION_1_1
+            && output.api_version >= vk::API_VERSION_1_1
+        {
+            crate::vram_budget::QueryRoute::Core11
+        } else if api.properties2_enabled {
+            crate::vram_budget::QueryRoute::EnabledKhr
+        } else {
+            crate::vram_budget::QueryRoute::Unknown
+        };
+        // SAFETY: the observed instance facts and Vulkan1.0 physical properties prove only this
+        // route. The synchronous query ends before the lease; no alias fallback is permitted.
+        unsafe { crate::vram_budget::free_mib(gipa, instance, physical, route) }
+    })
+    .flatten()
 }
 
-/// W23's latency_report is not merged yet; this named five-second hook is intentionally empty.
-fn report_reflex_latency_when_available() {}
+/// Read a background report only while debug output is enabled; emit only available samples.
+fn report_reflex_latency_when_available(
+    enabled: bool,
+    report: impl FnOnce() -> Option<String>,
+    emit: impl FnOnce(&str),
+) {
+    if enabled {
+        if let Some(line) = report() {
+            emit(&line);
+        }
+    }
+}
 
 /// Start once from entry, after queued hooks are applied. No runtime thread is started in unit
 /// tests; tests drive Runtime::plan synchronously with injected snapshots instead.
@@ -610,7 +651,11 @@ fn run(cfg: crate::config::Config) {
                 }
                 if cfg.general.log_level == crate::config::LogLevel::Debug {
                     if now_s - latency_at >= 5.0 {
-                        report_reflex_latency_when_available();
+                        report_reflex_latency_when_available(
+                            log::log_enabled!(log::Level::Debug),
+                            crate::reflex::latency_report,
+                            |line| log::debug!("{line}"),
+                        );
                         latency_at = now_s;
                     }
                     if cfg.debug.scatter_probe {
@@ -1249,5 +1294,508 @@ mod tests {
         assert_eq!(knob_value(1, 0), Some(90.0));
         assert_eq!(knob_value(3, 0), None);
         assert_eq!(knob_value(0, 5), None);
+    }
+    #[test]
+    fn reflex_latency_hook_emits_only_available_debug_reports_without_extra_allocation() {
+        let queried = Cell::new(false);
+        let emitted = Cell::new(false);
+        assert_eq!(
+            allocation_count(|| {
+                report_reflex_latency_when_available(
+                    false,
+                    || panic!("disabled debug logging must not query or allocate"),
+                    |_| panic!("disabled debug logging must not emit"),
+                );
+                report_reflex_latency_when_available(
+                    true,
+                    || {
+                        queried.set(true);
+                        None
+                    },
+                    |_| panic!("unavailable timings must not emit a line"),
+                );
+            }),
+            0
+        );
+        assert!(
+            queried.get(),
+            "the scheduled hook must call the report provider"
+        );
+        assert_eq!(
+            allocation_count(|| {
+                report_reflex_latency_when_available(
+                    true,
+                    || Some("Reflex: native timing sample".to_owned()),
+                    |line| {
+                        assert_eq!(line, "Reflex: native timing sample");
+                        emitted.set(true);
+                    },
+                );
+            }),
+            1,
+            "only the emitted provider string allocates"
+        );
+        assert!(
+            emitted.get(),
+            "available timings must reach the debug logger"
+        );
+    }
+    /// Real wrapper publication and teardown, isolated because the Vulkan state is first-wins.
+    mod live_queries {
+        use super::super::query_vram_free_mib;
+        use crate::guard::{guard, Feature};
+        use ash::vk::{self, Handle};
+        use std::cell::Cell;
+        use std::ffi::{c_char, CStr};
+        use std::sync::atomic::Ordering;
+
+        /// Instance generation created and observed by this child.
+        const INSTANCE: u64 = 0x2410;
+        /// Physical device returned only by that instance's enumeration.
+        const PHYSICAL: u64 = 0x2420;
+        /// First device identity, deliberately reused after retirement in one case.
+        const DEVICE: u64 = 0x2430;
+
+        thread_local! {
+            /// The recognized child case; callbacks never read the environment or allocate.
+            static CASE: Cell<u8> = const { Cell::new(0) };
+            /// Physical API support is independent of the observed application request.
+            static PHYSICAL_API: Cell<u32> = const { Cell::new(vk::API_VERSION_1_1) };
+            /// Properties calls, extension calls, alias lookups, then actual core/KHR calls.
+            static CALLS: Cell<[u32; 6]> = const { Cell::new([0; 6]) };
+            /// Native destruction remains observable independently of the lease.
+            static DESTROYS: Cell<u32> = const { Cell::new(0) };
+        }
+
+        /// Record only a fixed counter, without allocating during the native query.
+        fn note(index: usize) {
+            CALLS.with(|calls| {
+                let mut values = calls.get();
+                values[index] += 1;
+                calls.set(values);
+            });
+        }
+
+        /// Return an erased native entry point using the same name-directed contract as Vulkan.
+        fn entry(address: usize) -> vk::PFN_vkVoidFunction {
+            // SAFETY: every caller supplies zero or a function address recovered by exact name.
+            unsafe { std::mem::transmute::<usize, vk::PFN_vkVoidFunction>(address) }
+        }
+
+        /// Create one synthetic instance; all original input pointers remain owned by the child.
+        /// # Safety
+        /// The caller supplies one initialized writable instance output slot.
+        unsafe extern "system" fn create_instance(
+            _: *const vk::InstanceCreateInfo<'_>,
+            _: *const vk::AllocationCallbacks<'_>,
+            out: *mut vk::Instance,
+        ) -> vk::Result {
+            guard(
+                Feature::Governor,
+                || vk::Result::ERROR_INITIALIZATION_FAILED,
+                || {
+                    // SAFETY: the child owns this output for the complete synchronous call.
+                    unsafe { out.write(vk::Instance::from_raw(INSTANCE)) };
+                    vk::Result::SUCCESS
+                },
+            )
+        }
+
+        /// Return this exact instance's physical device through actual intercepted enumeration.
+        /// # Safety
+        /// The caller supplies a count and, when non-null, at least one writable output slot.
+        unsafe extern "system" fn enumerate(
+            instance: vk::Instance,
+            count: *mut u32,
+            out: *mut vk::PhysicalDevice,
+        ) -> vk::Result {
+            guard(
+                Feature::Governor,
+                || vk::Result::ERROR_INITIALIZATION_FAILED,
+                || {
+                    assert_eq!(instance.as_raw(), INSTANCE);
+                    // SAFETY: the count/output follow this fake's synchronous enumeration contract.
+                    unsafe {
+                        if !out.is_null() {
+                            assert!(*count >= 1);
+                            out.write(vk::PhysicalDevice::from_raw(PHYSICAL));
+                        }
+                        count.write(1);
+                    }
+                    vk::Result::SUCCESS
+                },
+            )
+        }
+
+        /// Create the same raw bits again only after the test has retired the first generation.
+        /// # Safety
+        /// The caller supplies one writable device output slot and a live synthetic physical device.
+        unsafe extern "system" fn create_device(
+            physical: vk::PhysicalDevice,
+            _: *const vk::DeviceCreateInfo<'_>,
+            _: *const vk::AllocationCallbacks<'_>,
+            out: *mut vk::Device,
+        ) -> vk::Result {
+            guard(
+                Feature::Governor,
+                || vk::Result::ERROR_INITIALIZATION_FAILED,
+                || {
+                    assert_eq!(physical.as_raw(), PHYSICAL);
+                    // SAFETY: the child keeps the native output slot writable throughout this call.
+                    unsafe { out.write(vk::Device::from_raw(DEVICE)) };
+                    vk::Result::SUCCESS
+                },
+            )
+        }
+
+        /// Finish native teardown after the real wrapper has invalidated the read lease.
+        /// # Safety
+        /// Handles are opaque fake values and no allocation callback is read.
+        unsafe extern "system" fn destroy_device(
+            device: vk::Device,
+            _: *const vk::AllocationCallbacks<'_>,
+        ) {
+            guard(
+                Feature::Governor,
+                || (),
+                || {
+                    assert_eq!(device.as_raw(), DEVICE);
+                    DESTROYS.with(|n| n.set(n.get() + 1));
+                },
+            );
+        }
+
+        /// Supply the physical version through the legal Vulkan1.0 command.
+        /// # Safety
+        /// The physical handle belongs to this fake and out is one writable native struct.
+        unsafe extern "system" fn properties(
+            physical: vk::PhysicalDevice,
+            out: *mut vk::PhysicalDeviceProperties,
+        ) {
+            guard(
+                Feature::Governor,
+                || (),
+                || {
+                    assert_eq!(physical.as_raw(), PHYSICAL);
+                    note(0);
+                    // SAFETY: the caller owns this initialized output for the native call.
+                    unsafe { (*out).api_version = PHYSICAL_API.with(Cell::get) };
+                },
+            );
+        }
+
+        /// Advertise the budget extension independently of command-pointer presence.
+        /// # Safety
+        /// The caller supplies the fixed free_mib buffer and writable count.
+        unsafe extern "system" fn extensions(
+            physical: vk::PhysicalDevice,
+            layer: *const c_char,
+            count: *mut u32,
+            out: *mut vk::ExtensionProperties,
+        ) -> vk::Result {
+            guard(
+                Feature::Governor,
+                || vk::Result::ERROR_INITIALIZATION_FAILED,
+                || {
+                    assert_eq!(physical.as_raw(), PHYSICAL);
+                    assert!(layer.is_null());
+                    note(1);
+                    let supported = CASE.with(Cell::get) != 12;
+                    let mut extension = vk::ExtensionProperties::default();
+                    for (to, from) in extension
+                        .extension_name
+                        .iter_mut()
+                        .zip(c"VK_EXT_memory_budget".to_bytes_with_nul())
+                    {
+                        *to = *from as c_char;
+                    }
+                    // SAFETY: free_mib gives capacity512; the fake writes at most one entry.
+                    unsafe {
+                        if supported {
+                            assert!(*count >= 1);
+                            out.write(extension);
+                        }
+                        count.write(u32::from(supported));
+                    }
+                    vk::Result::SUCCESS
+                },
+            )
+        }
+
+        /// Fill a real properties2/budget output chain owned by the caller.
+        /// # Safety
+        /// out points to initialized properties2 with a writable budget pNext.
+        unsafe fn budget(out: *mut vk::PhysicalDeviceMemoryProperties2<'_>) {
+            // SAFETY: the native query contract keeps both exact structs alive and writable.
+            unsafe {
+                assert_eq!(
+                    (*out).s_type.as_raw(),
+                    vk::StructureType::PHYSICAL_DEVICE_MEMORY_PROPERTIES_2.as_raw()
+                );
+                let budget = &mut *(*out)
+                    .p_next
+                    .cast::<vk::PhysicalDeviceMemoryBudgetPropertiesEXT<'_>>();
+                assert_eq!(
+                    budget.s_type.as_raw(),
+                    vk::StructureType::PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT.as_raw()
+                );
+                (*out).memory_properties.memory_heap_count = 1;
+                (*out).memory_properties.memory_heaps[0] = vk::MemoryHeap {
+                    size: 8 << 30,
+                    flags: vk::MemoryHeapFlags::DEVICE_LOCAL,
+                };
+                budget.heap_budget[0] = 7 << 30;
+                budget.heap_usage[0] = 5 << 30;
+            }
+        }
+
+        /// A non-null core address is deliberately available even for KHR-only instances.
+        /// # Safety
+        /// The physical handle and caller-owned native chain obey budget's contract.
+        unsafe extern "system" fn core(
+            physical: vk::PhysicalDevice,
+            out: *mut vk::PhysicalDeviceMemoryProperties2<'_>,
+        ) {
+            guard(
+                Feature::Governor,
+                || (),
+                || {
+                    assert_eq!(physical.as_raw(), PHYSICAL);
+                    note(4);
+                    // SAFETY: the query supplies this exact live output chain.
+                    unsafe { budget(out) };
+                },
+            );
+        }
+
+        /// The KHR alias has a separate counter and the same native output contract.
+        /// # Safety
+        /// The physical handle and caller-owned native chain obey budget's contract.
+        unsafe extern "system" fn khr(
+            physical: vk::PhysicalDevice,
+            out: *mut vk::PhysicalDeviceMemoryProperties2<'_>,
+        ) {
+            guard(
+                Feature::Governor,
+                || (),
+                || {
+                    assert_eq!(physical.as_raw(), PHYSICAL);
+                    note(5);
+                    // SAFETY: the query supplies this exact live output chain.
+                    unsafe { budget(out) };
+                },
+            );
+        }
+
+        /// Resolve the child's real native endpoints without capability-based pointer filtering.
+        /// # Safety
+        /// name is a synchronous NUL-terminated lookup; instance is null or this child's instance.
+        unsafe extern "system" fn gipa(
+            instance: vk::Instance,
+            name: *const c_char,
+        ) -> vk::PFN_vkVoidFunction {
+            guard(
+                Feature::Governor,
+                || None,
+                || {
+                    // SAFETY: the wrapper/query passes a live static native command name.
+                    let name = unsafe { CStr::from_ptr(name) }.to_bytes();
+                    if name != b"vkCreateInstance" {
+                        assert_eq!(instance.as_raw(), INSTANCE);
+                    }
+                    let case = CASE.with(Cell::get);
+                    entry(match name {
+                        b"vkCreateInstance" => create_instance as *const () as usize,
+                        b"vkEnumeratePhysicalDevices" => enumerate as *const () as usize,
+                        b"vkCreateDevice" => create_device as *const () as usize,
+                        b"vkDestroyDevice" => destroy_device as *const () as usize,
+                        b"vkGetPhysicalDeviceProperties" if case != 8 => {
+                            properties as *const () as usize
+                        }
+                        b"vkEnumerateDeviceExtensionProperties" => extensions as *const () as usize,
+                        b"vkGetPhysicalDeviceMemoryProperties2" => {
+                            note(2);
+                            if case == 6 {
+                                0
+                            } else {
+                                core as *const () as usize
+                            }
+                        }
+                        b"vkGetPhysicalDeviceMemoryProperties2KHR" => {
+                            note(3);
+                            if case == 7 {
+                                0
+                            } else {
+                                khr as *const () as usize
+                            }
+                        }
+                        _ => 0,
+                    })
+                },
+            )
+        }
+
+        /// Every route is reached through the real observed instance/device lease, never raw facts.
+        #[test]
+        fn leased_query_uses_observed_instance_and_physical_capabilities() {
+            const TEST: &str = "governor_thread::tests::live_queries::leased_query_uses_observed_instance_and_physical_capabilities";
+            const ARGS: [&str; 4] = ["--exact", TEST, "--nocapture", "--test-threads=1"];
+            const CASES: [&str; 14] = [
+                "core",
+                "khr",
+                "low-physical",
+                "low-physical-khr",
+                "unknown",
+                "no-route",
+                "missing-core",
+                "missing-khr",
+                "missing-properties",
+                "unleased",
+                "retired",
+                "reused",
+                "budget-missing",
+                "api-zero",
+            ];
+            let case = std::env::var("HEADROOM_W24_MEMORY").ok();
+            let exact = std::env::args_os()
+                .skip(1)
+                .eq(ARGS.map(std::ffi::OsString::from));
+            let selected = case
+                .as_deref()
+                .and_then(|case| CASES.iter().position(|&known| known == case));
+            let Some(index) = selected.filter(|_| exact) else {
+                for case in CASES {
+                    let output = std::process::Command::new(std::env::current_exe().unwrap())
+                        .args(ARGS)
+                        .env("HEADROOM_W24_MEMORY", case)
+                        .output()
+                        .unwrap();
+                    assert!(
+                        output.status.success(),
+                        "{case}: {}\n{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    println!("memory capability case passed: {case}");
+                }
+                return;
+            };
+            assert!(
+                exact,
+                "native fixture needs the exact selected test and one worker"
+            );
+            CASE.with(|case| case.set(index as u8));
+            PHYSICAL_API.with(|version| {
+                version.set(if matches!(index, 2 | 3) {
+                    vk::API_VERSION_1_0
+                } else {
+                    vk::API_VERSION_1_1
+                })
+            });
+            crate::reflex::init(crate::config::ReflexMode::Off);
+            crate::vk::REAL_GIPA.store(gipa as *const () as usize, Ordering::Release);
+            let names = [c"VK_KHR_get_physical_device_properties2".as_ptr()];
+            let app = vk::ApplicationInfo::default().api_version(if index == 13 {
+                0
+            } else if matches!(index, 1 | 5 | 7) {
+                vk::API_VERSION_1_0
+            } else {
+                vk::API_VERSION_1_1
+            });
+            let mut info = vk::InstanceCreateInfo::default().application_info(&app);
+            if matches!(index, 0 | 1 | 3 | 6 | 7 | 8) {
+                info = info.enabled_extension_names(&names);
+            }
+            // SAFETY: every native pointer belongs to this exact child fixture. The real wrappers
+            // copy creation facts, observe actual enumeration and publish the mandatory lease.
+            unsafe {
+                let mut instance = vk::Instance::null();
+                if index == 4 {
+                    assert_eq!(
+                        create_instance(&info, std::ptr::null(), &mut instance),
+                        vk::Result::SUCCESS
+                    );
+                } else {
+                    let create: vk::PFN_vkCreateInstance = std::mem::transmute(
+                        crate::vk::wrap_gipa(vk::Instance::null(), c"vkCreateInstance".as_ptr())
+                            .unwrap(),
+                    );
+                    assert_eq!(
+                        create(&info, std::ptr::null(), &mut instance),
+                        vk::Result::SUCCESS
+                    );
+                }
+                let enumerate: vk::PFN_vkEnumeratePhysicalDevices = std::mem::transmute(
+                    crate::vk::wrap_gipa(instance, c"vkEnumeratePhysicalDevices".as_ptr()).unwrap(),
+                );
+                let mut count = 1;
+                let mut physical = vk::PhysicalDevice::null();
+                assert_eq!(
+                    enumerate(instance, &mut count, &mut physical),
+                    vk::Result::SUCCESS
+                );
+                if index != 9 {
+                    let create: vk::PFN_vkCreateDevice = std::mem::transmute(
+                        crate::vk::wrap_gipa(instance, c"vkCreateDevice".as_ptr()).unwrap(),
+                    );
+                    let mut device = vk::Device::null();
+                    assert_eq!(
+                        create(
+                            physical,
+                            &vk::DeviceCreateInfo::default(),
+                            std::ptr::null(),
+                            &mut device
+                        ),
+                        vk::Result::SUCCESS
+                    );
+                }
+                CALLS.with(|calls| calls.set([0; 6]));
+                let expected = match index {
+                    0 | 10 | 11 => Some(2048),
+                    1 | 3 => Some(2048),
+                    _ => None,
+                };
+                assert_eq!(query_vram_free_mib(), expected);
+                let counts = match index {
+                    0 | 10 | 11 => [1, 1, 1, 0, 1, 0],
+                    1 | 3 => [1, 1, 0, 1, 0, 1],
+                    2 | 5 | 13 => [1, 0, 0, 0, 0, 0],
+                    6 => [1, 1, 1, 0, 0, 0],
+                    7 => [1, 1, 0, 1, 0, 0],
+                    12 => [1, 1, 0, 0, 0, 0],
+                    _ => [0; 6],
+                };
+                assert_eq!(CALLS.with(Cell::get), counts);
+                assert!(!crate::guard::is_disabled(Feature::Governor));
+                assert_eq!(
+                    super::allocation_count(|| {
+                        for _ in 0..100 {
+                            std::hint::black_box(query_vram_free_mib());
+                        }
+                    }),
+                    0
+                );
+                if matches!(index, 10 | 11) {
+                    crate::vk::wrap_destroy_device(vk::Device::from_raw(DEVICE), std::ptr::null());
+                    assert_eq!(DESTROYS.with(Cell::get), 1);
+                    if index == 11 {
+                        let mut device = vk::Device::null();
+                        assert_eq!(
+                            crate::vk::wrap_create_device(
+                                physical,
+                                &vk::DeviceCreateInfo::default(),
+                                std::ptr::null(),
+                                &mut device
+                            ),
+                            vk::Result::SUCCESS
+                        );
+                        assert_eq!(device.as_raw(), DEVICE);
+                    }
+                    CALLS.with(|calls| calls.set([0; 6]));
+                    assert_eq!(query_vram_free_mib(), None);
+                    assert_eq!(CALLS.with(Cell::get), [0; 6]);
+                }
+            }
+        }
     }
 }
