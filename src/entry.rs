@@ -288,12 +288,13 @@ pub fn start() {
     // here: `InitializeASI` runs before `WinMain`.
     knobs::scatter_distance::init(&cfg.knobs);
 
-    // 13. The scatter counter probe: a pre-hook on the grass pass that reads the game's grass GPU
-    // counters at most once per 500 ms. It hooks code, so it asks `code_patches_allowed`. It is
-    // off by default: it is installed only with `[Debug] ScatterProbe = 1` and `LogLevel = debug`,
-    // or with `EnableScatterDistance = 1` once the grass ceiling allows a raise (design.md 7.2a).
-    // It logs its own line, including why it is off. It is only created and queued here: the last
-    // step enables it.
+    // 13. The scatter counter probe: the grass-pass pre-hook only publishes its pass pointer
+    // and a call counter. A detached sampler copies seven blocks with ReadProcessMemory every
+    // 500 ms while calls continue. Nine transient misses are tolerated; the tenth or a copied
+    // self-check mismatch latches failure (design.md 7.2a). No sampling runs on the game thread.
+    // It asks code_patches_allowed and stays off by default: Debug ScatterProbe with debug
+    // logging, or an enabled scatter knob whose ceiling permits a raise. After installation it
+    // starts the sampler and logs its outcome. The final batch below enables the queued hook.
     features::scatter_probe::init(&cfg);
 
     // 14. The terrain detail distance: a checked pre-hook on the terrain update function. It is
