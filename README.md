@@ -29,7 +29,7 @@ Place these files in the game folder, next to the game executable:
 <game folder>\
   dinput8.dll                       Ultimate ASI Loader v10.0.0 x64
   ultimate-asi-loader-LICENSE.txt   the loader's MIT licence
-  LICENSE                          this mod's MIT licence
+  LICENSE                           this mod's MIT licence
   plugins\
     enshrouded-headroom.asi         this mod
     enshrouded-headroom.ini         settings
