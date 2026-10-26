@@ -52,7 +52,7 @@ If neither folder has a readable file, it tries to create the default file in th
 
 Missing keys use their defaults. Invalid values use their defaults, and numeric values outside their ranges are clamped, except `PaperWhiteNits` and `DisplayPeakNits`, which fall back to `game`. Unknown sections and keys are ignored with warnings. If `LowerAbove` is not greater than `RaiseBelow`, both return to their defaults. Section names, key names and word choices are case-insensitive. Boolean values accept `0`, `1`, `false` or `true`. Lines starting with `;` or `#` are comments.
 
-The tables list all 29 keys from [the default INI](enshrouded-headroom.default.ini), with their defaults as written there. GiB and MiB are binary units.
+The tables list all 31 keys from [the default INI](enshrouded-headroom.default.ini), with their defaults as written there. GiB and MiB are binary units.
 
 ### `[General]`
 
