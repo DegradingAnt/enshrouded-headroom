@@ -1,6 +1,6 @@
 # Enshrouded reverse-engineering notes
 
-Target: `enshrouded.exe`, sha256 `b28b448a8dbf48c932b717f035031f5a89712a7cccfcc2d6cac0d47e6421c12a`, build `f68140a3`, image base `0x140000000`.
+Target: `enshrouded.exe`, sha256 `b28b448a8dbf48c932b717f035031f5a89712a7cccfcc2d6cac0d47e6421c12a`, build `f68140a3`, image base `0x140000000`. The Steam exe of the same build has the same code at the same addresses (last section, "The Steam exe"); every virtual address in these notes holds for both.
 Tools: REA 6.3.0 + Ghidra 12.1.4, and capstone/pefile scratch probes (`xref.py`, `callers.py`, `func.py`, `stores.py` in the session scratchpad).
 Evidence labels: **VERIFIED** = read from bytes, decompile, or game log. **HYPOTHESIS** = inferred from names or neighbours.
 
@@ -169,3 +169,27 @@ Full write-ups: `research-2026-10-25-reflex.md` and `research-2026-10-25-scatter
 - The Reflex row is NOT shown in the in-game menu on Vulkan.
 - Reflex default: "On for NVIDIA". The `.ini` value `game` becomes `auto` (on for NVIDIA GPUs whose driver lists `VK_NV_low_latency2`).
 - The grass measurement tool goes into v1: a debug-only read of the game's scatter GPU-counter peak in dense grass, to compute a safe maximum distance.
+
+## The Steam exe (build f68140a3, Steam buildid 26082781), 2026-10-26
+
+The author moved from the old install (`C:\Games\Enshrouded`, being deleted) to Steam (`C:\Program Files (x86)\Steam\steamapps\common\Enshrouded`). The old exe is kept for reference at `reference\old-build\enshrouded.exe` (not in git).
+
+| | sha256 | bytes | mod label |
+|---|---|---|---|
+| old install | `b28b448a8dbf48c932b717f035031f5a89712a7cccfcc2d6cac0d47e6421c12a` | 35338752 | `f68140a3` |
+| Steam | `d64966e23b1a458ee6f147bcbceac0b577fa7e39a212f371287d8cc119817882` | 35338312 | `f68140a3-steam` |
+
+**VERIFIED** (controller's PE compare, then the ignored test `build_id::tests::steam_exe_matches_the_old_build_except_the_stub`, which reads both files):
+- `.text`, `.rdata`, `.data`, `.pdata`, `.rsrc` and `.reloc` have the same virtual address, the same raw size and byte-identical raw data. So every RVA, signature, patch site, the texture table (`0x1413b86d0`) and the IAT slot (`0x1413b2908`) are unchanged. The three ignored real-exe tests (signatures, texture table, async-compute site) pass on the Steam exe, with every signature at its anchor.
+- Same `TimeDateStamp` (1792507660), image base, `SectionAlignment` (`0x1000`) and `SizeOfImage` (`0x2a1e000`). Neither file has a certificate.
+- The entry point moved. Steam: `0x029e4310`, inside `.bind` (`0x029e4000`, size `0x39248`), which is Steam's DRM stub. Old: `0x0132dbb8`, inside `.text`, the game's own entry.
+- `.bind` is the only section with different bytes. The old exe has a `.bind` section too (size `0x39400` raw), with other content, but its entry point is in `.text`.
+- The section headers state the virtual sizes differently: the Steam headers give them exactly (`.text` `0x13b0730`), the old ones round them up to the page (`.text` `0x13b1000`). After rounding up to `SectionAlignment` they are equal for every section, so the loader maps the same pages.
+
+**HYPOTHESIS** (inferred, not checked): the old exe is a copy with the stub bypassed (entry point put back into `.text`, a changed `.bind` left in the file). And `.text` on disk is plain in the Steam exe (it equals the old `.text`, which ran), so the stub does not encrypt the code.
+
+**Mod**: `build_id::KNOWN` has both hashes. Both are known builds: code patches are on for either. The label only tells the log which file runs. The ignored real-exe tests read `ENSHROUDED_EXE` if it is set, else the Steam path above, and skip with a printed reason if there is no file.
+
+**Task 17 risk (Steam only)**: SteamStub runs before the game's entry. Check in game:
+1. When Ultimate ASI Loader calls `InitializeASI` relative to the stub. The loader fires on the exe's first kernel32 import call, and now that call may come from the stub, before the game's own start-up. Compare the time stamps in `dinput8.log` (`DebugLog=1`) with the mod log. The `GetProcAddress` slot swap (`vk::install`) and the signature scans need the final image, so they must not run while the stub is still unpacking.
+2. Whether the stub checks `.text` in memory. The async-compute patch (16 bytes at `0x1408490d5`) and the minhook detours are in `.text`. If the game exits or restarts through Steam after the code patches, find which feature does it (`AsyncCompute=off`, then `Enable<Knob>=0`); the texture budget is a write to `.rdata`, not `.text`.

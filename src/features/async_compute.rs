@@ -886,9 +886,10 @@ mod tests {
         );
     }
 
-    // ---- the real game exe (ignored: reads C:\Games\Enshrouded\enshrouded.exe) ----------------
+    // ---- the real game exe (ignored: reads ENSHROUDED_EXE, else the Steam install) -------------
 
-    /// Where the signature matches in build f68140a3 (sha256 b28b448a...), from the RE notes.
+    /// Where the signature matches in build f68140a3 (sha256 b28b448a...; the Steam exe has the
+    /// same code at the same address), from the RE notes.
     const MATCH_VA: u64 = 0x1_4084_90d2;
 
     /// The `.text` section of a PE32+ file: its virtual address (image base included) and the
@@ -919,17 +920,20 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "reads C:\\Games\\Enshrouded\\enshrouded.exe from disk"]
+    #[ignore = "reads the game exe (ENSHROUDED_EXE, else the Steam install) from disk"]
     fn original_bytes_are_in_the_game_exe_and_apply_patches_a_copy_of_its_code() {
+        use crate::build_id::test_support::game_exe_or_skip;
         use crate::build_id::{classify, sha256_file, Build};
         use crate::scan::find_unique;
-        let path = std::path::Path::new(r"C:\Games\Enshrouded\enshrouded.exe");
-        let build = classify(sha256_file(path).expect("hash the game exe"));
+        let Some(path) = game_exe_or_skip("original_bytes_are_in_the_game_exe") else {
+            return;
+        };
+        let build = classify(sha256_file(&path).expect("hash the game exe"));
         assert!(
             matches!(build, Build::Known(_)),
             "this check is for the known build; got {build:?}"
         );
-        let file = std::fs::read(path).expect("read the game exe");
+        let file = std::fs::read(&path).expect("read the game exe");
         let (text_va, text) = text_of(&file);
 
         // The signature matches once in `.text`, where the RE notes say.

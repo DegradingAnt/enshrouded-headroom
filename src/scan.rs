@@ -1475,11 +1475,12 @@ mod tests {
         );
     }
 
-    // ---- the real game exe (ignored: reads C:\Games\Enshrouded\enshrouded.exe) --------------
+    // ---- the real game exe (ignored: reads ENSHROUDED_EXE, else the Steam install) ----------
 
     /// The anchors from the RE notes: the virtual address each pattern matches at in build
-    /// f68140a3 (sha256 b28b448a...). The game-exe test asserts on them, so a pattern that drifts
-    /// to a different place fails the test; it is a build-specific check.
+    /// f68140a3 (sha256 b28b448a...; the Steam exe has the same code at the same addresses). The
+    /// game-exe test asserts on them, so a pattern that drifts to a different place fails the
+    /// test; it is a build-specific check.
     const ANCHORS: [(&str, u64); 10] = [
         ("SCENE_SETTINGS_FN", 0x1_400f_72b0),
         ("SCATTER_BRICK_LOAD", 0x1_4007_9502),
@@ -1494,9 +1495,13 @@ mod tests {
     ];
 
     #[test]
-    #[ignore = "reads C:\\Games\\Enshrouded\\enshrouded.exe from disk"]
+    #[ignore = "reads the game exe (ENSHROUDED_EXE, else the Steam install) from disk"]
     fn sigs_unique_in_game_exe() {
-        let file = std::fs::read(r"C:\Games\Enshrouded\enshrouded.exe").expect("read the game exe");
+        use crate::build_id::test_support::game_exe_or_skip;
+        let Some(path) = game_exe_or_skip("sigs_unique_in_game_exe") else {
+            return;
+        };
+        let file = std::fs::read(&path).expect("read the game exe");
         let info = parse_pe(&file).expect("PE headers of the game exe");
         let mut failures = Vec::new();
         let mut drift = Vec::new();

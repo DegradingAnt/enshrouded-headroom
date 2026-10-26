@@ -1,7 +1,7 @@
 # Enshrouded mod — design spec v2 (working name: `enshrouded-headroom`)
 
 Status: APPROVED by the author on 2026-10-25 (version 2, with the 23 findings of the adversarial spec review folded in). Next step: the implementation plan.
-Evidence and addresses: [RE-NOTES.md](RE-NOTES.md). Measurements: `C:\Games\Enshrouded\_perf\FINDINGS.md`.
+Evidence and addresses: [RE-NOTES.md](RE-NOTES.md). Measurements: `reference\old-build\_perf\FINDINGS.md` (a copy from the old install, which is being deleted).
 
 ## 1. Goal
 
@@ -17,7 +17,9 @@ Success criteria:
 ## 2. Scope
 
 In scope:
-- Game build `f68140a3`, exe sha256 `b28b448a8dbf48c932b717f035031f5a89712a7cccfcc2d6cac0d47e6421c12a`: the build on the author's machine.
+- Game build `f68140a3`, in two exes that have the same game code (checked section by section, see RE-NOTES). Both are known builds:
+  - the old install's exe, sha256 `b28b448a8dbf48c932b717f035031f5a89712a7cccfcc2d6cac0d47e6421c12a`, label `f68140a3`;
+  - the Steam exe (Steam buildid 26082781), sha256 `d64966e23b1a458ee6f147bcbceac0b577fa7e39a212f371287d8cc119817882`, label `f68140a3-steam`. This is the build on the author's machine now. Only the PE headers and Steam's DRM stub (the `.bind` section) differ from the old exe.
 - Windows x64 with the Vulkan renderer (the game default).
 - Discrete GPUs from NVIDIA, AMD and Intel. On integrated GPUs, the texture budget is left unchanged (section 6.1). Reflex is NVIDIA only.
 

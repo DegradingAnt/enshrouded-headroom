@@ -22,7 +22,9 @@
   - `+crt-static` through `.cargo/config.toml`.
 
 **Game build**
-- Known build: sha256 `b28b448a8dbf48c932b717f035031f5a89712a7cccfcc2d6cac0d47e6421c12a`, label `f68140a3`.
+- Known build `f68140a3`, in two exes with the same game code. Both are known:
+  - old install: sha256 `b28b448a8dbf48c932b717f035031f5a89712a7cccfcc2d6cac0d47e6421c12a`, label `f68140a3`;
+  - Steam (buildid 26082781): sha256 `d64966e23b1a458ee6f147bcbceac0b577fa7e39a212f371287d8cc119817882`, label `f68140a3-steam`.
 - On any other build, code patches and code hooks are OFF unless `AllowUnknownBuild = 1`.
 
 **Rules for game memory and hooks**
@@ -303,7 +305,7 @@ C:\Modding\Enshrouded\
 - [ ] **Step 2:** Run `cargo test scan::` and expect FAIL.
 - [ ] **Step 3:** Implement a naive scan, anchored on the first non-wildcard byte with `memchr`-style `position`. Read the section bounds from the in-memory PE headers.
 - [ ] **Step 4:** Run `cargo test scan::` and expect PASS.
-- [ ] **Step 5: Cross-check against the real exe.** Write a test-only helper `#[ignore] fn sigs_unique_in_game_exe()`. It reads `C:\Games\Enshrouded\enshrouded.exe` from disk, maps the sections by file offset, and asserts that every `sigs::ALL` entry is unique. Run `cargo test -- --ignored sigs_unique_in_game_exe` and expect PASS.
+- [ ] **Step 5: Cross-check against the real exe.** Write a test-only helper `#[ignore] fn sigs_unique_in_game_exe()`. It reads the game exe from disk (the path in `ENSHROUDED_EXE` if set, else `C:\Program Files (x86)\Steam\steamapps\common\Enshrouded\enshrouded.exe`; it skips with a printed reason if there is no file), maps the sections by file offset, and asserts that every `sigs::ALL` entry is unique. Run `cargo test -- --ignored sigs_unique_in_game_exe` and expect PASS.
 - [ ] **Step 6:** Commit: `feat(scan): exactly-once signature scanning + signature table`.
 
 ### Task 5: Patching primitives and import slots
@@ -882,13 +884,14 @@ Task 15 consumes this module. The governor's knob 1 is enabled only while `SCATT
 
 ### Task 17: In-game verification on the author's machine
 
-**Install** (needs the author's go-ahead; deploying into the game folder is the author's):
-- copy the loader v10.0.0 `dinput8.dll` (zip sha256 `3d5f2f2a…`) to `C:\Games\Enshrouded\`;
-- copy `enshrouded-headroom.asi` to `C:\Games\Enshrouded\plugins\`;
-- create `C:\Games\Enshrouded\global.ini` with `[GlobalSets] DebugLog=1`;
-- do not use `_perf\Launch-Enshrouded.ps1` at the same time.
+**Install** (needs the author's go-ahead; deploying into the game folder is the author's). The game is now the Steam install, `C:\Program Files (x86)\Steam\steamapps\common\Enshrouded\` (the old `C:\Games\Enshrouded` is being deleted):
+- copy the loader v10.0.0 `dinput8.dll` (zip sha256 `3d5f2f2a…`) to `C:\Program Files (x86)\Steam\steamapps\common\Enshrouded\`;
+- copy `enshrouded-headroom.asi` to `C:\Program Files (x86)\Steam\steamapps\common\Enshrouded\plugins\`;
+- create `C:\Program Files (x86)\Steam\steamapps\common\Enshrouded\global.ini` with `[GlobalSets] DebugLog=1`;
+- do not use the old `_perf\Launch-Enshrouded.ps1` launcher at the same time (a copy of the `_perf` files is in `reference\old-build\_perf`; the Steam folder has no `_perf`);
+- the old install had a `winmm.dll` (an unknown loader). The Steam folder has none (no `winmm.dll`, `dinput8.dll`, `plugins` or `global.ini` there, checked 2026-10-26). So there is one loader only, and nothing to remove.
 
-- [ ] **Step 1: Load check.** `dinput8.log` shows the trigger API and `enshrouded-headroom.asi` loaded. The mod log shows `game build: f68140a3; code patches on`.
+- [ ] **Step 1: Load check.** `dinput8.log` shows the trigger API and `enshrouded-headroom.asi` loaded. The mod log shows `game build: f68140a3-steam; code patches on`. This is a Steam exe: its entry point is in Steam's DRM stub (`.bind`), which runs before the game's own entry. Note when `InitializeASI` runs relative to the stub, and that the game still starts and stays up with the code patches on (`AsyncCompute=on` patches `.text`). See RE-NOTES, "The Steam exe".
 - [ ] **Step 2: Start-up features.** The game log shows `Setting texture streaming budget to 4,941,938,688 Bytes.` and `[render] async compute is enabled`.
 - [ ] **Step 3: Vulkan.** The mod log shows `wrapper chain engaged`, and Reflex enabled or the reason it is off.
 - [ ] **Step 4: Direction test.** Set `[Knobs]` so that each knob is forced to its maximum (add a debug key `ForceStep<Name>=4`, only honoured when `LogLevel=debug`). At a fixed spot, take screenshots at step 0 and step 4 for each knob.

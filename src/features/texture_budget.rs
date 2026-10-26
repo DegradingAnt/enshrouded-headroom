@@ -1009,10 +1009,11 @@ mod tests {
         assert!(!text.contains('('), "{text}");
     }
 
-    // ---- the real game exe (ignored: reads C:\Games\Enshrouded\enshrouded.exe) ----------------------
+    // ---- the real game exe (ignored: reads ENSHROUDED_EXE, else the Steam install) -------------------
 
-    /// Where the table is in build f68140a3 (sha256 b28b448a...): the controller's own check with
-    /// pefile, 2026-10-26. The top value is the last 8 bytes of the table.
+    /// Where the table is in build f68140a3 (sha256 b28b448a...; the Steam exe has the same data
+    /// at the same address): the controller's own check with pefile, 2026-10-26. The top value is
+    /// the last 8 bytes of the table.
     const TABLE_VA: u64 = 0x1_413b_86d0;
     const TOP_VALUE_VA: u64 = 0x1_413b_8718;
 
@@ -1044,17 +1045,20 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "reads C:\\Games\\Enshrouded\\enshrouded.exe from disk"]
+    #[ignore = "reads the game exe (ENSHROUDED_EXE, else the Steam install) from disk"]
     fn texture_table_unique_in_game_exe() {
+        use crate::build_id::test_support::game_exe_or_skip;
         use crate::build_id::{classify, sha256_file, Build};
-        let path = std::path::Path::new(r"C:\Games\Enshrouded\enshrouded.exe");
-        let build = classify(sha256_file(path).expect("hash the game exe"));
+        let Some(path) = game_exe_or_skip("texture_table_unique_in_game_exe") else {
+            return;
+        };
+        let build = classify(sha256_file(&path).expect("hash the game exe"));
         assert!(
             matches!(build, Build::Known(_)),
             "this check is for the known build; got {build:?}"
         );
 
-        let file = std::fs::read(path).expect("read the game exe");
+        let file = std::fs::read(&path).expect("read the game exe");
         // Exactly once in .rdata, at the address the RE notes give.
         let (rdata_va, rdata) = rdata_of(&file);
         let started = std::time::Instant::now();

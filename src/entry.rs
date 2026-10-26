@@ -246,7 +246,7 @@ mod tests {
         assert!(!read_flag(&off));
     }
 
-    const GAME_DIR: &str = r"C:\Games\Enshrouded\plugins";
+    const GAME_DIR: &str = r"C:\Program Files (x86)\Steam\steamapps\common\Enshrouded\plugins";
     const LOCAL: &str = r"C:\Users\someone\AppData\Local";
 
     #[test]
@@ -335,6 +335,19 @@ mod tests {
             build_line(&Ok(Build::Known("f68140a3")), true),
             "game build: f68140a3; code patches on"
         );
+    }
+
+    #[test]
+    fn the_build_line_for_the_steam_exe_names_its_label() {
+        // The Steam exe is the same code as f68140a3: code patches are decided the same way, and
+        // the log says which of the two files is running.
+        let steam = Build::Known("f68140a3-steam");
+        assert!(decide_code_patches(&steam, false));
+        assert_eq!(
+            build_line(&Ok(steam), true),
+            "game build: f68140a3-steam; code patches on"
+        );
+        assert_eq!(build_level(&Ok(steam)), log::Level::Info);
     }
 
     #[test]
