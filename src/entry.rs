@@ -259,6 +259,7 @@ pub fn start() {
     // `GetProcAddress` import slot, not code, so it does not wait for `code_patches_allowed` and
     // runs on unknown builds too. It runs after step 8, whose table the first device's hook writes,
     // and logs `vk wrapper installed`, or why it is off.
+    // The first device's hook also applies `Priority` (features::priority).
     crate::vk::init(
         crate::vk::TextureSettings {
             mode: cfg.general.texture_budget,

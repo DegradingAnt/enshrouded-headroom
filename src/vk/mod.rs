@@ -738,7 +738,8 @@ unsafe fn gdpa_choose(
 /// Calls the real one with the game's arguments, unchanged (Task 9 adds no extension, so the
 /// game's extension list goes through as it is). On the first device that is created it publishes
 /// the device and its physical device together (see [`game_device`]), logs `wrapper chain engaged
-/// (device created)`, and sizes the texture budget for the card (see [`texture_step`]).
+/// (device created)`, sizes the texture budget for the card (see [`texture_step`]), and applies
+/// the `Priority` setting (see [`priority::apply`]).
 ///
 /// # Safety
 ///
@@ -1173,8 +1174,9 @@ unsafe fn install_at(
     Ok(old)
 }
 
-/// The start-up step from `entry::start`: keep texture and priority settings for the first device and
-/// install the chain. It swaps an import slot, not code, so it runs on unknown builds too. Logs
+/// The start-up step from `entry::start`: keep the texture and priority settings for the first
+/// device and install the chain. It swaps an import slot, not code, so it runs on unknown builds
+/// too. Logs
 /// `vk wrapper installed`, or why it is off.
 pub fn init(texture: TextureSettings, priority: Priority) {
     // `entry::start` runs once, so the cell is empty; an `Err` could only mean it was set already.

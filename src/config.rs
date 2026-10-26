@@ -75,6 +75,7 @@ pub enum Priority {
     /// Leave the current process priority unchanged.
     Normal,
 }
+
 /// `[General] Reflex`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReflexMode {
@@ -702,6 +703,8 @@ mod tests {
         }
     }
 
+    // ---- Priority ----
+
     #[test]
     fn priority_defaults_to_above_normal() {
         let (cfg, warnings) = parse("");
@@ -745,6 +748,7 @@ mod tests {
             assert!(warnings.is_empty(), "{warnings:?}");
         }
     }
+
     // ---- The four tests from the task brief ----
 
     #[test]
@@ -808,6 +812,7 @@ mod tests {
         assert_eq!(g.texture_budget, TextureBudget::Auto);
         assert_eq!(g.texture_reserve_gib, 11.0);
         assert_eq!(g.async_compute, AsyncCompute::On);
+        assert_eq!(g.priority, Priority::AboveNormal);
         assert_eq!(g.reflex, ReflexMode::Game);
         assert!(!g.allow_unknown_build);
         assert_eq!(g.log_level, LogLevel::Info);
