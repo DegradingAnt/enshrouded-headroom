@@ -794,17 +794,37 @@ fn scenario(dir: &Path) {
             p_present_ids: ids.as_ptr(),
         };
         let swapchains = [swapchain];
-        let mut present_info = vk::PresentInfoKHR::default().swapchains(&swapchains);
+        let indices = [0u32];
+        let mut present_info = vk::PresentInfoKHR::default()
+            .swapchains(&swapchains)
+            .image_indices(&indices);
         present_info.p_next = &id2 as *const types::PresentId2KHR as *const c_void;
-        let bytes = |p: *const u8, n: usize| std::slice::from_raw_parts(p, n).to_vec();
-        let info_before = bytes(
-            (&present_info as *const vk::PresentInfoKHR).cast(),
-            size_of_val(&present_info),
-        );
-        let id2_before = bytes(
-            (&id2 as *const types::PresentId2KHR).cast(),
-            size_of_val(&id2),
-        );
+        // Compare initialized fields; repr(C) padding is not initialized Rust byte data.
+        let info_fields = |info: &vk::PresentInfoKHR<'_>| {
+            (
+                info.s_type.as_raw(),
+                info.p_next,
+                info.wait_semaphore_count,
+                info.p_wait_semaphores,
+                info.swapchain_count,
+                info.p_swapchains,
+                info.p_image_indices,
+                info.p_results,
+            )
+        };
+        let id_fields = |id: &types::PresentId2KHR| {
+            (
+                id.s_type.as_raw(),
+                id.p_next,
+                id.swapchain_count,
+                id.p_present_ids,
+            )
+        };
+        let info_before = info_fields(&present_info);
+        let id2_before = id_fields(&id2);
+        let ids_before = ids;
+        let swapchains_before = swapchains;
+        let indices_before = indices;
 
         let mut stamps = Vec::new();
         let seq = FRAMES.read_since(0, &mut stamps);
@@ -834,20 +854,11 @@ fn scenario(dir: &Path) {
             "{stamps:?}"
         );
         // Ruling G12: the present info and its pNext chain are exactly as the game made them.
-        assert_eq!(
-            bytes(
-                (&present_info as *const vk::PresentInfoKHR).cast(),
-                size_of_val(&present_info)
-            ),
-            info_before
-        );
-        assert_eq!(
-            bytes(
-                (&id2 as *const types::PresentId2KHR).cast(),
-                size_of_val(&id2)
-            ),
-            id2_before
-        );
+        assert_eq!(info_fields(&present_info), info_before);
+        assert_eq!(id_fields(&id2), id2_before);
+        assert_eq!(ids, ids_before);
+        assert_eq!(swapchains, swapchains_before);
+        assert_eq!(indices, indices_before);
     }
 
     // SAFETY: nothing of the DLL is in use.
