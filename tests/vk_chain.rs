@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use ash::vk::{self, Handle};
-use enshrouded_headroom::config::TextureBudget;
+use enshrouded_headroom::config::{Priority, TextureBudget};
 use enshrouded_headroom::frame_timer::FRAMES;
 use enshrouded_headroom::vk::{
     device_proc, game_device, types, wrap_create_device, wrap_create_swapchain, wrap_gdpa,
@@ -429,10 +429,13 @@ fn scenario(dir: &Path) {
     KERNEL_GPA.store(kernel_gpa, Ordering::Release);
 
     // 2. The start-up step, as entry::start runs it.
-    enshrouded_headroom::vk::init(TextureSettings {
-        mode: TextureBudget::Auto,
-        reserve_gib: 11.0,
-    });
+    enshrouded_headroom::vk::init(
+        TextureSettings {
+            mode: TextureBudget::Auto,
+            reserve_gib: 11.0,
+        },
+        Priority::Normal,
+    );
     assert_eq!(
         load(&REAL_GPA),
         fake_gpa as *const () as usize,
@@ -817,6 +820,11 @@ fn the_wrapper_chain_works_end_to_end() {
     assert!(
         engaged[0].contains("GPU \"Fake GPU\", discrete, largest device-local heap 16.0 GiB"),
         "{log}"
+    );
+    assert_eq!(
+        log.matches("priority: unchanged (setting)").count(),
+        1,
+        "priority is applied for the first device only:\n{log}"
     );
     // No texture-budget line: this exe has no texture table, so nothing was prepared.
     assert!(!log.contains("texture budget"), "{log}");

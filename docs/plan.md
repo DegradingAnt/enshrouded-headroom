@@ -153,10 +153,13 @@ C:\Modding\Enshrouded\
   - `pub enum AsyncCompute { On, Game }`
   - `pub enum ReflexMode { Game, Off, On, Boost }`
   - `pub fn parse(text: &str) -> (Config, Vec<String>)`. The `Vec` holds warnings.
-  - `pub fn load_or_create(dir: &Path) -> (Config, Vec<String>)`. It writes the default file if the file is missing.
+  - `pub fn read_ini(dir: &Path) -> io::Result<Option<(Config, Vec<String>)>>`. It reads an existing file; `Ok(None)` means it is missing.
+  - `pub fn write_default(dir: &Path) -> io::Result<()>`. It creates the default file, or returns `AlreadyExists` if the file exists.
   - `pub const DEFAULT_INI: &str = include_str!("../enshrouded-headroom.default.ini")`
   - `impl Default for Config`, which equals `parse(DEFAULT_INI).0`.
 - Field names are the snake_case of the `.ini` keys in spec section 8 (`target_fps: u32`, `raise_below: f64`, `max_object_distance: u8`, …).
+
+Start-up replaced `load_or_create` with `read_ini` and `write_default` through `entry::load_settings`. The loader tries the settings folders in order.
 
 **Clamp ranges**
 
@@ -204,7 +207,10 @@ C:\Modding\Enshrouded\
 }
 #[test] fn missing_file_writes_default() {
     let d = tempdir_in_target("cfg_missing");
-    let (_, w) = load_or_create(&d);
+    assert_eq!(read_ini(&d).unwrap(), None);
+    write_default(&d).unwrap();
+    let (c, w) = read_ini(&d).unwrap().unwrap();
+    assert_eq!(c, Config::default());
     assert!(w.is_empty());
     assert_eq!(std::fs::read_to_string(d.join("enshrouded-headroom.ini")).unwrap(), DEFAULT_INI);
 }
@@ -317,7 +323,7 @@ C:\Modding\Enshrouded\
 - Produces:
   - `pub struct Patched { pub addr: usize, pub original: Vec<u8> }`
   - `pub enum PatchError { Mismatch { at: usize, found: Vec<u8> }, Protect(u32), ReadBack }`
-  - `pub unsafe fn write_checked(addr: usize, expected: &[u8], new: &[u8]) -> Result<Patched, PatchError>`. It runs `VirtualProtect(PAGE_EXECUTE_READWRITE)`, writes, restores the protection, reads back and calls `FlushInstructionCache`.
+  - `pub unsafe fn write_checked(addr: usize, expected: &[u8], new: &[u8]) -> Result<Patched, PatchError>`. It makes each region writable (`PAGE_READWRITE` for non-executable regions and `PAGE_EXECUTE_READWRITE` for executable regions), writes, restores each region's own protection, reads back and calls `FlushInstructionCache`.
   - `pub unsafe fn write_u32_checked(addr: usize, expected: u32, new: u32) -> Result<Patched, PatchError>`
   - `pub fn alloc_near(target: usize, size: usize) -> Option<usize>`. It returns a `PAGE_READWRITE` allocation whose whole range is within ±2 GiB of `target`. It walks `VirtualQuery` free regions in 64 KiB steps.
   - `pub fn rel32(next_insn: usize, dest: usize) -> Option<i32>`
@@ -496,7 +502,7 @@ const GIB: u64 = 1 << 30;
   - `pub enum Wrap { Gipa, Gdpa, CreateDevice, CreateSwapchain, Present, Submit, Submit2 }`
   - `pub fn classify_gpa(name: &[u8]) -> Option<Wrap>`, `pub fn classify_gipa(name: &[u8]) -> Option<Wrap>`, `pub fn classify_gdpa(name: &[u8], reflex_active: bool) -> Option<Wrap>`. These are pure. `Submit` and `Submit2` are returned only when `reflex_active`.
   - `pub static WRAPPER_ENGAGED: AtomicBool`. It is set when `wrap_gipa` is handed out.
-  - `pub static GAME_DEVICE: AtomicUsize` and `pub static GAME_PHYS: AtomicUsize`. They hold the first device the game creates, and its physical device.
+  - `pub fn vk::game_device() -> Option<GameDevice>`, where `GameDevice { device: usize, phys: usize }`. It returns the first device the game creates and its physical device together, or `None` before then.
   - The extern wrappers are `wrap_gpa`, `wrap_gipa`, `wrap_gdpa`, `wrap_create_device`, `wrap_create_swapchain` and `wrap_present`. Each body runs inside `guard(Feature::VkWrap, call_original, …)`.
     - `wrap_gpa` guards: ordinal names (`name as usize <= 0xFFFF`) pass through. Names are compared only when `hModule == GetModuleHandleW("vulkan-1.dll")`.
     - `wrap_create_device` calls `texture_budget::apply` once, on the first call. It reads `vkGetPhysicalDeviceMemoryProperties` (the largest `DEVICE_LOCAL` heap) and `vkGetPhysicalDeviceProperties` (`deviceType == INTEGRATED_GPU`).
@@ -842,7 +848,7 @@ Task 15 consumes this module. The governor's knob 1 is enabled only while `SCATT
 - Modify: `src/vk/mod.rs` (wire `wrap_create_device`, `wrap_create_swapchain`, `wrap_submit`, and `on_present`)
 
 **Interfaces:**
-- Consumes: `vk::types`, `config::ReflexMode`, `GAME_DEVICE`.
+- Consumes: `vk::types`, `config::ReflexMode`, `vk::game_device()`.
 - Produces:
   - `pub enum TimelineFix { SetInVulkan12, SetInTimelineStruct, ChainNewStruct }`
   - `pub fn plan_device(exts: &[&CStr], has_v12_features: bool, has_timeline_struct: bool, api_version: u32) -> (Vec<&'static CStr> /*extra exts*/, TimelineFix)`. It is pure. The extra extensions are `VK_NV_low_latency2`, plus `VK_KHR_timeline_semaphore` when `api_version < VK_API_VERSION_1_2`. Already-present extensions are not duplicated.

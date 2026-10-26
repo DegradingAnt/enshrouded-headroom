@@ -49,7 +49,8 @@ use windows_sys::core::PCSTR;
 use windows_sys::Win32::Foundation::{FARPROC, HMODULE};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 
-use crate::config::TextureBudget;
+use crate::config::{Priority, TextureBudget};
+use crate::features::priority;
 use crate::features::texture_budget::{self, budget_bytes, outcome};
 use crate::frame_timer::{qpc_now, FRAMES};
 use crate::guard::{guard, Feature};
@@ -129,6 +130,8 @@ fn record_first_device(
 
 /// What `wrap_create_device` needs from the settings file. Set once, by [`init`].
 static TEXTURE_SETTINGS: OnceLock<TextureSettings> = OnceLock::new();
+/// The process priority setting, applied once after the first device is created.
+static PRIORITY_SETTING: OnceLock<Priority> = OnceLock::new();
 
 /// One flag per wrapper: "a null real pointer has been logged".
 static NULL_GPA: AtomicBool = AtomicBool::new(false);
@@ -735,7 +738,8 @@ unsafe fn gdpa_choose(
 /// Calls the real one with the game's arguments, unchanged (Task 9 adds no extension, so the
 /// game's extension list goes through as it is). On the first device that is created it publishes
 /// the device and its physical device together (see [`game_device`]), logs `wrapper chain engaged
-/// (device created)`, and sizes the texture budget for the card (see `texture_step`).
+/// (device created)`, sizes the texture budget for the card (see `texture_step`), and applies
+/// the `Priority` setting (see [`priority::apply`]).
 ///
 /// # Safety
 ///
@@ -798,7 +802,7 @@ unsafe fn after_create_device(
     unsafe { on_first_device(phys) };
 }
 
-/// The first device's one-time work: log the engaged line and set the texture budget.
+/// The first device's one-time work: log, set the texture budget and apply process priority.
 ///
 /// # Safety
 ///
@@ -830,6 +834,9 @@ unsafe fn on_first_device(phys: vk::PhysicalDevice) {
     );
     if let Some((level, line)) = step {
         log::log!(level, "{line}");
+    }
+    if let Some(setting) = PRIORITY_SETTING.get() {
+        priority::apply(*setting);
     }
 }
 
@@ -1167,12 +1174,14 @@ unsafe fn install_at(
     Ok(old)
 }
 
-/// The start-up step from `entry::start`: keep the texture settings for the first device and
-/// install the chain. It swaps an import slot, not code, so it runs on unknown builds too. Logs
+/// The start-up step from `entry::start`: keep the texture and priority settings for the first
+/// device and install the chain. It swaps an import slot, not code, so it runs on unknown builds
+/// too. Logs
 /// `vk wrapper installed`, or why it is off.
-pub fn init(texture: TextureSettings) {
+pub fn init(texture: TextureSettings, priority: Priority) {
     // `entry::start` runs once, so the cell is empty; an `Err` could only mean it was set already.
     let _ = TEXTURE_SETTINGS.set(texture);
+    let _ = PRIORITY_SETTING.set(priority);
     match install(&crate::scan::main_module()) {
         Ok(()) => log::info!("vk wrapper installed"),
         Err(why) => log::warn!("vk wrapper: off: {why}"),

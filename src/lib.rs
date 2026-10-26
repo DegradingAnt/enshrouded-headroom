@@ -10,6 +10,7 @@ pub mod display;
 pub mod entry;
 pub mod features;
 pub mod frame_timer;
+pub mod governor;
 pub mod guard;
 pub mod iat;
 pub mod log;

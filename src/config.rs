@@ -67,6 +67,15 @@ pub enum AsyncCompute {
     Game,
 }
 
+/// `[General] Priority`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Priority {
+    /// Raise the process priority after the first device is created.
+    AboveNormal,
+    /// Leave the current process priority unchanged.
+    Normal,
+}
+
 /// `[General] Reflex`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReflexMode {
@@ -83,6 +92,8 @@ pub struct General {
     pub texture_budget: TextureBudget,
     pub texture_reserve_gib: f64,
     pub async_compute: AsyncCompute,
+    /// The priority change made after renderer creation.
+    pub priority: Priority,
     pub reflex: ReflexMode,
     pub allow_unknown_build: bool,
     pub log_level: LogLevel,
@@ -135,6 +146,7 @@ const BUILTIN: Config = Config {
         texture_budget: TextureBudget::Auto,
         texture_reserve_gib: 11.0,
         async_compute: AsyncCompute::On,
+        priority: Priority::AboveNormal,
         reflex: ReflexMode::Game,
         allow_unknown_build: false,
         log_level: LogLevel::Info,
@@ -206,6 +218,15 @@ pub fn parse(text: &str) -> (Config, Vec<String>) {
             "AsyncCompute",
             d.general.async_compute,
             &[("on", AsyncCompute::On), ("game", AsyncCompute::Game)],
+        ),
+        priority: r.choice(
+            "General",
+            "Priority",
+            d.general.priority,
+            &[
+                ("above_normal", Priority::AboveNormal),
+                ("normal", Priority::Normal),
+            ],
         ),
         reflex: r.choice(
             "General",
@@ -334,33 +355,6 @@ pub fn read_ini(dir: &Path) -> io::Result<Option<(Config, Vec<String>)>> {
         Ok(bytes) => Ok(Some(parse(&String::from_utf8_lossy(&bytes)))),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
-    }
-}
-
-/// Read `<dir>\enshrouded-headroom.ini`. If the file is missing, write `DEFAULT_INI` there and use
-/// the defaults. An existing file is never overwritten. (One folder only: `entry` tries several
-/// with `read_ini` and `write_default`.)
-pub fn load_or_create(dir: &Path) -> (Config, Vec<String>) {
-    let path = dir.join(INI_FILE_NAME);
-    match read_ini(dir) {
-        Ok(Some(loaded)) => loaded,
-        Ok(None) => {
-            let warnings = match write_default(dir) {
-                Ok(()) => Vec::new(),
-                Err(error) => vec![format!(
-                    "cannot create {} ({error}), using the defaults",
-                    path.display()
-                )],
-            };
-            (Config::default(), warnings)
-        }
-        Err(error) => (
-            Config::default(),
-            vec![format!(
-                "cannot read {} ({error}), using the defaults",
-                path.display()
-            )],
-        ),
     }
 }
 
@@ -682,6 +676,52 @@ mod tests {
         }
     }
 
+    // ---- Priority ----
+
+    #[test]
+    fn priority_defaults_to_above_normal() {
+        let (cfg, warnings) = parse("");
+        assert_eq!(cfg.general.priority, Priority::AboveNormal);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(Config::default().general.priority, Priority::AboveNormal);
+    }
+
+    #[test]
+    fn priority_accepts_both_settings() {
+        for (value, expected) in [
+            ("above_normal", Priority::AboveNormal),
+            ("normal", Priority::Normal),
+        ] {
+            let (cfg, warnings) = one("General", "Priority", value);
+            assert_eq!(cfg.general.priority, expected, "{value}");
+            assert!(warnings.is_empty(), "{warnings:?}");
+        }
+    }
+
+    #[test]
+    fn priority_bad_value_warns_and_uses_above_normal() {
+        let (cfg, warnings) = one("General", "Priority", "high");
+        assert_eq!(cfg.general.priority, Priority::AboveNormal);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("[General] Priority"), "{warnings:?}");
+        assert!(
+            warnings[0].contains("using the default above_normal"),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn priority_accepts_upper_case() {
+        for (value, expected) in [
+            ("ABOVE_NORMAL", Priority::AboveNormal),
+            ("NORMAL", Priority::Normal),
+        ] {
+            let (cfg, warnings) = one("GENERAL", "PRIORITY", value);
+            assert_eq!(cfg.general.priority, expected, "{value}");
+            assert!(warnings.is_empty(), "{warnings:?}");
+        }
+    }
+
     // ---- The four tests from the task brief ----
 
     #[test]
@@ -720,7 +760,10 @@ mod tests {
     #[test]
     fn missing_file_writes_default() {
         let d = tempdir_in_target("cfg_missing");
-        let (_, w) = load_or_create(&d);
+        assert_eq!(read_ini(&d).unwrap(), None);
+        write_default(&d).unwrap();
+        let (c, w) = read_ini(&d).unwrap().unwrap();
+        assert_eq!(c, Config::default());
         assert!(w.is_empty());
         assert_eq!(
             std::fs::read_to_string(d.join("enshrouded-headroom.ini")).unwrap(),
@@ -745,6 +788,7 @@ mod tests {
         assert_eq!(g.texture_budget, TextureBudget::Auto);
         assert_eq!(g.texture_reserve_gib, 11.0);
         assert_eq!(g.async_compute, AsyncCompute::On);
+        assert_eq!(g.priority, Priority::AboveNormal);
         assert_eq!(g.reflex, ReflexMode::Game);
         assert!(!g.allow_unknown_build);
         assert_eq!(g.log_level, LogLevel::Info);
@@ -1347,7 +1391,7 @@ mod tests {
         }
     }
 
-    // ---- load_or_create ----
+    // ---- Settings file reads and writes ----
 
     #[test]
     fn existing_file_is_read_and_left_alone() {
@@ -1355,10 +1399,14 @@ mod tests {
         let path = d.join(INI_FILE_NAME);
         let text = "[Governor]\nTargetFps=100\n[Knobs]\nMaxTerrainDistance=1\n";
         std::fs::write(&path, text).unwrap();
-        let (c, w) = load_or_create(&d);
+        let (c, w) = read_ini(&d).unwrap().unwrap();
         assert!(w.is_empty(), "{w:?}");
         assert_eq!(c.governor.target_fps, 100);
         assert_eq!(c.knobs.max_terrain_distance, 1);
+        assert_eq!(
+            write_default(&d).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
     }
 
@@ -1370,7 +1418,7 @@ mod tests {
             b"[Governor]\nTargetFps=60\n; caf\xe9 \xff\xfe\n",
         )
         .unwrap();
-        let (c, w) = load_or_create(&d);
+        let (c, w) = read_ini(&d).unwrap().unwrap();
         assert!(w.is_empty(), "{w:?}");
         assert_eq!(c.governor.target_fps, 60);
     }
@@ -1378,22 +1426,14 @@ mod tests {
     #[test]
     fn missing_folder_is_created_for_the_default_file() {
         let d = tempdir_in_target("cfg_missing_folder").join("a").join("b");
-        let (c, w) = load_or_create(&d);
+        write_default(&d).unwrap();
+        let (c, w) = read_ini(&d).unwrap().unwrap();
         assert!(w.is_empty(), "{w:?}");
         assert_eq!(c, Config::default());
         assert_eq!(
             std::fs::read_to_string(d.join(INI_FILE_NAME)).unwrap(),
             DEFAULT_INI
         );
-    }
-
-    #[test]
-    fn unwritable_folder_gives_defaults_and_a_warning() {
-        let d = tempdir_in_target("cfg_unwritable");
-        std::fs::write(d.join("blocker"), "a file, not a folder").unwrap();
-        let (c, w) = load_or_create(&d.join("blocker").join("sub"));
-        assert_eq!(c, Config::default());
-        assert_eq!(w.len(), 1, "{w:?}");
     }
 
     #[test]
@@ -1409,7 +1449,9 @@ mod tests {
         assert_eq!(result.unwrap_err().to_string(), "disk full");
         assert!(!path.exists(), "the half-written file must be gone");
         // So the next start finds no file and writes a whole one.
-        let (c, w) = load_or_create(&d);
+        assert_eq!(read_ini(&d).unwrap(), None);
+        write_default(&d).unwrap();
+        let (c, w) = read_ini(&d).unwrap().unwrap();
         assert!(w.is_empty(), "{w:?}");
         assert_eq!(c, Config::default());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), DEFAULT_INI);
@@ -1431,16 +1473,5 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "[Governor]\nTargetFps=100\n"
         );
-    }
-
-    #[test]
-    fn unreadable_settings_path_gives_defaults_and_a_warning_and_is_not_replaced() {
-        let d = tempdir_in_target("cfg_unreadable");
-        let path = d.join(INI_FILE_NAME);
-        std::fs::create_dir(&path).unwrap(); // a folder where the file should be
-        let (c, w) = load_or_create(&d);
-        assert_eq!(c, Config::default());
-        assert_eq!(w.len(), 1, "{w:?}");
-        assert!(path.is_dir());
     }
 }

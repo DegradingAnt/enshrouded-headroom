@@ -2,4 +2,5 @@
 //! [`crate::entry::start`] and, if it hooks the game, its call to the wrappers in `vk`.
 
 pub mod async_compute;
+pub mod priority;
 pub mod texture_budget;

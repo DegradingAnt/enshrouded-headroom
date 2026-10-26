@@ -892,31 +892,12 @@ mod tests {
     /// same code at the same address), from the RE notes.
     const MATCH_VA: u64 = 0x1_4084_90d2;
 
-    /// The `.text` section of a PE32+ file: its virtual address (image base included) and the
-    /// bytes of it that are in the file. Walks the headers by hand because the parser in `scan`
-    /// is private.
+    /// The `.text` section of a PE32+ file: its virtual address (image base included)
+    /// and the bytes of it that are in the file (the lesser of raw and virtual size).
     fn text_of(file: &[u8]) -> (u64, &[u8]) {
-        use crate::scan::{u16_at, u32_at, u64_at};
-        let nt = u32_at(file, 0x3c).unwrap() as usize;
-        let n_sections = u16_at(file, nt + 6).unwrap() as usize;
-        let optional_size = u16_at(file, nt + 20).unwrap() as usize;
-        let optional = nt + 24;
-        assert_eq!(u16_at(file, optional), Some(0x20b), "PE32+");
-        let image_base = u64_at(file, optional + 24).unwrap();
-        let table = optional + optional_size;
-        for i in 0..n_sections {
-            let at = table + i * 40;
-            if file.get(at..at + 8) != Some(b".text\0\0\0".as_slice()) {
-                continue;
-            }
-            let virtual_size = u32_at(file, at + 8).unwrap() as usize;
-            let rva = u32_at(file, at + 12).unwrap() as u64;
-            let raw_size = u32_at(file, at + 16).unwrap() as usize;
-            let raw_ptr = u32_at(file, at + 20).unwrap() as usize;
-            let len = virtual_size.min(raw_size);
-            return (image_base + rva, &file[raw_ptr..raw_ptr + len]);
-        }
-        panic!("no .text section");
+        crate::scan::parse_pe(file)
+            .and_then(|pe| pe.section_va_bytes(file, ".text"))
+            .expect("section address and bytes in the PE32+ file")
     }
 
     #[test]
