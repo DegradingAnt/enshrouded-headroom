@@ -450,3 +450,447 @@ Evidence: REA/Ghidra on the old-build exe (sha256 `b28b448a...`; the Steam exe h
 - **The counter fields (VERIFIED, ev_30587ee1).** The pool update `0x1400a8fd0` walks the entries (stride 0x40). For each live entry (byte +0x3c) it writes +0x14 = the read-back value (last), +0x18 = min, +0x1c = max (peak) and +0x28 = a frame stamp. It never writes +0x20 or +0x24. The peak is never reset, so it is the peak since the scene view was built.
 - **What the probe reads (design).** At most once every 500 ms (QPC time), before the original runs: obj, pool and the entry base from the chain; for A, B and C the handle, then `[entry+0x38]` (must equal the handle, which must not be 0), last (+0x14), peak (+0x1c), warn (+0x20) and cap (+0x24). The reads come from 7 blocks (`pass` +0x8..+0x20, owner +0x20..+0x28, pool +0x48..+0x50, obj +0x8..+0x14, and each entry +0x14..+0x3c). Each block is checked once with `VirtualQuery` before it is read. (It sampled every 30th call with a check per read until the stutter fix, 2026-10-26.) The self-check needs A.warn = `0xf000` and A.cap = `0x14000`.
 - **Not verified (HYPOTHESIS).** That `FUN_1400767a0` runs once per frame (one caller; not traced to the frame loop). Which thread runs the pool update compared with this function: a read can see a value from the frame before. That the game never frees or moves the entry array while the scene view lives.
+
+
+## Native climbing (2026-10-26 spike)
+
+These are supplied read-only spike results, transcribed without new reverse engineering. VERIFIED and HYPOTHESIS retain the spike's classifications; neither label establishes an in-game mod result. Routes are proposals and open questions remain unresolved.
+
+- [VERIFIED] Evidence scope: spike `wf_cd1066c9-e7c`, 2026-10-26, installed Steam build 26082781. Exe evidence comes from reference sha256 `b28b448a…`; patch-site bytes were re-checked in Steam sha256 `d64966e2…`, with identical `.text`.
+  - Receipt: Supplied climbing spike summary and patch-site comparison below.
+- [VERIFIED] Read-only helper filenames: pestr.py, xref.py, dump.py, rtype.py, owner.py, prog.py, bpat.py and fun_1402d7990.c.
+  - Receipt: Supplied climbing spike helper inventory.
+
+- [HYPOTHESIS] The climbing summary calls the bounded vertical speed 20 m/s. It reports no wall-hit handler for the glider and only a floor-collision exit. The detailed component and wall-hit interpretations retain their HYPOTHESIS labels below.
+  - Receipt: Supplied climbing summary, FUN_140419570 hypothesis and glider facts/open questions.
+- [VERIFIED] ShroudForge exposes generic reflected ECS read/write; its profile supplies no climb or locomotion offsets.
+  - Receipt: Supplied summary and ShroudForge Lua/profile receipts below.
+
+### Climbing facts and receipts
+
+- [VERIFIED] Native climb component keen::ecs::Climb, size 0x98: climbType +0x0 (ecs.ClimbType), climbState +0x1 (ecs.ClimbState), climbNormal +0x4 (float3), climbBlockingTimeEnd +0x10 (Time), attachmentEntityId +0x18 (EntityId), climbCollisionQueries +0x1c (ClimbCollisionQuery[4], 0x1c each: enable, resultFlags, defaultResult, nonPlayerResult), laddersQueryId +0x8c, ladderStepPhase +0x90.
+  - Receipt: Reflection type desc 0x141a032b0 (name ptr → 'Climb' 0x141d2ac18, 'ecs.Climb' 0x141cbb270; size u32 0x98 at +0x40; count 8). Field table 0x141990030, stride 0x30: (name, len, type desc, offset). Dumped with rtype.py/dump.py.
+- [VERIFIED] ClimbType = {Invalid 0, Wall 1, Ladder 2}.
+  - Receipt: Enum descs 0x141987350 (members 0x141986d90), 0x141988010 (members 0x141987cd0) and 0x1419897d0 (members 0x141988dd0). Member stride 0x28: (name, len, value).
+- [VERIFIED] ClimbState = {Invalid 0, Enter 1, Climb 2, Exit 3}.
+  - Receipt: Enum descs 0x141987350 (members 0x141986d90), 0x141988010 (members 0x141987cd0) and 0x1419897d0 (members 0x141988dd0). Member stride 0x28: (name, len, value).
+- [VERIFIED] ClimbCollisionQueryType = {Wall_ExitTop, Ladder_StepUp, Ladder_StepDown, Ladder_ExitTop, Count}.
+  - Receipt: Enum descs 0x141987350 (members 0x141986d90), 0x141988010 (members 0x141987cd0) and 0x1419897d0 (members 0x141988dd0). Member stride 0x28: (name, len, value).
+- [VERIFIED] LocomotionState has 12 values: Walking 0, Sliding 1, Falling 2, Flying 3, HangGliding 4, HookPulling 5, HookSwinging 6, ClimbingWall 7, ClimbingLadder 8, Swimming 9, Diving 10, BuildingFlying 11. ecs.DynamicLocomotion (size 0x1c8) holds: state +0x59, previousState +0x5a, floorNormal +0xc, slopeNormal +0x18, groundSlopeNormal +0x24, takeOffTime +0xb0, jumpType +0x154, jumpCount +0x155, ledgeHeight +0x184, gliderTurbulence +0x190.
+  - Receipt: LocomotionState desc 0x141a88df0 (members 0x141a87ce0). DynamicLocomotion desc 0x141892c20, 65 fields (rtype.py).
+- [VERIFIED] The impact program 'player_locomotion_climb_wall' is the wall-climb system.
+  - Receipt: Program descriptor 0x141deff50 = (name ptr 0x141df0308, len 0x1c, fn 0x1404188c0, then (list ptr, count) groups). Ladder descriptor 0x141df12b0. Read with prog.py.
+- [VERIFIED] Its function is 0x1404188c0.
+  - Receipt: Program descriptor 0x141deff50 = (name ptr 0x141df0308, len 0x1c, fn 0x1404188c0, then (list ptr, count) groups). Ladder descriptor 0x141df12b0. Read with prog.py.
+- [VERIFIED] Its component lists are: config MovementColliderConfig; read CurrentTransform, MovementCollider, MovementVector, PlayerState, SlotSelection, Stamina; write Actor, ActorInput, Climb, LerpTransform, Velocity.
+  - Receipt: Program descriptor 0x141deff50 = (name ptr 0x141df0308, len 0x1c, fn 0x1404188c0, then (list ptr, count) groups). Ladder descriptor 0x141df12b0. Read with prog.py.
+- [VERIFIED] Its services are ActionSequenceRegistry, ColliderSystem, ItemRegistry and AttributeRegistry.
+  - Receipt: Program descriptor 0x141deff50 = (name ptr 0x141df0308, len 0x1c, fn 0x1404188c0, then (list ptr, count) groups). Ladder descriptor 0x141df12b0. Read with prog.py.
+- [VERIFIED] The ladder program 'player_locomotion_climb_ladder' has its function at 0x140425c60.
+  - Receipt: Program descriptor 0x141deff50 = (name ptr 0x141df0308, len 0x1c, fn 0x1404188c0, then (list ptr, count) groups). Ladder descriptor 0x141df12b0. Read with prog.py.
+- [VERIFIED] The climb state machine in FUN_1404188c0 works like this.
+  - Receipt: REA decompile ev_97b75139… (FUN_1404188c0): '*(char*)(local_e8+1)==1 … FUN_14021aaa0(local_148,0x23) … =2'. ev_a4e5ceb1… (FUN_14024b360). actor.StateFlag member 35 = ClimbingTransition (desc 0x1417fe9b0).
+- [VERIFIED] For a wall climb (FUN_14024b360: climbType==1 && climbState!=0): Enter(1) becomes Climb(2) once the actor state flag 0x23 (ClimbingTransition) is clear.
+  - Receipt: REA decompile ev_97b75139… (FUN_1404188c0): '*(char*)(local_e8+1)==1 … FUN_14021aaa0(local_148,0x23) … =2'. ev_a4e5ceb1… (FUN_14024b360). actor.StateFlag member 35 = ClimbingTransition (desc 0x1417fe9b0).
+- [VERIFIED] Exit(3) resets climbType, climbState and attachmentEntityId to 0 once 0x23 is clear.
+  - Receipt: REA decompile ev_97b75139… (FUN_1404188c0): '*(char*)(local_e8+1)==1 … FUN_14021aaa0(local_148,0x23) … =2'. ev_a4e5ceb1… (FUN_14024b360). actor.StateFlag member 35 = ClimbingTransition (desc 0x1417fe9b0).
+- [VERIFIED] After that, FUN_140418280 processes events.
+  - Receipt: REA decompile ev_97b75139… (FUN_1404188c0): '*(char*)(local_e8+1)==1 … FUN_14021aaa0(local_148,0x23) … =2'. ev_a4e5ceb1… (FUN_14024b360). actor.StateFlag member 35 = ClimbingTransition (desc 0x1417fe9b0).
+- [VERIFIED] Then climbState==0 calls FUN_140419570 (the start check) and climbState==2 calls FUN_140418c50 (the climb update).
+  - Receipt: REA decompile ev_97b75139… (FUN_1404188c0): '*(char*)(local_e8+1)==1 … FUN_14021aaa0(local_148,0x23) … =2'. ev_a4e5ceb1… (FUN_14024b360). actor.StateFlag member 35 = ClimbingTransition (desc 0x1417fe9b0).
+- [VERIFIED] Climbing starts with no button.
+  - Receipt: REA decompile ev_ba53f40e… (FUN_140419570), ev_1c7bdddc… (FUN_140218200). AbilityFlag member table 0x141b5b370 (desc via 0x141b61600): 16=CanClimb. String refs: 0x14024b7bc → 0x14150aed8 and 0x14024b515 → 0x14150aef8.
+- [VERIFIED] FUN_140419570 checks the CanClimb ability (FUN_140218200(actor,0x10) tests bit 16 of actor+0xc00/+0xbc8; actor.AbilityFlag 16 = CanClimb).
+  - Receipt: REA decompile ev_ba53f40e… (FUN_140419570), ev_1c7bdddc… (FUN_140218200). AbilityFlag member table 0x141b5b370 (desc via 0x141b61600): 16=CanClimb. String refs: 0x14024b7bc → 0x14150aed8 and 0x14024b515 → 0x14150aef8.
+- [VERIFIED] It then requires |param_1[4]+4| <= 20.0 (vertical speed).
+  - Receipt: REA decompile ev_ba53f40e… (FUN_140419570), ev_1c7bdddc… (FUN_140218200). AbilityFlag member table 0x141b5b370 (desc via 0x141b61600): 16=CanClimb. String refs: 0x14024b7bc → 0x14150aed8 and 0x14024b515 → 0x14150aef8.
+- [VERIFIED] It tries the top-entry probe FUN_14024c320, and if that fails the bottom/middle probe FUN_14024c0d0.
+  - Receipt: REA decompile ev_ba53f40e… (FUN_140419570), ev_1c7bdddc… (FUN_140218200). AbilityFlag member table 0x141b5b370 (desc via 0x141b61600): 16=CanClimb. String refs: 0x14024b7bc → 0x14150aed8 and 0x14024b515 → 0x14150aef8.
+- [VERIFIED] It also needs FUN_14024a020 (attribute hash 0x4b6aa8b > 0).
+  - Receipt: REA decompile ev_ba53f40e… (FUN_140419570), ev_1c7bdddc… (FUN_140218200). AbilityFlag member table 0x141b5b370 (desc via 0x141b61600): 16=CanClimb. String refs: 0x14024b7bc → 0x14150aed8 and 0x14024b515 → 0x14150aef8.
+- [VERIFIED] On success it writes Climb.climbNormal and builds a 3-point LerpTransform: FUN_14024b720 ('prepareEnterClimbingWallTop') or FUN_14024b4c0 ('prepareEnterClimbingWallBottomOrMiddle').
+  - Receipt: REA decompile ev_ba53f40e… (FUN_140419570), ev_1c7bdddc… (FUN_140218200). AbilityFlag member table 0x141b5b370 (desc via 0x141b61600): 16=CanClimb. String refs: 0x14024b7bc → 0x14150aed8 and 0x14024b515 → 0x14150aef8.
+- [VERIFIED] Then it starts the action sequence hash 0x99ae6705 (top) or 0xa17e05ee (bottom/middle) via FUN_140215fe0.
+  - Receipt: REA decompile ev_ba53f40e… (FUN_140419570), ev_1c7bdddc… (FUN_140218200). AbilityFlag member table 0x141b5b370 (desc via 0x141b61600): 16=CanClimb. String refs: 0x14024b7bc → 0x14150aed8 and 0x14024b515 → 0x14150aef8.
+- [HYPOTHESIS] The component at param_1[4] (|.y| <= 20) is the Velocity component, and attribute 0x4b6aa8b is current stamina, so FUN_14024a020 means 'stamina > 0'.
+  - Receipt: Inference. The climb program writes Velocity (float3 at +0). FUN_14024a020 reads an int attribute from a component flagged by +6&1, and stamina_depletion_climb_wall applies the same 0x4b6aa8b gate to its Stamina component.
+- [VERIFIED] The bottom/middle entry probe FUN_14024c0d0 needs non-zero ActorInput.desiredWorldMoveInput (+0x198 x, +0x1a0 z).
+  - Receipt: REA decompile ev_a79f733b… (FUN_14024c0d0): 'param_3 + 0x198', 'param_3 + 0x1a0', 'FUN_14024abc0(&local_48,param_2,&local_68,&local_58,0x3f400000)', 'if (fVar3 <= 0.7853982)'. ActorInput desc 0x141952b10: +0x198 desiredWorldMoveInput.
+- [VERIFIED] It fails with code 0x1e while time < Climb.climbBlockingTimeEnd (+0x10), a re-grab cooldown.
+  - Receipt: REA decompile ev_a79f733b… (FUN_14024c0d0): 'param_3 + 0x198', 'param_3 + 0x1a0', 'FUN_14024abc0(&local_48,param_2,&local_68,&local_58,0x3f400000)', 'if (fVar3 <= 0.7853982)'. ActorInput desc 0x141952b10: +0x198 desiredWorldMoveInput.
+- [VERIFIED] It calls the wall probe at 0.75 m and accepts only acos(dot(-hitNormal, inputDir)) <= 0.7853982 (45°).
+  - Receipt: REA decompile ev_a79f733b… (FUN_14024c0d0): 'param_3 + 0x198', 'param_3 + 0x1a0', 'FUN_14024abc0(&local_48,param_2,&local_68,&local_58,0x3f400000)', 'if (fVar3 <= 0.7853982)'. ActorInput desc 0x141952b10: +0x198 desiredWorldMoveInput.
+- [VERIFIED] Walking or sprinting into a valid wall therefore latches with no button.
+  - Receipt: REA decompile ev_a79f733b… (FUN_14024c0d0): 'param_3 + 0x198', 'param_3 + 0x1a0', 'FUN_14024abc0(&local_48,param_2,&local_68,&local_58,0x3f400000)', 'if (fVar3 <= 0.7853982)'. ActorInput desc 0x141952b10: +0x198 desiredWorldMoveInput.
+- [VERIFIED] The wall probe FUN_14024abc0 does these steps. (1) A forward ray from pos+(0,2,0), length param+0.65 (=1.4 m). (2) Four corner rays at heights 2.0 m and 1.25 m, ±0.5 lateral.
+  - Receipt: REA asm ev_45b1a63d…: 0x14024acc8 'MOV dword ptr [RSP+0x28],0x100' (c7 44 24 28 00 01 00 00) and 0x14024af4f (same bytes) before CALL 0x1409fff60. 0x14024afb8/0x14024afec 'MOVSS XMMx,[0x1413b825c]' = 0.001f. 0x14024ad82 'c7 44 24 40 01 00 03 00' + 'MOV EAX,5' → bitmask. Constants: 0x14150af68=0.65, 0x1413b5678=2.0, 0x1414faf6c=1.25, 0x1413b3c94=0.5, 0x1413b5b3c=0.55.
+- [VERIFIED] Both steps use collider mask 0x100. (3) All four hit normals must match within 0.001, else fail code 0x15. (4) A clearance sweep with mask bits {1,3,5} (else code 0x1e). (5) The result is hit + normal*0.55 plus the normal.
+  - Receipt: REA asm ev_45b1a63d…: 0x14024acc8 'MOV dword ptr [RSP+0x28],0x100' (c7 44 24 28 00 01 00 00) and 0x14024af4f (same bytes) before CALL 0x1409fff60. 0x14024afb8/0x14024afec 'MOVSS XMMx,[0x1413b825c]' = 0.001f. 0x14024ad82 'c7 44 24 40 01 00 03 00' + 'MOV EAX,5' → bitmask. Constants: 0x14150af68=0.65, 0x1413b5678=2.0, 0x1414faf6c=1.25, 0x1413b3c94=0.5, 0x1413b5b3c=0.55.
+- [VERIFIED] Mask 0x100 = ColliderFlags bit 8 = ClimbingWall.
+  - Receipt: ecs.ColliderFlags desc 0x1418983b0, members 0x1418952d0: 0 World, 1 WorldNotDisplaced, 3 Solid, 5 Walkable, 6 WalkablePlatform, 8 ClimbingWall, … (23 members). The tutorial text in enshrouded_053.dat at byte 901419730 says 'Walk up to the Climbing Wall to latch on to the iron lattice' (read with dd).
+- [VERIFIED] So native wall climbing only latches onto flat colliders flagged ClimbingWall.
+  - Receipt: ecs.ColliderFlags desc 0x1418983b0, members 0x1418952d0: 0 World, 1 WorldNotDisplaced, 3 Solid, 5 Walkable, 6 WalkablePlatform, 8 ClimbingWall, … (23 members). The tutorial text in enshrouded_053.dat at byte 901419730 says 'Walk up to the Climbing Wall to latch on to the iron lattice' (read with dd).
+- [VERIFIED] Natural voxel rock and normal walls never qualify.
+  - Receipt: ecs.ColliderFlags desc 0x1418983b0, members 0x1418952d0: 0 World, 1 WorldNotDisplaced, 3 Solid, 5 Walkable, 6 WalkablePlatform, 8 ClimbingWall, … (23 members). The tutorial text in enshrouded_053.dat at byte 901419730 says 'Walk up to the Climbing Wall to latch on to the iron lattice' (read with dd).
+- [HYPOTHESIS] Other code also passes the ClimbingWall mask. 'c7 44 24 28 00 01 00 00' occurs 9 times in .text: 0x14024acc8, 0x14024af4f, 0x14024b238, 0x14024c688, 0x140684f16, 0x1406b2e8a, 0x140843216, 0x140bd2d7b, 0x1412d73aa. '41 b9 00 01 00 00' occurs at 0x14024c73f, among other places.
+  - Receipt: Python bytes scan of the Steam exe .text (counts 9 and 29). Only the attribution of 0x14024acc8 and 0x14024af4f is decompile-verified.
+- [HYPOTHESIS] The sites in the 0x14024a000–0x14024d000 cluster are the climb probes: entry, update and top-exit.
+  - Receipt: Python bytes scan of the Steam exe .text (counts 9 and 29). Only the attribution of 0x14024acc8 and 0x14024af4f is decompile-verified.
+- [VERIFIED] The climb update FUN_140418c50 does these things.
+  - Receipt: REA decompile ev_149b3d58… (FUN_140418c50). Call site 0x140418fef is preceded by '33 c9' (xor ecx,ecx). Assembly ev_d0b956a8… shows the default load 'MOVSS XMM0,[0x14150af74]'. Bytes at 0x14150af74 = 9a 99 f9 3f. String refs 0x14024bcf9 → 0x14150af20 and 0x14024ba85 → 0x14150af40.
+- [VERIFIED] It moves along the wall plane from ActorInput.desiredLocalMoveInput (+0x18c, +0x194) at a default speed of 1.95 (FUN_14024a2b0 called with RCX=0 returns [0x14150af74]=1.95f).
+  - Receipt: REA decompile ev_149b3d58… (FUN_140418c50). Call site 0x140418fef is preceded by '33 c9' (xor ecx,ecx). Assembly ev_d0b956a8… shows the default load 'MOVSS XMM0,[0x14150af74]'. Bytes at 0x14150af74 = 9a 99 f9 3f. String refs 0x14024bcf9 → 0x14150af20 and 0x14024ba85 → 0x14150af40.
+- [VERIFIED] When the wall is lost (FUN_14024b390==0) it calls FUN_14024a090, which stops climbing (fall).
+  - Receipt: REA decompile ev_149b3d58… (FUN_140418c50). Call site 0x140418fef is preceded by '33 c9' (xor ecx,ecx). Assembly ev_d0b956a8… shows the default load 'MOVSS XMM0,[0x14150af74]'. Bytes at 0x14150af74 = 9a 99 f9 3f. String refs 0x14024bcf9 → 0x14150af20 and 0x14024ba85 → 0x14150af40.
+- [VERIFIED] The exit-top check FUN_14024c9f0 leads to FUN_14024bc90 ('prepareExitClimbingWallTop') and sequence 0xc83e5552: this is the native mantle at the top.
+  - Receipt: REA decompile ev_149b3d58… (FUN_140418c50). Call site 0x140418fef is preceded by '33 c9' (xor ecx,ecx). Assembly ev_d0b956a8… shows the default load 'MOVSS XMM0,[0x14150af74]'. Bytes at 0x14150af74 = 9a 99 f9 3f. String refs 0x14024bcf9 → 0x14150af20 and 0x14024ba85 → 0x14150af40.
+- [VERIFIED] The bottom exit FUN_14024c8f0 leads to FUN_14024ba30 and sequence 0xa524eca9.
+  - Receipt: REA decompile ev_149b3d58… (FUN_140418c50). Call site 0x140418fef is preceded by '33 c9' (xor ecx,ecx). Assembly ev_d0b956a8… shows the default load 'MOVSS XMM0,[0x14150af74]'. Bytes at 0x14150af74 = 9a 99 f9 3f. String refs 0x14024bcf9 → 0x14150af20 and 0x14024ba85 → 0x14150af40.
+- [VERIFIED] Climb stamina: the program stamina_depletion_climb_wall (fn 0x1402eb420) adds 8.0 × |movement·dt| × attribute 0xb8388248 (default 1.0) to StaminaDepletion.accumulatedValue.
+  - Receipt: Descriptor 0x141dfecd0 (reads MovementVector, SlotSelection, Stamina, StaminaDepletionMod; writes Actor, Climb, StaminaDepletion). REA decompile ev_2800f695…. Call at 0x1402eb789 preceded by '33 c9'. FUN_14024a360 default [0x1413b6808] = 8.0f (bytes 00 00 00 41). StateFlag 6 = Exhausted.
+- [VERIFIED] Stamina therefore drains per metre moved, not per second.
+  - Receipt: Descriptor 0x141dfecd0 (reads MovementVector, SlotSelection, Stamina, StaminaDepletionMod; writes Actor, Climb, StaminaDepletion). REA decompile ev_2800f695…. Call at 0x1402eb789 preceded by '33 c9'. FUN_14024a360 default [0x1413b6808] = 8.0f (bytes 00 00 00 41). StateFlag 6 = Exhausted.
+- [VERIFIED] If actor StateFlag 6 (Exhausted) is set, it calls FUN_14024a090, which stops climbing (the player falls).
+  - Receipt: Descriptor 0x141dfecd0 (reads MovementVector, SlotSelection, Stamina, StaminaDepletionMod; writes Actor, Climb, StaminaDepletion). REA decompile ev_2800f695…. Call at 0x1402eb789 preceded by '33 c9'. FUN_14024a360 default [0x1413b6808] = 8.0f (bytes 00 00 00 41). StateFlag 6 = Exhausted.
+- [VERIFIED] Jumping off and interrupts: actor.JumpType 13 = FreeClimbing, 12 = LadderClimbing, 8 = Glider, 14 = Mountain. ecs.JumpRuntimeType 7 = FreeClimbing.
+  - Receipt: Enum descs 0x141b38270, 0x14187b260 and 0x141ad9be0. Program descriptor 0x141dc4de0.
+- [VERIFIED] The program actor_jump_abort_climbing (fn 0x140267650; Actor, ActorInput, Climb) ends a climb on jump.
+  - Receipt: Enum descs 0x141b38270, 0x14187b260 and 0x141ad9be0. Program descriptor 0x141dc4de0.
+- [VERIFIED] ClimbWallTestId lists ClimbUp/DownFlawless, SubsequentAlignedWalls, InterruptByJump and InterruptByHitEvent.
+  - Receipt: Enum descs 0x141b38270, 0x14187b260 and 0x141ad9be0. Program descriptor 0x141dc4de0.
+- [VERIFIED] A native ledge grab exists, but only out of water.
+  - Receipt: Descriptor 0x141dfa140 → fn 0x1402d7990 (writes Climb, LerpTransform, DynamicLocomotion, Stamina). Decompile around line 1257: 'FUN_14021aaa0(local_970,0x2b)' … 'FUN_140420ec0' … 'FUN_14041fcd0(local_7f0,uVar19,&lStack_230)' … 'FUN_140215fe0(&local_478,…,0x26de28ee,0x18,0x38)'. StateFlag 43 = FloatingOnWater.
+- [VERIFIED] Inside player_control_action_sequence (fn 0x1402d7990), when actor flag 0x2b (FloatingOnWater) is set, the code runs the probe FUN_140420ec0.
+  - Receipt: Descriptor 0x141dfa140 → fn 0x1402d7990 (writes Climb, LerpTransform, DynamicLocomotion, Stamina). Decompile around line 1257: 'FUN_14021aaa0(local_970,0x2b)' … 'FUN_140420ec0' … 'FUN_14041fcd0(local_7f0,uVar19,&lStack_230)' … 'FUN_140215fe0(&local_478,…,0x26de28ee,0x18,0x38)'. StateFlag 43 = FloatingOnWater.
+- [VERIFIED] On success it calls FUN_14041fcd0 ('prepareLedgeGrab'), which builds a 3-point LerpTransform and sets DynamicLocomotion.ledgeHeight (+0x184) = top.y − start.y.
+  - Receipt: Descriptor 0x141dfa140 → fn 0x1402d7990 (writes Climb, LerpTransform, DynamicLocomotion, Stamina). Decompile around line 1257: 'FUN_14021aaa0(local_970,0x2b)' … 'FUN_140420ec0' … 'FUN_14041fcd0(local_7f0,uVar19,&lStack_230)' … 'FUN_140215fe0(&local_478,…,0x26de28ee,0x18,0x38)'. StateFlag 43 = FloatingOnWater.
+- [VERIFIED] It then starts sequence 0x26de28ee.
+  - Receipt: Descriptor 0x141dfa140 → fn 0x1402d7990 (writes Climb, LerpTransform, DynamicLocomotion, Stamina). Decompile around line 1257: 'FUN_14021aaa0(local_970,0x2b)' … 'FUN_140420ec0' … 'FUN_14041fcd0(local_7f0,uVar19,&lStack_230)' … 'FUN_140215fe0(&local_478,…,0x26de28ee,0x18,0x38)'. StateFlag 43 = FloatingOnWater.
+- [VERIFIED] Character controller data: SlopeDefinition {steepFloorAngle, slidingAngle, fallDamageAngle, slidingMaterialMinAngle} is a data resource referenced by ecs.SlopeConfig.
+  - Receipt: Descs 0x14196a9b0 (SlopeDefinition), 0x141a019e0 (SlopeConfig), 0x1418a83a0 (MovementColliderConfig), 0x141893b50 (MovementCollisionResults) and 0x141982270 (PlayerLocomotion).
+- [VERIFIED] MovementColliderConfig has width, height, maxStepHeightVoxels, maxStepHeightProps, enableCollideAndSlide, collideAndSlideMask and stairHandling.
+  - Receipt: Descs 0x14196a9b0 (SlopeDefinition), 0x141a019e0 (SlopeConfig), 0x1418a83a0 (MovementColliderConfig), 0x141893b50 (MovementCollisionResults) and 0x141982270 (PlayerLocomotion).
+- [VERIFIED] MovementCollisionResults has spheroidNormal (wall contact), groundNormal, groundDistance, isGroundWalkable, hasGroundCollision and hasSpheroidCollision.
+  - Receipt: Descs 0x14196a9b0 (SlopeDefinition), 0x141a019e0 (SlopeConfig), 0x1418a83a0 (MovementColliderConfig), 0x141893b50 (MovementCollisionResults) and 0x141982270 (PlayerLocomotion).
+- [VERIFIED] PlayerLocomotion averages the slope (averageSlopeAngle +0x24, smoothedSlopeAngle +0x2c).
+  - Receipt: Descs 0x14196a9b0 (SlopeDefinition), 0x141a019e0 (SlopeConfig), 0x1418a83a0 (MovementColliderConfig), 0x141893b50 (MovementCollisionResults) and 0x141982270 (PlayerLocomotion).
+- [VERIFIED] The numeric walkable-slope limit is in game data, not in the exe.
+  - Receipt: Descs 0x14196a9b0 (SlopeDefinition), 0x141a019e0 (SlopeConfig), 0x1418a83a0 (MovementColliderConfig), 0x141893b50 (MovementCollisionResults) and 0x141982270 (PlayerLocomotion).
+- [VERIFIED] Glider: it is LocomotionState HangGliding (4) / StateFlag 37.
+  - Receipt: Descs 0x141933410 (GliderConfig) and 0x141ae9d50 (GliderTestId). Program descriptor 0x141df9210. Negative check: `python -I pestr.py enshrouded.exe 'glid|wingsuit|paraglid|…'` (ASCII ≥4 chars, whole exe, 103 hits, none 'wingsuit').
+- [VERIFIED] GliderConfig has accelerationForward, airResistance (longitudinal, lateral, vertical), yaw/pitch/roll speeds and updraftStrengthChargeStartValue.
+  - Receipt: Descs 0x141933410 (GliderConfig) and 0x141ae9d50 (GliderTestId). Program descriptor 0x141df9210. Negative check: `python -I pestr.py enshrouded.exe 'glid|wingsuit|paraglid|…'` (ASCII ≥4 chars, whole exe, 103 hits, none 'wingsuit').
+- [VERIFIED] The programs are player_can_trigger_glider (fn 0x1402d6530; reads SlotSelection, PlayerSkillsUi, SkillTree), stamina_depletion_glider (fn 0x1402ebb00) and locomotion_glider_upstream.
+  - Receipt: Descs 0x141933410 (GliderConfig) and 0x141ae9d50 (GliderTestId). Program descriptor 0x141df9210. Negative check: `python -I pestr.py enshrouded.exe 'glid|wingsuit|paraglid|…'` (ASCII ≥4 chars, whole exe, 103 hits, none 'wingsuit').
+- [VERIFIED] GliderTestId has only GliderExitFloorCollision as a collision exit.
+  - Receipt: Descs 0x141933410 (GliderConfig) and 0x141ae9d50 (GliderTestId). Program descriptor 0x141df9210. Negative check: `python -I pestr.py enshrouded.exe 'glid|wingsuit|paraglid|…'` (ASCII ≥4 chars, whole exe, 103 hits, none 'wingsuit').
+- [VERIFIED] The exe has no 'wingsuit' string.
+  - Receipt: Descs 0x141933410 (GliderConfig) and 0x141ae9d50 (GliderTestId). Program descriptor 0x141df9210. Negative check: `python -I pestr.py enshrouded.exe 'glid|wingsuit|paraglid|…'` (ASCII ≥4 chars, whole exe, 103 hits, none 'wingsuit').
+- [HYPOTHESIS] A wall hit while gliding has no dedicated handler.
+  - Receipt: Absence of any glider wall-exit test id or string. Not traced in code.
+- [HYPOTHESIS] The glider body collide-and-slides along walls through MovementCollider. A mod can detect the contact from MovementCollisionResults.spheroidNormal / hasSpheroidCollision.
+  - Receipt: Absence of any glider wall-exit test id or string. Not traced in code.
+- [VERIFIED] Animation system: the anim graph runtime nodes include SampleAnimationClip, StateMachine, LayerBlend, LayerBlendCharacterSpace, IKSolver, BipedFeetIKSolver, GenericFeetIKSolver, RetargetSolver, RotateBone, OffsetBone, ConstraintOrientation, PostProcessInput, Save/UseCachedPose and LocalToCharacterPose.
+  - Receipt: pestr.py '^anim_graph\.runtime_graph\..*NodeDefinition$' list. Descs 0x141ba35b0 (BipedFeetIKSolverNodeDefinition), 0x1416ca010 (IKChainItem_Runtime) and 0x141957380 (AutoHandIK_HandInfo). Program descriptor 0x141e06b30.
+- [VERIFIED] BipedFeetIKSolverNodeDefinition has left/right foot IK chain ids, pole-target slots, pelvisSlot and canCrouch.
+  - Receipt: pestr.py '^anim_graph\.runtime_graph\..*NodeDefinition$' list. Descs 0x141ba35b0 (BipedFeetIKSolverNodeDefinition), 0x1416ca010 (IKChainItem_Runtime) and 0x141957380 (AutoHandIK_HandInfo). Program descriptor 0x141e06b30.
+- [VERIFIED] IKChainItem_Runtime = {hash, start, effector}.
+  - Receipt: pestr.py '^anim_graph\.runtime_graph\..*NodeDefinition$' list. Descs 0x141ba35b0 (BipedFeetIKSolverNodeDefinition), 0x1416ca010 (IKChainItem_Runtime) and 0x141957380 (AutoHandIK_HandInfo). Program descriptor 0x141e06b30.
+- [VERIFIED] AutoHandIK_HandInfo = {handBoneIndex, handTargetBoneIndex}.
+  - Receipt: pestr.py '^anim_graph\.runtime_graph\..*NodeDefinition$' list. Descs 0x141ba35b0 (BipedFeetIKSolverNodeDefinition), 0x1416ca010 (IKChainItem_Runtime) and 0x141957380 (AutoHandIK_HandInfo). Program descriptor 0x141e06b30.
+- [VERIFIED] The client program client_biped_feet_ik_raycast (fn 0x1402ffa70) raycasts the feet against colliders (AnimationGraphComponent2, BipedFeetIKComponent, MovementCollider).
+  - Receipt: pestr.py '^anim_graph\.runtime_graph\..*NodeDefinition$' list. Descs 0x141ba35b0 (BipedFeetIKSolverNodeDefinition), 0x1416ca010 (IKChainItem_Runtime) and 0x141957380 (AutoHandIK_HandInfo). Program descriptor 0x141e06b30.
+- [VERIFIED] Animation clips are the KFC resource JointAnimation: {hierarchyHash u64, positionFactor, positionTangent, scaleFactor, headers JointAnimationHeader[], data vf32_data[], fps u16, frameCount u16, jointCount u16, flags u16}.
+  - Receipt: Descs 0x14184aa30 (JointAnimation) and 0x1418c6ec0 (Animation). xxd of enshrouded.kfc offset 0 = 4b 46 43 34. `rg -a -o -b 'JointAnimation|AnimationGraph|anim_graph|AnimationClip'` on kfc and kfc_resources: 0 hits.
+- [VERIFIED] The authoring type Animation has startFrame/endFrame, loopType, root-motion flags and retargetData. enshrouded.kfc starts with 'KFC4'. kfc and kfc_resources contain no plaintext animation type names.
+  - Receipt: Descs 0x14184aa30 (JointAnimation) and 0x1418c6ec0 (Animation). xxd of enshrouded.kfc offset 0 = 4b 46 43 34. `rg -a -o -b 'JointAnimation|AnimationGraph|anim_graph|AnimationClip'` on kfc and kfc_resources: 0 hits.
+- [VERIFIED] Game data: 'climb' text appears only in enshrouded_053.dat (71 hits, all localisation text). kfc_resources holds compressed name fragments: ClimbingClaws at 18488409, climbingWall at 9970212, Climbing4x4 at 9092300, Climbing2x2 at 10152367, Climbingcorner_outer_2x2 at 8856684 and climb_ladder at 214125064 (these look like Climbing Wall building pieces).
+  - Receipt: `rg -a -c -i 'climb' enshrouded_0*.dat` over all 55 .dat files: only enshrouded_053.dat:71. `rg -a -o -b -i '[a-z0-9_./]*climb[a-z0-9_./]*' enshrouded.kfc_resources` (14 hits). The reading of the fragments as building pieces is a hypothesis.
+- [HYPOTHESIS] There is an unfinished or optional 'Climbing Claws / Climbing Tool' equipment slot.
+  - Receipt: owner.py: desc 0x14198cc40 (+0x64 climbWall), 0x141be9c20, 0x14183f820. EquipmentSlot desc 0x141974e60 (27 members, none climb). Loca at enshrouded_053.dat byte 901022380 and 901681760.
+- [HYPOTHESIS] PackedEquipmentSlotEntityIds.climbWall is at +0x64, the UI has FbUiEquipmentSlotIcons.wallClimber and FbUiLocaEquipmentMenu.climbTool, and the loca has a claws description next to '… dummy' strings.
+  - Receipt: owner.py: desc 0x14198cc40 (+0x64 climbWall), 0x141be9c20, 0x14183f820. EquipmentSlot desc 0x141974e60 (27 members, none climb). Loca at enshrouded_053.dat byte 901022380 and 901681760.
+- [HYPOTHESIS] But the EquipmentSlot enum has no climb member, and FUN_140419570 has no equipment check.
+  - Receipt: owner.py: desc 0x14198cc40 (+0x64 climbWall), 0x141be9c20, 0x14183f820. EquipmentSlot desc 0x141974e60 (27 members, none climb). Loca at enshrouded_053.dat byte 901022380 and 901681760.
+- [HYPOTHESIS] So claws are probably not required to climb.
+  - Receipt: owner.py: desc 0x14198cc40 (+0x64 climbWall), 0x141be9c20, 0x14183f820. EquipmentSlot desc 0x141974e60 (27 members, none climb). Loca at enshrouded_053.dat byte 901022380 and 901681760.
+- [VERIFIED] ShroudForge is MIT (Copyright (c) 2026 bonsaibauer).
+  - Receipt: shroudforge-src/LICENSE line 1. mods/sf-unlimited-flight/src/mod.lua lines 118, 130, 148, 155, 161, 164, 225 and 239. docs/website/data/enshrouded-1076226…/types.lua line 12385.
+- [VERIFIED] Its Lua API reads and writes any reflected component by name. sf-unlimited-flight uses runtime.ecs.read_fields(entity,'keen::ecs::Actor',…) with currentState flag 'HangGliding', runtime.ecs.query('keen::ecs::PlayerInput'), ActorInput 'desiredLocalMoveInput.z', CurrentTransform, Gravity and runtime.overrides.attribute(entity,'StaminaDepletionMod_Glider').
+  - Receipt: shroudforge-src/LICENSE line 1. mods/sf-unlimited-flight/src/mod.lua lines 118, 130, 148, 155, 161, 164, 225 and 239. docs/website/data/enshrouded-1076226…/types.lua line 12385.
+- [VERIFIED] Its types.lua lists keen::ecs::Climb.
+  - Receipt: shroudforge-src/LICENSE line 1. mods/sf-unlimited-flight/src/mod.lua lines 118, 130, 148, 155, 161, 164, 225 and 239. docs/website/data/enshrouded-1076226…/types.lua line 12385.
+- [VERIFIED] The ShroudForge profile 26082781.json targets the Steam exe sha256 d64966e2…, kfcFormat 4.
+  - Receipt: Python json walk of sf-release-profiles/26082781.json (keys schemaVersion…resourceWriteLayout).
+- [VERIFIED] It holds generic layouts only: ownerLayout, ecsReadLayout (entityManager table 392, componentOffsets 132, componentStrides 2692, maximumEntities 1048576), ecsWriteLayout (scene-thread gate on thread 'GameServer'), serviceLayout, resourceLayout (atomic scalar resource writes) and provenance 'read-validated'.
+  - Receipt: Python json walk of sf-release-profiles/26082781.json (keys schemaVersion…resourceWriteLayout).
+- [VERIFIED] It names no Climb, Locomotion or Velocity offsets; component layouts come from reflection at run time.
+  - Receipt: Python json walk of sf-release-profiles/26082781.json (keys schemaVersion…resourceWriteLayout).
+- [VERIFIED] The patch sites and signatures are identical and unique in the installed Steam exe. 'f3 0f 59 d1 c7 44 24 28 00 01 00 00 f3 0f 59 d9 44 89 6c 24' (mask site 0x14024acc8) occurs once. '0f 5c cc f3 44 0f 10 da c7 44 24 28 00 01 00 00 45 0f c6 db' (0x14024af4f) occurs once.
+  - Receipt: Python bytes compare of the old-build and Steam enshrouded.exe at file offsets 0x24a0c8, 0x24a34f, 0x24a182 and 0x418970, plus data.count(sig)==1 on the Steam exe.
+- [VERIFIED] The FUN_140419570 prologue '40 55 57 48 8d 6c 24 d8 48 81 ec 28 01 00 00 48 8b f9 48 8b 49 68 48 85' occurs once.
+  - Receipt: Python bytes compare of the old-build and Steam enshrouded.exe at file offsets 0x24a0c8, 0x24a34f, 0x24a182 and 0x418970, plus data.count(sig)==1 on the Steam exe.
+- [VERIFIED] The FUN_14024abc0 prologue (32 bytes) occurs once.
+  - Receipt: Python bytes compare of the old-build and Steam enshrouded.exe at file offsets 0x24a0c8, 0x24a34f, 0x24a182 and 0x418970, plus data.count(sig)==1 on the Steam exe.
+- [VERIFIED] Ladders: ecs.Ladder = {topOffset, bottomOffset, normal} (size 0x24).
+  - Receipt: Descs 0x141a03370, 0x141ad3ac0, 0x1419067a0 and 0x1419068f0 (rtype.py).
+- [VERIFIED] ClimbLadderTestId has 19 tests (tilted, staggered and aligned ladders, step blocked, WalkAgainstLadderBack).
+  - Receipt: Descs 0x141a03370, 0x141ad3ac0, 0x1419067a0 and 0x1419068f0 (rtype.py).
+- [VERIFIED] The events actor.StartClimbing and actor.StopClimbing (size 0x70) carry isLadder +0x60 and lerpDuration +0x68.
+  - Receipt: Descs 0x141a03370, 0x141ad3ac0, 0x1419067a0 and 0x1419068f0 (rtype.py).
+
+### Climbing routes (unimplemented)
+
+These are the spike's proposed steps, including its then-pending documentation prerequisites. They are not work performed by this transcription.
+
+- [HYPOTHESIS] Proposed route **moderate**: P1a: widen the game's own probe. Patch the ClimbingWall mask 0x100 at the climb-probe sites (0x14024acc8, 0x14024af4f, then the update/exit sites 0x14024b238, 0x14024c688, 0x14024c73f once attributed) to also accept World/Solid (bits 0/3). Redirect the two 0.001 coplanarity loads (0x14024afb8, 0x14024afec → [0x1413b825c]) to a looser mod-owned constant. All native behaviour then stays: auto-latch by walking or sprinting into a wall, the Enter/Climb/Exit sequences, the mantle at the top, stamina and jump-off.
+  - Receipt: Supplied climbing spike, Routes; proposal, not a tested result.
+- [HYPOTHESIS] P1a — cost: Small Rust .asi feature: about 5 checked immediate writes plus 2 RIP-displacement redirects with unique signatures, in the style of patch.rs and sigs.rs. Plus in-game testing on rock, voxel walls and building walls.
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] P1a — risks: (1) Voxel terrain may answer collider queries differently from props, so World may not cover terrain. (2) Irregular rock normals may cause jitter, losing the wall (fall), or failed top exits. (3) Every probe in the climb cluster must get the same change, or the update drops the player. This may explain the 'wall becomes walkable' class of bug. (4) The climb programs read authoritative ECS (GameServer thread), so a client without the mod on a modded host, or the reverse, may desync. (5) The addresses are new: by the house rules they must go into docs/re-notes.md and sigs.rs before use.
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] P1a — next: Resolve the containing functions of 0x14024b238, 0x14024c688 and 0x14024c73f (and FUN_14024c320, FUN_14024c9f0, FUN_140417d90). Decode FUN_1409fff60's argument order to confirm that the arg at [RSP+0x28] is the ColliderFlags mask. Check how voxel terrain answers queries with mask bit 0. Then build a debug-only test toggle and test in game.
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] Proposed route **hard**: P1b: detour the start check FUN_140419570 (and the wall-lost check FUN_14024b390). Call the original first. If it does not latch, run a mod-owned probe through the game's raycast FUN_1409fff60 with a World|Solid mask and averaged normals. Then fill Climb.climbType=1 / climbState=1 / climbNormal and call the native FUN_14024b4c0 plus sequence 0xa17e05ee exactly as the native code does.
+  - Receipt: Supplied climbing spike, Routes; proposal, not a tested result.
+- [HYPOTHESIS] P1b — cost: A medium inline hook on the game's ECS worker path, plus re-implementing the probe and its tolerances. It needs the impact-iterator struct layout (param_1[...] slots) for FUN_140419570.
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] P1b — risks: Calling internal functions with a wrong context struct crashes the game. The hook runs inside the per-entity program loop, so it must stay cheap (it runs every frame for every player). Wall loss during the climb is still decided by the native update unless that is hooked too.
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] P1b — next: Map the 0x178-byte query-iterator struct (param_1 indices → component pointers) from FUN_1409b6e60 and the program's component list order. Then prototype read-only logging of the probe result codes (0x06, 0x15, 0x1e, 0x1f) to see why native starts fail.
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] Proposed route **moderate**: P2: Zelda behaviours on top of P1. Ledge mantle = the native exit-top (FUN_14024bc90, sequence 0xc83e5552). Stamina = the native per-metre drain (8.0/m × attribute 0xb8388248), tunable through that attribute in the way ShroudForge overrides StaminaDepletionMod_Glider. Jump-climb = the start check has no grounded test, only |vy|<=20, so a mid-air latch may already work. Jump-off = the native FreeClimbing jump. Glider grab = allow the start while HangGliding (needs the CanClimb ability bit during the glider sequence, and an abort of the glider sequence).
+  - Receipt: Supplied climbing spike, Routes; proposal, not a tested result.
+- [HYPOTHESIS] P2 — cost: Mostly free once P1 works. The glider grab needs either a data change to the glider action-sequence ability flags or a hook that sets bit 16 in actor+0xc00/+0xbc8 and ends HangGliding.
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] P2 — risks: Ability masks are written by the action-sequence system every frame, so a forced bit may be overwritten or may break other sequences. The glider sequence end and the climb Enter sequence may conflict. The water-only ledge grab (0x26de28ee) is not wired for land; reusing it on land is unproven.
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] P2 — next: In game: log the CanClimb bit and the |v.y| value while jumping or gliding at a ClimbingWall-flagged wall (the vanilla iron-lattice walls) to see whether native mid-air and glider latches already happen. Find where the AbilityFlag mask (actor+0xc00) is computed.
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] Proposed route **hard**: P3: IK so hands and feet sit on the surface. Foot IK exists (BipedFeetIKSolver node + client_biped_feet_ik_raycast fn 0x1402ffa70). Hand IK exists only as AutoHandIK to a target bone, and the generic IKSolver needs IK chains defined in the anim graph data. Option A: hook the feet-IK raycast program and feed wall hits while ClimbingWall. Option B: find the final pose output (RenderPoseHandleValue / skinToJointMatrices) and post-process the hand and foot chains with a Rust two-bone IK.
+  - Receipt: Supplied climbing spike, Routes; proposal, not a tested result.
+- [HYPOTHESIS] P3 — cost: Large. It needs the anim graph evaluation entry, the pose buffer layout, the skeleton joint indices of the player hierarchy, and a two-bone IK solver in Rust.
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] P3 — risks: The hook point for pose post-processing is not found yet. Writing the pose buffer from the wrong thread or at the wrong time tears or crashes the render. The BipedFeetIK node may be disabled during climb sequences (disableIK parameter).
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] P3 — next: Trace the BipedFeetIKSolver runtime node's evaluate function (via FUN_141097570, which references desc 0x141ba35b0, and the node-type dispatch). Find where RenderPoseHandleValue's pose is finalised. Decode the climb-sequence anim graph parameters.
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] Proposed route **blocked**: P4: better or new climb animations. Reuse the existing sequences now (wall enter 0x99ae6705 / 0xa17e05ee, exit 0xc83e5552 / 0xa524eca9, the climb loop through the anim graph, the water ledge grab 0x26de28ee, the ladder sequences). New clips would mean authoring JointAnimation (compressed vf32 data matching the player's hierarchyHash), adding a KFC4 resource (table entry plus .dat chunk), and referencing it from the anim graph and action-sequence resources.
+  - Receipt: Supplied climbing spike, Routes; proposal, not a tested result.
+- [HYPOTHESIS] P4 — cost: Very large: a KFC4 writer, a vf32 encoder and anim-graph editing. No local tool covers it. ShroudForge validates only atomic scalar resource writes, and its kfc-parser submodule is empty in the clone.
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] P4 — risks: Format errors corrupt the game data load. Every game patch changes the data build. The data are third-party derived assets.
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] P4 — next: The proposed next step was to shallow-clone bonsaibauer/kfc-parser (branch kfc4_compatibility), read it and check its licence. Until then, P4 = choose among the existing sequences only.
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+
+### Climbing open questions
+
+- [HYPOTHESIS] Open at the spike: The climbing spike did not clone kfc-parser. The ShroudForge kfc-parser submodule directory was empty. Its licence was UNVERIFIED in that spike (.gitmodules points to github.com/bonsaibauer/kfc-parser, branch kfc4_compatibility).
+  - Receipt: Supplied climbing spike, Open questions; unresolved unless separately stated.
+- [HYPOTHESIS] Open at the spike: Who sets AbilityFlag CanClimb (bit 16 of actor+0xc00/+0xbc8)? Is it off during the glider or jump sequences? This decides whether glider-grab and jump-grab need extra work.
+  - Receipt: Supplied climbing spike, Open questions; unresolved unless separately stated.
+- [HYPOTHESIS] Open at the spike: What do FUN_14048f3d0(ctx+0x28) (+0x50 != 0 → fail code 6) and the component at param_1[5] in FUN_140419570 mean?
+  - Receipt: Supplied climbing spike, Open questions; unresolved unless separately stated.
+- [HYPOTHESIS] Open at the spike: Is attribute 0x4b6aa8b current stamina, and is 0xb8388248 the climb stamina-depletion multiplier? Which data-side attribute names (for example 'StaminaDepletionMod_…') map to them?
+  - Receipt: Supplied climbing spike, Open questions; unresolved unless separately stated.
+- [HYPOTHESIS] Open at the spike: Does FUN_1409fff60 with mask bit 0 (World) hit voxel terrain? Which of the 9 'mov [rsp+0x28],0x100' sites belong to the climb update and exit probes?
+  - Receipt: Supplied climbing spike, Open questions; unresolved unless separately stated.
+- [HYPOTHESIS] Open at the spike: Is the Climbing Claws / climbWall equipment slot shipped or dummy? The tutorial says climbing walls need only stamina.
+  - Receipt: Supplied climbing spike, Open questions; unresolved unless separately stated.
+- [HYPOTHESIS] Open at the spike: Where is the glider-to-wall contact handled, if anywhere? (No code traced; HYPOTHESIS collide-and-slide.)
+  - Receipt: Supplied climbing spike, Open questions; unresolved unless separately stated.
+- [HYPOTHESIS] Open at the spike: Where is the final character pose written (the pose post-process hook point for IK)?
+  - Receipt: Supplied climbing spike, Open questions; unresolved unless separately stated.
+- [HYPOTHESIS] Open at the spike: What are the numeric SlopeDefinition values (steepFloorAngle and so on) for the player's SlopeConfig? They are in compressed game data; not extracted.
+  - Receipt: Supplied climbing spike, Open questions; unresolved unless separately stated.
+- [HYPOTHESIS] Open at the spike: ClimbAnywhere's two board bugs (inconsistent start; break when the wall becomes walkable) match the strict native start rules and the native wall-loss and bottom-exit checks. This is a HYPOTHESIS: by the clean-room rule the third-party DLL was not examined.
+  - Receipt: Supplied climbing spike, Open questions; unresolved unless separately stated.
+
+### Climbing evidence limits and discrepancies
+
+- [HYPOTHESIS] The start-check fact labels the bounded value as vertical speed, but the supplied inference separately identifies param_1[4] as Velocity. Both labels and the expression |param_1[4]+4| <= 20.0 are retained; the component attribution is not promoted to VERIFIED.
+  - Receipt: FUN_140419570 fact and its following hypothesis, ev_ba53f40e….
+- [HYPOTHESIS] The mask instructions are attributed in the supplied facts, while their argument order remains an open next step. The update/exit candidates remain unattributed. No signature bytes or file offsets are corrected here.
+  - Receipt: Climbing probe facts, P1a and its next step.
+- [HYPOTHESIS] The climbing spike's raw compressed-name fragments are observations only. Their interpretation as building pieces is a hypothesis. The glass spike below says raw strings of the compressed container are not valid resource evidence.
+  - Receipt: Climbing game-data fragment receipt and glass KFC4 receipt; the different evidence limits are retained.
+- [HYPOTHESIS] The climbing spike left kfc-parser's licence UNVERIFIED and its submodule empty. The separate glass spike records a read-only clone and GPL-3.0-or-later evidence. These are different spike observations; the earlier unknown is retained.
+  - Receipt: Climbing P4/open question and glass kfc-parser HEAD db1580a receipt.
+
+
+## Glass and window materials (2026-10-26 spike)
+
+**Clear glass is deferred. Real see-through glass needs shader or renderer work.** The supplied routes do not establish a working transparent pane or block.
+
+**Licence boundary:** the glass spike read kfc-parser, licensed GPL-3.0-or-later. No source code from it may be copied into this repository. It was shallow-cloned read-only. The source was read, not built or run. The supplied route text's shorter GPL-3.0 wording is retained below; the manifest receipt records GPL-3.0-or-later.
+
+- [VERIFIED] Evidence scope: spike `wf_cd1066c9-e7c`, 2026-10-26, installed build 26082781. The spike changed neither repository nor game files.
+  - Receipt: Supplied glass spike summary and section-hash comparison below.
+- [VERIFIED] Helper and receipt filenames: kfc4.py, refl.py, mats.py, kw_scan.py, summary.txt, scan_glass.txt, scan_window.txt, iteminfo_strings.txt, block_items.txt, mats_census.txt, models_all.txt, models_window.txt, mats_glass_detail.txt and refl_*.txt.
+  - Receipt: Supplied glass spike helper inventory.
+
+- [HYPOTHESIS] EML/kfc-parser data edits have the same visual ceiling as load-time material edits. A prop pane using the VFX forward-transparent path remains untested.
+  - Receipt: Supplied glass summary and routes (a), (b) and (d).
+
+### Glass facts and receipts
+
+- [VERIFIED] There is no placeable glass building block. 74 Block_T*/Block_Roof_* building-block ItemInfo names exist; none contains glass, crystal, ice, clear or transp.
+  - Receipt: kfc4.py scan '[A-Za-z]' over all 4,262 keen::ItemInfo resources in the installed enshrouded.kfc_resources -> iteminfo_strings.txt (26,114 strings). grep -o -E 'Block_[A-Za-z0-9_]+' | sort -u -> block_items.txt (100 names). grep -i -E 'glass|crystal|ice|clear|transp' block_items.txt -> empty. Scope: ItemInfo debug names only; English display text is not in the KFC resources.
+- [VERIFIED] Glass exists as a crafting material item (Material_T4_Glass, Material_T4_Glass_Shards) with recipes Material_T4_Recyled_Glass, Material_T4_Factory_Glass_SM and Material_T5_Factory_Glass_BF2.
+  - Receipt: scan_glass.txt: ItemInfo res#54793 string 'Material_T4_Glass' at u0x9268de0; res#90877 'Material_T4_Glass_Shards' at u0x99d2700; RecipeRegistryResource res#48592 at u0x7d1b778, u0x7d1b80c, u0x7d1a378.
+- [VERIFIED] It does not exist as a voxel material.
+  - Receipt: scan_glass.txt: ItemInfo res#54793 string 'Material_T4_Glass' at u0x9268de0; res#90877 'Material_T4_Glass_Shards' at u0x99d2700; RecipeRegistryResource res#48592 at u0x7d1b778, u0x7d1b80c, u0x7d1a378.
+- [VERIFIED] The game data is KFC4.
+  - Receipt: enshrouded.kfc bytes 0..3 = 4B 46 43 34 ('KFC4'). Output of 'kfc4.py summary' saved as summary.txt. Raw scan of the compressed file gave truncated names such as 'Window_FramR]' at file offset 0x9a7a2c.
+- [VERIFIED] Resources sit in enshrouded.kfc_resources as 58 zstd chunks (481,531,128 bytes uncompressed, 91,812 resources).
+  - Receipt: enshrouded.kfc bytes 0..3 = 4B 46 43 34 ('KFC4'). Output of 'kfc4.py summary' saved as summary.txt. Raw scan of the compressed file gave truncated names such as 'Window_FramR]' at file offset 0x9a7a2c.
+- [VERIFIED] The container version string is '1273043|^/game38/branches/release_1.0|2026-10-20T14:55:29.904125Z'. A raw strings scan of the compressed file is not valid evidence.
+  - Receipt: enshrouded.kfc bytes 0..3 = 4B 46 43 34 ('KFC4'). Output of 'kfc4.py summary' saved as summary.txt. Raw scan of the compressed file gave truncated names such as 'Window_FramR]' at file offset 0x9a7a2c.
+- [VERIFIED] The reference exe and the installed exe have byte-identical .text, .rdata and .data.
+  - Receipt: PE section sha256 prefixes: .text 44b331987bcf5fd5, .rdata c95a135bd7cb56fe, .data 9ae9c97559c3c834 are identical in both files. Only .bind differs (98e7bc4d vs b30f230e).
+- [VERIFIED] Reflection read from either file is valid for build 26082781.
+  - Receipt: PE section sha256 prefixes: .text 44b331987bcf5fd5, .rdata c95a135bd7cb56fe, .data 9ae9c97559c3c834 are identical in both files. Only .bind differs (98e7bc4d vs b30f230e).
+- [VERIFIED] keen::SolidVoxelMaterial (size 304, 30 fields) has no opacity, alpha, transparency, refraction or IOR field. keen::VoxelMaterialType has only {0 Terrain, 1 Building}.
+  - Receipt: refl.py on the reference exe: TypeMetadata VA 0x141af0300 (SolidVoxelMaterial) and VA 0x141aef130 (VoxelMaterialType). Each TypeMetadata is accepted only when FNV-1a32(qualified name) equals the u32 at +0x50. 12,646 types found.
+- [VERIFIED] Voxel building blocks are drawn from keen::BuildingMaterialBlendingMaterialLayerTextureShaderData (size 60).
+  - Receipt: refl.py: VA 0x1417f1120 (BuildingMaterialBlendingMaterialLayerTextureShaderData); VA 0x141a1b8f0 (PbrMaterialLayer .opacityMap @0x80).
+- [VERIFIED] It holds emissive, albedo, metallic, roughness, reflectance, normal, height and ao maps plus tiling and displacement values.
+  - Receipt: refl.py: VA 0x1417f1120 (BuildingMaterialBlendingMaterialLayerTextureShaderData); VA 0x141a1b8f0 (PbrMaterialLayer .opacityMap @0x80).
+- [VERIFIED] It has no opacity map and no alpha, although the authoring type PbrMaterialLayer has opacityMap @0x80.
+  - Receipt: refl.py: VA 0x1417f1120 (BuildingMaterialBlendingMaterialLayerTextureShaderData); VA 0x141a1b8f0 (PbrMaterialLayer .opacityMap @0x80).
+- [VERIFIED] No shipped render material or model uses the Transparent effect.
+  - Receipt: 'mats.py census' saved as mats_census.txt; 'mats.py models .' saved as models_all.txt. Layouts come from our-build reflection: RenderMaterialResource VA 0x141ad3830 (size 40, debugName @0x20); RenderEffectId VA 0x141abc080 (8 = Transparent). 0 of 3,458 debugNames failed to decode at @0x20, which confirms the layout.
+- [VERIFIED] All 3,458 RenderMaterialResources are Pbr, TerraformingCursor or SkyTexture.
+  - Receipt: 'mats.py census' saved as mats_census.txt; 'mats.py models .' saved as models_all.txt. Layouts come from our-build reflection: RenderMaterialResource VA 0x141ad3830 (size 40, debugName @0x20); RenderEffectId VA 0x141abc080 (8 = Transparent). 0 of 3,458 debugNames failed to decode at @0x20, which confirms the layout.
+- [VERIFIED] All 14,339 model slots are Pbr (14,259), TerraformingCursor (73) or SkyTexture (7).
+  - Receipt: 'mats.py census' saved as mats_census.txt; 'mats.py models .' saved as models_all.txt. Layouts come from our-build reflection: RenderMaterialResource VA 0x141ad3830 (size 40, debugName @0x20); RenderEffectId VA 0x141abc080 (8 = Transparent). 0 of 3,458 debugNames failed to decode at @0x20, which confirms the layout.
+- [VERIFIED] The Iron Window Frame models have no glass.
+  - Receipt: models_window.txt and models_all.txt, for example 'MODEL res#82247 global_props_iron_window_frame_01_a -> slot0 res#66456 global_iron_02_a'. Template scan: TEMPLATE res#60008 Prop_Buildings_Iron_Window_Frame_01_A -> models ['global_props_iron_window_frame_01_a'].
+- [VERIFIED] Every global_props_iron_window_frame_* and *_ceiling_* model has one material slot: global_iron_02_a (res#66456, opaque Pbr + CanDissolve) or villageprops_iron.
+  - Receipt: models_window.txt and models_all.txt, for example 'MODEL res#82247 global_props_iron_window_frame_01_a -> slot0 res#66456 global_iron_02_a'. Template scan: TEMPLATE res#60008 Prop_Buildings_Iron_Window_Frame_01_A -> models ['global_props_iron_window_frame_01_a'].
+- [VERIFIED] Each Prop_Buildings_Iron_Window_* ECS template references exactly one such model.
+  - Receipt: models_window.txt and models_all.txt, for example 'MODEL res#82247 global_props_iron_window_frame_01_a -> slot0 res#66456 global_iron_02_a'. Template scan: TEMPLATE res#60008 Prop_Buildings_Iron_Window_Frame_01_A -> models ['global_props_iron_window_frame_01_a'].
+- [VERIFIED] The glass-looking window panes are opaque deferred Pbr surfaces with light transmission. env_coldheights_window_01_translucent (res#66155): flags DisableShadows|Translucent, rfx FoliageTranslucency, translucencyStrength 1.0. ancients_props_windows_01_a (res#58625): AlphaTested|Translucent, SampleOpacity|FoliageTranslucency, translucencyStrength 1.0.
+  - Receipt: mats_glass_detail.txt ('mats.py mat'). PbrRfxRenderMaterial layout from VA 0x141a89330: translucencyStrength @0xa0, flags @0xf0. PbrRfxRenderMaterialFlag VA 0x141a6b810.
+- [VERIFIED] Desert furniture glass env_desert_furniture_glass_01 (res#57327) is plain opaque Pbr.
+  - Receipt: mats_glass_detail.txt ('mats.py mat'). PbrRfxRenderMaterial layout from VA 0x141a89330: translucencyStrength @0xa0, flags @0xf0. PbrRfxRenderMaterialFlag VA 0x141a6b810.
+- [HYPOTHESIS] The frosted/milky look comes from FoliageTranslucency (light transmission through an opaque surface) plus textures (albedo, packed material_map, emissive).
+  - Receipt: Inferred from F3. PbrRfxRenderMaterial (size 244) has no opacity scalar, no tint colour and no refraction/IOR field (VA 0x141a89330). The shader behaviour itself was not observed in-game.
+- [HYPOTHESIS] It is not a tunable opacity or refraction value.
+  - Receipt: Inferred from F3. PbrRfxRenderMaterial (size 244) has no opacity scalar, no tint colour and no refraction/IOR field (VA 0x141a89330). The shader behaviour itself was not observed in-game.
+- [VERIFIED] 'FrostedGlass' is the UI background blur, not window glass.
+  - Receipt: refl.py: VA 0x141badb30 (FrostedGlassRenderParameters) and VA 0x141a507b0 (RenderSystemResource). scan_glass.txt: GpcResource res#68385 string 'game38_ui/frosted_glass.gpc' at u0x7fd1d88.
+- [VERIFIED] FrostedGlassRenderParameters = {downsampleSteps, sigma, useSoftClipping, threshold, shoulder} lives in RenderSystemResource.frostedGlass @0x10, and its shader pack is game38_ui/frosted_glass.gpc.
+  - Receipt: refl.py: VA 0x141badb30 (FrostedGlassRenderParameters) and VA 0x141a507b0 (RenderSystemResource). scan_glass.txt: GpcResource res#68385 string 'game38_ui/frosted_glass.gpc' at u0x7fd1d88.
+- [VERIFIED] The material loader validates a material before GPU upload.
+  - Receipt: REA/Ghidra 12.1.4 decompile of 0x1400cddd0 (log string '[material_loader] Failed create load material id '%k', out of memory!') and of 0x1400cfca0. Bytes at 0x1400cdf3a: C7 44 24 30 4B 89 E1 AE = mov dword ptr [rsp+0x30], 0xaee1894b.
+- [VERIFIED] FUN_1400cddd0 requests type 0xAEE1894B and calls FUN_1400cfca0.
+  - Receipt: REA/Ghidra 12.1.4 decompile of 0x1400cddd0 (log string '[material_loader] Failed create load material id '%k', out of memory!') and of 0x1400cfca0. Bytes at 0x1400cdf3a: C7 44 24 30 4B 89 E1 AE = mov dword ptr [rsp+0x30], 0xaee1894b.
+- [VERIFIED] FUN_1400cfca0 fails (state 4) unless the per-effect slot (param_1 + effectId*0x50) exists and its signature at +0x190 equals the material's dataTypeSignature at res+0xc.
+  - Receipt: REA/Ghidra 12.1.4 decompile of 0x1400cddd0 (log string '[material_loader] Failed create load material id '%k', out of memory!') and of 0x1400cfca0. Bytes at 0x1400cdf3a: C7 44 24 30 4B 89 E1 AE = mov dword ptr [rsp+0x30], 0xaee1894b.
+- [VERIFIED] It then copies the data blob (max 0x800 bytes), patches texture handles and uploads it via FUN_141017cb0.
+  - Receipt: REA/Ghidra 12.1.4 decompile of 0x1400cddd0 (log string '[material_loader] Failed create load material id '%k', out of memory!') and of 0x1400cfca0. Bytes at 0x1400cdf3a: C7 44 24 30 4B 89 E1 AE = mov dword ptr [rsp+0x30], 0xaee1894b.
+- [HYPOTHESIS] All Pbr materials share dataTypeSignature 0x1220F31F, so switching one to effect Transparent (8) without data in the Transparent effect's format would fail the loader's signature check.
+  - Receipt: mats_glass_detail.txt: sig=1220f31f on all 8 dumped materials. The consequence follows from the FUN_1400cfca0 check; it is not tested at runtime.
+- [VERIFIED] A world holds at most 256 voxel materials.
+  - Receipt: refl.py: VA 0x141890a40 (VoxelMaterialId) and VA 0x1416baee0 (VoxelWorldResource).
+- [VERIFIED] VoxelMaterialId is a uint8 typedef, and VoxelWorldResource.materialGuids is StaticArray<Guid,256> @0x1c.
+  - Receipt: refl.py: VA 0x141890a40 (VoxelMaterialId) and VA 0x1416baee0 (VoxelWorldResource).
+- [VERIFIED] 85 building materials ship.
+  - Receipt: 'kfc4.py dump' of BuildingMaterialBlendingResource, GiVoxelBuildingMaterialResource, BuildingMaterialParametersResource and VoxelBlueprintMaterialPoolRegistryResource, parsed with our-build layouts (refl_voxel.txt). The reading '128 = fixed capacity' is an inference.
+- [VERIFIED] The GPU data blocks hold exactly 128 slots each: BuildingMaterialBlending 50,176 bytes = 128 x 392, and GiVoxelBuildingMaterial 23,040 bytes = 128 x 180.
+  - Receipt: 'kfc4.py dump' of BuildingMaterialBlendingResource, GiVoxelBuildingMaterialResource, BuildingMaterialParametersResource and VoxelBlueprintMaterialPoolRegistryResource, parsed with our-build layouts (refl_voxel.txt). The reading '128 = fixed capacity' is an inference.
+- [VERIFIED] BuildingMaterialParameters.materials = 85.
+  - Receipt: 'kfc4.py dump' of BuildingMaterialBlendingResource, GiVoxelBuildingMaterialResource, BuildingMaterialParametersResource and VoxelBlueprintMaterialPoolRegistryResource, parsed with our-build layouts (refl_voxel.txt). The reading '128 = fixed capacity' is an inference.
+- [VERIFIED] Blueprint pools: BuildingDefaultMaterials 61, BuildingRoofMaterials 14, TerrainMaterials 56, OvergrowthMaterials 5.
+  - Receipt: 'kfc4.py dump' of BuildingMaterialBlendingResource, GiVoxelBuildingMaterialResource, BuildingMaterialParametersResource and VoxelBlueprintMaterialPoolRegistryResource, parsed with our-build layouts (refl_voxel.txt). The reading '128 = fixed capacity' is an inference.
+- [VERIFIED] GI treats building blocks as opaque.
+  - Receipt: refl.py: VA 0x141bcc4c0 (GiVoxelMaterial, size 60, 11 fields).
+- [VERIFIED] GiVoxelMaterial = albedo, roughness, emissive, metallic, reflectance, tiling and maps, with no transparency term.
+  - Receipt: refl.py: VA 0x141bcc4c0 (GiVoxelMaterial, size 60, 11 fields).
+- [HYPOTHESIS] The engine has forward OIT transparent pipelines (Transparent_Forward_Oit_Lit_Shaded and others, TransparentFakeReflections, TransparentUpsample) in renderer/renderer.gpc.
+  - Receipt: scan_window.txt and scan_gpc.txt: GpcResource res#90631 'renderer/renderer.gpc' with pipeline names at +0xf368 and others. refl.py: TransparentInstanceData VA 0x141758990 (size 176). The VFX/water reading is an inference.
+- [HYPOTHESIS] Their per-instance data (TransparentInstanceData: color, alpha, perceptualRoughness, uvDistortion*, flipbook) suggests they serve VFX and water.
+  - Receipt: scan_window.txt and scan_gpc.txt: GpcResource res#90631 'renderer/renderer.gpc' with pipeline names at +0xf368 and others. refl.py: TransparentInstanceData VA 0x141758990 (size 176). The VFX/water reading is an inference.
+- [VERIFIED] kfc-parser/EML can write game data.
+  - Receipt: kfc-parser HEAD db1580a (2026-10-23): Cargo.toml:31 license = "GPL-3.0-or-later"; crates/kfc-base/src/container/writer.rs:159-232 (new_incremental_with_options); docs/src/eml/index.md ('only supports asset modifications before the game starts'); docs/src/eml/api/assets/resource.md (create_resource).
+- [VERIFIED] It is GPL-3.0-or-later.
+  - Receipt: kfc-parser HEAD db1580a (2026-10-23): Cargo.toml:31 license = "GPL-3.0-or-later"; crates/kfc-base/src/container/writer.rs:159-232 (new_incremental_with_options); docs/src/eml/index.md ('only supports asset modifications before the game starts'); docs/src/eml/api/assets/resource.md (create_resource).
+- [VERIFIED] KFCWriter incremental mode opens the game's .kfc and .kfc_resources for write and appends new chunks.
+  - Receipt: kfc-parser HEAD db1580a (2026-10-23): Cargo.toml:31 license = "GPL-3.0-or-later"; crates/kfc-base/src/container/writer.rs:159-232 (new_incremental_with_options); docs/src/eml/index.md ('only supports asset modifications before the game starts'); docs/src/eml/api/assets/resource.md (create_resource).
+- [VERIFIED] EML applies Lua 'patch' mods before the game starts and can create new resources.
+  - Receipt: kfc-parser HEAD db1580a (2026-10-23): Cargo.toml:31 license = "GPL-3.0-or-later"; crates/kfc-base/src/container/writer.rs:159-232 (new_incremental_with_options); docs/src/eml/index.md ('only supports asset modifications before the game starts'); docs/src/eml/api/assets/resource.md (create_resource).
+- [VERIFIED] ShroudForge (MIT) publishes modified .kfc/.kfc_resources/.dat sets into the game folder with recovery, and has a runtime write_loaded_field API.
+  - Receipt: shroudforge-src/modules/game-files/game_file_transaction.rs:1-5; docs/evidence/runtime/runtime-api-audit-20261016.md:33; mods/world-editor/src/*.lua (grep material|voxel finds copy/paste only).
+- [VERIFIED] Its world editor only copies and pastes existing voxel cells; it shows no voxel material creation.
+  - Receipt: shroudforge-src/modules/game-files/game_file_transaction.rs:1-5; docs/evidence/runtime/runtime-api-audit-20261016.md:33; mods/world-editor/src/*.lua (grep material|voxel finds copy/paste only).
+- [HYPOTHESIS] The English item 'Iron Window Frame' corresponds to debug name Prop_Decoration_T4_Window_Iron_Frame (ItemInfo res#46699).
+  - Receipt: The mapping is by debug name only. English loca text is not in the KFC resources: grep -c -i 'iron window' scan_window.txt -> 0.
+- [VERIFIED] The old-build ShroudForge type dump (EA update 08, 2026-06-29) is not layout-safe for this build.
+  - Receipt: ShroudForge types.json vs refl.py output for keen::RenderMaterialResource and keen::RenderEffectId. A first mats.py run with the old layout gave 3,458 of 3,458 bad debugNames.
+- [VERIFIED] RenderMaterialResource is 48 bytes there (debugName @0x28) but 40 bytes in 26082781 (debugName @0x20).
+  - Receipt: ShroudForge types.json vs refl.py output for keen::RenderMaterialResource and keen::RenderEffectId. A first mats.py run with the old layout gave 3,458 of 3,458 bad debugNames.
+- [VERIFIED] RenderEffectId lost 'Simple', which shifted all values by one.
+  - Receipt: ShroudForge types.json vs refl.py output for keen::RenderMaterialResource and keen::RenderEffectId. A first mats.py run with the old layout gave 3,458 of 3,458 bad debugNames.
+
+### Glass routes (deferred, unimplemented)
+
+These are the spike's proposed steps, including its then-pending documentation prerequisites. None authorizes or records implementation.
+
+- [HYPOTHESIS] Proposed route **moderate**: (a) Edit the window/glass materials in game data before launch (EML Lua 'patch' mod, ShroudForge game-files, or our own clean-room KFC4 writer). Change the RenderMaterialResource flags and PbrRfxRenderMaterial values, or swap the albedo/material_map/opacity textures, for env_coldheights_window_01_translucent, ancients_props_windows_01_a and env_desert_furniture_glass_01.
+  - Receipt: Supplied glass spike, Routes; proposal, not a tested result.
+- [HYPOTHESIS] (a) — cost: Low to medium for a 'less frosted' or 'open pane' result: remove Translucent/FoliageTranslucency, lighten the textures, or set AlphaTested+SampleOpacity with an empty opacity map so the pane disappears. Real see-through glass is NOT reachable this way: no Pbr data path has alpha blending, and the loader ties the effect to the data signature.
+  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] (a) — risks: Steam verify or updates overwrite the patched files. Patch tools rewrite 1 GB-class files. kfc-parser is GPL-3.0 and our repo is MIT, so its code cannot be reused; we can only point users to EML. EML's dinput8 proxy clashes with our ASI Loader dinput8.dll (dbghelp variant needed, HYPOTHESIS). Some panes share a material with banners and fences (ancients_props_windows_01_a), so an edit changes those props too.
+  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] (a) — next: 1) Decide whether 'clear' may mean 'no pane' or 'lighter pane', since true transparency is not available. 2) Prototype on one material (env_coldheights_window_01_translucent, GUID 441116632b6bcc41843bcac29e725f7c) with EML in a throwaway copy of the game folder. 3) Look in-game; this needs the author and the game, outside this repo's scope (AGENTS.md: in-game work is elsewhere).
+  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] Proposed route **moderate**: (b) Patch the material at load time from our .asi. Hook the material loader (FUN_1400cddd0 / FUN_1400cfca0), match the material GUID in param_2, and edit the RenderMaterialResource bytes (flags at +1, PbrRfxRenderMaterial translucencyStrength @0xa0, flags @0xf0) before the state-2 copy and upload.
+  - Receipt: Supplied glass spike, Routes; proposal, not a tested result.
+- [HYPOTHESIS] (b) — cost: Medium. Needs a new signature around 0x1400cdf3a (C7 44 24 30 4B 89 E1 AE), a hook that stays small, a GUID table and tests. The visual ceiling is the same as route (a): tweaks only, no see-through glass.
+  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] (b) — risks: The addresses are new and not in docs/re-notes.md or src/sigs.rs; AGENTS.md rule 4 requires adding them with this evidence first. The hook runs in-process on the streaming/load path, so a bad write crashes the game. It is build-specific (unknown builds must turn it off). Editing after upload has no effect, because the data lives in a GPU buffer.
+  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] (b) — next: 1) Add FUN_1400cddd0/FUN_1400cfca0 and the signature bytes to docs/re-notes.md as a separate docs PR. 2) Confirm the in-memory layout of param_2 (+0x18 resource handle, +0x20 resource pointer) with a read-only probe build. 3) Only then propose a worksheet task. No code until the maintainer agrees.
+  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] Proposed route **blocked**: (c) Add a NEW clear-glass voxel building block (new voxel material + PbrBuildingMaterial layer + GI entry + BuildingMaterialParameters + ItemInfo + recipe + blueprint material-pool entry).
+  - Receipt: Supplied glass spike, Routes; proposal, not a tested result.
+- [HYPOTHESIS] (c) — cost: Very high. True transparency would need a new voxel render path, because the building-block GPU layer has no opacity/alpha and voxel chunks go through the GBuffer/PbrBuilding path. GI is opaque. An OPAQUE 'glass-look' block (glossy, tinted, emissive) is possible in principle: 85 of 128 GPU slots are used and ids are u8, so there is room. It would still need baked RenderDataBlock edits, a new building material layer, item, recipe and pool entries, and the location of the SolidVoxelMaterial definitions is unknown.
+  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] (c) — risks: Save files store voxel material GUIDs per world (materialGuids[256]); a removed or changed material could break saves. Multiplayer: every client and the server need the same data. No public tool (EML, ShroudForge) shows it has ever been done. Large binary blobs (RenderDataBlock patch points) must be rebuilt exactly.
+  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] (c) — next: Do not start. If the author still wants an opaque glass-look block: 1) find where SolidVoxelMaterial definitions live at runtime (open question); 2) dump one existing block end to end (for example Block_T4_Metal_Iron_CRAFTING) across ItemInfo, pool, BuildingMaterialParameters, the blending layer and GI; 3) write a cost estimate.
+  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] Proposed route **hard**: (d) Untested idea: a new prop window pane drawn through the engine's forward OIT transparent pipeline (renderer.gpc Transparent_Forward_Oit_Lit_Shaded), for example as a VFX mesh attached to a window prop template.
+  - Receipt: Supplied glass spike, Routes; proposal, not a tested result.
+- [HYPOTHESIS] (d) — cost: High. It needs a VFX resource or mesh with a transparent material in the VFX data format (VfxResource / VfxMeshResource / TransparentInstanceData), wired into a prop ECS template, plus a new item and recipe if it is to be placeable.
+  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] (d) — risks: Pure hypothesis: no shipped model uses this path for geometry. VFX meshes may not cast or receive the right lighting, and may be culled or depth-faded oddly. OIT cost on large panes. Needs a data writer (route a).
+  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] (d) — next: 1) Find one shipped VFX that renders a lit transparent mesh (search VfxResource for flags that select the Lit/Shaded OIT variants). 2) Dump its data with our-build layouts. 3) Judge whether a static pane is expressible. Report back before any build work.
+  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
+
+### Glass open questions
+
+- [HYPOTHESIS] Open at the spike: Where do the 85 building SolidVoxelMaterial definitions live at runtime? SolidVoxelMaterial is not a top-level resource type in the shipped KFC (148-type census). Is it baked into another resource, generated, or held in a VoxelMaterialResolvedList inside a larger resource?
+  - Receipt: Supplied glass spike, Open questions; unresolved unless separately stated.
+- [HYPOTHESIS] Open at the spike: Does the RenderEffectId Transparent (8) slot in the material loader (param_1 + 8*0x50 + 0x148) exist at runtime, and what dataTypeSignature does it expect? This is what decides whether a data-only transparent prop material is possible at all.
+  - Receipt: Supplied glass spike, Open questions; unresolved unless separately stated.
+- [HYPOTHESIS] Open at the spike: Which ECS template does the player-placeable Prop_Decoration_T4_Window_Iron_Frame use? The Prop_Buildings_Iron_Window_* templates checked here are world props; the placeable one is linked by debug name only.
+  - Receipt: Supplied glass spike, Open questions; unresolved unless separately stated.
+- [HYPOTHESIS] Open at the spike: Where is the English localisation stored (needed to confirm that 'Iron Window Frame' = Prop_Decoration_T4_Window_Iron_Frame)? It is not in the KFC resources; it may be in .dat content.
+  - Receipt: Supplied glass spike, Open questions; unresolved unless separately stated.
+- [HYPOTHESIS] Open at the spike: Does EML's dbghelp.dll proxy coexist with Ultimate ASI Loader's dinput8.dll in this install? Not tested (read-only spike).
+  - Receipt: Supplied glass spike, Open questions; unresolved unless separately stated.
+- [HYPOTHESIS] Open at the spike: What should 'clear' mean for the author: an empty frame (achievable), a lighter or less milky pane (achievable), or real see-through glass with reflections (not achievable without new rendering work)?
+  - Receipt: Supplied glass spike, Open questions; unresolved unless separately stated.
+
+### Glass evidence limits and discrepancies
+
+- [HYPOTHESIS] The supplied block fact reports 74 Block_T*/Block_Roof_* items, while its broader Block_* receipt reports 100 names. Both counts and scan scopes are retained; the spike does not reconcile them. The absence claim covers ItemInfo debug names, not English display names.
+  - Receipt: iteminfo_strings.txt and block_items.txt; supplied no-placeable-glass fact.
+- [HYPOTHESIS] The summary describes the frosted appearance and VFX/water role directly. The detailed facts label those interpretations HYPOTHESIS, with no in-game shader observation. The detailed labels govern their use here.
+  - Receipt: mats_glass_detail.txt, scan_window.txt, scan_gpc.txt and TransparentInstanceData reflection.
+- [HYPOTHESIS] The supplied 128-slot calculation is recorded as VERIFIED data, but reading it as fixed capacity is expressly an inference. The proposed opaque block's available-room argument does not prove that adding a material works.
+  - Receipt: BuildingMaterialBlendingResource and GiVoxelBuildingMaterialResource dumps, plus route (c).
