@@ -293,6 +293,9 @@ pub fn start() {
     // last step enables it.
     features::scatter_probe::init(&cfg);
 
+    // Terrain detail distance: create and queue its checked pre-hook before the enable batch.
+    knobs::terrain_distance::init(&cfg.knobs);
+
     // Later code hooks (Task 14's terrain hook) are created and queued above this line, so they
     // join the one batch below.
 

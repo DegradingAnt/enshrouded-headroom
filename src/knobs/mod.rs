@@ -15,6 +15,7 @@
 
 pub mod object_distance;
 pub mod scatter_distance;
+pub mod terrain_distance;
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
