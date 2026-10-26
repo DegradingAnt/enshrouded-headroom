@@ -282,6 +282,9 @@ pub fn start() {
     // here: `InitializeASI` runs before `WinMain`.
     knobs::scatter_distance::init(&cfg.knobs);
 
+    // Terrain detail distance: create and queue its checked pre-hook before the enable batch.
+    knobs::terrain_distance::init(&cfg.knobs);
+
     // Later code hooks (Task 14's terrain hook) are created and queued above this line, so they
     // join the one batch below.
 
