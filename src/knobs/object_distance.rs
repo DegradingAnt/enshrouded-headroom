@@ -173,9 +173,12 @@ unsafe fn publish_checked(scene: *const u8, now: u64) -> bool {
 ///
 /// # Safety
 ///
-/// `scene` is null, or points to a scene-settings struct, at least `0x344` bytes, that the
+/// `scene` is null, or points to a scene-settings struct, at least `0x420` bytes, that the
 /// original has just written and that no other thread accesses meanwhile.
 unsafe fn post_work(scene: *mut u8, apply: bool, factor: f32, now: u64) {
+    // SAFETY: the original just wrote the caller-owned complete scene; this work runs inside
+    // the inner guard, before distance publication or writes.
+    unsafe { crate::features::hdr_peak::post_scene(scene) };
     #[cfg(test)]
     if PANIC_IN_POST.load(Ordering::Relaxed) {
         panic!("PANIC_IN_POST is set");
@@ -233,7 +236,7 @@ unsafe fn call_original(trampoline: usize, scene: *mut u8, settings: *const u8, 
 ///
 /// # Safety
 ///
-/// The game's contract for the function: `scene` points to the scene-settings struct it writes,
+/// The game's contract: `scene` points to the caller-owned scene, at least `0x420` bytes,
 /// and `settings` and `extra` are what it reads.
 pub unsafe extern "system" fn scene_settings_detour(
     scene: *mut u8,
@@ -400,7 +403,7 @@ mod tests {
 
     #[test]
     fn scales_both_fields_and_clamps() {
-        let mut s = vec![0u8; 0x400];
+        let mut s = vec![0u8; 0x424];
         put_f32(&mut s, 0x33c, 1.0);
         put_f32(&mut s, 0x340, 1.0);
         unsafe { apply_to_scene(s.as_mut_ptr(), 0.72) };
@@ -415,7 +418,7 @@ mod tests {
         // The clamp stops at 1.0, so the hook can only lower the multipliers: never below the
         // menu. A NaN factor (a bad value from anywhere) must not reach the game.
         for factor in [1.0, 1.5, f32::INFINITY, f32::NAN] {
-            let mut s = vec![0u8; 0x400];
+            let mut s = vec![0u8; 0x424];
             put_f32(&mut s, 0x33c, 3.0);
             put_f32(&mut s, 0x340, 1.5);
             unsafe { apply_to_scene(s.as_mut_ptr(), factor) };
@@ -430,7 +433,7 @@ mod tests {
     #[test]
     fn every_object_step_survives_the_clamp() {
         for step in OBJECT_STEPS {
-            let mut s = vec![0u8; 0x400];
+            let mut s = vec![0u8; 0x424];
             put_f32(&mut s, 0x33c, 1.0);
             put_f32(&mut s, 0x340, 1.0);
             unsafe { apply_to_scene(s.as_mut_ptr(), step) };
@@ -444,7 +447,7 @@ mod tests {
 
     #[test]
     fn apply_writes_only_the_two_fields() {
-        let mut s: Vec<u8> = (0..0x400).map(|i| (i % 251) as u8).collect();
+        let mut s: Vec<u8> = (0..0x424).map(|i| (i % 251) as u8).collect();
         put_f32(&mut s, 0x33c, 2.0);
         put_f32(&mut s, 0x340, 1.0);
         let before = s.clone();
@@ -476,7 +479,7 @@ mod tests {
     #[test]
     fn publishes_scatter_level() {
         let _g = globals();
-        let mut s = vec![0u8; 0x400];
+        let mut s = vec![0u8; 0x424];
         put_u32(&mut s, 0x290, 3);
         unsafe { publish_from_scene(s.as_ptr(), 9) };
         assert_eq!(SCATTER_LEVEL.load(Relaxed), 3);
@@ -485,7 +488,7 @@ mod tests {
     #[test]
     fn publish_from_scene_publishes_the_baseline_and_the_time_and_reads_only() {
         let _g = globals();
-        let mut s = vec![0u8; 0x400];
+        let mut s = vec![0u8; 0x424];
         put_f32(&mut s, 0x33c, 3.0);
         put_u32(&mut s, 0x290, 1);
         let before = s.clone();
@@ -499,7 +502,7 @@ mod tests {
     #[test]
     fn hook_publishes_even_when_object_knob_off() {
         let _g = globals();
-        let mut s = vec![0u8; 0x400];
+        let mut s = vec![0u8; 0x424];
         put_f32(&mut s, 0x33c, 2.0);
         put_f32(&mut s, 0x340, 1.0);
         put_u32(&mut s, 0x290, 2);
@@ -518,7 +521,7 @@ mod tests {
     #[test]
     fn post_work_publishes_the_game_value_then_scales() {
         let _g = globals();
-        let mut s = vec![0u8; 0x400];
+        let mut s = vec![0u8; 0x424];
         put_f32(&mut s, 0x33c, 2.0);
         put_f32(&mut s, 0x340, 1.0);
         put_u32(&mut s, 0x290, 3);
@@ -544,7 +547,7 @@ mod tests {
     /// A scene as the game function may leave it: `main` at +0x33c, 1.0 at +0x340, `level` at
     /// +0x290.
     fn scene_with(main: f32, level: u32) -> Vec<u8> {
-        let mut s = vec![0u8; 0x400];
+        let mut s = vec![0u8; 0x424];
         put_f32(&mut s, 0x33c, main);
         put_f32(&mut s, 0x340, 1.0);
         put_u32(&mut s, 0x290, level);
@@ -762,7 +765,7 @@ mod tests {
     /// Call the fake through its address, as the game's caller does.
     fn call_fake(scene: &mut [u8], settings: &[u8], extra: &[u32; 3]) {
         let f: SceneSettingsFn = std::hint::black_box(fake_scene_settings);
-        // SAFETY: `scene` has room for every field the fake (or the hook) writes, below 0x400;
+        // SAFETY: `scene` has room for every field the fake (or the hook) writes, below 0x424;
         // `settings` is readable at +0x3c and `extra` at [0].
         unsafe { f(scene.as_mut_ptr(), settings.as_ptr(), extra.as_ptr()) };
     }
@@ -823,6 +826,113 @@ mod tests {
     }
 
     #[test]
+    fn hdr_peak_readback_uncertainty_disables_runtime_without_touching_scene() {
+        in_child(
+            "hdr_peak_readback_uncertainty_disables_runtime_without_touching_scene",
+            || {
+                crate::features::hdr::test_fail_readback_after_write();
+                assert_eq!(crate::features::hdr::effective_paper_white_nits(), 250.0);
+                assert!(!crate::features::hdr::paper_white_is_verified());
+                let line = crate::features::hdr_peak::test_configure(true, Some(800));
+                assert_eq!(
+                    line,
+                    "hdr peak: off: paper-white patch read-back failed; effective value is unknown"
+                );
+                assert!(!crate::features::hdr_peak::enabled());
+                let mut scene = vec![0xa5u8; 0x424];
+                scene[0x408] = 1;
+                scene[0x41e..0x420].copy_from_slice(&600u16.to_le_bytes());
+                let expected = scene.clone();
+                // SAFETY: the fresh child exclusively owns the complete readable/writable scene.
+                unsafe { crate::features::hdr_peak::post_scene(scene.as_mut_ptr()) };
+                assert_eq!(scene, expected);
+            },
+        );
+    }
+
+    #[test]
+    fn hdr_peak_runtime_bridge_uses_checked_eighty_nits_and_fresh_game_peak() {
+        in_child(
+            "hdr_peak_runtime_bridge_uses_checked_eighty_nits_and_fresh_game_peak",
+            || {
+                crate::features::hdr::test_publish_checked_eighty();
+                assert_eq!(crate::features::hdr::effective_paper_white_nits(), 80.0);
+                crate::features::hdr_peak::test_configure(true, None);
+                let target = fake_scene_settings as *const () as usize;
+                APPLY_FACTOR.store(false, Relaxed);
+                // SAFETY: target is our owned executable stand-in with the detour's type.
+                unsafe { hook_at(target) }.unwrap();
+                assert_eq!(apply_queued(), Ok(1));
+                for (colour, game_peak, want) in
+                    [(1, 800u16, 800u16), (2, 1200, 1200), (0, 110, 110)]
+                {
+                    let mut scene = vec![0xa5u8; 0x424];
+                    scene[0x408] = colour;
+                    scene[0x41e..0x420].copy_from_slice(&game_peak.to_le_bytes());
+                    let mut expected = scene.clone();
+                    put_u32(&mut expected, 0x308, 7);
+                    put_f32(&mut expected, 0x33c, 2.0);
+                    put_f32(&mut expected, 0x340, 1.0);
+                    put_u32(&mut expected, 0x290, 3);
+                    expected[0x41e..0x420].copy_from_slice(&want.to_le_bytes());
+                    call_fake(&mut scene, &settings_with_level(3), &[7, 0, 0]);
+                    assert_eq!(scene, expected, "colour={colour}, fresh peak={game_peak}");
+                }
+                assert_eq!(FAKE_CALLS.load(Relaxed), 3);
+                // Override uses the same effective getter even if the game's target differs.
+                crate::features::hdr_peak::test_configure(true, Some(800));
+                let mut scene = vec![0u8; 0x424];
+                scene[0x408] = 1;
+                scene[0x41e..0x420].copy_from_slice(&600u16.to_le_bytes());
+                call_fake(&mut scene, &settings_with_level(3), &[7, 0, 0]);
+                assert_eq!(&scene[0x41e..0x420], &800u16.to_le_bytes());
+                assert_eq!(FAKE_CALLS.load(Relaxed), 4);
+                // SAFETY: the test owns this installed hook and no thread runs it now.
+                unsafe { MinHook::remove_hook(target as *mut c_void) }.unwrap();
+            },
+        );
+    }
+
+    #[test]
+    fn hdr_peak_panic_leaves_the_complete_original_scene_and_runs_original_once() {
+        in_child(
+            "hdr_peak_panic_leaves_the_complete_original_scene_and_runs_original_once",
+            || {
+                assert!(!is_disabled(Feature::ObjectDistance));
+                crate::features::hdr_peak::test_configure(true, Some(800));
+                let mut scene = vec![0xa5u8; 0x424];
+                scene[0x408] = 1;
+                scene[0x41e..0x420].copy_from_slice(&600u16.to_le_bytes());
+                let mut expected = scene.clone();
+                // Capture all the fake original's writes before installing its hook.
+                call_fake(&mut expected, &settings_with_level(3), &[7, 0, 0]);
+                FAKE_CALLS.store(0, Relaxed);
+                let target = fake_scene_settings as *const () as usize;
+                APPLY_FACTOR.store(true, Relaxed);
+                OBJECT.set(0.5);
+                // SAFETY: target is our owned executable stand-in with the detour's type.
+                unsafe { hook_at(target) }.unwrap();
+                assert_eq!(apply_queued(), Ok(1));
+                crate::features::hdr_peak::test_panic(true);
+                call_fake(&mut scene, &settings_with_level(3), &[7, 0, 0]);
+                assert_eq!(FAKE_CALLS.load(Relaxed), 1);
+                assert_eq!(
+                    scene, expected,
+                    "no peak or distance write escaped the panic"
+                );
+                assert!(is_disabled(Feature::ObjectDistance));
+                assert_eq!(OBJECT.last_seen(), 0);
+                crate::features::hdr_peak::test_panic(false);
+                call_fake(&mut scene, &settings_with_level(3), &[7, 0, 0]);
+                assert_eq!(FAKE_CALLS.load(Relaxed), 2);
+                assert_eq!(scene, expected);
+                // SAFETY: the test owns this installed hook and no thread runs it now.
+                unsafe { MinHook::remove_hook(target as *mut c_void) }.unwrap();
+            },
+        );
+    }
+
+    #[test]
     fn real_hook_runs_the_original_once_then_publishes_and_scales() {
         in_child(
             "real_hook_runs_the_original_once_then_publishes_and_scales",
@@ -833,7 +943,7 @@ mod tests {
                 let extra = [7u32, 0, 0];
 
                 // Unhooked, the fake writes the game-like values.
-                let mut scene = vec![0u8; 0x400];
+                let mut scene = vec![0u8; 0x424];
                 call_fake(&mut scene, &settings, &extra);
                 assert_eq!(FAKE_CALLS.load(Relaxed), 1);
                 assert_eq!((get_f32(&scene, 0x33c), get_f32(&scene, 0x340)), (2.0, 1.0));
@@ -849,7 +959,7 @@ mod tests {
                 assert_eq!(apply_queued(), Ok(1));
 
                 let before = qpc_now();
-                let mut scene = vec![0u8; 0x400];
+                let mut scene = vec![0u8; 0x424];
                 call_fake(&mut scene, &settings, &extra);
                 let after = qpc_now();
                 assert_eq!(FAKE_CALLS.load(Relaxed), 2, "the original ran exactly once");
@@ -868,7 +978,7 @@ mod tests {
                 // SAFETY: the hook at `target` was created above and nothing runs it now.
                 unsafe { MinHook::remove_hook(target as *mut c_void) }.unwrap();
                 let seen = OBJECT.last_seen();
-                let mut scene = vec![0u8; 0x400];
+                let mut scene = vec![0u8; 0x424];
                 call_fake(&mut scene, &settings, &extra);
                 assert_eq!(FAKE_CALLS.load(Relaxed), 3);
                 assert_eq!(get_f32(&scene, 0x33c), 2.0, "unscaled");
@@ -919,7 +1029,7 @@ mod tests {
                 // SAFETY: as in the real-hook test.
                 unsafe { hook_at(target) }.unwrap();
                 assert_eq!(apply_queued(), Ok(1));
-                let mut scene = vec![0u8; 0x400];
+                let mut scene = vec![0u8; 0x424];
                 call_fake(&mut scene, &settings_with_level(3), &[1, 0, 0]);
                 assert_eq!(FAKE_CALLS.load(Relaxed), 1);
                 assert_eq!(get_f32(&scene, 0x33c), 2.0, "unscaled");
@@ -945,7 +1055,7 @@ mod tests {
 
                 // The feature is on, so the real detour runs its post-work, which panics.
                 PANIC_IN_POST.store(true, Relaxed);
-                let mut scene = vec![0u8; 0x400];
+                let mut scene = vec![0u8; 0x424];
                 call_fake(&mut scene, &settings_with_level(3), &[1, 0, 0]);
                 assert_eq!(FAKE_CALLS.load(Relaxed), 1, "the original ran exactly once");
                 assert!(
