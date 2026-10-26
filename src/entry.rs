@@ -396,6 +396,30 @@ mod tests {
     }
 
     #[test]
+    fn unwritable_folder_gives_defaults_and_a_warning() {
+        with_scratch("cfg-unwritable", |base| {
+            let dir = unusable_dir(base, "settings");
+            let (cfg, warnings, file) = load_settings(&[dir]);
+            assert_eq!(cfg, Config::default());
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert_eq!(file, None);
+        });
+    }
+
+    #[test]
+    fn unreadable_settings_path_gives_defaults_and_a_warning_and_is_not_replaced() {
+        with_scratch("cfg-unreadable", |base| {
+            let path = base.join(INI_FILE_NAME);
+            std::fs::create_dir(&path).unwrap(); // a folder where the file should be
+            let (cfg, warnings, file) = load_settings(&[base.to_path_buf()]);
+            assert_eq!(cfg, Config::default());
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert_eq!(file, None);
+            assert!(path.is_dir());
+        });
+    }
+
+    #[test]
     fn an_unusable_module_folder_gets_its_ini_in_the_fallback() {
         with_scratch("module-unusable-create", |base| {
             let module = unusable_dir(base, "module");
@@ -453,11 +477,15 @@ mod tests {
             let ini = write_ini(&fallback, 120);
             let (cfg, warnings, file) = load_settings(&[module.clone(), fallback]);
             assert_eq!(cfg.governor.target_fps, 120);
-            assert_eq!(file, Some(ini));
+            assert_eq!(file, Some(ini.clone()));
             assert!(warnings.is_empty(), "{warnings:?}");
             assert!(
                 !module.join(INI_FILE_NAME).exists(),
                 "the module folder must stay empty"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&ini).unwrap(),
+                "[Governor]\nTargetFps=120\n"
             );
         });
     }

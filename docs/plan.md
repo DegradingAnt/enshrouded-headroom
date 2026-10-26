@@ -153,10 +153,13 @@ C:\Modding\Enshrouded\
   - `pub enum AsyncCompute { On, Game }`
   - `pub enum ReflexMode { Game, Off, On, Boost }`
   - `pub fn parse(text: &str) -> (Config, Vec<String>)`. The `Vec` holds warnings.
-  - `pub fn load_or_create(dir: &Path) -> (Config, Vec<String>)`. It writes the default file if the file is missing.
+  - `pub fn read_ini(dir: &Path) -> io::Result<Option<(Config, Vec<String>)>>`. It reads an existing file; `Ok(None)` means it is missing.
+  - `pub fn write_default(dir: &Path) -> io::Result<()>`. It creates the default file, or returns `AlreadyExists` if the file exists.
   - `pub const DEFAULT_INI: &str = include_str!("../enshrouded-headroom.default.ini")`
   - `impl Default for Config`, which equals `parse(DEFAULT_INI).0`.
 - Field names are the snake_case of the `.ini` keys in spec section 8 (`target_fps: u32`, `raise_below: f64`, `max_object_distance: u8`, …).
+
+Start-up replaced `load_or_create` with `read_ini` and `write_default` through `entry::load_settings`. The loader tries the settings folders in order.
 
 **Clamp ranges**
 
@@ -204,7 +207,10 @@ C:\Modding\Enshrouded\
 }
 #[test] fn missing_file_writes_default() {
     let d = tempdir_in_target("cfg_missing");
-    let (_, w) = load_or_create(&d);
+    assert_eq!(read_ini(&d).unwrap(), None);
+    write_default(&d).unwrap();
+    let (c, w) = read_ini(&d).unwrap().unwrap();
+    assert_eq!(c, Config::default());
     assert!(w.is_empty());
     assert_eq!(std::fs::read_to_string(d.join("enshrouded-headroom.ini")).unwrap(), DEFAULT_INI);
 }
