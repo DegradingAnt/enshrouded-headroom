@@ -130,17 +130,37 @@ pub struct KnobsCfg {
     pub terrain_ring_scale: f64,
 }
 
+/// `[Hdr] PaperWhiteNits`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PaperWhiteNits {
+    /// Keep the game's hard-coded 250-nit value.
+    Game,
+    /// Replace it with a finite value from 40 through 400 nits.
+    Nits(f32),
+}
+
+/// The `[Hdr]` section.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HdrCfg {
+    /// The composite pass's paper-white scale.
+    pub paper_white_nits: PaperWhiteNits,
+}
+
 /// All settings.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Config {
     pub general: General,
     pub governor: GovernorCfg,
     pub knobs: KnobsCfg,
+    pub hdr: HdrCfg,
 }
 
 /// The default settings. `parse` falls back to these values, and `DEFAULT_INI` repeats them (a test
 /// checks that the two agree).
 const BUILTIN: Config = Config {
+    hdr: HdrCfg {
+        paper_white_nits: PaperWhiteNits::Game,
+    },
     general: General {
         enabled: true,
         texture_budget: TextureBudget::Auto,
@@ -184,7 +204,7 @@ impl Default for Config {
 
 /// The sections this version knows, spelled as the spec spells them. A section that is not here is
 /// unknown. Task 15 adds `Debug`.
-const SECTIONS: [&str; 3] = ["General", "Governor", "Knobs"];
+const SECTIONS: [&str; 4] = ["General", "Governor", "Knobs", "Hdr"];
 
 /// Parse the text of a settings file. The `Vec` holds one warning per problem found.
 pub fn parse(text: &str) -> (Config, Vec<String>) {
@@ -335,12 +355,16 @@ pub fn parse(text: &str) -> (Config, Vec<String>) {
         terrain_ring_scale: r.float("Knobs", "TerrainRingScale", k.terrain_ring_scale, 1.0, 1.6),
     };
 
+    let hdr = HdrCfg {
+        paper_white_nits: r.paper_white_nits(),
+    };
     r.report_unknown();
     (
         Config {
             general,
             governor,
             knobs,
+            hdr,
         },
         r.warnings,
     )
@@ -574,6 +598,27 @@ impl Reader {
         }
     }
 
+    /// `game` or a finite number from 40 through 400 nits; invalid values use `game`.
+    fn paper_white_nits(&mut self) -> PaperWhiteNits {
+        let Some(text) = self.raw("Hdr", "PaperWhiteNits") else {
+            return PaperWhiteNits::Game;
+        };
+        if text.eq_ignore_ascii_case("game") {
+            return PaperWhiteNits::Game;
+        }
+        if let Some(nits) = parse_number(&text).filter(|nits| (40.0..=400.0).contains(nits)) {
+            return PaperWhiteNits::Nits(nits as f32);
+        }
+        self.not_valid(
+            "Hdr",
+            "PaperWhiteNits",
+            &text,
+            "game or a finite number in 40..=400",
+            "game",
+        );
+        PaperWhiteNits::Game
+    }
+
     /// Warn about each section and key that no getter asked for.
     fn report_unknown(&mut self) {
         let mut unknown = Vec::new();
@@ -719,6 +764,33 @@ mod tests {
             let (cfg, warnings) = one("GENERAL", "PRIORITY", value);
             assert_eq!(cfg.general.priority, expected, "{value}");
             assert!(warnings.is_empty(), "{warnings:?}");
+        }
+    }
+
+    #[test]
+    fn hdr_paper_white_accepts_game_and_finite_nits_only() {
+        for text in [
+            "",
+            "[Hdr]\nPaperWhiteNits=game",
+            "[HDR]\nPAPERWHITENITS=GaMe",
+        ] {
+            let (cfg, warnings) = parse(text);
+            assert_eq!(cfg.hdr.paper_white_nits, PaperWhiteNits::Game);
+            assert!(warnings.is_empty(), "{warnings:?}");
+        }
+        for (text, want) in [("40", 40.0), ("80", 80.0), ("200,5", 200.5), ("400", 400.0)] {
+            let (cfg, warnings) = parse(&format!("[Hdr]\nPaperWhiteNits={text}"));
+            assert_eq!(cfg.hdr.paper_white_nits, PaperWhiteNits::Nits(want));
+            assert!(warnings.is_empty(), "{warnings:?}");
+        }
+        for text in [
+            "39.99", "400.01", "0", "-1", "NaN", "inf", "-inf", "1e300", "", "banana",
+        ] {
+            let (cfg, warnings) = parse(&format!("[Hdr]\nPaperWhiteNits={text}"));
+            assert_eq!(cfg.hdr.paper_white_nits, PaperWhiteNits::Game, "{text}");
+            assert_eq!(warnings.len(), 1, "{text}: {warnings:?}");
+            assert!(warnings[0].contains("[Hdr] PaperWhiteNits"));
+            assert!(warnings[0].contains("using the default game"));
         }
     }
 
