@@ -116,8 +116,8 @@ fn gib_to_bytes(gib: f64) -> Option<u64> {
 /// Why the table could not be used.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TbError {
-    /// The table is not in `.rdata` (a different build, or not Enshrouded), or `.rdata` could not
-    /// be read.
+    /// The table is not in `.rdata` (a different build, or not Enshrouded), or `.rdata` or the
+    /// table could not be read. The underlying error is in the debug log.
     NotFound,
     /// The table is in `.rdata` this many times. Which one the game reads is not known.
     Multiple(usize),
@@ -127,17 +127,22 @@ pub enum TbError {
 }
 
 impl fmt::Display for TbError {
+    /// The texts hold no parentheses, so that `texture budget: off: <text>` has no nested ones.
+    /// The words "changed by another tool" are the spec's (design.md); Task 17 looks for them in
+    /// the log.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TbError::NotFound => f.write_str("the texture budget table was not found in .rdata"),
+            TbError::NotFound => f.write_str(
+                "the texture budget table was not found in .rdata (or .rdata could not be read)",
+            ),
             TbError::Multiple(n) => write!(
                 f,
                 "{n} copies of the texture budget table in .rdata, expected exactly one"
             ),
             TbError::ChangedByOtherTool => write!(
                 f,
-                "the table's top value is not the original {} GiB: another tool (the old \
-                 launcher, or another plugin) has already changed it",
+                "the top value is not the original {} GiB: changed by another tool, such as the \
+                 old launcher or another plugin",
                 ORIGINAL_TOP / GIB
             ),
         }
@@ -146,10 +151,16 @@ impl fmt::Display for TbError {
 
 impl std::error::Error for TbError {}
 
+/// Fold a scan failure into a [`TbError`]. A failure that carries more than `NotFound` can say
+/// (no match, an unreadable section, a pattern that does not parse) is noted at debug level
+/// first, so the detail is not lost.
 fn from_scan(error: ScanError) -> TbError {
     match error {
         ScanError::Multiple(n) => TbError::Multiple(n),
-        ScanError::NotFound | ScanError::BadPattern(_) => TbError::NotFound,
+        ScanError::NotFound | ScanError::BadPattern(_) => {
+            log::debug!("texture budget: scan failed: {error}");
+            TbError::NotFound
+        }
     }
 }
 
@@ -222,7 +233,10 @@ pub fn prepare(m: &Module) -> Result<Prepared, TbError> {
     // SAFETY: start-up only (see above), so nothing else changes or unmaps the memory between
     // the check inside `read_checked` and the read. The scan has just matched 80 bytes at `at`
     // inside `.rdata`.
-    let table = unsafe { read_checked(at, TABLE_LEN) }.map_err(|_| TbError::NotFound)?;
+    let table = unsafe { read_checked(at, TABLE_LEN) }.map_err(|error| {
+        log::debug!("texture budget: cannot read the table at {at:#x}: {error}");
+        TbError::NotFound
+    })?;
     check_top(&table)?;
     let top_value_addr = at.checked_add(PREFIX_LEN).ok_or(TbError::NotFound)?;
     Ok(Prepared { top_value_addr })
@@ -235,9 +249,13 @@ pub fn prepare(m: &Module) -> Result<Prepared, TbError> {
 /// runs while the game's threads run, and says so. The game reads the value about 4.6 s later
 /// (see the module docs), so no thread is using it now.
 ///
-/// `write_checked` writes only if memory still holds the original 2 GiB. So a second call, or a
-/// value changed by another tool since [`prepare`], gives [`PatchError::Mismatch`] and changes
-/// nothing; [`outcome`] words that for the log.
+/// `bytes` equal to the original 2 GiB (an explicit `TextureBudget = 2`, say) is `Ok` without any
+/// access to the table: there is nothing to change, so the page is not made writable for a moment
+/// to write the value that is already there. [`outcome`] says "unchanged" for that.
+///
+/// Otherwise `write_checked` writes only if memory still holds the original 2 GiB. So a second
+/// call, or a value changed by another tool since [`prepare`], gives [`PatchError::Mismatch`] and
+/// changes nothing; [`outcome`] words that for the log.
 ///
 /// # Safety
 ///
@@ -245,6 +263,9 @@ pub fn prepare(m: &Module) -> Result<Prepared, TbError> {
 /// nowhere else), and the caller must run before the game reads the table, as the module docs
 /// describe. Then the 8 bytes are data that no thread is using.
 pub unsafe fn apply(p: &Prepared, bytes: u64) -> Result<(), PatchError> {
+    if bytes == ORIGINAL_TOP {
+        return Ok(());
+    }
     // SAFETY: `p.top_value_addr` is the top value of the table that `prepare` matched in the
     // game's `.rdata`. It is data, not code, and by the contract above nothing reads it yet.
     // `expected` and `new` are temporaries on this stack frame, not the target.
@@ -265,25 +286,48 @@ fn gib_text(bytes: u64) -> String {
 
 /// The log level and line for the result of [`apply`], with the numbers behind it.
 ///
-/// Success is `texture budget: 2.0 GiB -> 4.6 GiB (device-local 15.6 GiB, reserve 11 GiB)`. A
-/// `Mismatch` is information, not a failure: it is what a second call finds (the value is
-/// already changed), and the line says what the table holds now. Any other error is a warning.
+/// `mode`, `device_local` and `reserve_gib` are what `budget_bytes` was asked; `bytes` is what it
+/// answered and `apply` was given.
+///
+/// - Success is `texture budget: 2.0 GiB -> 4.6 GiB (device-local 15.6 GiB, reserve 11 GiB)`. The
+///   reserve is named only for `Auto`, where it plays a part; an explicit size leaves it out.
+/// - `bytes` equal to the original 2 GiB is `texture budget: unchanged (the budget is already 2
+///   GiB)`, since `apply` wrote nothing.
+/// - A `Mismatch` is information, not a failure: it is what a second call finds (the value is
+///   already changed), and the line says what the table holds now.
+/// - `ReadBack` is a warning that says the bytes were written, since they were.
+/// - Any other error is a warning that nothing was applied.
 pub fn outcome(
     result: &Result<(), PatchError>,
     bytes: u64,
     device_local: u64,
     reserve_gib: f64,
+    mode: &TextureBudget,
 ) -> (Level, String) {
     match result {
-        Ok(()) => (
+        Ok(()) if bytes == ORIGINAL_TOP => (
             Level::Info,
             format!(
-                "texture budget: {} -> {} (device-local {}, reserve {reserve_gib} GiB)",
-                gib_text(ORIGINAL_TOP),
-                gib_text(bytes),
-                gib_text(device_local)
+                "texture budget: unchanged (the budget is already {} GiB)",
+                ORIGINAL_TOP / GIB
             ),
         ),
+        Ok(()) => {
+            let reserve = if matches!(mode, TextureBudget::Auto) {
+                format!(", reserve {reserve_gib} GiB")
+            } else {
+                String::new()
+            };
+            (
+                Level::Info,
+                format!(
+                    "texture budget: {} -> {} (device-local {}{reserve})",
+                    gib_text(ORIGINAL_TOP),
+                    gib_text(bytes),
+                    gib_text(device_local)
+                ),
+            )
+        }
         Err(PatchError::Mismatch { found, .. }) => {
             let now = <[u8; 8]>::try_from(found.as_slice())
                 .map(u64::from_le_bytes)
@@ -300,6 +344,13 @@ pub fn outcome(
                 ),
             )
         }
+        Err(PatchError::ReadBack) => (
+            Level::Warn,
+            format!(
+                "texture budget: {} written, but the read-back did not match",
+                gib_text(bytes)
+            ),
+        ),
         Err(error) => (
             Level::Warn,
             format!("texture budget: not applied ({error})"),
@@ -332,7 +383,7 @@ fn start_up(
     if matches!(mode, TextureBudget::Off) {
         return (
             Level::Info,
-            "texture budget: off (TextureBudget = off in the settings file)".to_owned(),
+            "texture budget: off: TextureBudget = off in the settings file".to_owned(),
         );
     }
     match search() {
@@ -349,7 +400,7 @@ fn start_up(
                 ),
             )
         }
-        Err(error) => (Level::Warn, format!("texture budget: off ({error})")),
+        Err(error) => (Level::Warn, format!("texture budget: off: {error}")),
     }
 }
 
@@ -440,6 +491,26 @@ mod tests {
         // A card smaller than the reserve.
         assert_eq!(budget_bytes(4 * GIB, 11.0, false, &auto), None);
         assert_eq!(budget_bytes(0, 11.0, false, &auto), None);
+    }
+
+    #[test]
+    fn cards_of_8_and_10_gb_are_unchanged_with_the_default_reserve() {
+        // Device-local heaps in MiB: about 7.6 GiB and 9.6 GiB (a card's usable share of its
+        // memory), and the full 8 GiB and 10 GiB. All are under the 13 GiB that the default
+        // 11 GiB reserve plus the game's own 2 GiB need.
+        let mib = |n: u64| n * 1024 * 1024;
+        for (card, heap) in [
+            ("8 GB, usable", mib(7_782)),
+            ("8 GB, full", mib(8 * 1024)),
+            ("10 GB, usable", mib(9_830)),
+            ("10 GB, full", mib(10 * 1024)),
+        ] {
+            assert_eq!(
+                budget_bytes(heap, 11.0, false, &TextureBudget::Auto),
+                None,
+                "{card}"
+            );
+        }
     }
 
     #[test]
@@ -720,6 +791,31 @@ mod tests {
     }
 
     #[test]
+    fn applying_the_original_size_does_not_touch_the_page() {
+        // An address that is not mapped: a `write_checked` call would give `NotMapped`. So `Ok`
+        // means there was no call.
+        let nowhere = Prepared { top_value_addr: 0 };
+        // SAFETY: `apply` of the original size makes no memory access at all.
+        assert_eq!(unsafe { apply(&nowhere, ORIGINAL_TOP) }, Ok(()));
+        // SAFETY: as above, to show that a write of any other size does reach `write_checked`.
+        let other = unsafe { apply(&nowhere, 5 * GIB) };
+        assert_eq!(other, Err(PatchError::NotMapped));
+
+        // In an image: the bytes stay as they were, and a later real change still works.
+        let mem = image();
+        mem.put(RDATA_RVA, &table_bytes());
+        mem.protect(RDATA_RVA, 0x1000, PAGE_READONLY);
+        let p = prepare(&module(&mem)).unwrap();
+        // SAFETY: `p` points into `mem`, which this test owns and nothing else uses.
+        assert_eq!(unsafe { apply(&p, ORIGINAL_TOP) }, Ok(()));
+        assert_eq!(mem.get(RDATA_RVA, 80), table_bytes());
+        assert_eq!(protect_of(mem.base + RDATA_RVA), PAGE_READONLY);
+        // SAFETY: as above.
+        assert_eq!(unsafe { apply(&p, 5 * GIB) }, Ok(()));
+        assert_eq!(mem.get(RDATA_RVA + 72, 8), (5 * GIB).to_le_bytes());
+    }
+
+    #[test]
     fn a_second_apply_finds_the_new_value_and_changes_nothing() {
         let mem = image();
         mem.put(RDATA_RVA, &table_bytes());
@@ -759,7 +855,13 @@ mod tests {
 
     #[test]
     fn the_applied_line_names_the_real_numbers() {
-        let (level, line) = outcome(&Ok(()), 16_753_098_752 - 11 * GIB, 16_753_098_752, 11.0);
+        let (level, line) = outcome(
+            &Ok(()),
+            16_753_098_752 - 11 * GIB,
+            16_753_098_752,
+            11.0,
+            &TextureBudget::Auto,
+        );
         assert_eq!(level, Level::Info);
         assert_eq!(
             line,
@@ -768,12 +870,46 @@ mod tests {
     }
 
     #[test]
+    fn an_explicit_size_leaves_the_reserve_out_of_the_line() {
+        let (level, line) = outcome(
+            &Ok(()),
+            6 * GIB,
+            16_753_098_752,
+            11.0,
+            &TextureBudget::Gib(6.0),
+        );
+        assert_eq!(level, Level::Info);
+        assert_eq!(
+            line,
+            "texture budget: 2.0 GiB -> 6.0 GiB (device-local 15.6 GiB)"
+        );
+    }
+
+    #[test]
+    fn writing_the_original_size_is_logged_as_unchanged() {
+        for mode in [TextureBudget::Auto, TextureBudget::Gib(2.0)] {
+            let (level, line) = outcome(&Ok(()), ORIGINAL_TOP, 16 * GIB, 11.0, &mode);
+            assert_eq!(level, Level::Info, "{mode:?}");
+            assert_eq!(
+                line, "texture budget: unchanged (the budget is already 2 GiB)",
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
     fn a_second_apply_is_logged_as_information_not_as_a_failure() {
         let mismatch = PatchError::Mismatch {
             at: 0x1000,
             found: (5 * GIB).to_le_bytes().to_vec(),
         };
-        let (level, line) = outcome(&Err(mismatch), 7 * GIB, 16 * GIB, 11.0);
+        let (level, line) = outcome(
+            &Err(mismatch),
+            7 * GIB,
+            16 * GIB,
+            11.0,
+            &TextureBudget::Auto,
+        );
         assert_eq!(level, Level::Info);
         assert!(line.starts_with("texture budget: "), "{line}");
         assert!(line.contains("already"), "{line}");
@@ -784,14 +920,32 @@ mod tests {
     fn other_patch_errors_are_warnings() {
         for error in [
             PatchError::Protect(5),
-            PatchError::ReadBack,
             PatchError::NotMapped,
             PatchError::BadLength,
         ] {
-            let (level, line) = outcome(&Err(error), 5 * GIB, 16 * GIB, 11.0);
+            let (level, line) = outcome(&Err(error), 5 * GIB, 16 * GIB, 11.0, &TextureBudget::Auto);
             assert_eq!(level, Level::Warn, "{line}");
-            assert!(line.starts_with("texture budget: "), "{line}");
+            assert!(line.starts_with("texture budget: not applied ("), "{line}");
         }
+    }
+
+    #[test]
+    fn a_read_back_mismatch_says_the_bytes_were_written() {
+        let (level, line) = outcome(
+            &Err(PatchError::ReadBack),
+            5 * GIB,
+            16 * GIB,
+            11.0,
+            &TextureBudget::Auto,
+        );
+        assert_eq!(level, Level::Warn);
+        assert!(line.starts_with("texture budget: "), "{line}");
+        assert!(
+            line.contains("written, but the read-back did not match"),
+            "{line}"
+        );
+        assert!(line.contains("5.0 GiB"), "{line}");
+        assert!(!line.contains("not applied"), "{line}");
     }
 
     #[test]
@@ -827,18 +981,32 @@ mod tests {
 
     #[test]
     fn start_up_warns_when_it_cannot_use_the_table() {
-        for (error, word) in [
-            (TbError::NotFound, "not found"),
+        for (error, phrase) in [
+            (
+                TbError::NotFound,
+                "not found in .rdata (or .rdata could not be read)",
+            ),
             (TbError::Multiple(3), "3 copies"),
-            (TbError::ChangedByOtherTool, "another tool"),
+            // The spec's words (design.md); Task 17 looks for them in the log.
+            (TbError::ChangedByOtherTool, "changed by another tool"),
         ] {
             let cell = OnceLock::new();
             let (level, line) = start_up(&TextureBudget::Auto, || Err(error.clone()), &cell);
             assert_eq!(level, Level::Warn, "{error:?}");
-            assert!(line.starts_with("texture budget: off ("), "{line}");
-            assert!(line.contains(word), "{line} should contain {word:?}");
+            assert!(line.starts_with("texture budget: off: "), "{line}");
+            assert!(line.contains(phrase), "{line} should contain {phrase:?}");
+            // No parenthesis inside a parenthesis, and nothing but the reason after `off:`.
+            assert!(line.matches('(').count() <= 1, "{line}");
             assert!(cell.get().is_none(), "{error:?}");
         }
+    }
+
+    #[test]
+    fn the_changed_by_another_tool_text_names_the_launcher() {
+        let text = TbError::ChangedByOtherTool.to_string();
+        assert!(text.contains("changed by another tool"), "{text}");
+        assert!(text.contains("launcher"), "{text}");
+        assert!(!text.contains('('), "{text}");
     }
 
     // ---- the real game exe (ignored: reads C:\Games\Enshrouded\enshrouded.exe) ----------------------

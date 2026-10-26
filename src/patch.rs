@@ -28,7 +28,8 @@ use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
 use windows_sys::Win32::System::Memory::{
     VirtualAlloc, VirtualFree, VirtualProtect, VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT,
-    MEM_FREE, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, PAGE_READWRITE,
+    MEM_FREE, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+    PAGE_EXECUTE_WRITECOPY, PAGE_READWRITE,
 };
 use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -88,6 +89,9 @@ impl std::error::Error for PatchError {}
 struct Piece {
     addr: usize,
     len: usize,
+    /// The protection of the `VirtualQuery` region the piece lies in, as it was reported. It
+    /// decides what [`writable_protection`] asks for.
+    protect: u32,
 }
 
 /// What `VirtualQuery` said about the region that holds an address.
@@ -149,6 +153,7 @@ fn readable_pieces(addr: usize, len: usize) -> Option<Vec<Piece>> {
         pieces.push(Piece {
             addr: at,
             len: piece_end.saturating_sub(at),
+            protect: r.protect,
         });
         at = piece_end;
     }
@@ -200,10 +205,29 @@ fn set_protect(p: &Piece, protect: u32) -> Result<u32, u32> {
     }
 }
 
+/// The protection bits that mean "code may run from this page".
+const EXECUTABLE: u32 =
+    PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+
+/// The protection to ask for to make a page whose current protection is `current` writable:
+/// `PAGE_EXECUTE_READWRITE` if code may run from it already, otherwise `PAGE_READWRITE`.
+///
+/// A data patch (the `.rdata` texture table, say) must not turn a page that cannot execute into
+/// one that can, even for a moment: a policy that forbids dynamic code (ACG) refuses a page that is
+/// both writable and executable.
+fn writable_protection(current: u32) -> u32 {
+    if current & EXECUTABLE != 0 {
+        PAGE_EXECUTE_READWRITE
+    } else {
+        PAGE_READWRITE
+    }
+}
+
 /// The operating-system calls [`write_checked_with`] makes besides `VirtualQuery`, as a trait so
 /// the tests can make each of them fail or record when it is called.
 trait Os {
-    /// Make the pages of `p` writable. Returns their old protection, or `GetLastError()`.
+    /// Make the pages of `p` writable, with the protection [`writable_protection`] gives for
+    /// `p.protect`. Returns their old protection, or `GetLastError()`.
     fn set_writable(&mut self, p: &Piece) -> Result<u32, u32>;
 
     /// Put the pages of `p` back to the protection `old`. The error is `GetLastError()`.
@@ -228,7 +252,7 @@ struct WindowsOs;
 
 impl Os for WindowsOs {
     fn set_writable(&mut self, p: &Piece) -> Result<u32, u32> {
-        set_protect(p, PAGE_EXECUTE_READWRITE)
+        set_protect(p, writable_protection(p.protect))
     }
 
     fn restore(&mut self, p: &Piece, old: u32) -> Result<(), u32> {
@@ -290,9 +314,10 @@ fn restore_all(changed: &[(Piece, u32)], os: &mut impl Os) -> bool {
 /// Replace `expected` with `new` at `addr`, only if memory holds exactly `expected`.
 ///
 /// In order: reject bad lengths; `VirtualQuery` the whole range and refuse it unless every byte
-/// is committed and readable (so the compare cannot fault); compare; make the pages
-/// `PAGE_EXECUTE_READWRITE`; write; put each page's own old protection back; read the bytes back;
-/// `FlushInstructionCache`. Nothing is written on any error before the write, and the old
+/// is committed and readable (so the compare cannot fault); compare; make each region writable
+/// (`PAGE_READWRITE` for a region that cannot execute, `PAGE_EXECUTE_READWRITE` for one that can,
+/// see `writable_protection`); write; put each region's own old protection back; read the bytes
+/// back; `FlushInstructionCache`. Nothing is written on any error before the write, and the old
 /// protection is restored whether or not the read-back matches. If restoring a protection fails
 /// (it should not), the patch stays in place, the pages stay writable, and a warning is logged.
 ///
@@ -711,8 +736,8 @@ mod tests {
     use super::test_support::{info, protect_of, Mem};
     use super::*;
     use windows_sys::Win32::System::Memory::{
-        VirtualAlloc, MEM_COMMIT, MEM_FREE, MEM_RESERVE, PAGE_EXECUTE, PAGE_EXECUTE_READ,
-        PAGE_GUARD, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
+        VirtualAlloc, MEM_COMMIT, MEM_FREE, MEM_RESERVE, PAGE_GUARD, PAGE_NOACCESS, PAGE_NOCACHE,
+        PAGE_READONLY, PAGE_WRITECOPY,
     };
 
     const PAGE: usize = 0x1000;
@@ -1108,7 +1133,11 @@ mod tests {
     // ---- the page-protection rollback logic, without any memory ---------------------------
 
     fn piece(addr: usize) -> Piece {
-        Piece { addr, len: 16 }
+        Piece {
+            addr,
+            len: 16,
+            protect: PAGE_READWRITE,
+        }
     }
 
     #[test]
@@ -1168,6 +1197,139 @@ mod tests {
         );
         assert_eq!(fake.warnings.len(), 1);
         assert!(restore_all(&changed, &mut FakeOs::default()));
+    }
+
+    // ---- which protection a page is made writable with (T7-6) -----------------------------
+
+    #[test]
+    fn only_a_page_that_can_execute_is_made_executable_and_writable() {
+        for current in [PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY] {
+            assert_eq!(writable_protection(current), PAGE_READWRITE, "{current:#x}");
+        }
+        for current in [
+            PAGE_EXECUTE,
+            PAGE_EXECUTE_READ,
+            PAGE_EXECUTE_READWRITE,
+            PAGE_EXECUTE_WRITECOPY,
+        ] {
+            assert_eq!(
+                writable_protection(current),
+                PAGE_EXECUTE_READWRITE,
+                "{current:#x}"
+            );
+        }
+        // Modifier bits do not change the answer.
+        assert_eq!(
+            writable_protection(PAGE_READONLY | PAGE_NOCACHE),
+            PAGE_READWRITE
+        );
+        assert_eq!(
+            writable_protection(PAGE_EXECUTE_READ | PAGE_NOCACHE),
+            PAGE_EXECUTE_READWRITE
+        );
+    }
+
+    #[test]
+    fn a_piece_carries_the_protection_of_its_region() {
+        let m = Mem::rw(2 * PAGE);
+        m.protect(PAGE, PAGE, PAGE_READONLY);
+        let pieces = readable_pieces(m.base + PAGE - 2, 4).unwrap();
+        assert_eq!(pieces.len(), 2);
+        assert_eq!(pieces[0].protect, PAGE_READWRITE);
+        assert_eq!(pieces[1].protect, PAGE_READONLY);
+    }
+
+    /// The real calls, except that right after `set_writable` it asks `VirtualQuery` what
+    /// protection the first page really has, and notes it in `made`.
+    #[derive(Default)]
+    struct SpyOs {
+        made: Vec<u32>,
+    }
+
+    impl Os for SpyOs {
+        fn set_writable(&mut self, p: &Piece) -> Result<u32, u32> {
+            let old = WindowsOs.set_writable(p)?;
+            self.made.push(protect_of(p.addr));
+            Ok(old)
+        }
+
+        fn restore(&mut self, p: &Piece, old: u32) -> Result<(), u32> {
+            WindowsOs.restore(p, old)
+        }
+
+        unsafe fn read(&mut self, addr: usize, len: usize) -> Vec<u8> {
+            // SAFETY: the caller guarantees `[addr, addr + len)` is readable.
+            unsafe { WindowsOs.read(addr, len) }
+        }
+
+        fn flush(&mut self, addr: usize, len: usize) -> bool {
+            WindowsOs.flush(addr, len)
+        }
+
+        fn warn(&mut self, message: &str) {
+            WindowsOs.warn(message);
+        }
+    }
+
+    #[test]
+    fn a_read_only_page_is_made_writable_without_the_execute_bit() {
+        // What the page is made, per what it was: (before, while the write happens).
+        for (before, during) in [
+            (PAGE_READONLY, PAGE_READWRITE),
+            (PAGE_READWRITE, PAGE_READWRITE),
+            (PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE),
+            (PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_READWRITE),
+        ] {
+            let m = Mem::rw(PAGE);
+            m.put(0, &[1, 2, 3, 4]);
+            m.protect(0, PAGE, before);
+            let mut spy = SpyOs::default();
+            // SAFETY: the range is inside `m`, a page this test owns and no other thread uses;
+            // `expected` and `new` are literals, not borrows of it.
+            let r = unsafe { write_checked_with(&mut spy, m.base, &[1, 2, 3, 4], &[5, 6, 7, 8]) };
+            assert!(r.is_ok(), "{before:#x}: {r:?}");
+            assert_eq!(spy.made, vec![during], "page was {before:#x}");
+            assert_eq!(protect_of(m.base), before, "restored to {before:#x}");
+            assert_eq!(m.get(0, 4), vec![5, 6, 7, 8], "page was {before:#x}");
+        }
+    }
+
+    #[test]
+    fn a_read_only_image_page_can_be_patched_without_the_execute_bit() {
+        // The first page of this test's own exe: PE headers in an image section, read-only, as
+        // the game's `.rdata` is. Four bytes of the DOS stub are changed and put back; nothing
+        // reads them.
+        let base = crate::scan::main_module().base;
+        assert_ne!(base, 0);
+        let target = base + 0x44;
+        assert_eq!(protect_of(base), PAGE_READONLY);
+        // SAFETY: the header page is committed and readable, and stays so; start-up rule: this
+        // test is the only code that changes those four bytes.
+        let original = unsafe { read_checked(target, 4) }.unwrap();
+        let mut changed = original.clone();
+        changed[0] ^= 0xff;
+
+        let mut spy = SpyOs::default();
+        // SAFETY: the four DOS-stub bytes are data nothing uses; `original` and `changed` are
+        // separate vectors.
+        let r = unsafe { write_checked_with(&mut spy, target, &original, &changed) };
+        assert!(r.is_ok(), "{r:?}");
+        // SAFETY: as above; this puts the bytes back.
+        let back = unsafe { write_checked_with(&mut WindowsOs, target, &changed, &original) };
+        assert!(back.is_ok(), "{back:?}");
+
+        assert_eq!(spy.made.len(), 1);
+        // An image page that is made writable reads as read-write or copy-on-write.
+        assert_ne!(
+            spy.made[0] & (PAGE_READWRITE | PAGE_WRITECOPY),
+            0,
+            "{:#x}",
+            spy.made[0]
+        );
+        assert_eq!(spy.made[0] & EXECUTABLE, 0, "{:#x}", spy.made[0]);
+        assert_eq!(protect_of(base), PAGE_READONLY, "restored");
+        // SAFETY: as above.
+        assert_eq!(unsafe { read_checked(target, 4) }.unwrap(), original);
     }
 
     // ---- rel32 (hazard 6) ------------------------------------------------------------------
