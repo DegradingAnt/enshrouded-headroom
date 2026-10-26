@@ -31,6 +31,7 @@ Place these files in the game folder, next to the game executable:
   dinput8.dll                       Ultimate ASI Loader v10.0.0 x64
   ultimate-asi-loader-LICENSE.txt   the loader's MIT licence
   LICENSE                           this mod's MIT licence
+  THIRD_PARTY_NOTICES.md            dependency and bundled-library notices
   plugins\
     enshrouded-headroom.asi         this mod
     enshrouded-headroom.ini         settings
@@ -159,7 +160,7 @@ State that tests were not run when submitting a change checked only on Linux, so
 
 ## Licence
 
-This mod uses the MIT licence; see [LICENSE](LICENSE). Ultimate ASI Loader also uses the MIT licence. Its licence must accompany the bundled loader as `ultimate-asi-loader-LICENSE.txt`.
+This mod uses the MIT licence; see [LICENSE](LICENSE). Ultimate ASI Loader also uses the MIT licence. Its licence must accompany the bundled loader as `ultimate-asi-loader-LICENSE.txt`. The release also includes [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), with the MinHook, HDE and loader notices and the resolved Rust package licences.
 
 ## Credits
 
