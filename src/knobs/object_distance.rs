@@ -153,17 +153,23 @@ unsafe fn publish_checked(scene: *const u8, now: u64) -> bool {
 
 /// The detour's work after the original returned. A null `scene` does nothing.
 ///
-/// **The rule: compounding is impossible.** The game function writes only 3.0, 2.0 or 1.0 to
-/// `+0x33c` (REA ev_7ac38aaf). For a models value of 3 or more it returns without writing
-/// `+0x33c`/`+0x340` at all (the `JNZ` at 0x1400f7694). So:
+/// **The rule: the hook never scales a field it scaled before, with the `OBJECT_STEPS` factors.**
+/// The game function writes only 3.0, 2.0 or 1.0 to `+0x33c` (REA ev_7ac38aaf). For a models
+/// value of 3 or more it returns without writing `+0x33c`/`+0x340` at all (the `JNZ` at
+/// 0x1400f7694). So:
 /// - `+0x33c` holds exactly 3.0, 2.0 or 1.0: it is the game's value for this call. It is
 ///   published as the baseline, and with `apply` both fields are scaled by `factor`.
 /// - Any other value (one this hook scaled earlier, or one the game did not write): both fields
 ///   are left alone and no baseline is published. The scatter level and the time are still
 ///   published (the world is rendering), and `OBJECT_UNKNOWN_BASELINE` counts the call.
 ///
-/// No step product is a game value (test `a_scaled_field_is_never_taken_for_a_game_value`), so a
-/// field the hook already scaled is never scaled again.
+/// This holds for the `OBJECT_STEPS` values, not for every factor. In the clamp range a factor
+/// writes from 0.5 up to, but not including, 1.0 (1.0 writes nothing). There, exactly two factors
+/// map a game value onto a game value: 0.5 (2.0 -> 1.0) and 0.6666667 (3.0 -> 2.0). An exhaustive
+/// f32 sweep found them (test `only_two_factors_in_the_clamp_range_map_a_game_value_onto_one`).
+/// Neither is a step, and no product of 3.0, 2.0 or 1.0 with a step is a game value (test
+/// `a_scaled_field_is_never_taken_for_a_game_value`). So with the steps, a field the hook already
+/// scaled is never scaled again.
 ///
 /// # Safety
 ///
@@ -613,6 +619,26 @@ mod tests {
         assert!(!is_game_value(-1.0) && !is_game_value(f32::NAN) && !is_game_value(-0.0));
     }
 
+    #[test]
+    fn only_two_factors_in_the_clamp_range_map_a_game_value_onto_one() {
+        // The claim in `post_work`'s docs, by an exhaustive sweep: every f32 factor that writes
+        // (from 0.5 up to, but not including, 1.0; 1.0 writes nothing) times every game value.
+        let mut hits = Vec::new();
+        for bits in MIN_FACTOR.to_bits()..MAX_FACTOR.to_bits() {
+            let factor = f32::from_bits(bits);
+            for game in [3.0f32, 2.0, 1.0] {
+                if is_game_value(game * factor) {
+                    hits.push((factor, game, game * factor));
+                }
+            }
+        }
+        assert_eq!(hits, [(0.5, 2.0, 1.0), (2.0 / 3.0, 3.0, 2.0)]);
+        assert_eq!(2.0f32 / 3.0, 0.6666667);
+        for (factor, _, _) in hits {
+            assert!(!OBJECT_STEPS.contains(&factor), "{factor} is a step");
+        }
+    }
+
     // ---- start-up decision and install --------------------------------------------------------
 
     fn knobs(object: bool, scatter: bool, terrain: bool) -> KnobsCfg {
@@ -883,8 +909,10 @@ mod tests {
                 assert_eq!(calls.get(), 2);
                 assert!(!post_ran.get());
 
-                // The same through the real detour on a hooked fake: the trampoline runs once and
-                // nothing is published.
+                // The feature is off now, so on a hooked fake the detour takes only the outer
+                // guard's fallback: the trampoline runs once and nothing is published. This checks
+                // that fallback, not the detour's own panic path; with the feature on, that path
+                // is `the_real_detour_runs_the_original_once_when_its_post_work_panics`.
                 let target = fake_scene_settings as *const () as usize;
                 APPLY_FACTOR.store(true, Relaxed);
                 OBJECT.set(0.5);

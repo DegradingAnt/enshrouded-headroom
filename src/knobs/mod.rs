@@ -34,8 +34,11 @@ use crate::guard::catch;
 ///   [`baseline`](KnobShared::baseline) loads the counter with `Acquire` before the baseline, so
 ///   a reader that sees change `n` reads the baseline of change `n` or a newer one; the newer
 ///   one's change shows on its next read, so no change is missed.
-///   [`last_seen`](KnobShared::last_seen) loads the time with `Acquire`, so a reader that sees a
-///   publish's time also sees what that publish (and its caller, before it) stored.
+/// - [`seen`](KnobShared::seen) (game thread) stores only the time, with `Release`. The hook's
+///   `Relaxed` stores before it (for example `OBJECT_UNKNOWN_BASELINE` and `SCATTER_LEVEL`) are
+///   therefore ordered before that time. It leaves the baseline and the change counter alone.
+/// - [`last_seen`](KnobShared::last_seen) loads the time with `Acquire`, so a reader that sees the
+///   time of a publish or a seen also sees what that call (and its caller, before it) stored.
 pub struct KnobShared {
     /// The value the hook applies (a factor, or metres for the scatter knob), as `f32` bits.
     value_bits: AtomicU32,
@@ -43,7 +46,8 @@ pub struct KnobShared {
     baseline_bits: AtomicU32,
     /// How many times the baseline has changed (wraps). 0 before the first change.
     baseline_seq: AtomicU32,
-    /// `QueryPerformanceCounter` time of the last publish; 0 before the first.
+    /// `QueryPerformanceCounter` time passed to the last call of publish or seen; 0 before the
+    /// first such call.
     last_seen_qpc: AtomicU64,
 }
 
@@ -94,7 +98,8 @@ impl KnobShared {
         (f32::from_bits(bits), seq)
     }
 
-    /// The `QueryPerformanceCounter` time of the last publish, or 0. Governor thread.
+    /// The `QueryPerformanceCounter` time of the last publish or seen, or 0 before the first such
+    /// call. Governor thread.
     pub fn last_seen(&self) -> u64 {
         self.last_seen_qpc.load(Ordering::Acquire)
     }

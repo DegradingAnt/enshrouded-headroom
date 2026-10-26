@@ -72,15 +72,14 @@ fn exe_path() -> Option<PathBuf> {
 /// Called by Ultimate ASI Loader once the game process is up. Must never unwind into the loader.
 ///
 /// `entry::start` has no `guard::Feature` of its own (the enum is fixed at the nine features), so
-/// this `catch_unwind` is its guard: a panic in the start-up sequence stops it, and the game goes
-/// on without the rest of the mod.
+/// [`guard::catch`] is its guard: a panic in the start-up sequence stops it, and the game goes on
+/// without the rest of the mod. `guard::catch` never drops the panic payload (see there), and the
+/// panic hook has already logged the panic, so the `Err` text is not needed here.
 #[no_mangle]
 pub extern "C" fn InitializeASI() {
-    if let Err(payload) = std::panic::catch_unwind(entry::start) {
-        // Never drop the payload: `panic_any` can carry a value whose destructor panics, and a
-        // panic here would unwind into the loader. Forgetting leaks a few bytes, once.
-        std::mem::forget(payload);
-    }
+    // Unwind safety: after a panic nothing here uses the state `entry::start` was changing; the
+    // later start-up steps simply do not run.
+    let _ = guard::catch("start-up", entry::start);
 }
 
 /// `DllMain` only turns off thread notifications; all real work waits for `InitializeASI`.
