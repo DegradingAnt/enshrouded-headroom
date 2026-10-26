@@ -1495,4 +1495,99 @@ mod tests {
         }
         assert_eq!(writes.len(), 8);
     }
+
+    /// The Steam exe laid out as the loader maps it: the headers at 0 and each section's file
+    /// bytes at its RVA, in one read-write block of `SizeOfImage` bytes. No relocation is applied;
+    /// the climb sites and the tolerance loads use no absolute address.
+    fn steam_image(file: &[u8]) -> (Mem, Module) {
+        use crate::scan::{u16_at, u32_at};
+        let pe = u32_at(file, 0x3c).unwrap() as usize;
+        let file_header = pe + 4;
+        let sections = usize::from(u16_at(file, file_header + 2).unwrap());
+        let optional = file_header + 20;
+        let table = optional + usize::from(u16_at(file, file_header + 16).unwrap());
+        let size = u32_at(file, optional + 56).unwrap() as usize;
+        let headers = u32_at(file, optional + 60).unwrap() as usize;
+        let mem = Mem::rw(size);
+        mem.put(0, &file[..headers]);
+        for i in 0..sections {
+            let s = table + i * 40;
+            let virtual_size = u32_at(file, s + 8).unwrap() as usize;
+            let rva = u32_at(file, s + 12).unwrap() as usize;
+            let raw_size = u32_at(file, s + 16).unwrap() as usize;
+            let raw_ptr = u32_at(file, s + 20).unwrap() as usize;
+            let len = virtual_size.min(raw_size);
+            mem.put(rva, &file[raw_ptr..raw_ptr + len]);
+        }
+        let module = Module {
+            base: mem.base,
+            size,
+        };
+        (mem, module)
+    }
+
+    /// The whole start-up step on the Steam exe's own bytes: every scan, the snapshot, the
+    /// checks, the page and the writes run as they do in the game. It prints the log line.
+    #[test]
+    #[ignore = "reads the Steam exe (ENSHROUDED_STEAM_EXE, else the Steam path); a skip shows only with -- --ignored --nocapture"]
+    fn install_on_the_steam_exe_bytes_logs_what_changed() {
+        use crate::build_id::test_support::steam_exe_or_skip;
+        let Some(path) = steam_exe_or_skip("install_on_the_steam_exe_bytes_logs_what_changed")
+        else {
+            return;
+        };
+        let file = std::fs::read(&path).expect("read the game exe");
+        let (mem, module) = steam_image(&file);
+        let before = mem.get(0, module.size);
+        // The settings the in-game test starts with.
+        let cfg = ExperimentalCfg {
+            climb_voxel_hold: true,
+            ..on()
+        };
+        let mut pages = Vec::new();
+        let (level, line) = start_up(&cfg, true, || {
+            let alloc = |targets: &[usize], size: usize| {
+                let page = alloc_near_all(targets, size)?;
+                // SAFETY: `alloc_near_all` returns the base of a fresh VirtualAlloc block of at
+                // least `size` bytes, and nothing else frees it.
+                pages.push(unsafe { Mem::adopt(page, size) });
+                Some(page)
+            };
+            // SAFETY: `module` is read-write memory of this test that no thread executes.
+            unsafe { install_with(&module, &cfg, alloc) }
+        });
+        println!("{level} {line}");
+        assert_eq!(level, Level::Info, "{line}");
+        let page = pages[0].base;
+        assert_eq!(
+            line,
+            format!(
+                "climb anything: on (EXPERIMENTAL): mask 0x100 -> 0x124 at exe+0x24accc and \
+                 exe+0x24af53; plane tolerance 0.001 -> 0.05 (loads at exe+0x24afbc and \
+                 exe+0x24aff0 read the mod page {page:#x}, not exe+0x13b825c); voxel hold on at \
+                 exe+0x24b4a5; clearance game; all 16 climb signatures matched once"
+            )
+        );
+        assert_eq!(pages[0].get(0, 4), 0.05f32.to_le_bytes());
+        // Only the sites changed: the two masks, the two disp32s and the 12-byte return.
+        let after = mem.get(0, module.size);
+        let diff = changed(&before, &after);
+        let allowed = [
+            0x24_accc..0x24_acd0,
+            0x24_af53..0x24_af57,
+            0x24_afbc..0x24_afc0,
+            0x24_aff0..0x24_aff4,
+            0x24_b4a5..0x24_b4b1,
+        ];
+        assert!(
+            diff.iter().all(|i| allowed.iter().any(|r| r.contains(i))),
+            "changed: {diff:x?}"
+        );
+        assert_eq!(after[0x24_accc..0x24_acd0], [0x24, 0x01, 0x00, 0x00]);
+        assert_eq!(after[0x24_af53..0x24_af57], [0x24, 0x01, 0x00, 0x00]);
+        assert_eq!(target_of(&mem, 0x24_afbc), page);
+        assert_eq!(target_of(&mem, 0x24_aff0), page);
+        assert_eq!(after[0x24_b4a5..0x24_b4b1], WALL_LOST_VOXEL_HOLD);
+        assert_eq!(after[0x13_b825c..0x13_b8260], 0.001f32.to_le_bytes());
+    }
 }
