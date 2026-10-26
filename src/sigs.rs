@@ -119,6 +119,17 @@ pub const TERRAIN_UPDATE_FN: Sig = Sig {
     patch_offsets: &[0],
 };
 
+/// The grass pass function `FUN_1400767a0(rcx, pass, f)` (counter-probe pre-hook; prologue only,
+/// so fragile across updates). The pattern is its first 14 bytes, so the match VA is the function
+/// (0x1400767a0 in f68140a3); hook at match + `patch_offset()` (0). It has no immediate site.
+/// docs/re-notes.md, "Scatter counter probe".
+pub const SCATTER_FRAME_FN: Sig = Sig {
+    name: "SCATTER_FRAME_FN",
+    pattern: "48 89 54 24 10 55 53 57 41 55 41 56 41 57",
+    sections: &[".text"],
+    patch_offsets: &[0],
+};
+
 /// Every signature in this file, in table order.
 pub const ALL: &[&Sig] = &[
     &SCENE_SETTINGS_FN,
@@ -131,6 +142,7 @@ pub const ALL: &[&Sig] = &[
     &VOXEL_HIGH_IMMS,
     &ASYNC_OVERRIDE,
     &TERRAIN_UPDATE_FN,
+    &SCATTER_FRAME_FN,
 ];
 
 #[cfg(test)]
@@ -142,8 +154,8 @@ mod tests {
     }
 
     #[test]
-    fn all_has_the_ten_entries_with_distinct_names_and_patterns() {
-        assert_eq!(ALL.len(), 10);
+    fn all_has_the_eleven_entries_with_distinct_names_and_patterns() {
+        assert_eq!(ALL.len(), 11);
         for (i, a) in ALL.iter().enumerate() {
             for b in ALL.iter().skip(i + 1) {
                 assert_ne!(a.name, b.name);
@@ -169,7 +181,21 @@ mod tests {
                 "VOXEL_HIGH_IMMS",
                 "ASYNC_OVERRIDE",
                 "TERRAIN_UPDATE_FN",
+                "SCATTER_FRAME_FN",
             ]
+        );
+    }
+
+    /// The probe hooks the function entry: the pattern is the 14-byte prologue, with no wildcard
+    /// and no immediate site, and it is in `ALL`, so the game-exe test checks it.
+    #[test]
+    fn scatter_frame_fn_is_the_entry_prologue() {
+        assert!(ALL.contains(&&SCATTER_FRAME_FN));
+        assert_eq!(SCATTER_FRAME_FN.patch_offsets, &[0]);
+        assert_eq!(SCATTER_FRAME_FN.patch_offset(), 0);
+        assert_eq!(
+            tokens(&SCATTER_FRAME_FN),
+            ["48", "89", "54", "24", "10", "55", "53", "57", "41", "55", "41", "56", "41", "57"]
         );
     }
 

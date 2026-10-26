@@ -282,10 +282,17 @@ pub fn start() {
     // here: `InitializeASI` runs before `WinMain`.
     knobs::scatter_distance::init(&cfg.knobs);
 
+    // 13. The scatter counter probe: a pre-hook on the grass pass that reads the game's grass GPU
+    // counters every 30th call. It hooks code, so it asks `code_patches_allowed`; it is installed
+    // with `EnableScatterDistance = 1`, or with `[Debug] ScatterProbe = 1` and `LogLevel = debug`,
+    // and logs its own line, including why it is off. It is only created and queued here: the
+    // last step enables it.
+    features::scatter_probe::init(&cfg);
+
     // Later code hooks (Task 14's terrain hook) are created and queued above this line, so they
     // join the one batch below.
 
-    // 13. Enable every queued hook at once (MinHook's queued enable). This is the only place that
+    // 14. Enable every queued hook at once (MinHook's queued enable). This is the only place that
     // enables hooks. It logs one line if any hook was queued.
     knobs::enable_queued_hooks();
 }
