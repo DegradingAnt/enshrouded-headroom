@@ -72,6 +72,7 @@ The `_perf\Launch-Enshrouded.ps1` launcher from 2026-10-23 is replaced by this m
 | `async_compute` | Reproduces the game's own `--enable-async-compute` override (6.2). |
 | `frame_timer` | Records present-to-present times (6.3). |
 | `reflex` | NVIDIA Reflex through `VK_NV_low_latency2` (6.5). |
+| `antilag` | Pure AMD Anti-Lag 2 planning and sequencing (6.6); wiring is separate. |
 | `vram_budget` | Reads the live VRAM budget and usage through `VK_EXT_memory_budget` when available (6.4). |
 | `governor` | Pure control logic: frame times and VRAM headroom in, knob steps out. It never reads game memory (6.4). |
 | `knobs` | The game-side hooks for 7.1–7.3 and the start-up patches for 7.4 and 7.5. |
@@ -187,6 +188,11 @@ Fixed debug steps obey the same probe, grass capacity and memory gates as automa
 
 ### 6.5 NVIDIA Reflex (experimental)
 
+Startup publishes the parsed Reflex mode before Vulkan interception. The real present wrapper
+runs the Reflex sequence for an eligible live swapchain. Driver failures set the Reflex disabled
+bit silently; no logging is scheduled from the present path. Fake-driver tests cover this wiring.
+In-game behavior and latency improvement remain unverified.
+
 Fact: the exe contains none of `vkLatencySleepNV`, `vkSetLatencySleepModeNV`, `vkSetLatencyMarkerNV`, `VK_NV_low_latency`, `low_latency2`, `NvAPI` or `nvapi64` (whole-file ASCII and UTF-16 search, 2026-10-25). The menu has a Reflex option (`nvidiaReflex`), but the Vulkan path cannot call Reflex, so the option is very likely inert.
 
 Research, 2026-10-25 (`research-2026-10-25-reflex.md` in the author's notes, with a refuter check):
@@ -200,41 +206,43 @@ On the author's machine (game log, 2026-10-25):
 - line 892: `timelineSemaphore=VK_TRUE` in the feature listing;
 - line 905: the game enables `VK_KHR_present_id2`.
 
-Method (NVIDIA only, and only if the driver lists `VK_NV_low_latency2`):
-1. **Device.** `wrap_create_device` copies the game's create info and adds `VK_NV_low_latency2`. It also enables timeline semaphores:
-   - If a `VkPhysicalDeviceVulkan12Features` struct is in the chain, it sets `timelineSemaphore = VK_TRUE` there.
-   - Otherwise, if a `VkPhysicalDeviceTimelineSemaphoreFeatures` struct is there, it sets it there.
-   - Otherwise it chains a new `VkPhysicalDeviceTimelineSemaphoreFeatures`.
-   - If the instance API version is below 1.2, it also adds `VK_KHR_timeline_semaphore`.
-   - If neither `VK_KHR_present_id` nor `VK_KHR_present_id2` is in the game's list, it adds `VK_KHR_present_id` (`VUID-vkCreateDevice-ppEnabledExtensionNames-01387`). The game drops `present_id2` on AMD, on NVIDIA drivers below 0x9a438000, and when the driver lacks it. If the driver lists neither, Reflex is off.
-   - **If the modified call fails, it calls again with the game's original create info and turns Reflex off for the session** (review finding 1).
-2. **Swapchain.** `wrap_create_swapchain` chains `VkSwapchainLatencyCreateInfoNV { latencyModeEnable = TRUE }`. **If that call fails, it calls again without it** and Reflex stays off. On success it calls `vkSetLatencySleepModeNV(lowLatencyMode = TRUE, lowLatencyBoost per .ini, minimumIntervalUs = 0)`. It does this again on every swapchain re-creation.
-3. **Frame IDs.** The mod keeps its own frame counter, starting at 1. `VK_NV_low_latency2` present IDs are not the `VkPresentId2KHR` IDs (review finding 3, Vulkan refpage `VkSetLatencyMarkerInfoNV`). There is no submit wrapper. Implicit attribution ties pending submits to the frame at the next `vkQueuePresentKHR`, and the game presents from a single call site (0x140fd529a). `VkLatencySubmissionPresentIdNV` is optional and is ignored below specVersion 3 (ruling 2026-10-25, research item G10).
-4. **Per frame,** in `wrap_present`:
-   - set `PRESENT_START`, call the real present, set `PRESENT_END`, and increment the frame counter;
-   - call `vkLatencySleepNV` with the mod's timeline semaphore and the next target value;
-   - wait with `vkWaitSemaphores` and a **100 ms hang-guard timeout**. Three timeouts in a row turn Reflex off for the session; a success resets the count; a lost device turns it off at once. If the real present returned `VK_ERROR_OUT_OF_DATE_KHR` or `VK_SUBOPTIMAL_KHR`, that frame's sleep is skipped and Reflex stays on (the new swapchain is re-armed when it is created). Each turn-off is logged (review finding 2; research items G7 and G8);
-   - set `SIMULATION_START` for the new frame. There is no `RENDERSUBMIT_START`.
-   - The sleep runs on the thread that presents, before it starts the next frame's work. Whether that also delays the game's input sampling depends on the game's threading, which is not known. That is why Reflex is experimental and must be measured.
-5. **Measurement.** Every 5 s, on the present thread (inside `wrap_present`, on that frame's swapchain, which is valid there), the mod reads `vkGetLatencyTimingsNV` and logs the average latency from simulation start to GPU render end, and present to display.
+Method (NVIDIA only, and only if the driver lists `VK_NV_low_latency2` revision 2 or later):
+1. **Device.** Before creation the mod queries the driver extension list and timeline/present-ID feature bits. The saved menu is still unknown. Every configured mode except `off` may prepare Reflex. The mod adds `VK_NV_low_latency2`, timeline support, and present-ID support without duplicates. It preserves an enabled `VK_KHR_present_id2` path. Otherwise it enables `VK_KHR_present_id` and its queried feature. It copies each changed feature node and every prefix node it must relink; it never writes into the game's input chain. A Vulkan 1.2 feature structure takes precedence over a standalone timeline structure. Device groups with more than one device are refused.
+   - Unchanged `vkCreateInstance` calls provide the requested API version and enabled `VK_KHR_get_physical_device_properties2` fact after successful creation. The observed instance generation retains those facts with its resolver. Reflex first reads physical properties through the Vulkan 1.0 command. It uses core Features2 only when both requested and physical API versions are at least 1.1; otherwise it uses Features2KHR only if that instance explicitly enabled the extension. Unknown facts or a missing selected function leave the device untouched, without trying the other alias. Pointer presence alone is not permission to use a route.
+   - Wiring still conservatively requires and enables the listed `VK_KHR_timeline_semaphore` extension, including on Vulkan 1.2+, and uses its KHR wait entry point.
+   - Typed copies currently support Features2, Vulkan 1.1/1.2/1.3 features, timeline, present-ID v1/v2, device group, synchronization2 and dynamic rendering nodes. An unknown device-chain layout, a cycle, or more than 64 nodes leaves the original device untouched. This is a compatibility limit, not proof that every game/driver chain is supported.
+   - If the modified create call fails, the mod calls the driver exactly once with the game's **original create-info pointer**, original chain and extension list, then leaves Reflex disabled for the session (`driver refused`).
+2. **Swapchain.** The mod prepends an owned `VkSwapchainLatencyCreateInfoNV` with `latencyModeEnable = TRUE`, borrowing the original tail unchanged. An already-present latency node is left alone. A rejected modified call retries the exact original pointer once and disables Reflex. A successful new swapchain gets an owned timeline semaphore and a sleep-mode command from the current decision. Recreation re-arms the new swapchain. If the saved menu becomes known later and changes that decision, the mod updates the sleep mode once.
+3. **Frame IDs and attribution.** IDs start at 1 and never wrap. They are independent of the game's `VkPresentId2KHR` IDs. The mod leaves `VkPresentInfoKHR` and its chain untouched. There is **no submit hook** and no `VkLatencySubmissionPresentIdNV` chaining in v1. Markers around present and implicit driver attribution are the known limit; they do not identify individual application submissions.
+4. **Present.** The exact order is `PRESENT_START`, the real present, `PRESENT_END`, `vkLatencySleepNV`, and `vkWaitSemaphores` with a **10 ms timeout**. After a successful wait, increment the frame ID, then emit `SIMULATION_START` and `RENDERSUBMIT_START`. The first timeout, lost device or out-of-date result disables Reflex. Any other sleep/wait failure also fails closed. Later presents do not sleep or wait. The original result is cached before post-work, so even a caught post-work panic cannot present again.
+   - The normal present path has no allocation, blocking lock or log. Atomic non-waiting admission rejects concurrent or reentrant present streams, disables Reflex, and lets the real present run. The one game present call site is evidence for the expected serialized stream, not a general thread-safety guarantee. Already-entered driver work must return before it can observe another thread's disable.
+   - Pacing occurs on the thread that presents, before its next frame. The effect on input sampling is unverified because the game's threading is not known.
+5. **Lifetime and teardown.** A reader count is incremented before the active runtime pointer is loaded. Destruction detaches that pointer, then drains existing readers before freeing it. Both atomics use sequential consistency, so a reader cannot see the retired pointer while the writer sees the pre-reader zero. The device table and semaphore remain live for every present and report call. Wrapped device/swapchain destruction still retires resources when Reflex or ordinary Vulkan wrapping is disabled. Required GetProcAddress/GIPA/GDPA lookup routes also remain wrapped after disable. The game must obey Vulkan external synchronization and obtain those destroy functions through the installed chain.
+   - A timed-out latency sleep can still signal its semaphore later. Retirement must drain that pending timeline value before destroying the semaphore. This can wait on a stuck driver during teardown; it is outside the normal present path. The 10 ms present timeout does not prove completion of native signaling.
+   - `vk::with_game_device` provides the separate governor with a read-only lease on the first device and its enumerated physical-device parent. Only actual outputs from `vkEnumeratePhysicalDevices` or core/KHR physical-device group enumeration establish parentage. SUCCESS and INCOMPLETE outputs count; failed and count-only calls do not. The matching instance generation and real GIPA remain together. This applies to every GPU and Reflex mode, subject to observed parentage and compatible native lifetime entry points.
+   - Device and instance teardown reject new leases and wait for old ones. Instance retirement removes its physical-device observations, so reused handle values cannot revive an old device context. After the first device dies the API stays unavailable. Callbacks must not destroy leased handles, retain them after returning, or launch asynchronous native work with them.
+   - Unknown or ambiguous parentage fails closed. The registry retains at most 64 live instances and 256 physical-device handles per instance. Untracked handles do not enable Reflex or GPU-info queries. A conflicting first-wins lifetime function leaves the optional feature that requires it unavailable instead of replacing dispatch already issued to another instance. Destruction for an unadmitted device uses its matching original function when addresses differ. Device-query admission proves only the device destructor; swapchain retirement requires Reflex admission. The existing optional GPU-info query resolves through its proven parent; unknown parentage skips that query while preserving native creation, process priority and texture-budget policy.
+6. **Measurement.** `reflex::latency_report() -> Option<String>` calls `vkGetLatencyTimingsNV` under a reader lease and formats averages for valid simulation-start-to-GPU-end and present-call timestamps. Missing timestamps produce no fabricated sample. The API has no display timestamp, so it does not claim a present-to-display measurement. It may allocate and belongs on a background thread. W23 does not schedule or log it; Task 15 owns the later five-second schedule.
 
 `.ini`: `Reflex = game | auto | off | on | boost`, default `auto`.
-- Every enabled mode requires an NVIDIA GPU whose driver lists `VK_NV_low_latency2`.
+- Every enabled mode requires an NVIDIA GPU whose driver lists the extension and required capabilities.
 - `auto` and `on` enable Reflex without boost; `boost` enables it with boost; `off` disables it.
-- `game` follows the player's saved in-game Reflex value: 0 is off, 1 is on and 2 is boost.
-  A missing or unknown value uses the `auto` answer. Reading the saved value belongs to future wiring.
+- `game` follows the saved value: 0 is off, 1 is on and 2 is boost. Unknown values use the `auto` answer.
+- The scene-settings post-hook reads the verified `RDX-8` u32 and `RDX-11` vsync byte only when the checked relationship `R8 == RDX + 0x54` holds. Values outside Reflex 0..2 or vsync 0..1 publish unknown. A single Relaxed atomic publishes the coherent pair, with no hook logging.
 - A bad setting warns and falls back to `auto`.
 
-W19 implements only the pure device planner and mode decision. Its extension list contains
-`VK_NV_low_latency2`, plus `VK_KHR_timeline_semaphore` below Vulkan 1.2, without duplicates.
-Tasks 16/16b own the runtime wiring. Task 16 must also check the driver capabilities, present-ID
-prerequisites and create-call retry rules above before using the plan.
+W19's pure `plan_device` and `decide_mode` contracts are unchanged. W23 adds runtime wiring.
+Validation uses fake native function tables and the real wrappers, including immutable chain copies,
+exact-pointer retries, timeout disable, swapchain recreation and the native menu post-hook.
+This is **not verified in game; the maintainer runs the boot test**. Latency improvement still needs
+an in-game A/B measurement at the same spot and frame rate.
 
-Proof: the mod log shows the extension and latency mode enabled, and the logged latency is lower with Reflex on than off, at the same spot and the same fps. If it is not lower, that result goes to the author, who decides the default.
-
-Types: `ash` 0.38.0 already has all `VK_NV_low_latency2` structs. The pure layer reuses them.
-`src/vk/types.rs` defines the missing AMD types from the pinned Khronos registry.
-
+Primary API sources: [Khronos low-latency2](https://docs.vulkan.org/refpages/latest/refpages/source/VK_NV_low_latency2.html),
+[latency sleep](https://docs.vulkan.org/refpages/latest/refpages/source/vkLatencySleepNV.html),
+[semaphore lifetime](https://docs.vulkan.org/refpages/latest/refpages/source/vkDestroySemaphore.html), and
+[latency reports](https://docs.vulkan.org/refpages/latest/refpages/source/vkGetLatencyTimingsNV.html).
+Layouts use ash 0.38.0 (Vulkan 1.3.281) and the existing present-ID2 declarations pinned to
+[Vulkan-Headers v1.4.366, commit 73814d006638aa00bd553215b054f0f02e457e22](https://github.com/KhronosGroup/Vulkan-Headers/blob/73814d006638aa00bd553215b054f0f02e457e22/include/vulkan/vulkan_core.h).
 ### 6.6 AMD Anti-Lag 2 (experimental)
 
 Anti-Lag is not verified on AMD hardware. W19 adds only pure planning, mode decisions, AMD ABI
@@ -445,7 +453,7 @@ roll-off remain hypotheses, with the limits recorded in `docs/re-notes.md`,
   - On an unknown build, only API-level features apply: the frame timer, the governor's timing, Reflex, and the texture budget, which needs a full 80-byte table match. Code patches and code hooks stay off, unless `AllowUnknownBuild = 1` (review finding 10). The log says which applied.
   - A game update therefore turns the knobs off until the mod is updated, instead of risking a crash.
 - **Driver refusals.** Changed `vkCreateDevice` and `vkCreateSwapchainKHR` calls are retried with the game's original arguments if they fail. The feature then stays off.
-- **No waits without timeouts** on game threads. The Reflex wait has a 100 ms hang-guard timeout (6.5).
+- **No waits without timeouts** on game threads. The Reflex present wait has a 10 ms timeout (6.5). Pending semaphore retirement can wait longer during teardown, as documented in 6.5.
 - **Panics.** Every extern function catches unwinds and falls back to the original.
 - **Memory access.** Hooks read only the arguments the game passes in, at that moment. The governor never reads game memory. Access violations cannot be caught by `catch_unwind`, so the design avoids the stale pointers that would cause them (review finding 11).
 - **Original bytes** are kept for every patch. They are not restored at process exit.
@@ -516,7 +524,7 @@ In-game checks on the author's machine:
 
 1. Async compute default: `on` for everyone.
 2. Byte signatures: published in the public repo (an exception to the private rule).
-3. Reflex default: `auto`, meaning on for NVIDIA (the author, 2026-10-25). It replaces `game`: the in-game option is not shown on Vulkan.
+3. Reflex default: `auto`, meaning on for supported NVIDIA devices. `game` is retained and follows the saved 0/1/2 value; unknown values use the auto answer. The in-game option is not shown on Vulkan.
 4. Licence: MIT.
 5. Name: `enshrouded-headroom` for now; rename before the Nexus release.
 6. Spec v2: approved.

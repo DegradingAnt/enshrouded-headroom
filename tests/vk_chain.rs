@@ -131,6 +131,8 @@ unsafe extern "system" fn fake_gpa(module: HMODULE, name: PCSTR) -> FARPROC {
         note(format!("gpa({:#x}, {n})", module as usize));
         let out = if n == "vkGetInstanceProcAddr" {
             addr(fake_gipa as *const ())
+        } else if n == "vkCreateInstance" {
+            addr(fake_create_instance as *const ())
         } else {
             addr(other_farproc as *const ())
         };
@@ -162,12 +164,54 @@ unsafe extern "system" fn fake_gipa(
     let n = unsafe { name_of(name) };
     note(format!("gipa({:#x}, {n})", instance.as_raw()));
     to_void(match n.as_str() {
+        "vkCreateInstance" => addr(fake_create_instance as *const ()),
         "vkGetDeviceProcAddr" => addr(fake_gdpa as *const ()),
         "vkCreateDevice" => addr(fake_create_device as *const ()),
+        "vkQueuePresentKHR" => addr(fake_present as *const ()),
+        "vkCreateSwapchainKHR" => addr(fake_create_swapchain as *const ()),
+        "vkEnumeratePhysicalDevices" => addr(fake_enumerate_physical as *const ()),
         "vkGetPhysicalDeviceMemoryProperties" => addr(fake_memory_properties as *const ()),
         "vkGetPhysicalDeviceProperties" => addr(fake_properties as *const ()),
         _ => addr(other_vk as *const ()),
     })
+}
+
+/// Create the fake instance through the unchanged native observer.
+/// # Safety
+/// The caller supplies writable instance output; remaining inputs stay borrowed by the wrapper.
+unsafe extern "system" fn fake_create_instance(
+    _: *const vk::InstanceCreateInfo<'_>,
+    _: *const vk::AllocationCallbacks<'_>,
+    out: *mut vk::Instance,
+) -> vk::Result {
+    let body = || {
+        note("create_instance".into());
+        // SAFETY: the caller supplies one live output slot.
+        unsafe { out.write(vk::Instance::from_raw(INSTANCE)) };
+        vk::Result::SUCCESS
+    };
+    enshrouded_headroom::guard::guard(enshrouded_headroom::guard::Feature::VkWrap, body, body)
+}
+
+/// Actual enumeration output establishes the fake device's native parent.
+/// # Safety
+/// The test passes one writable physical handle and count storage, or a count-only query.
+unsafe extern "system" fn fake_enumerate_physical(
+    _: vk::Instance,
+    count: *mut u32,
+    out: *mut vk::PhysicalDevice,
+) -> vk::Result {
+    let body = || {
+        // SAFETY: caller provides the described storage; exactly one output is written.
+        unsafe {
+            if !out.is_null() {
+                out.write(vk::PhysicalDevice::from_raw(PHYS));
+            }
+            count.write(1);
+        }
+        vk::Result::SUCCESS
+    };
+    enshrouded_headroom::guard::guard(enshrouded_headroom::guard::Feature::VkWrap, body, body)
 }
 
 /// The fake `vkGetDeviceProcAddr`.
@@ -267,6 +311,7 @@ unsafe extern "system" fn fake_properties(
     // SAFETY: the chain passes a valid struct to fill.
     let out = unsafe { &mut *out };
     out.device_type = vk::PhysicalDeviceType::DISCRETE_GPU;
+    out.api_version = vk::API_VERSION_1_2;
     for (dst, &src) in out.device_name.iter_mut().zip(b"Fake GPU\0") {
         *dst = src as c_char;
     }
@@ -503,7 +548,7 @@ fn scenario(dir: &Path) {
     );
     // Another vulkan-1 name passes through.
     // SAFETY: as above.
-    let got = unsafe { gpa_via_slot(slot, vulkan, c"vkCreateInstance") };
+    let got = unsafe { gpa_via_slot(slot, vulkan, c"vkEnumerateInstanceVersion") };
     assert_eq!(got, other_farproc as *const () as usize);
     take_calls();
     // An ordinal on vulkan-1 itself, which the fake finds: the module matches, so only the
@@ -522,9 +567,24 @@ fn scenario(dir: &Path) {
     let instance = vk::Instance::from_raw(INSTANCE);
     // SAFETY (the calls below): made-up handles the fakes never dereference, and literal names.
     unsafe {
-        // A global command with no instance: passed through, no instance recorded.
+        // Global creation is observed, while the ordinary instance lookup slot stays unset.
         let got = gipa(vk::Instance::null(), c"vkCreateInstance".as_ptr());
-        assert_eq!(void_addr(got), other_vk as *const () as usize);
+        assert_eq!(
+            void_addr(got),
+            enshrouded_headroom::vk::wrap_create_instance as *const () as usize
+        );
+        let create = std::mem::transmute::<vk::PFN_vkVoidFunction, vk::PFN_vkCreateInstance>(got);
+        let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_2);
+        let mut created = vk::Instance::null();
+        assert_eq!(
+            create(
+                &vk::InstanceCreateInfo::default().application_info(&app),
+                std::ptr::null(),
+                &mut created
+            ),
+            vk::Result::SUCCESS
+        );
+        assert_eq!(created.as_raw(), instance.as_raw());
         assert_eq!(load(&GAME_INSTANCE), 0);
 
         let gdpa = gipa(instance, c"vkGetDeviceProcAddr".as_ptr());
@@ -551,11 +611,24 @@ fn scenario(dir: &Path) {
         );
 
         let got = gipa(instance, c"vkEnumeratePhysicalDevices".as_ptr());
-        assert_eq!(void_addr(got), other_vk as *const () as usize);
+        assert_ne!(
+            void_addr(got),
+            fake_enumerate_physical as *const () as usize
+        );
+        let enumerate =
+            std::mem::transmute::<vk::PFN_vkVoidFunction, vk::PFN_vkEnumeratePhysicalDevices>(got);
+        let mut count = 1;
+        let mut physical = vk::PhysicalDevice::null();
+        assert_eq!(
+            enumerate(instance, &mut count, &mut physical),
+            vk::Result::SUCCESS
+        );
+        assert_eq!(physical.as_raw(), PHYS);
         assert_eq!(
             take_calls(),
             [
                 "gipa(0x0, vkCreateInstance)",
+                "create_instance",
                 "gipa(0x11110000, vkGetDeviceProcAddr)",
                 "gipa(0x11110000, vkCreateDevice)",
                 "gipa(0x11110000, vkGetPhysicalDeviceMemoryProperties)",
@@ -593,6 +666,9 @@ fn scenario(dir: &Path) {
                     &allocator as *const _ as usize,
                     &mut device as *mut _ as usize
                 ),
+                "gipa(0x11110000, vkDestroyDevice)".to_owned(),
+                "gipa(0x11110000, vkGetPhysicalDeviceMemoryProperties)".to_owned(),
+                "gipa(0x11110000, vkGetPhysicalDeviceProperties)".to_owned(),
                 "memory_properties(0x22220000)".to_owned(),
                 "properties(0x22220000)".to_owned(),
             ]
@@ -676,9 +752,13 @@ fn scenario(dir: &Path) {
                 "gdpa(0x33330000, vkQueueSubmit)",
                 "gdpa(0x33330000, vkQueueSubmit2)",
                 "gdpa(0x33330000, vkGetDeviceProcAddr)",
+                "gipa(0x11110000, vkGetDeviceProcAddr)",
                 "gdpa(0x33331000, vkQueuePresentKHR)",
+                "gipa(0x11110000, vkQueuePresentKHR)",
                 "gdpa(0x33331000, vkQueuePresentKHR)",
+                "gipa(0x11110000, vkQueuePresentKHR)",
                 "gdpa(0x33331000, vkGetDeviceProcAddr)",
+                "gipa(0x11110000, vkGetDeviceProcAddr)",
                 "gdpa(0x33330000, vkLatencySleepNV)",
             ]
         );
@@ -853,4 +933,1252 @@ fn the_wrapper_chain_works_end_to_end() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Isolated fake-driver cases exercise the real create wrappers, including exact-pointer retries.
+mod reflex_driver {
+    use super::*;
+    use enshrouded_headroom::{
+        guard::{guard, Feature},
+        reflex,
+    };
+    static ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+    static ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+    static CHANGED_OK: AtomicUsize = AtomicUsize::new(0);
+    static RETRY_OK: AtomicUsize = AtomicUsize::new(0);
+    static A_DESTROYS: AtomicUsize = AtomicUsize::new(0);
+    static B_DESTROYS: AtomicUsize = AtomicUsize::new(0);
+    static WRONG_GPU_QUERY: AtomicUsize = AtomicUsize::new(0);
+    static QUERY_INSTANCE: AtomicUsize = AtomicUsize::new(0);
+    static ENUM_RESULT: AtomicUsize = AtomicUsize::new(0);
+    static VENDOR: AtomicUsize = AtomicUsize::new(0x10de);
+    static REFUSE: AtomicUsize = AtomicUsize::new(0);
+
+    /// Physical API and instance creation facts are independent inputs to route selection.
+    static PHYSICAL_API: AtomicUsize = AtomicUsize::new(vk::API_VERSION_1_2 as usize);
+    /// Route cases start without newer core feature nodes; other cases retain their chain checks.
+    static CAPS_CASE: AtomicUsize = AtomicUsize::new(0);
+    static INSTANCE_FAILURE: AtomicUsize = AtomicUsize::new(0);
+    static CORE_LOOKUPS: AtomicUsize = AtomicUsize::new(0);
+    static KHR_LOOKUPS: AtomicUsize = AtomicUsize::new(0);
+    static CORE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static KHR_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static MISSING_CORE: AtomicUsize = AtomicUsize::new(0);
+    static MISSING_KHR: AtomicUsize = AtomicUsize::new(0);
+    /// # Safety
+    /// Inputs/output obey vkCreateInstance; successful output is the fake B instance.
+    unsafe extern "system" fn create_instance(
+        _: *const vk::InstanceCreateInfo<'_>,
+        _: *const vk::AllocationCallbacks<'_>,
+        out: *mut vk::Instance,
+    ) -> vk::Result {
+        guard(
+            Feature::VkWrap,
+            || vk::Result::ERROR_UNKNOWN,
+            || {
+                if INSTANCE_FAILURE.load(Ordering::Relaxed) != 0 {
+                    return vk::Result::ERROR_INITIALIZATION_FAILED;
+                }
+                // SAFETY: caller supplies writable output; no real Vulkan objects are used.
+                unsafe { out.write(vk::Instance::from_raw(INSTANCE + 1)) };
+                vk::Result::SUCCESS
+            },
+        )
+    }
+    /// Create through the real lookup observer, never inject capability metadata.
+    fn observe_instance(case: &str) {
+        if case == "caps-unknown" {
+            return;
+        }
+        let requested = if matches!(case, "caps-khr" | "caps-no-route" | "caps-khr-missing") {
+            vk::API_VERSION_1_0
+        } else if case == "caps-core" {
+            vk::API_VERSION_1_1
+        } else {
+            vk::API_VERSION_1_2
+        };
+        let khr = matches!(
+            case,
+            "caps-khr" | "caps-khr-missing" | "caps-low-physical-khr" | "caps-core-missing"
+        );
+        let app = vk::ApplicationInfo::default().api_version(requested);
+        let names = [c"VK_KHR_get_physical_device_properties2".as_ptr()];
+        let info = vk::InstanceCreateInfo::default()
+            .application_info(&app)
+            .enabled_extension_names(if khr { &names } else { &[] });
+        if case == "caps-failed-create" {
+            INSTANCE_FAILURE.store(1, Ordering::Relaxed);
+        }
+        let mut instance = vk::Instance::null();
+        // SAFETY: exact fake global entry point, initialized inputs and live output.
+        let result = unsafe {
+            let raw = wrap_gipa(vk::Instance::null(), c"vkCreateInstance".as_ptr()).unwrap();
+            let create =
+                std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkCreateInstance>(raw);
+            create(&info, std::ptr::null(), &mut instance)
+        };
+        if case == "caps-failed-create" {
+            assert_eq!(result, vk::Result::ERROR_INITIALIZATION_FAILED);
+            assert!(instance.is_null());
+            // Subsequent enumeration represents a separate pre-existing, unobserved B instance.
+        } else {
+            assert_eq!(result, vk::Result::SUCCESS);
+            assert_eq!(instance.as_raw(), INSTANCE + 1);
+        }
+    }
+    /// # Safety
+    /// Exact core alias; counter distinguishes it from the independently returned KHR pointer.
+    unsafe extern "system" fn features_core(
+        phys: vk::PhysicalDevice,
+        out: *mut vk::PhysicalDeviceFeatures2<'_>,
+    ) {
+        let body = || {
+            CORE_CALLS.fetch_add(1, Ordering::Relaxed);
+            // SAFETY: this wrapper forwards its exact live input to the shared fake implementation.
+            unsafe { features(phys, out) };
+        };
+        guard(Feature::VkWrap, body, body)
+    }
+    /// # Safety
+    /// Exact KHR alias; its pointer is distinct even though its Vulkan layout matches core.
+    unsafe extern "system" fn features_khr(
+        phys: vk::PhysicalDevice,
+        out: *mut vk::PhysicalDeviceFeatures2<'_>,
+    ) {
+        let body = || {
+            KHR_CALLS.fetch_add(1, Ordering::Relaxed);
+            // SAFETY: this wrapper forwards its exact live input to the shared fake implementation.
+            unsafe { features(phys, out) };
+        };
+        guard(Feature::VkWrap, body, body)
+    }
+    /// # Safety
+    /// The test passes a writable physical-properties output.
+    unsafe extern "system" fn properties(
+        _: vk::PhysicalDevice,
+        out: *mut vk::PhysicalDeviceProperties,
+    ) {
+        guard(
+            Feature::VkWrap,
+            || (),
+            || {
+                // SAFETY: the query supplies this live output object.
+                unsafe {
+                    (*out).vendor_id = VENDOR.load(Ordering::Relaxed) as u32;
+                    (*out).api_version = PHYSICAL_API.load(Ordering::Relaxed) as u32;
+                }
+            },
+        );
+    }
+    /// Fake parent-specific memory query; the output belongs to the caller.
+    unsafe extern "system" fn memory(
+        _: vk::PhysicalDevice,
+        out: *mut vk::PhysicalDeviceMemoryProperties,
+    ) {
+        let body = || {
+            // SAFETY: caller supplies the exact writable Vulkan output type.
+            unsafe { out.write(vk::PhysicalDeviceMemoryProperties::default()) };
+        };
+        guard(Feature::VkWrap, body, body);
+    }
+    /// A stale instance A properties pointer must never be used for physical device B.
+    unsafe extern "system" fn wrong_properties(
+        _: vk::PhysicalDevice,
+        _: *mut vk::PhysicalDeviceProperties,
+    ) {
+        let body = || {
+            WRONG_GPU_QUERY.fetch_add(1, Ordering::Relaxed);
+        };
+        guard(Feature::VkWrap, body, body);
+    }
+    /// # Safety
+    /// Vulkan's extension-query contract, supplied by the wrapper under test.
+    unsafe extern "system" fn extensions(
+        _: vk::PhysicalDevice,
+        _: *const c_char,
+        count: *mut u32,
+        out: *mut vk::ExtensionProperties,
+    ) -> vk::Result {
+        guard(
+            Feature::VkWrap,
+            || vk::Result::ERROR_UNKNOWN,
+            || {
+                let names = [
+                    c"VK_NV_low_latency2",
+                    c"VK_KHR_timeline_semaphore",
+                    c"VK_KHR_present_id",
+                ];
+                // SAFETY: query output capacity is at least the count previously advertised.
+                unsafe {
+                    if !out.is_null() {
+                        for (index, name) in names.iter().enumerate() {
+                            let mut entry = vk::ExtensionProperties {
+                                spec_version: 3,
+                                ..Default::default()
+                            };
+                            for (dst, byte) in entry
+                                .extension_name
+                                .iter_mut()
+                                .zip(name.to_bytes_with_nul())
+                            {
+                                *dst = *byte as c_char;
+                            }
+                            out.add(index).write(entry);
+                        }
+                    }
+                    count.write(3);
+                }
+                vk::Result::SUCCESS
+            },
+        )
+    }
+    /// # Safety
+    /// The wrapper supplies a writable Features2 chain with the queried feature layouts.
+    unsafe extern "system" fn features(
+        _: vk::PhysicalDevice,
+        out: *mut vk::PhysicalDeviceFeatures2<'_>,
+    ) {
+        guard(
+            Feature::VkWrap,
+            || (),
+            || {
+                // SAFETY: the query's output chain consists of these live feature structs.
+                unsafe {
+                    let mut node = (*out).p_next.cast::<vk::BaseOutStructure<'_>>();
+                    while !node.is_null() {
+                        match (*node).s_type {
+                            vk::StructureType::PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES => {
+                                (*node.cast::<vk::PhysicalDeviceTimelineSemaphoreFeatures<'_>>())
+                                    .timeline_semaphore = vk::TRUE
+                            }
+                            vk::StructureType::PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR => {
+                                (*node.cast::<vk::PhysicalDevicePresentIdFeaturesKHR<'_>>())
+                                    .present_id = vk::TRUE
+                            }
+                            _ => (),
+                        }
+                        node = (*node).p_next;
+                    }
+                }
+            },
+        );
+    }
+    /// Enumerate distinct physical devices for two live fake instances.
+    unsafe extern "system" fn enumerate_physical(
+        instance: vk::Instance,
+        count: *mut u32,
+        out: *mut vk::PhysicalDevice,
+    ) -> vk::Result {
+        let body = || {
+            // SAFETY: the test provides one writable output or a count-only query.
+            unsafe {
+                if !out.is_null() {
+                    out.write(vk::PhysicalDevice::from_raw(
+                        if instance.as_raw() == INSTANCE {
+                            PHYS + 1
+                        } else {
+                            PHYS
+                        },
+                    ));
+                }
+                count.write(1);
+            }
+            match ENUM_RESULT.load(Ordering::Relaxed) {
+                1 => vk::Result::INCOMPLETE,
+                2 => vk::Result::ERROR_UNKNOWN,
+                _ => vk::Result::SUCCESS,
+            }
+        };
+        guard(Feature::VkWrap, body, body)
+    }
+    /// Actual group outputs have the same parentage contract for the core and KHR aliases.
+    unsafe extern "system" fn enumerate_groups(
+        instance: vk::Instance,
+        count: *mut u32,
+        out: *mut vk::PhysicalDeviceGroupProperties<'_>,
+    ) -> vk::Result {
+        let body = || {
+            // SAFETY: count and optional one-element initialized group storage are supplied by the test.
+            unsafe {
+                if !out.is_null() {
+                    (*out).physical_device_count = 1;
+                    (*out).physical_devices[0] =
+                        vk::PhysicalDevice::from_raw(if instance.as_raw() == INSTANCE {
+                            PHYS + 1
+                        } else {
+                            PHYS
+                        });
+                }
+                count.write(1);
+            }
+            vk::Result::SUCCESS
+        };
+        guard(Feature::VkWrap, body, body)
+    }
+    /// B's native destructor records every actual invocation, including after mod disable.
+    unsafe extern "system" fn destroy_device(_: vk::Device, _: *const vk::AllocationCallbacks<'_>) {
+        let body = || {
+            B_DESTROYS.fetch_add(1, Ordering::Relaxed);
+        };
+        guard(Feature::VkWrap, body, body);
+    }
+    /// A's instance-specific destructor must never receive B's child device.
+    unsafe extern "system" fn other_destroy_device(
+        _: vk::Device,
+        _: *const vk::AllocationCallbacks<'_>,
+    ) {
+        let body = || {
+            A_DESTROYS.fetch_add(1, Ordering::Relaxed);
+        };
+        guard(Feature::VkWrap, body, body);
+    }
+    /// B's native swapchain destructor records actual invocation.
+    unsafe extern "system" fn destroy_swapchain(
+        _: vk::Device,
+        _: vk::SwapchainKHR,
+        _: *const vk::AllocationCallbacks<'_>,
+    ) {
+        let body = || {
+            B_DESTROYS.fetch_add(1, Ordering::Relaxed);
+        };
+        guard(Feature::VkWrap, body, body);
+    }
+    /// A's instance-specific swapchain destructor must never receive B's child device.
+    unsafe extern "system" fn other_destroy_swapchain(
+        _: vk::Device,
+        _: vk::SwapchainKHR,
+        _: *const vk::AllocationCallbacks<'_>,
+    ) {
+        let body = || {
+            A_DESTROYS.fetch_add(1, Ordering::Relaxed);
+        };
+        guard(Feature::VkWrap, body, body);
+    }
+    /// B's device-level dispatch returns its own destructors, regardless of the mod's flag.
+    unsafe extern "system" fn gdpa(_: vk::Device, name: *const c_char) -> vk::PFN_vkVoidFunction {
+        let body = || {
+            // SAFETY: every test lookup supplies a static terminated name.
+            to_void(match unsafe { CStr::from_ptr(name) }.to_bytes() {
+                b"vkDestroyDevice" => destroy_device as *const () as usize,
+                b"vkDestroySwapchainKHR" => destroy_swapchain as *const () as usize,
+                _ if PRESENT_CASE.load(Ordering::Relaxed) != 0 => present_entry(name),
+                _ => 0,
+            })
+        };
+        guard(Feature::VkWrap, body, body)
+    }
+    /// The fake owns no native instance resources.
+    unsafe extern "system" fn destroy_instance(
+        _: vk::Instance,
+        _: *const vk::AllocationCallbacks<'_>,
+    ) {
+        guard(Feature::VkWrap, || (), || ());
+    }
+    /// # Safety
+    /// Called with a terminated function name.
+    unsafe extern "system" fn gipa(
+        instance: vk::Instance,
+        name: *const c_char,
+    ) -> vk::PFN_vkVoidFunction {
+        let body = || {
+            // SAFETY: every request uses a valid NUL-terminated name.
+            let name = unsafe { CStr::from_ptr(name) };
+            if matches!(
+                name.to_bytes(),
+                b"vkGetPhysicalDeviceProperties"
+                    | b"vkEnumerateDeviceExtensionProperties"
+                    | b"vkGetPhysicalDeviceFeatures2"
+            ) {
+                QUERY_INSTANCE.store(instance.as_raw() as usize, Ordering::Relaxed);
+            }
+            to_void(match name.to_bytes() {
+                b"vkEnumeratePhysicalDeviceGroups" | b"vkEnumeratePhysicalDeviceGroupsKHR" => {
+                    enumerate_groups as *const () as usize
+                }
+                b"vkEnumeratePhysicalDevices" => enumerate_physical as *const () as usize,
+                b"vkDestroyInstance" => destroy_instance as *const () as usize,
+                b"vkDestroyDevice" => {
+                    if instance.as_raw() == INSTANCE {
+                        other_destroy_device as *const () as usize
+                    } else {
+                        destroy_device as *const () as usize
+                    }
+                }
+                b"vkDestroySwapchainKHR" => {
+                    if instance.as_raw() == INSTANCE {
+                        other_destroy_swapchain as *const () as usize
+                    } else {
+                        destroy_swapchain as *const () as usize
+                    }
+                }
+                b"vkGetDeviceProcAddr" => gdpa as *const () as usize,
+                b"vkGetPhysicalDeviceMemoryProperties" => memory as *const () as usize,
+                b"vkGetPhysicalDeviceProperties" => properties as *const () as usize,
+                b"vkEnumerateDeviceExtensionProperties" => extensions as *const () as usize,
+                b"vkCreateInstance" => create_instance as *const () as usize,
+                b"vkGetPhysicalDeviceFeatures2" => {
+                    CORE_LOOKUPS.fetch_add(1, Ordering::Relaxed);
+                    if MISSING_CORE.load(Ordering::Relaxed) != 0 {
+                        0
+                    } else {
+                        features_core as *const () as usize
+                    }
+                }
+                b"vkGetPhysicalDeviceFeatures2KHR" => {
+                    KHR_LOOKUPS.fetch_add(1, Ordering::Relaxed);
+                    if MISSING_KHR.load(Ordering::Relaxed) != 0 {
+                        0
+                    } else {
+                        features_khr as *const () as usize
+                    }
+                }
+                _ => 0,
+            })
+        };
+        guard(Feature::VkWrap, body, body)
+    }
+    /// # Safety
+    /// Vulkan device-create inputs and output remain live during this fake call.
+    unsafe extern "system" fn create(
+        _: vk::PhysicalDevice,
+        info: *const vk::DeviceCreateInfo<'_>,
+        _: *const vk::AllocationCallbacks<'_>,
+        out: *mut vk::Device,
+    ) -> vk::Result {
+        guard(
+            Feature::VkWrap,
+            || vk::Result::ERROR_UNKNOWN,
+            || {
+                let attempt = ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+                if info as usize == ORIGINAL.load(Ordering::Relaxed) {
+                    RETRY_OK.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    // SAFETY: the wrapper's owned create-info/chain/list remain live during the driver call.
+                    unsafe {
+                        let info = &*info;
+                        let names = std::slice::from_raw_parts(
+                            info.pp_enabled_extension_names,
+                            info.enabled_extension_count as usize,
+                        );
+                        let low = names
+                            .iter()
+                            .any(|n| CStr::from_ptr(*n) == c"VK_NV_low_latency2");
+                        let mut timeline = false;
+                        let mut present = false;
+                        let mut address_preserved = false;
+                        let mut node = info.p_next.cast::<vk::BaseInStructure<'_>>();
+                        while !node.is_null() {
+                            if (*node).s_type
+                                == vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_2_FEATURES
+                            {
+                                let f = &*node.cast::<vk::PhysicalDeviceVulkan12Features<'_>>();
+                                timeline = f.timeline_semaphore == vk::TRUE;
+                                address_preserved = f.buffer_device_address == vk::TRUE;
+                            }
+                            if (*node).s_type
+                                == vk::StructureType::PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES
+                            {
+                                timeline = (*node
+                                    .cast::<vk::PhysicalDeviceTimelineSemaphoreFeatures<'_>>())
+                                .timeline_semaphore
+                                    == vk::TRUE;
+                            }
+                            if (*node).s_type
+                                == vk::StructureType::PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR
+                            {
+                                present = (*node
+                                    .cast::<vk::PhysicalDevicePresentIdFeaturesKHR<'_>>())
+                                .present_id
+                                    == vk::TRUE;
+                            }
+                            node = (*node).p_next;
+                        }
+                        if low
+                            && timeline
+                            && present
+                            && (address_preserved || CAPS_CASE.load(Ordering::Relaxed) != 0)
+                        {
+                            CHANGED_OK.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+                if REFUSE.load(Ordering::Relaxed) != 0 && attempt == 0 {
+                    return vk::Result::ERROR_EXTENSION_NOT_PRESENT;
+                }
+                // SAFETY: caller output storage is writable.
+                unsafe {
+                    out.write(vk::Device::from_raw(DEVICE));
+                }
+                vk::Result::SUCCESS
+            },
+        )
+    }
+
+    /// Enable the complete fake table only for the actual-present child cases.
+    static PRESENT_CASE: AtomicUsize = AtomicUsize::new(0);
+    /// Inject native failures without unwinding across the ABI.
+    static PRESENT_RESULT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+    static WAIT_RESULT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+    /// Sleep failures stop before issuing any wait.
+    static SLEEP_RESULT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+    static PRESENT_INFO: AtomicUsize = AtomicUsize::new(0);
+    static PRESENT_TAIL: AtomicUsize = AtomicUsize::new(0);
+
+    /// Resolve only the native functions required to arm and exercise Reflex.
+    fn present_entry(name: *const c_char) -> usize {
+        // SAFETY: gdpa received a terminated Vulkan function name.
+        match unsafe { CStr::from_ptr(name) }.to_bytes() {
+            b"vkCreateSemaphore" => latency_semaphore as *const () as usize,
+            b"vkDestroySemaphore" => latency_destroy as *const () as usize,
+            b"vkSetLatencySleepModeNV" => latency_mode as *const () as usize,
+            b"vkSetLatencyMarkerNV" => latency_marker as *const () as usize,
+            b"vkLatencySleepNV" => latency_sleep as *const () as usize,
+            b"vkWaitSemaphores" | b"vkWaitSemaphoresKHR" => latency_wait as *const () as usize,
+            b"vkGetLatencyTimingsNV" => latency_timings as *const () as usize,
+            b"vkCreateSwapchainKHR" => latency_swapchain as *const () as usize,
+            b"vkQueuePresentKHR" => latency_present as *const () as usize,
+            _ => 0,
+        }
+    }
+    /// # Safety
+    /// The wrapper provides initialized semaphore input and writable output.
+    unsafe extern "system" fn latency_semaphore(
+        _: vk::Device,
+        info: *const vk::SemaphoreCreateInfo<'_>,
+        _: *const vk::AllocationCallbacks<'_>,
+        out: *mut vk::Semaphore,
+    ) -> vk::Result {
+        guard(
+            Feature::VkWrap,
+            || vk::Result::ERROR_UNKNOWN,
+            || {
+                // SAFETY: Runtime supplies this exact initialized timeline node and output.
+                unsafe {
+                    let timeline = &*((*info).p_next.cast::<vk::SemaphoreTypeCreateInfo<'_>>());
+                    assert!(timeline.semaphore_type == vk::SemaphoreType::TIMELINE);
+                    out.write(vk::Semaphore::from_raw(77));
+                }
+                vk::Result::SUCCESS
+            },
+        )
+    }
+    /// # Safety
+    /// The fake semaphore remains live until wrapped retirement.
+    unsafe extern "system" fn latency_destroy(
+        _: vk::Device,
+        _: vk::Semaphore,
+        _: *const vk::AllocationCallbacks<'_>,
+    ) {
+        let body = || note("destroy semaphore".into());
+        guard(Feature::VkWrap, body, body)
+    }
+    /// # Safety
+    /// The wrapper provides a live sleep-mode input.
+    unsafe extern "system" fn latency_mode(
+        _: vk::Device,
+        _: vk::SwapchainKHR,
+        info: *const vk::LatencySleepModeInfoNV<'_>,
+    ) -> vk::Result {
+        guard(
+            Feature::VkWrap,
+            || vk::Result::ERROR_UNKNOWN,
+            || {
+                // SAFETY: the native call borrows this initialized input.
+                let info = unsafe { &*info };
+                note(format!(
+                    "mode:{}:{}",
+                    info.low_latency_mode, info.low_latency_boost
+                ));
+                vk::Result::SUCCESS
+            },
+        )
+    }
+    /// # Safety
+    /// The wrapper supplies a valid marker input.
+    unsafe extern "system" fn latency_marker(
+        _: vk::Device,
+        _: vk::SwapchainKHR,
+        info: *const vk::SetLatencyMarkerInfoNV<'_>,
+    ) {
+        guard(
+            Feature::VkWrap,
+            || (),
+            || {
+                // SAFETY: live initialized input for this synchronous call.
+                let info = unsafe { &*info };
+                note(format!(
+                    "marker:{}:{}",
+                    info.present_id,
+                    info.marker.as_raw()
+                ));
+            },
+        )
+    }
+    /// # Safety
+    /// The wrapper supplies a valid sleep input.
+    unsafe extern "system" fn latency_sleep(
+        _: vk::Device,
+        _: vk::SwapchainKHR,
+        info: *const vk::LatencySleepInfoNV<'_>,
+    ) -> vk::Result {
+        guard(
+            Feature::VkWrap,
+            || vk::Result::ERROR_UNKNOWN,
+            || {
+                // SAFETY: live initialized input for this synchronous call.
+                note(format!("sleep:{}", unsafe { (*info).value }));
+                vk::Result::from_raw(SLEEP_RESULT.load(Ordering::Relaxed))
+            },
+        )
+    }
+    /// # Safety
+    /// The wrapper supplies valid wait arrays, retained through the call.
+    unsafe extern "system" fn latency_wait(
+        _: vk::Device,
+        _: *const vk::SemaphoreWaitInfo<'_>,
+        timeout: u64,
+    ) -> vk::Result {
+        guard(
+            Feature::VkWrap,
+            || vk::Result::ERROR_UNKNOWN,
+            || {
+                note(format!("wait:{timeout}"));
+                if timeout == u64::MAX {
+                    vk::Result::SUCCESS
+                } else {
+                    vk::Result::from_raw(WAIT_RESULT.load(Ordering::Relaxed))
+                }
+            },
+        )
+    }
+    /// # Safety
+    /// No timings are written; the initialized zero reports remain untouched.
+    unsafe extern "system" fn latency_timings(
+        _: vk::Device,
+        _: vk::SwapchainKHR,
+        _: *mut vk::GetLatencyMarkerInfoNV<'_>,
+    ) {
+        guard(Feature::VkWrap, || (), || ())
+    }
+    /// # Safety
+    /// The fake receives live Vulkan create info and writable output.
+    unsafe extern "system" fn latency_swapchain(
+        _: vk::Device,
+        _: *const vk::SwapchainCreateInfoKHR<'_>,
+        _: *const vk::AllocationCallbacks<'_>,
+        out: *mut vk::SwapchainKHR,
+    ) -> vk::Result {
+        guard(
+            Feature::VkWrap,
+            || vk::Result::ERROR_UNKNOWN,
+            || {
+                // SAFETY: caller supplies writable output.
+                unsafe { out.write(vk::SwapchainKHR::from_raw(SWAPCHAIN)) };
+                vk::Result::SUCCESS
+            },
+        )
+    }
+    /// # Safety
+    /// The actual present wrapper must forward the test's original live info unchanged.
+    unsafe extern "system" fn latency_present(
+        queue: vk::Queue,
+        info: *const vk::PresentInfoKHR<'_>,
+    ) -> vk::Result {
+        let body = || {
+            assert_eq!(queue.as_raw(), QUEUE);
+            assert_eq!(info as usize, PRESENT_INFO.load(Ordering::Relaxed));
+            // SAFETY: present_child retains the info and its chain through this call.
+            assert_eq!(
+                unsafe { (*info).p_next } as usize,
+                PRESENT_TAIL.load(Ordering::Relaxed)
+            );
+            note("present".into());
+            vk::Result::from_raw(PRESENT_RESULT.load(Ordering::Relaxed))
+        };
+        guard(Feature::VkWrap, body, body)
+    }
+    /// Drive the real lookup, swapchain and present wrappers after parsed-mode device creation.
+    fn present_child(case: &str, device: vk::Device) {
+        // SAFETY: the exact fake resolver returns these matching native signatures.
+        let (create, present) = unsafe {
+            wrap_gipa(
+                vk::Instance::from_raw(INSTANCE + 1),
+                c"vkGetDeviceProcAddr".as_ptr(),
+            );
+            let create = wrap_gdpa(device, c"vkCreateSwapchainKHR".as_ptr()).unwrap();
+            let present = wrap_gdpa(device, c"vkQueuePresentKHR".as_ptr()).unwrap();
+            (
+                std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkCreateSwapchainKHR>(
+                    create,
+                ),
+                std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkQueuePresentKHR>(
+                    present,
+                ),
+            )
+        };
+        assert_eq!(present as usize, wrap_present as *const () as usize);
+        let mut swapchain = vk::SwapchainKHR::null();
+        // SAFETY: initialized inputs and live fake device/output.
+        assert_eq!(
+            unsafe {
+                (if case == "present-no-runtime" {
+                    latency_swapchain
+                } else {
+                    create
+                })(
+                    device,
+                    &vk::SwapchainCreateInfoKHR::default(),
+                    std::ptr::null(),
+                    &mut swapchain,
+                )
+            },
+            vk::Result::SUCCESS
+        );
+        let setup = take_calls();
+        if matches!(case, "present-off" | "present-no-runtime") {
+            assert!(!setup.iter().any(|call| call.starts_with("mode:")));
+            assert_eq!(
+                CHANGED_OK.load(Ordering::Relaxed),
+                usize::from(case != "present-off")
+            );
+        } else {
+            assert!(setup.iter().any(|call| call == "mode:1:0"));
+        }
+        let result = match case {
+            "present-lost" => vk::Result::ERROR_DEVICE_LOST,
+            "present-outdated" => vk::Result::ERROR_OUT_OF_DATE_KHR,
+            _ => vk::Result::SUBOPTIMAL_KHR,
+        };
+        PRESENT_RESULT.store(result.as_raw(), Ordering::Relaxed);
+        WAIT_RESULT.store(
+            match case {
+                "present-timeout" => vk::Result::TIMEOUT,
+                "present-wait-lost" => vk::Result::ERROR_DEVICE_LOST,
+                "present-wait-error" => vk::Result::ERROR_UNKNOWN,
+                _ => vk::Result::SUCCESS,
+            }
+            .as_raw(),
+            Ordering::Relaxed,
+        );
+        SLEEP_RESULT.store(
+            if case == "present-sleep-error" {
+                vk::Result::ERROR_UNKNOWN.as_raw()
+            } else {
+                0
+            },
+            Ordering::Relaxed,
+        );
+        if case == "present-disabled" {
+            enshrouded_headroom::guard::disable(Feature::VkWrap, "test disabled forwarding");
+        }
+        let plain = matches!(
+            case,
+            "present-off" | "present-no-runtime" | "present-other-swapchain" | "present-disabled"
+        );
+        let swaps = [if case == "present-other-swapchain" {
+            vk::SwapchainKHR::from_raw(SWAPCHAIN + 1)
+        } else {
+            swapchain
+        }];
+        let indices = [7];
+        let tail = vk::BaseInStructure {
+            s_type: vk::StructureType::from_raw(1_000_479_001),
+            ..Default::default()
+        };
+        let mut info = vk::PresentInfoKHR::default()
+            .swapchains(&swaps)
+            .image_indices(&indices);
+        info.p_next = (&tail as *const vk::BaseInStructure<'_>).cast();
+        PRESENT_INFO.store(&info as *const _ as usize, Ordering::Relaxed);
+        PRESENT_TAIL.store(info.p_next as usize, Ordering::Relaxed);
+        let mut timestamps = Vec::new();
+        let before = FRAMES.read_since(0, &mut timestamps);
+        for frame in 1..=2 {
+            // SAFETY: live fake handles and immutable info/chain through the real wrapper.
+            assert_eq!(
+                unsafe { present(vk::Queue::from_raw(QUEUE), &info) },
+                result
+            );
+            let calls = take_calls();
+            if plain || (frame == 2 && case != "present-success") {
+                assert_eq!(calls, ["present"]);
+            } else {
+                let mut expected = vec![
+                    format!("marker:{frame}:4"),
+                    "present".into(),
+                    format!("marker:{frame}:5"),
+                ];
+                if !matches!(case, "present-lost" | "present-outdated") {
+                    expected.push(format!("sleep:{frame}"));
+                    if case != "present-sleep-error" {
+                        expected.push("wait:10000000".into());
+                    }
+                    if case == "present-success" {
+                        expected.extend([
+                            format!("marker:{}:0", frame + 1),
+                            format!("marker:{}:2", frame + 1),
+                        ]);
+                    }
+                }
+                assert_eq!(calls, expected);
+            }
+            assert_eq!(info.p_next as usize, PRESENT_TAIL.load(Ordering::Relaxed));
+            assert_eq!(tail.s_type.as_raw(), 1_000_479_001);
+            assert!(tail.p_next.is_null());
+            assert_eq!(indices, [7]);
+        }
+        let recorded = if case == "present-disabled" { 0 } else { 2 };
+        assert_eq!(
+            FRAMES.read_since(before, &mut timestamps),
+            before + recorded
+        );
+        assert_eq!(timestamps.len() as u64, recorded);
+        assert!(timestamps.iter().all(|t| *t != 0));
+        assert_eq!(
+            enshrouded_headroom::guard::is_disabled(Feature::Reflex),
+            !plain && case != "present-success"
+        );
+        // SAFETY: retire while fake device/semaphore handles remain live; timeout cleanup is outside present.
+        unsafe { enshrouded_headroom::vk::wrap_destroy_device(device, std::ptr::null()) };
+    }
+    /// Actual wrapper behavior, not a helper-only acceptance test; each mode/failure gets fresh globals.
+    #[test]
+    fn actual_present_uses_parsed_mode_and_preserves_native_call() {
+        const NAME: &str =
+            "reflex_driver::actual_present_uses_parsed_mode_and_preserves_native_call";
+        if let Ok(case) = std::env::var("W23_PRESENT_CHILD") {
+            child(&case);
+            return;
+        }
+        for case in [
+            "present-success",
+            "present-timeout",
+            "present-lost",
+            "present-outdated",
+            "present-wait-lost",
+            "present-wait-error",
+            "present-sleep-error",
+            "present-off",
+            "present-no-runtime",
+            "present-other-swapchain",
+            "present-disabled",
+        ] {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture"])
+                .env("W23_PRESENT_CHILD", case)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{case}: {}\\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    /// Non-null pointers cannot authorize an alias; successful instance observation is required.
+    #[test]
+    fn feature_query_requires_proven_core_or_khr_route() {
+        const NAME: &str = "reflex_driver::feature_query_requires_proven_core_or_khr_route";
+        const CHILD_ARGS: [&str; 4] = ["--exact", NAME, "--nocapture", "--test-threads=1"];
+        const CASES: [&str; 9] = [
+            "caps-khr",
+            "caps-core",
+            "caps-unknown",
+            "caps-failed-create",
+            "caps-no-route",
+            "caps-low-physical",
+            "caps-low-physical-khr",
+            "caps-core-missing",
+            "caps-khr-missing",
+        ];
+        let exact_child = std::env::args_os()
+            .skip(1)
+            .eq(CHILD_ARGS.map(std::ffi::OsString::from));
+        if let Some(case) = std::env::var("W23_CAPS_CHILD")
+            .ok()
+            .filter(|case| exact_child && CASES.contains(&case.as_str()))
+        {
+            assert!(
+                exact_child,
+                "capability child requires exact one-worker arguments before changing globals"
+            );
+            child(&case);
+            return;
+        }
+        for case in CASES {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(CHILD_ARGS)
+                .env("W23_CAPS_CHILD", case)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{case}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            println!("capability case passed: {case}");
+        }
+    }
+    fn child(case: &str) {
+        let (config, warnings) = enshrouded_headroom::config::parse(if case == "present-off" {
+            "[General]\nReflex = off\n"
+        } else {
+            "[General]\nReflex = auto\n"
+        });
+        assert!(warnings.is_empty());
+        reflex::init(config.general.reflex);
+        CAPS_CASE.store(usize::from(case.starts_with("caps-")), Ordering::Relaxed);
+        PRESENT_CASE.store(usize::from(case.starts_with("present-")), Ordering::Relaxed);
+        REAL_GIPA.store(gipa as *const () as usize, Ordering::Release);
+        observe_instance(case);
+        if matches!(case, "caps-low-physical" | "caps-low-physical-khr") {
+            PHYSICAL_API.store(vk::API_VERSION_1_0 as usize, Ordering::Relaxed);
+        }
+        if case == "caps-core" {
+            PHYSICAL_API.store(vk::API_VERSION_1_1 as usize, Ordering::Relaxed);
+        }
+        MISSING_CORE.store(usize::from(case == "caps-core-missing"), Ordering::Relaxed);
+        MISSING_KHR.store(usize::from(case == "caps-khr-missing"), Ordering::Relaxed);
+        GAME_INSTANCE.store(INSTANCE as usize, Ordering::Release);
+        REAL_CREATE_DEVICE.store(create as *const () as usize, Ordering::Release);
+        if case.starts_with("dispatch-conflict") {
+            // SAFETY: obtain distinct A-native destructors through the actual installed GIPA wrapper.
+            unsafe {
+                if !case.contains("-query-") {
+                    enshrouded_headroom::vk::wrap_gipa(
+                        vk::Instance::from_raw(INSTANCE),
+                        c"vkDestroyDevice".as_ptr(),
+                    );
+                }
+                enshrouded_headroom::vk::wrap_gipa(
+                    vk::Instance::from_raw(INSTANCE),
+                    c"vkDestroySwapchainKHR".as_ptr(),
+                );
+            }
+        }
+        if case == "incomplete" {
+            ENUM_RESULT.store(1, Ordering::Relaxed);
+        }
+        if case == "enum-failure" {
+            ENUM_RESULT.store(2, Ordering::Relaxed);
+        }
+        if case != "unobserved" {
+            // SAFETY: fake instances and initialized one-element outputs obey the exact fake APIs.
+            unsafe {
+                for instance in if case == "parentage" {
+                    vec![INSTANCE, INSTANCE + 1]
+                } else {
+                    vec![INSTANCE + 1]
+                } {
+                    let instance = vk::Instance::from_raw(instance);
+                    if matches!(case, "groups" | "groups-khr") {
+                        let name = if case == "groups" {
+                            c"vkEnumeratePhysicalDeviceGroups"
+                        } else {
+                            c"vkEnumeratePhysicalDeviceGroupsKHR"
+                        };
+                        let raw =
+                            enshrouded_headroom::vk::wrap_gipa(instance, name.as_ptr()).unwrap();
+                        let enumerate = std::mem::transmute::<
+                            unsafe extern "system" fn(),
+                            vk::PFN_vkEnumeratePhysicalDeviceGroups,
+                        >(raw);
+                        let mut count = 1;
+                        let mut group = vk::PhysicalDeviceGroupProperties::default();
+                        assert_eq!(
+                            enumerate(instance, &mut count, &mut group),
+                            vk::Result::SUCCESS
+                        );
+                        assert_eq!(group.physical_device_count, 1);
+                    } else {
+                        let raw = enshrouded_headroom::vk::wrap_gipa(
+                            instance,
+                            c"vkEnumeratePhysicalDevices".as_ptr(),
+                        )
+                        .unwrap();
+                        let enumerate = std::mem::transmute::<
+                            unsafe extern "system" fn(),
+                            vk::PFN_vkEnumeratePhysicalDevices,
+                        >(raw);
+                        let mut count = 1;
+                        let mut physical = vk::PhysicalDevice::null();
+                        let output = if case == "count-only" {
+                            std::ptr::null_mut()
+                        } else {
+                            &mut physical
+                        };
+                        let result = enumerate(instance, &mut count, output);
+                        assert_eq!(
+                            result,
+                            if case == "incomplete" {
+                                vk::Result::INCOMPLETE
+                            } else if case == "enum-failure" {
+                                vk::Result::ERROR_UNKNOWN
+                            } else {
+                                vk::Result::SUCCESS
+                            }
+                        );
+                    }
+                }
+            }
+        }
+        if case == "parentage" {
+            enshrouded_headroom::vk::REAL_GET_MEMORY_PROPERTIES
+                .store(memory as *const () as usize, Ordering::Release);
+            enshrouded_headroom::vk::REAL_GET_PROPERTIES
+                .store(wrong_properties as *const () as usize, Ordering::Release);
+        }
+        if case == "vendor" {
+            VENDOR.store(0x1002, Ordering::Relaxed);
+        }
+        if case == "refusal" {
+            REFUSE.store(1, Ordering::Relaxed);
+        }
+        let mut tail = vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true);
+        let mut v12 = vk::PhysicalDeviceVulkan12Features::default().buffer_device_address(true);
+        v12.p_next = (&mut tail as *mut vk::PhysicalDeviceVulkan13Features<'_>).cast();
+        let original_next = v12.p_next;
+        let names = [c"VK_KHR_swapchain".as_ptr()];
+        let mut info = vk::DeviceCreateInfo::default().enabled_extension_names(&names);
+        info.p_next = if case.starts_with("caps-") {
+            // The 1.0 route cases must not request newer core feature structs themselves.
+            std::ptr::null()
+        } else {
+            (&v12 as *const vk::PhysicalDeviceVulkan12Features<'_>).cast()
+        };
+        let original_chain = info.p_next;
+        ORIGINAL.store(&info as *const _ as usize, Ordering::Relaxed);
+        let mut device = vk::Device::null();
+        // SAFETY: live fake inputs/outputs and fake function table for the made-up physical device.
+        let result = unsafe {
+            wrap_create_device(
+                vk::PhysicalDevice::from_raw(PHYS),
+                &info,
+                std::ptr::null(),
+                &mut device,
+            )
+        };
+        assert_eq!(result, vk::Result::SUCCESS);
+        assert_eq!(info.p_next, original_chain);
+        assert_eq!(v12.p_next, original_next);
+        assert_eq!(v12.timeline_semaphore, vk::FALSE);
+        assert_eq!(v12.buffer_device_address, vk::TRUE);
+        if case.starts_with("caps-") {
+            let (core, khr) = match case {
+                "caps-core" => (1, 0),
+                "caps-khr" | "caps-low-physical-khr" => (0, 1),
+                _ => (0, 0),
+            };
+            assert_eq!(
+                CORE_CALLS.load(Ordering::Relaxed),
+                core,
+                "forbidden core feature call"
+            );
+            assert_eq!(KHR_CALLS.load(Ordering::Relaxed), khr, "KHR feature call");
+            assert_eq!(
+                CORE_LOOKUPS.load(Ordering::Relaxed),
+                core + usize::from(case == "caps-core-missing"),
+                "only resolve a permitted core route"
+            );
+            assert_eq!(
+                KHR_LOOKUPS.load(Ordering::Relaxed),
+                khr + usize::from(case == "caps-khr-missing"),
+                "only resolve a permitted KHR route"
+            );
+            let modified = usize::from(core + khr != 0);
+            assert_eq!(CHANGED_OK.load(Ordering::Relaxed), modified);
+            assert_eq!(
+                RETRY_OK.load(Ordering::Relaxed),
+                1 - modified,
+                "unknown/missing route forwards the original pointer unchanged"
+            );
+            assert_eq!(ATTEMPTS.load(Ordering::Relaxed), 1);
+            return;
+        }
+        if case.starts_with("present-") {
+            present_child(case, device);
+            return;
+        }
+        if case.starts_with("dispatch-conflict-") {
+            assert_eq!(
+                enshrouded_headroom::vk::with_game_device(|_, _, _| ()).is_some(),
+                case.contains("-query-")
+            );
+            assert_eq!(CHANGED_OK.load(Ordering::Relaxed), 0);
+            assert_eq!(RETRY_OK.load(Ordering::Relaxed), 1);
+            // SAFETY: B's actual GIPA supplies the fake device resolver before ordinary wrapping is disabled.
+            let get_device = unsafe {
+                let raw = enshrouded_headroom::vk::wrap_gipa(
+                    vk::Instance::from_raw(INSTANCE + 1),
+                    c"vkGetDeviceProcAddr".as_ptr(),
+                )
+                .unwrap();
+                std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkGetDeviceProcAddr>(raw)
+            };
+            if case.ends_with("disabled") {
+                enshrouded_headroom::guard::disable(Feature::VkWrap, "test");
+            }
+            let name = if case.contains("swapchain") {
+                c"vkDestroySwapchainKHR"
+            } else {
+                c"vkDestroyDevice"
+            };
+            // SAFETY: look up and invoke the actual signature for B's native object once.
+            unsafe {
+                let raw = if case.contains("-gipa-") {
+                    enshrouded_headroom::vk::wrap_gipa(
+                        vk::Instance::from_raw(INSTANCE + 1),
+                        name.as_ptr(),
+                    )
+                } else {
+                    get_device(device, name.as_ptr())
+                }
+                .unwrap();
+                if case.contains("swapchain") {
+                    std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkDestroySwapchainKHR>(
+                        raw,
+                    )(device, vk::SwapchainKHR::from_raw(44), std::ptr::null());
+                } else {
+                    std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkDestroyDevice>(
+                        raw,
+                    )(device, std::ptr::null());
+                }
+            }
+            assert_eq!(
+                A_DESTROYS.load(Ordering::Relaxed),
+                0,
+                "A dispatch must never destroy B's object"
+            );
+            assert_eq!(
+                B_DESTROYS.load(Ordering::Relaxed),
+                1,
+                "B's matched native destructor runs once"
+            );
+            return;
+        }
+        match case {
+            "unobserved" | "enum-failure" | "count-only" | "dispatch-conflict" => {
+                assert!(enshrouded_headroom::vk::with_game_device(|_, _, _| ()).is_none());
+                assert_eq!(CHANGED_OK.load(Ordering::Relaxed), 0);
+                assert_eq!(RETRY_OK.load(Ordering::Relaxed), 1);
+                if case != "dispatch-conflict" {
+                    assert_eq!(QUERY_INSTANCE.load(Ordering::Relaxed), 0);
+                }
+            }
+            "parentage" => {
+                assert_eq!(
+                    WRONG_GPU_QUERY.load(Ordering::Relaxed),
+                    0,
+                    "instance A GPU dispatch must not query B"
+                );
+                assert_eq!(
+                    QUERY_INSTANCE.load(Ordering::Relaxed),
+                    (INSTANCE + 1) as usize
+                );
+                assert_eq!(
+                    enshrouded_headroom::vk::with_game_device(|d, _, i| (d.phys, i)),
+                    Some((PHYS as usize, (INSTANCE + 1) as usize))
+                );
+                // Destroying unrelated A cannot retire B's context; destroying B must.
+                for instance in [INSTANCE, INSTANCE + 1] {
+                    if instance == INSTANCE + 1 {
+                        // SAFETY: Vulkan requires the child device to be destroyed before its parent.
+                        unsafe {
+                            enshrouded_headroom::vk::wrap_destroy_device(device, std::ptr::null())
+                        };
+                    }
+                    // SAFETY: each live fake instance is destroyed exactly once through its lookup.
+                    unsafe {
+                        let raw = enshrouded_headroom::vk::wrap_gipa(
+                            vk::Instance::from_raw(instance),
+                            c"vkDestroyInstance".as_ptr(),
+                        )
+                        .unwrap();
+                        let destroy = std::mem::transmute::<
+                            unsafe extern "system" fn(),
+                            vk::PFN_vkDestroyInstance,
+                        >(raw);
+                        destroy(vk::Instance::from_raw(instance), std::ptr::null());
+                    }
+                    assert_eq!(
+                        enshrouded_headroom::vk::with_game_device(|_, _, i| i),
+                        if instance == INSTANCE {
+                            Some((INSTANCE + 1) as usize)
+                        } else {
+                            None
+                        }
+                    );
+                }
+            }
+            "extension" | "groups" | "groups-khr" | "incomplete" => {
+                assert_eq!(ATTEMPTS.load(Ordering::Relaxed), 1);
+                assert_eq!(CHANGED_OK.load(Ordering::Relaxed), 1);
+                assert_eq!(RETRY_OK.load(Ordering::Relaxed), 0);
+            }
+            "refusal" => {
+                assert_eq!(ATTEMPTS.load(Ordering::Relaxed), 2);
+                assert_eq!(CHANGED_OK.load(Ordering::Relaxed), 1);
+                assert_eq!(RETRY_OK.load(Ordering::Relaxed), 1);
+                assert!(enshrouded_headroom::guard::is_disabled(Feature::Reflex));
+            }
+            "vendor" => {
+                assert_eq!(ATTEMPTS.load(Ordering::Relaxed), 1);
+                assert_eq!(CHANGED_OK.load(Ordering::Relaxed), 0);
+                assert_eq!(RETRY_OK.load(Ordering::Relaxed), 1);
+                assert!(!enshrouded_headroom::guard::is_disabled(Feature::Reflex));
+            }
+            _ => unreachable!(),
+        }
+    }
+    #[test]
+    fn listed_extension_original_retry_and_vendor_gate() {
+        if let Ok(case) = std::env::var("W23_FAKE_DRIVER") {
+            child(&case);
+            return;
+        }
+        for case in [
+            "dispatch-conflict-query-gdpa-swapchain-enabled",
+            "dispatch-conflict-query-gdpa-swapchain-disabled",
+            "dispatch-conflict-query-gipa-swapchain-enabled",
+            "dispatch-conflict-query-gipa-swapchain-disabled",
+            "dispatch-conflict-gdpa-device-enabled",
+            "dispatch-conflict-gdpa-device-disabled",
+            "dispatch-conflict-gdpa-swapchain-enabled",
+            "dispatch-conflict-gdpa-swapchain-disabled",
+            "dispatch-conflict-gipa-device-enabled",
+            "dispatch-conflict-gipa-device-disabled",
+            "dispatch-conflict-gipa-swapchain-enabled",
+            "dispatch-conflict-gipa-swapchain-disabled",
+            "dispatch-conflict",
+            "parentage",
+            "unobserved",
+            "enum-failure",
+            "count-only",
+            "groups",
+            "groups-khr",
+            "incomplete",
+            "extension",
+            "refusal",
+            "vendor",
+        ] {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "reflex_driver::listed_extension_original_retry_and_vendor_gate",
+                    "--nocapture",
+                ])
+                .env("W23_FAKE_DRIVER", case)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{case}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
 }
