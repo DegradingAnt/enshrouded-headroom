@@ -13,6 +13,7 @@ pub mod frame_timer;
 pub mod governor;
 pub mod guard;
 pub mod iat;
+pub mod knobs;
 pub mod log;
 pub mod patch;
 pub mod scan;

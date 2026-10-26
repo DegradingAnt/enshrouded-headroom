@@ -15,6 +15,7 @@ use crate::build_id::{self, Build};
 use crate::config::{self, Config, INI_FILE_NAME};
 use crate::features;
 use crate::guard;
+use crate::knobs;
 
 /// Sub-folder of `%LOCALAPPDATA%` for the settings file when the module folder has none and cannot
 /// hold one. It is the same folder the log falls back to.
@@ -267,6 +268,19 @@ pub fn start() {
         },
         cfg.general.priority,
     );
+
+    // 11. The scene-settings hook: object draw distance, the detail-scattering level and the
+    // governor's world-rendering signal. It hooks code, so it asks `code_patches_allowed`; it is
+    // installed when any distance knob is on, and logs its own line, including why it is off. It
+    // is only created and queued here: the last step enables it.
+    knobs::object_distance::init(&cfg.knobs);
+
+    // Later code hooks (Task 14's terrain hook) are created and queued above this line, so they
+    // join the one batch below.
+
+    // 12. Enable every queued hook at once (MinHook's queued enable). This is the only place that
+    // enables hooks. It logs one line if any hook was queued.
+    knobs::enable_queued_hooks();
 }
 
 #[cfg(test)]
