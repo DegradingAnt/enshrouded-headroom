@@ -307,11 +307,12 @@ pub fn install(m: &Module) -> Result<(), String> {
 }
 
 /// The body of [`init`], with the code-patch answer and the install passed in. `install` runs only
-/// when code patches are allowed and at least one distance knob is on. Returns the log level and
+/// when code patches are allowed and a distance knob or the saved Reflex menu needs it. Returns the log level and
 /// the one line to log.
 fn start_up(
     knobs: &KnobsCfg,
     code_patches: bool,
+    game_menu: bool,
     install: impl FnOnce() -> Result<(), String>,
 ) -> (Level, String) {
     if !code_patches {
@@ -322,7 +323,8 @@ fn start_up(
     }
     if !(knobs.enable_object_distance
         || knobs.enable_scatter_distance
-        || knobs.enable_terrain_distance)
+        || knobs.enable_terrain_distance
+        || game_menu)
     {
         return (
             Level::Info,
@@ -336,6 +338,18 @@ fn start_up(
             Level::Info,
             "object distance: on (scene-settings hook queued)".to_owned(),
         ),
+        Ok(())
+            if game_menu
+                && !(knobs.enable_object_distance
+                    || knobs.enable_scatter_distance
+                    || knobs.enable_terrain_distance) =>
+        {
+            (
+                Level::Info,
+                "object distance: off; scene-settings hook queued for the saved Reflex menu"
+                    .to_owned(),
+            )
+        }
         Ok(()) => (
             Level::Info,
             "object distance: off (EnableObjectDistance = 0); the scene-settings hook is queued \
@@ -355,9 +369,12 @@ fn start_up(
 pub fn init(knobs: &KnobsCfg) {
     // Before the hook can be enabled, so its first call sees the setting.
     APPLY_FACTOR.store(knobs.enable_object_distance, Ordering::Release);
-    let (level, line) = start_up(knobs, entry::code_patches_allowed(), || {
-        install(&main_module())
-    });
+    let (level, line) = start_up(
+        knobs,
+        entry::code_patches_allowed(),
+        crate::reflex::wants_game_menu(),
+        || install(&main_module()),
+    );
     log::log!(level, "{line}");
 }
 
@@ -658,7 +675,7 @@ mod tests {
     #[test]
     fn no_code_patches_means_no_hook_and_says_so() {
         let called = Cell::new(false);
-        let (level, line) = start_up(&knobs(true, true, true), false, || {
+        let (level, line) = start_up(&knobs(true, true, true), false, false, || {
             called.set(true);
             Ok(())
         });
@@ -673,7 +690,7 @@ mod tests {
     #[test]
     fn all_three_distance_knobs_off_means_no_hook() {
         let called = Cell::new(false);
-        let (level, line) = start_up(&knobs(false, false, false), true, || {
+        let (level, line) = start_up(&knobs(false, false, false), true, false, || {
             called.set(true);
             Ok(())
         });
@@ -694,7 +711,7 @@ mod tests {
             (false, false, true),
         ] {
             let called = Cell::new(false);
-            let (level, _) = start_up(&knobs(o, s, t), true, || {
+            let (level, _) = start_up(&knobs(o, s, t), true, false, || {
                 called.set(true);
                 Ok(())
             });
@@ -705,9 +722,9 @@ mod tests {
 
     #[test]
     fn the_line_says_whether_the_factor_is_applied() {
-        let (_, on) = start_up(&knobs(true, false, false), true, || Ok(()));
+        let (_, on) = start_up(&knobs(true, false, false), true, false, || Ok(()));
         assert_eq!(on, "object distance: on (scene-settings hook queued)");
-        let (_, off) = start_up(&knobs(false, true, true), true, || Ok(()));
+        let (_, off) = start_up(&knobs(false, true, true), true, false, || Ok(()));
         assert_eq!(
             off,
             "object distance: off (EnableObjectDistance = 0); the scene-settings hook is \
@@ -717,7 +734,7 @@ mod tests {
 
     #[test]
     fn an_install_failure_is_a_warning_with_the_reason() {
-        let (level, line) = start_up(&knobs(true, true, true), true, || {
+        let (level, line) = start_up(&knobs(true, true, true), true, false, || {
             Err("the game code was not found".to_owned())
         });
         assert_eq!(level, Level::Warn);
@@ -1113,5 +1130,23 @@ mod tests {
                 MinHook::remove_hook(target as *mut c_void).unwrap();
             }
         });
+    }
+    /// Following the saved Reflex setting still installs the reader when all distance knobs are off.
+    #[test]
+    fn game_reflex_alone_requests_scene_hook() {
+        let called = Cell::new(false);
+        let (level, line) = start_up(&knobs(false, false, false), true, true, || {
+            called.set(true);
+            Ok(())
+        });
+        assert!(called.get());
+        assert_eq!(level, Level::Info);
+        assert!(line.contains("saved Reflex menu"));
+        let called = Cell::new(false);
+        let _ = start_up(&knobs(false, false, false), false, true, || {
+            called.set(true);
+            Ok(())
+        });
+        assert!(!called.get(), "unknown-build code-patch gate still wins");
     }
 }

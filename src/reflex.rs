@@ -172,6 +172,43 @@ mod tests {
 #[cfg(test)]
 mod wiring_tests {
     use super::*;
+    /// Only Game requests the native saved-value reader; all other modes keep startup unchanged.
+    #[test]
+    fn menu_hook_request_follows_initialized_mode() {
+        if let Ok(value) = std::env::var("W23_MODE_CHILD") {
+            let (mode, expected) = match value.as_str() {
+                "game" => (ReflexMode::Game, true),
+                "off" => (ReflexMode::Off, false),
+                "on" => (ReflexMode::On, false),
+                "boost" => (ReflexMode::Boost, false),
+                _ => (ReflexMode::Auto, false),
+            };
+            assert!(
+                !wants_game_menu(),
+                "unset configuration leaves existing startup unchanged"
+            );
+            init(mode);
+            assert_eq!(wants_game_menu(), expected);
+            return;
+        }
+        for value in ["game", "off", "on", "boost", "auto"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "reflex::wiring_tests::menu_hook_request_follows_initialized_mode",
+                    "--nocapture",
+                ])
+                .env("W23_MODE_CHILD", value)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{value}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
     /// The real reader accepts only the verified options relationship and both enum ranges.
     #[test]
     fn menu_guard_and_ranges() {
@@ -331,6 +368,11 @@ static MODE: OnceLock<ReflexMode> = OnceLock::new();
 /// Save the parsed setting before installing Vulkan hooks.
 pub fn init(mode: ReflexMode) {
     let _ = MODE.set(mode);
+}
+
+/// Whether the saved menu needs the scene-settings reader, even with every distance knob off.
+pub fn wants_game_menu() -> bool {
+    MODE.get() == Some(&ReflexMode::Game)
 }
 
 /// Driver capabilities queried before modifying the device create info.
