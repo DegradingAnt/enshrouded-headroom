@@ -29,7 +29,7 @@ use log::Level;
 use super::{SCATTER, SCATTER_STEPS};
 use crate::config::KnobsCfg;
 use crate::entry;
-use crate::patch::{alloc_near, rel32, write_checked};
+use crate::patch::{alloc_near_all, rel32, rel32_target, write_checked, PatchError, Patched};
 use crate::scan::{find_in_sections, main_module, readable_run, walk_readable, Module, Pattern};
 use crate::sigs::{Sig, SCATTER_BRICK_LOAD, SCATTER_INSTANCE_LOADS};
 
@@ -72,7 +72,7 @@ const NOT_90: &str = "the grass distance value is not the game's 90 m (changed b
 /// (for example a page of another tool, or of this mod if it was installed already).
 const OUTSIDE_IMAGE: &str = "a grass distance load reads outside the game's image (changed by \
                              another tool or a different build)";
-/// Why [`install`] stopped: `alloc_near` found no block that a rel32 from the loads reaches.
+/// Why [`install`] stopped: `alloc_near_all` found no block that a rel32 from both loads reaches.
 const NO_PAGE: &str = "no free memory within 2 GiB of the game code for the distance value";
 
 /// The little-endian disp32 that makes a RIP-relative load read `new_target`. Pure.
@@ -119,9 +119,9 @@ pub fn set_distance(m: f32) {
     let m = clamp_distance(m);
     let page = SCATTER_FLOAT.load(Ordering::Acquire);
     if page != 0 {
-        // SAFETY: a non-zero `SCATTER_FLOAT` is the address `point_loads_at_page` stored: the
-        // start of a block that `alloc_near` committed read-write, 64 KiB aligned (so aligned for
-        // a u32), and never freed, so it is valid for reads and writes for the rest of the
+        // SAFETY: a non-zero `SCATTER_FLOAT` is the address `point_loads_at_page_with` stored: the
+        // start of a block that `alloc_near_all` committed read-write, 64 KiB aligned (so aligned
+        // for a u32), and never freed, so it is valid for reads and writes for the rest of the
         // process. Its only other writer is that function's first write, which comes before the
         // address is published (`Release` there, `Acquire` above). Its only readers are the
         // game's two distance loads: each a 4-byte `movss` from this aligned address, which
@@ -166,8 +166,7 @@ impl Load {
 
     /// The address the load reads with its disp32 as it was read.
     fn target(&self) -> Option<usize> {
-        let disp = isize::try_from(i32::from_le_bytes(self.old)).ok()?;
-        self.insn_end()?.checked_add_signed(disp)
+        rel32_target(self.insn_end()?, i32::from_le_bytes(self.old))
     }
 }
 
@@ -253,21 +252,45 @@ unsafe fn check_vanilla(m: &Module, loads: &[Load; 2]) -> Result<usize, String> 
     Ok(vanilla_target(read(brick)?, read(instance)?)?)
 }
 
-/// Write 90.0 into the page float, publish its address in [`SCATTER_FLOAT`], then point each
-/// load's disp32 at it, in that order (plan ruling 9). A thread that ran a load meanwhile would
-/// read 90.0 either way.
-///
-/// Every new disp32 is worked out first, so a page out of reach writes nothing at all. If a
-/// write fails after the publish, the address is taken back (0) and a load already redirected is
-/// put back, so the governor never moves just one of the two loads. `Err` is the reason.
+/// [`point_loads_at_page_with`], every write done by `write_checked`.
 ///
 /// # Safety
 ///
-/// - `page` is the start of a block from `alloc_near` that nothing else uses (at least 4 bytes,
-///   read-write), or an address that no rel32 from the loads reaches (refused before any write).
-/// - `write_checked`'s contract for each load's disp32: start-up only, and no thread runs the
-///   load instructions meanwhile.
+/// As [`point_loads_at_page_with`].
 unsafe fn point_loads_at_page(loads: &[Load; 2], page: usize) -> Result<(), String> {
+    let write = |addr: usize, old: &[u8; 4], new: &[u8; 4]| {
+        // SAFETY: `point_loads_at_page_with` calls this only for the page float and the two
+        // loads' disp32s, which this function's contract covers.
+        unsafe { write_checked(addr, old, new) }
+    };
+    // SAFETY: this function's contract is `point_loads_at_page_with`'s.
+    unsafe { point_loads_at_page_with(loads, page, write) }
+}
+
+/// Write 90.0 into the page float, publish its address in [`SCATTER_FLOAT`], then point each
+/// load's disp32 at it, in that order (plan ruling 9). A thread that ran a load meanwhile would
+/// read 90.0 either way. `write(addr, old, new)` does each write: the page float (old: the
+/// zeros of a fresh page), then the brick disp32, then the instance disp32, then (only if the
+/// instance write failed) the brick disp32 back. Production passes `write_checked`; a test can
+/// watch or fail each write.
+///
+/// Every new disp32 is worked out first, so a page out of reach writes nothing at all. A page
+/// that is not zero is refused before anything is published. If a disp32 write fails, the address
+/// is taken back (0) and a load already redirected is put back, so the governor never moves just
+/// one of the two loads. `Err` is the reason.
+///
+/// # Safety
+///
+/// - `page` is the start of a block from `alloc_near_all` that nothing else uses (at least 4
+///   bytes, read-write, zero-filled), or an address that no rel32 from the loads reaches (refused
+///   before any write).
+/// - `write_checked`'s contract for the page float and each load's disp32: start-up only, and no
+///   thread runs the load instructions meanwhile. `write` must be safe to call on those ranges.
+unsafe fn point_loads_at_page_with(
+    loads: &[Load; 2],
+    page: usize,
+    mut write: impl FnMut(usize, &[u8; 4], &[u8; 4]) -> Result<Patched, PatchError>,
+) -> Result<(), String> {
     let mut new = [[0u8; 4]; 2];
     for (slot, load) in new.iter_mut().zip(loads) {
         let (name, at) = (load.name, load.disp_addr);
@@ -278,31 +301,30 @@ unsafe fn point_loads_at_page(loads: &[Load; 2], page: usize) -> Result<(), Stri
             format!("{name}: the distance page at {page:#x} is out of reach of the load at {at:#x}")
         })?;
     }
-    // SAFETY: `page` is the start of a fresh read-write block from `alloc_near` (this function's
-    // contract; an unreachable address returned above). It is 64 KiB aligned, so aligned for a
-    // u32, and no load reads it yet.
-    unsafe { (page as *mut u32).write(VANILLA_BITS) };
+    // The page float first. `page` is a fresh block (this function's contract), so it holds zeros
+    // and no load reads it yet; anything else is refused before the address is published.
+    write(page, &[0; 4], &VANILLA_BITS.to_le_bytes())
+        .map_err(|error| format!("the distance page at {page:#x} could not be written: {error}"))?;
     SCATTER_FLOAT.store(page, Ordering::Release);
 
     let [brick, instance] = loads;
     let [brick_new, instance_new] = new;
-    // SAFETY (both writes and the undo): each range is the four disp32 bytes of a load
-    // instruction in the game's `.text`. A disp32 store is not atomic (these are not 4-byte
-    // aligned: 0x14007950b and 0x14007693a), and that is fine here: this runs from
-    // `InitializeASI`, before the game's `WinMain`, so no game thread runs these instructions yet
-    // (this function's contract). `old` and the new bytes are locals, not the target memory.
-    if let Err(error) = unsafe { write_checked(brick.disp_addr, &brick.old, &brick_new) } {
+    // The disp32 writes and the undo: each range is the four disp32 bytes of a load instruction
+    // in the game's `.text`. A disp32 store is not atomic (these are not 4-byte aligned:
+    // 0x14007950b and 0x14007693a), and that is fine here: this runs from `InitializeASI`, before
+    // the game's `WinMain`, so no game thread runs these instructions yet (this function's
+    // contract). `old` and the new bytes are locals, not the target memory.
+    if let Err(error) = write(brick.disp_addr, &brick.old, &brick_new) {
         SCATTER_FLOAT.store(0, Ordering::Release);
         return Err(format!(
             "{}: the load at {:#x} was not redirected: {error}",
             brick.name, brick.disp_addr
         ));
     }
-    // SAFETY: as above.
-    if let Err(error) = unsafe { write_checked(instance.disp_addr, &instance.old, &instance_new) } {
+    if let Err(error) = write(instance.disp_addr, &instance.old, &instance_new) {
         SCATTER_FLOAT.store(0, Ordering::Release);
-        // SAFETY: as above; the brick disp32 holds `brick_new`, written a moment ago.
-        let undo = unsafe { write_checked(brick.disp_addr, &brick_new, &brick.old) };
+        // The brick disp32 holds `brick_new`, written a moment ago.
+        let undo = write(brick.disp_addr, &brick_new, &brick.old);
         let brick_now = match undo {
             Ok(_) => "the brick load was put back".to_owned(),
             Err(undo_error) => format!(
@@ -321,10 +343,10 @@ unsafe fn point_loads_at_page(loads: &[Load; 2], page: usize) -> Result<(), Stri
 /// Point both High-level grass distance loads at a float in the mod's own page, which holds 90.0.
 ///
 /// In order: find both loads and read their disp32s; refuse unless both read the same address
-/// inside the image and it holds exactly 90.0 ([`vanilla_target`]); allocate the page near the
-/// loads; then [`point_loads_at_page`]. `Err` is the reason for the log. On an `Err` the game code
+/// inside the image and it holds exactly 90.0 (`vanilla_target`); allocate a page that both loads
+/// reach; then `point_loads_at_page`. `Err` is the reason for the log. On an `Err` the game code
 /// is as it was, except in the one case the text names. No capacity site is written. The page
-/// is never freed, also when a later step fails (`alloc_near`'s rule).
+/// is never freed, also when a later step fails (`alloc_near_all`'s rule).
 ///
 /// # Safety
 ///
@@ -338,12 +360,16 @@ pub unsafe fn install(m: &Module) -> Result<(), String> {
     // SAFETY: as above.
     let target = unsafe { check_vanilla(m, &loads) }?;
     log::debug!("grass distance: both loads read 90.0 at {target:#x}");
-    let [_, instance] = &loads;
-    let near = instance.insn_end().ok_or(NO_PAGE)?;
-    let page = alloc_near(near, size_of::<u32>()).ok_or(NO_PAGE)?;
+    // Both loads must reach the page: their ends are 0x2bd1 bytes apart in build f68140a3.
+    let [brick, instance] = &loads;
+    let ends = [
+        instance.insn_end().ok_or(NO_PAGE)?,
+        brick.insn_end().ok_or(NO_PAGE)?,
+    ];
+    let page = alloc_near_all(&ends, size_of::<u32>()).ok_or(NO_PAGE)?;
     log::debug!("grass distance: page at {page:#x}");
-    // SAFETY: `page` is a fresh block from `alloc_near` that nothing else knows; the rest is this
-    // function's start-up contract.
+    // SAFETY: `page` is a fresh, zero-filled block from `alloc_near_all` that nothing else knows;
+    // the rest is this function's start-up contract.
     unsafe { point_loads_at_page(&loads, page) }
 }
 
@@ -395,26 +421,38 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::knobs::{SCATTER, SCATTER_STEPS};
-    use crate::patch::alloc_near;
     use crate::patch::test_support::Mem;
+    use crate::patch::{alloc_near_all, PatchError};
     use crate::scan::{main_module, Module};
     use crate::sigs::{
         Sig, SCATTER_BRICK_LOAD, SCATTER_CAP_ALLOC, SCATTER_CAP_CONST, SCATTER_INSTANCE_LOADS,
     };
     use log::Level;
     use std::cell::Cell;
-    use std::sync::atomic::Ordering::Relaxed;
+    use std::sync::atomic::Ordering::{Acquire, Relaxed};
     use std::sync::{Mutex, MutexGuard, PoisonError};
 
     /// `SCATTER_FLOAT` and `SCATTER` are process-wide and tests run in parallel, so every test
-    /// that uses them holds this lock. It also starts each such test with no page installed.
+    /// that uses them holds this lock.
     static GLOBALS: Mutex<()> = Mutex::new(());
 
-    fn globals() -> MutexGuard<'static, ()> {
+    /// Holds `GLOBALS`. A test starts with no page published. On drop the address goes back to 0
+    /// before the lock is let go, so no other test sees the address of a page this test freed.
+    struct Globals {
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl Drop for Globals {
+        fn drop(&mut self) {
+            SCATTER_FLOAT.store(0, Relaxed);
+        }
+    }
+
+    fn globals() -> Globals {
         let lock = GLOBALS.lock().unwrap_or_else(PoisonError::into_inner);
         SCATTER_FLOAT.store(0, Relaxed);
         SCATTER.set(90.0);
-        lock
+        Globals { _lock: lock }
     }
 
     // ---- the values the plan gives verbatim ---------------------------------------------------
@@ -738,9 +776,163 @@ mod tests {
         assert_eq!(SCATTER_FLOAT.load(Relaxed), 0);
     }
 
-    /// A page near the image's loads, as `install` gets one.
-    fn page_near(module: &Module) -> usize {
-        alloc_near(module.base + INSTANCE_DISP + 4, 4).unwrap()
+    /// A page that both of the image's loads reach, as `install` gets one. The `Mem` frees it when
+    /// the test drops it.
+    fn page_near(module: &Module) -> Mem {
+        let ends = [
+            module.base + BRICK_DISP + 4,
+            module.base + INSTANCE_DISP + 4,
+        ];
+        let base = alloc_near_all(&ends, 4).unwrap();
+        // SAFETY: `alloc_near_all` returns the base of a fresh VirtualAlloc block of at least 4
+        // bytes, and nothing else frees it.
+        unsafe { Mem::adopt(base, 4) }
+    }
+
+    #[test]
+    fn a_disp32_past_the_end_of_the_signature_is_refused_before_the_scan() {
+        let (mem, module) = image();
+        let before = all(&mem);
+        // The match is 17 bytes, so a disp32 at +14 would end one byte past it.
+        let outside = Sig {
+            patch_offsets: &[14],
+            ..SCATTER_BRICK_LOAD
+        };
+        // SAFETY: as in `install_here`.
+        let why = unsafe { find_load(&module, &outside) }.unwrap_err();
+        assert_eq!(
+            why,
+            "SCATTER_BRICK_LOAD: the disp32 is not inside the signature"
+        );
+        // The last four bytes of the match are inside it: accepted, and read from the image.
+        let last = Sig {
+            patch_offsets: &[13],
+            ..SCATTER_BRICK_LOAD
+        };
+        // SAFETY: as in `install_here`.
+        let load = unsafe { find_load(&module, &last) }.unwrap();
+        assert_eq!(load.disp_addr, module.base + BRICK_RVA + 13);
+        assert_eq!(load.old, [0x48, 0x83, 0xc4, 0x28]);
+        assert_eq!(all(&mem), before);
+    }
+
+    /// One write that `point_loads_at_page_with` asked for, and what had been published then.
+    #[derive(Debug, PartialEq)]
+    struct Seen {
+        /// Where the write goes.
+        addr: usize,
+        /// `SCATTER_FLOAT` just before the write.
+        published: usize,
+        /// The page float just before the write.
+        page_value: f32,
+    }
+
+    #[test]
+    fn the_page_holds_90_and_is_published_before_either_disp32_is_written() {
+        // Plan ruling 9: page float, then the publish, then the two disp32s.
+        let _g = globals();
+        let (mem, module) = image();
+        // SAFETY: as in `install_here`.
+        let loads = unsafe { find_loads(&module) }.unwrap();
+        let page = page_near(&module);
+        let mut seen = Vec::new();
+        let write = |addr: usize, old: &[u8; 4], new: &[u8; 4]| {
+            seen.push(Seen {
+                addr,
+                published: SCATTER_FLOAT.load(Acquire),
+                page_value: read_f32(page.base),
+            });
+            // SAFETY: `point_loads_at_page_with` passes the page float or a disp32 of the
+            // synthetic image; nothing runs either.
+            unsafe { write_checked(addr, old, new) }
+        };
+        // SAFETY: as in `install_here`; `page` is a fresh block that both loads reach, and the
+        // write function passes every write on to `write_checked` unchanged.
+        let result = unsafe { point_loads_at_page_with(&loads, page.base, write) };
+        assert_eq!(result, Ok(()));
+        let (brick, instance) = (module.base + BRICK_DISP, module.base + INSTANCE_DISP);
+        assert_eq!(
+            seen,
+            [
+                // The page float, before anything is published.
+                Seen {
+                    addr: page.base,
+                    published: 0,
+                    page_value: 0.0
+                },
+                // Then each disp32, with the page published and holding 90.0.
+                Seen {
+                    addr: brick,
+                    published: page.base,
+                    page_value: 90.0
+                },
+                Seen {
+                    addr: instance,
+                    published: page.base,
+                    page_value: 90.0
+                },
+            ]
+        );
+        assert_eq!(SCATTER_FLOAT.load(Acquire), page.base);
+        assert_eq!(target_of(&mem, BRICK_DISP), page.base);
+        assert_eq!(target_of(&mem, INSTANCE_DISP), page.base);
+    }
+
+    #[test]
+    fn a_failed_undo_leaves_the_brick_on_the_page_and_publishes_nothing() {
+        let _g = globals();
+        let (mem, module) = image();
+        // SAFETY: as in `install_here`.
+        let loads = unsafe { find_loads(&module) }.unwrap();
+        let page = page_near(&module);
+        let (brick, instance) = (module.base + BRICK_DISP, module.base + INSTANCE_DISP);
+        let mut brick_writes = 0;
+        // Fails the instance disp32 and the second brick write (the undo); passes the rest on.
+        let write = |addr: usize, old: &[u8; 4], new: &[u8; 4]| {
+            if addr == brick {
+                brick_writes += 1;
+                if brick_writes == 2 {
+                    return Err(PatchError::Protect(5));
+                }
+            }
+            if addr == instance {
+                return Err(PatchError::Protect(5));
+            }
+            // SAFETY: `addr` is the page float or the brick disp32 of the synthetic image;
+            // nothing runs either.
+            unsafe { write_checked(addr, old, new) }
+        };
+        // SAFETY: as in the write-order test.
+        let why = unsafe { point_loads_at_page_with(&loads, page.base, write) }.unwrap_err();
+        assert_eq!(brick_writes, 2, "the redirect, then the undo");
+        assert!(why.contains("SCATTER_INSTANCE_LOADS"), "{why}");
+        assert!(why.contains("could not be put back"), "{why}");
+        assert_eq!(SCATTER_FLOAT.load(Acquire), 0, "the address is taken back");
+        assert_eq!(
+            target_of(&mem, BRICK_DISP),
+            page.base,
+            "the brick reads the page"
+        );
+        assert_eq!(read_f32(page.base), 90.0, "which holds the game's value");
+        assert_eq!(target_of(&mem, INSTANCE_DISP), module.base + CONST_RVA);
+    }
+
+    #[test]
+    fn a_page_that_is_not_fresh_refuses_and_changes_nothing() {
+        let _g = globals();
+        let (mem, module) = image();
+        // SAFETY: as in `install_here`.
+        let loads = unsafe { find_loads(&module) }.unwrap();
+        let before = all(&mem);
+        let page = page_near(&module);
+        page.put(0, &[1, 2, 3, 4]);
+        // SAFETY: as in `install_here`; the page is refused before it is written.
+        let why = unsafe { point_loads_at_page(&loads, page.base) }.unwrap_err();
+        assert!(why.contains("the distance page"), "{why}");
+        assert!(why.contains("not the expected ones"), "{why}");
+        assert_eq!(page.get(0, 4), [1, 2, 3, 4]);
+        assert_eq!(all(&mem), before);
+        assert_eq!(SCATTER_FLOAT.load(Acquire), 0);
     }
 
     #[test]
@@ -753,8 +945,8 @@ mod tests {
         mem.put(BRICK_DISP, &[1, 2, 3, 4]);
         let before = all(&mem);
         let page = page_near(&module);
-        // SAFETY: as in `install_here`; `page` is a fresh block from `alloc_near`.
-        let why = unsafe { point_loads_at_page(&loads, page) }.unwrap_err();
+        // SAFETY: as in `install_here`; `page` is a fresh block that both loads reach.
+        let why = unsafe { point_loads_at_page(&loads, page.base) }.unwrap_err();
         assert!(why.contains("SCATTER_BRICK_LOAD"), "{why}");
         assert!(why.contains("not the expected ones"), "{why}");
         assert_eq!(all(&mem), before, "nothing written");
@@ -771,7 +963,7 @@ mod tests {
         let before = all(&mem);
         let page = page_near(&module);
         // SAFETY: as in the brick test.
-        let why = unsafe { point_loads_at_page(&loads, page) }.unwrap_err();
+        let why = unsafe { point_loads_at_page(&loads, page.base) }.unwrap_err();
         assert!(why.contains("SCATTER_INSTANCE_LOADS"), "{why}");
         assert!(why.contains("put back"), "{why}");
         assert_eq!(all(&mem), before, "the brick disp32 is the original again");
@@ -918,49 +1110,14 @@ mod tests {
     /// the bytes) and docs/re-notes.md.
     const BRICK_MATCH_VA: u64 = 0x1_4007_9502;
     const INSTANCE_MATCH_VA: u64 = 0x1_4007_691c;
-    const DISTANCE_CONST_VA: u64 = 0x1_413b_65fc;
-
-    /// Each section of a PE32+ file: `(name, virtual address with the image base, file offset,
-    /// bytes in the file)`. Walks the headers by hand because the parser in `scan` is private.
-    fn sections_of(file: &[u8]) -> Vec<([u8; 8], u64, usize, usize)> {
-        use crate::scan::{u16_at, u32_at, u64_at};
-        let nt = u32_at(file, 0x3c).unwrap() as usize;
-        let n_sections = u16_at(file, nt + 6).unwrap() as usize;
-        let optional_size = u16_at(file, nt + 20).unwrap() as usize;
-        let optional = nt + 24;
-        assert_eq!(u16_at(file, optional), Some(0x20b), "PE32+");
-        let image_base = u64_at(file, optional + 24).unwrap();
-        let table = optional + optional_size;
-        (0..n_sections)
-            .map(|i| {
-                let at = table + i * 40;
-                let name: [u8; 8] = file[at..at + 8].try_into().unwrap();
-                let virtual_size = u32_at(file, at + 8).unwrap() as usize;
-                let rva = u32_at(file, at + 12).unwrap() as u64;
-                let raw_size = u32_at(file, at + 16).unwrap() as usize;
-                let raw_ptr = u32_at(file, at + 20).unwrap() as usize;
-                (name, image_base + rva, raw_ptr, virtual_size.min(raw_size))
-            })
-            .collect()
-    }
-
-    /// The four bytes at virtual address `va`, from whichever section holds them on disk.
-    fn bytes_at(file: &[u8], va: u64) -> [u8; 4] {
-        for (_, start, raw_ptr, len) in sections_of(file) {
-            if va >= start && va + 4 <= start + len as u64 {
-                let at = raw_ptr + (va - start) as usize;
-                return file[at..at + 4].try_into().unwrap();
-            }
-        }
-        panic!("{va:#x} is in no section of the file");
-    }
+    const DISTANCE_CONST_VA: usize = 0x1_413b_65fc;
 
     #[test]
     #[ignore = "reads the game exe (ENSHROUDED_EXE, else the Steam path); a skip shows only with -- --ignored --nocapture"]
     fn scatter_sigs_unique_in_game_exe() {
         use crate::build_id::test_support::game_exe_or_skip;
         use crate::build_id::{classify, sha256_file};
-        use crate::scan::{find_unique, Pattern};
+        use crate::scan::{find_unique, parse_pe_file, Pattern};
         let Some(path) = game_exe_or_skip("scatter_sigs_unique_in_game_exe") else {
             return;
         };
@@ -970,11 +1127,8 @@ mod tests {
             classify(sha256_file(&path).expect("hash the game exe"))
         );
         let file = std::fs::read(&path).expect("read the game exe");
-        let (_, text_va, text_ptr, text_len) = sections_of(&file)
-            .into_iter()
-            .find(|(name, ..)| name == b".text\0\0\0")
-            .expect("a .text section");
-        let text = &file[text_ptr..text_ptr + text_len];
+        let pe = parse_pe_file(&file).expect("PE headers of the game exe");
+        let (text_va, text) = pe.section_va_bytes(&file, ".text").unwrap();
         let mut found = Vec::new();
         for (sig, anchor) in [
             (&SCATTER_BRICK_LOAD, BRICK_MATCH_VA),
@@ -985,10 +1139,19 @@ mod tests {
             let va = text_va + at as u64;
             assert_eq!(va, anchor, "{}", sig.name);
             let disp_va = va + sig.patch_offset() as u64;
-            let insn_end = disp_va + 4;
-            let disp = i32::from_le_bytes(bytes_at(&file, disp_va));
-            let target = insn_end.checked_add_signed(i64::from(disp)).unwrap();
-            let bits = u32::from_le_bytes(bytes_at(&file, target));
+            // The load as `find_load` would make it, so `target` is the production code's.
+            let load = Load {
+                name: sig.name,
+                disp_addr: disp_va as usize,
+                old: pe
+                    .bytes_at_va(&file, disp_va, 4)
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            };
+            let (insn_end, target) = (load.insn_end().unwrap(), load.target().unwrap());
+            let bytes = pe.bytes_at_va(&file, target as u64, 4).unwrap();
+            let bits = u32::from_le_bytes(bytes.try_into().unwrap());
             println!(
                 "{:<24} match {va:#x}  disp32 at {disp_va:#x}  insn end {insn_end:#x}  \
                  reads {target:#x} = {} (bits {bits:#010x})",
@@ -997,10 +1160,10 @@ mod tests {
             );
             assert_eq!(target, DISTANCE_CONST_VA, "{}", sig.name);
             assert_eq!(bits, VANILLA_BITS, "{}", sig.name);
-            found.push((target as usize, bits));
+            found.push((target, bits));
         }
         let decision = vanilla_target(found[0], found[1]);
         println!("vanilla decision: {decision:x?}");
-        assert_eq!(decision, Ok(DISTANCE_CONST_VA as usize));
+        assert_eq!(decision, Ok(DISTANCE_CONST_VA));
     }
 }

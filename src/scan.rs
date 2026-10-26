@@ -358,6 +358,34 @@ impl PeInfo {
         })
     }
 
+    /// The `len` file bytes at virtual address `va` (image base included), from the section whose
+    /// bytes in the file (as `raw_virtual` gives them) hold all of them. `Err` if no section does.
+    pub(crate) fn bytes_at_va<'file>(
+        &self,
+        file: &'file [u8],
+        va: u64,
+        len: usize,
+    ) -> Result<&'file [u8], String> {
+        let missing = || format!("{va:#x}+{len:#x} is in no section's bytes in the file");
+        let rva = va
+            .checked_sub(self.image_base)
+            .and_then(|rva| u32::try_from(rva).ok())
+            .ok_or_else(missing)?;
+        for section in &self.sections {
+            let Some(offset) = rva.checked_sub(section.rva) else {
+                continue;
+            };
+            let Ok(bytes) = self.raw_virtual(file, section) else {
+                continue;
+            };
+            let start = offset as usize;
+            if let Some(found) = start.checked_add(len).and_then(|end| bytes.get(start..end)) {
+                return Ok(found);
+            }
+        }
+        Err(missing())
+    }
+
     /// Name the section containing `rva`, using its unaligned virtual size.
     pub(crate) fn section_of(&self, rva: u32) -> Option<String> {
         self.sections
@@ -1248,6 +1276,37 @@ mod tests {
         // `.bind` starts past the end of a file of 0x300 bytes.
         assert!(pe.raw(file.get(..0x300).unwrap(), bind).is_err());
         assert!(pe.raw(&[], text).is_err());
+    }
+
+    #[test]
+    fn bytes_at_va_reads_the_file_bytes_of_a_virtual_address() {
+        let mut file = two_section_pe();
+        file[OPTIONAL + 24..OPTIONAL + 32].copy_from_slice(&0x1_4000_0000u64.to_le_bytes());
+        let pe = parse_pe_file(&file).unwrap();
+        // Byte `i` of the file is `i as u8` from 0x200 on: `.text` rva 0x1000 is file 0x200,
+        // `.bind` rva 0x3000 is file 0x400.
+        assert_eq!(
+            pe.bytes_at_va(&file, 0x1_4000_1010, 4),
+            Ok(&[0x10, 0x11, 0x12, 0x13][..])
+        );
+        assert_eq!(
+            pe.bytes_at_va(&file, 0x1_4000_11fc, 4),
+            Ok(&[0xfc, 0xfd, 0xfe, 0xff][..])
+        );
+        assert_eq!(
+            pe.bytes_at_va(&file, 0x1_4000_30fc, 4),
+            Ok(&[0xfc, 0xfd, 0xfe, 0xff][..])
+        );
+        for va in [
+            0x1_4000_11fd, // runs past the 0x200 file bytes of `.text`
+            0x1_4000_1200, // in `.text` in memory, but not in the file
+            0x1_4000_2ffe, // between the sections, running into `.bind`
+            0x1_4000_30fd, // runs past the end of `.bind`
+            0x1010,        // below the image base
+            u64::MAX,
+        ] {
+            assert!(pe.bytes_at_va(&file, va, 4).is_err(), "{va:#x}");
+        }
     }
 
     #[test]
