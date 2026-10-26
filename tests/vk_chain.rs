@@ -1781,11 +1781,8 @@ mod reflex_driver {
     #[test]
     fn feature_query_requires_proven_core_or_khr_route() {
         const NAME: &str = "reflex_driver::feature_query_requires_proven_core_or_khr_route";
-        if let Ok(case) = std::env::var("W23_CAPS_CHILD") {
-            child(&case);
-            return;
-        }
-        for case in [
+        const CHILD_ARGS: [&str; 4] = ["--exact", NAME, "--nocapture", "--test-threads=1"];
+        const CASES: [&str; 9] = [
             "caps-khr",
             "caps-core",
             "caps-unknown",
@@ -1795,9 +1792,24 @@ mod reflex_driver {
             "caps-low-physical-khr",
             "caps-core-missing",
             "caps-khr-missing",
-        ] {
+        ];
+        let exact_child = std::env::args_os()
+            .skip(1)
+            .eq(CHILD_ARGS.map(std::ffi::OsString::from));
+        if let Some(case) = std::env::var("W23_CAPS_CHILD")
+            .ok()
+            .filter(|case| exact_child && CASES.contains(&case.as_str()))
+        {
+            assert!(
+                exact_child,
+                "capability child requires exact one-worker arguments before changing globals"
+            );
+            child(&case);
+            return;
+        }
+        for case in CASES {
             let output = Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", NAME, "--nocapture"])
+                .args(CHILD_ARGS)
                 .env("W23_CAPS_CHILD", case)
                 .output()
                 .unwrap();
@@ -1807,6 +1819,7 @@ mod reflex_driver {
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
+            println!("capability case passed: {case}");
         }
     }
     fn child(case: &str) {

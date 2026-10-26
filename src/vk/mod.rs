@@ -1029,7 +1029,7 @@ pub unsafe extern "system" fn wrap_create_instance(
         completed.set(Some(result));
         result
     };
-    guard(Feature::VkWrap, &original, || {
+    guard(Feature::VkWrap, original, || {
         // SAFETY: these are the unchanged original native input pointers, still live for this call.
         let api = unsafe { requested_instance_api(info) };
         let result = original();
