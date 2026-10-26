@@ -456,12 +456,18 @@ Evidence: REA/Ghidra on the old-build exe (sha256 `b28b448a...`; the Steam exe h
 
 These are supplied read-only spike results, transcribed without new reverse engineering. VERIFIED and HYPOTHESIS retain the spike's classifications; neither label establishes an in-game mod result. Routes are proposals and open questions remain unresolved.
 
-- [VERIFIED] Evidence scope: spike `wf_cd1066c9-e7c`, 2026-10-26, installed Steam build 26082781. Exe evidence comes from reference sha256 `b28b448a…`; patch-site bytes were re-checked in Steam sha256 `d64966e2…`, with identical `.text`.
+- [VERIFIED] Evidence scope: spike `wf_cd1066c9-e7c`, 2026-10-26, installed Steam build 26082781.
+  - Receipt: Supplied climbing spike summary and patch-site comparison below.
+- [VERIFIED] Exe evidence comes from reference sha256 `b28b448a…`; patch-site bytes were re-checked in Steam sha256 `d64966e2…`, with identical `.text`.
   - Receipt: Supplied climbing spike summary and patch-site comparison below.
 - [VERIFIED] Read-only helper filenames: pestr.py, xref.py, dump.py, rtype.py, owner.py, prog.py, bpat.py and fun_1402d7990.c.
   - Receipt: Supplied climbing spike helper inventory.
 
-- [HYPOTHESIS] The climbing summary calls the bounded vertical speed 20 m/s. It reports no wall-hit handler for the glider and only a floor-collision exit. The detailed component and wall-hit interpretations retain their HYPOTHESIS labels below.
+- [HYPOTHESIS] The climbing summary calls the bounded vertical speed 20 m/s.
+  - Receipt: Supplied climbing summary, FUN_140419570 hypothesis and glider facts/open questions.
+- [HYPOTHESIS] It reports no wall-hit handler for the glider and only a floor-collision exit.
+  - Receipt: Supplied climbing summary, FUN_140419570 hypothesis and glider facts/open questions.
+- [HYPOTHESIS] The detailed component and wall-hit interpretations retain their HYPOTHESIS labels below.
   - Receipt: Supplied climbing summary, FUN_140419570 hypothesis and glider facts/open questions.
 - [VERIFIED] ShroudForge exposes generic reflected ECS read/write; its profile supplies no climb or locomotion offsets.
   - Receipt: Supplied summary and ShroudForge Lua/profile receipts below.
@@ -476,7 +482,9 @@ These are supplied read-only spike results, transcribed without new reverse engi
   - Receipt: Enum descs 0x141987350 (members 0x141986d90), 0x141988010 (members 0x141987cd0) and 0x1419897d0 (members 0x141988dd0). Member stride 0x28: (name, len, value).
 - [VERIFIED] ClimbCollisionQueryType = {Wall_ExitTop, Ladder_StepUp, Ladder_StepDown, Ladder_ExitTop, Count}.
   - Receipt: Enum descs 0x141987350 (members 0x141986d90), 0x141988010 (members 0x141987cd0) and 0x1419897d0 (members 0x141988dd0). Member stride 0x28: (name, len, value).
-- [VERIFIED] LocomotionState has 12 values: Walking 0, Sliding 1, Falling 2, Flying 3, HangGliding 4, HookPulling 5, HookSwinging 6, ClimbingWall 7, ClimbingLadder 8, Swimming 9, Diving 10, BuildingFlying 11. ecs.DynamicLocomotion (size 0x1c8) holds: state +0x59, previousState +0x5a, floorNormal +0xc, slopeNormal +0x18, groundSlopeNormal +0x24, takeOffTime +0xb0, jumpType +0x154, jumpCount +0x155, ledgeHeight +0x184, gliderTurbulence +0x190.
+- [VERIFIED] LocomotionState has 12 values: Walking 0, Sliding 1, Falling 2, Flying 3, HangGliding 4, HookPulling 5, HookSwinging 6, ClimbingWall 7, ClimbingLadder 8, Swimming 9, Diving 10, BuildingFlying 11.
+  - Receipt: LocomotionState desc 0x141a88df0 (members 0x141a87ce0). DynamicLocomotion desc 0x141892c20, 65 fields (rtype.py).
+- [VERIFIED] ecs.DynamicLocomotion (size 0x1c8) holds: state +0x59, previousState +0x5a, floorNormal +0xc, slopeNormal +0x18, groundSlopeNormal +0x24, takeOffTime +0xb0, jumpType +0x154, jumpCount +0x155, ledgeHeight +0x184, gliderTurbulence +0x190.
   - Receipt: LocomotionState desc 0x141a88df0 (members 0x141a87ce0). DynamicLocomotion desc 0x141892c20, 65 fields (rtype.py).
 - [VERIFIED] The impact program 'player_locomotion_climb_wall' is the wall-climb system.
   - Receipt: Program descriptor 0x141deff50 = (name ptr 0x141df0308, len 0x1c, fn 0x1404188c0, then (list ptr, count) groups). Ladder descriptor 0x141df12b0. Read with prog.py.
@@ -522,9 +530,17 @@ These are supplied read-only spike results, transcribed without new reverse engi
   - Receipt: REA decompile ev_a79f733b… (FUN_14024c0d0): 'param_3 + 0x198', 'param_3 + 0x1a0', 'FUN_14024abc0(&local_48,param_2,&local_68,&local_58,0x3f400000)', 'if (fVar3 <= 0.7853982)'. ActorInput desc 0x141952b10: +0x198 desiredWorldMoveInput.
 - [VERIFIED] Walking or sprinting into a valid wall therefore latches with no button.
   - Receipt: REA decompile ev_a79f733b… (FUN_14024c0d0): 'param_3 + 0x198', 'param_3 + 0x1a0', 'FUN_14024abc0(&local_48,param_2,&local_68,&local_58,0x3f400000)', 'if (fVar3 <= 0.7853982)'. ActorInput desc 0x141952b10: +0x198 desiredWorldMoveInput.
-- [VERIFIED] The wall probe FUN_14024abc0 does these steps. (1) A forward ray from pos+(0,2,0), length param+0.65 (=1.4 m). (2) Four corner rays at heights 2.0 m and 1.25 m, ±0.5 lateral.
+- [VERIFIED] The wall probe FUN_14024abc0 does these steps. (1) A forward ray from pos+(0,2,0), length param+0.65 (=1.4 m).
   - Receipt: REA asm ev_45b1a63d…: 0x14024acc8 'MOV dword ptr [RSP+0x28],0x100' (c7 44 24 28 00 01 00 00) and 0x14024af4f (same bytes) before CALL 0x1409fff60. 0x14024afb8/0x14024afec 'MOVSS XMMx,[0x1413b825c]' = 0.001f. 0x14024ad82 'c7 44 24 40 01 00 03 00' + 'MOV EAX,5' → bitmask. Constants: 0x14150af68=0.65, 0x1413b5678=2.0, 0x1414faf6c=1.25, 0x1413b3c94=0.5, 0x1413b5b3c=0.55.
-- [VERIFIED] Both steps use collider mask 0x100. (3) All four hit normals must match within 0.001, else fail code 0x15. (4) A clearance sweep with mask bits {1,3,5} (else code 0x1e). (5) The result is hit + normal*0.55 plus the normal.
+- [VERIFIED] (2) Four corner rays at heights 2.0 m and 1.25 m, ±0.5 lateral.
+  - Receipt: REA asm ev_45b1a63d…: 0x14024acc8 'MOV dword ptr [RSP+0x28],0x100' (c7 44 24 28 00 01 00 00) and 0x14024af4f (same bytes) before CALL 0x1409fff60. 0x14024afb8/0x14024afec 'MOVSS XMMx,[0x1413b825c]' = 0.001f. 0x14024ad82 'c7 44 24 40 01 00 03 00' + 'MOV EAX,5' → bitmask. Constants: 0x14150af68=0.65, 0x1413b5678=2.0, 0x1414faf6c=1.25, 0x1413b3c94=0.5, 0x1413b5b3c=0.55.
+- [VERIFIED] Both steps use collider mask 0x100.
+  - Receipt: REA asm ev_45b1a63d…: 0x14024acc8 'MOV dword ptr [RSP+0x28],0x100' (c7 44 24 28 00 01 00 00) and 0x14024af4f (same bytes) before CALL 0x1409fff60. 0x14024afb8/0x14024afec 'MOVSS XMMx,[0x1413b825c]' = 0.001f. 0x14024ad82 'c7 44 24 40 01 00 03 00' + 'MOV EAX,5' → bitmask. Constants: 0x14150af68=0.65, 0x1413b5678=2.0, 0x1414faf6c=1.25, 0x1413b3c94=0.5, 0x1413b5b3c=0.55.
+- [VERIFIED] (3) All four hit normals must match within 0.001, else fail code 0x15.
+  - Receipt: REA asm ev_45b1a63d…: 0x14024acc8 'MOV dword ptr [RSP+0x28],0x100' (c7 44 24 28 00 01 00 00) and 0x14024af4f (same bytes) before CALL 0x1409fff60. 0x14024afb8/0x14024afec 'MOVSS XMMx,[0x1413b825c]' = 0.001f. 0x14024ad82 'c7 44 24 40 01 00 03 00' + 'MOV EAX,5' → bitmask. Constants: 0x14150af68=0.65, 0x1413b5678=2.0, 0x1414faf6c=1.25, 0x1413b3c94=0.5, 0x1413b5b3c=0.55.
+- [VERIFIED] (4) A clearance sweep with mask bits {1,3,5} (else code 0x1e).
+  - Receipt: REA asm ev_45b1a63d…: 0x14024acc8 'MOV dword ptr [RSP+0x28],0x100' (c7 44 24 28 00 01 00 00) and 0x14024af4f (same bytes) before CALL 0x1409fff60. 0x14024afb8/0x14024afec 'MOVSS XMMx,[0x1413b825c]' = 0.001f. 0x14024ad82 'c7 44 24 40 01 00 03 00' + 'MOV EAX,5' → bitmask. Constants: 0x14150af68=0.65, 0x1413b5678=2.0, 0x1414faf6c=1.25, 0x1413b3c94=0.5, 0x1413b5b3c=0.55.
+- [VERIFIED] (5) The result is hit + normal*0.55 plus the normal.
   - Receipt: REA asm ev_45b1a63d…: 0x14024acc8 'MOV dword ptr [RSP+0x28],0x100' (c7 44 24 28 00 01 00 00) and 0x14024af4f (same bytes) before CALL 0x1409fff60. 0x14024afb8/0x14024afec 'MOVSS XMMx,[0x1413b825c]' = 0.001f. 0x14024ad82 'c7 44 24 40 01 00 03 00' + 'MOV EAX,5' → bitmask. Constants: 0x14150af68=0.65, 0x1413b5678=2.0, 0x1414faf6c=1.25, 0x1413b3c94=0.5, 0x1413b5b3c=0.55.
 - [VERIFIED] Mask 0x100 = ColliderFlags bit 8 = ClimbingWall.
   - Receipt: ecs.ColliderFlags desc 0x1418983b0, members 0x1418952d0: 0 World, 1 WorldNotDisplaced, 3 Solid, 5 Walkable, 6 WalkablePlatform, 8 ClimbingWall, … (23 members). The tutorial text in enshrouded_053.dat at byte 901419730 says 'Walk up to the Climbing Wall to latch on to the iron lattice' (read with dd).
@@ -532,7 +548,11 @@ These are supplied read-only spike results, transcribed without new reverse engi
   - Receipt: ecs.ColliderFlags desc 0x1418983b0, members 0x1418952d0: 0 World, 1 WorldNotDisplaced, 3 Solid, 5 Walkable, 6 WalkablePlatform, 8 ClimbingWall, … (23 members). The tutorial text in enshrouded_053.dat at byte 901419730 says 'Walk up to the Climbing Wall to latch on to the iron lattice' (read with dd).
 - [VERIFIED] Natural voxel rock and normal walls never qualify.
   - Receipt: ecs.ColliderFlags desc 0x1418983b0, members 0x1418952d0: 0 World, 1 WorldNotDisplaced, 3 Solid, 5 Walkable, 6 WalkablePlatform, 8 ClimbingWall, … (23 members). The tutorial text in enshrouded_053.dat at byte 901419730 says 'Walk up to the Climbing Wall to latch on to the iron lattice' (read with dd).
-- [HYPOTHESIS] Other code also passes the ClimbingWall mask. 'c7 44 24 28 00 01 00 00' occurs 9 times in .text: 0x14024acc8, 0x14024af4f, 0x14024b238, 0x14024c688, 0x140684f16, 0x1406b2e8a, 0x140843216, 0x140bd2d7b, 0x1412d73aa. '41 b9 00 01 00 00' occurs at 0x14024c73f, among other places.
+- [HYPOTHESIS] Other code also passes the ClimbingWall mask.
+  - Receipt: Python bytes scan of the Steam exe .text (counts 9 and 29). Only the attribution of 0x14024acc8 and 0x14024af4f is decompile-verified.
+- [HYPOTHESIS] 'c7 44 24 28 00 01 00 00' occurs 9 times in .text: 0x14024acc8, 0x14024af4f, 0x14024b238, 0x14024c688, 0x140684f16, 0x1406b2e8a, 0x140843216, 0x140bd2d7b, 0x1412d73aa.
+  - Receipt: Python bytes scan of the Steam exe .text (counts 9 and 29). Only the attribution of 0x14024acc8 and 0x14024af4f is decompile-verified.
+- [HYPOTHESIS] '41 b9 00 01 00 00' occurs at 0x14024c73f, among other places.
   - Receipt: Python bytes scan of the Steam exe .text (counts 9 and 29). Only the attribution of 0x14024acc8 and 0x14024af4f is decompile-verified.
 - [HYPOTHESIS] The sites in the 0x14024a000–0x14024d000 cluster are the climb probes: entry, update and top-exit.
   - Receipt: Python bytes scan of the Steam exe .text (counts 9 and 29). Only the attribution of 0x14024acc8 and 0x14024af4f is decompile-verified.
@@ -552,7 +572,9 @@ These are supplied read-only spike results, transcribed without new reverse engi
   - Receipt: Descriptor 0x141dfecd0 (reads MovementVector, SlotSelection, Stamina, StaminaDepletionMod; writes Actor, Climb, StaminaDepletion). REA decompile ev_2800f695…. Call at 0x1402eb789 preceded by '33 c9'. FUN_14024a360 default [0x1413b6808] = 8.0f (bytes 00 00 00 41). StateFlag 6 = Exhausted.
 - [VERIFIED] If actor StateFlag 6 (Exhausted) is set, it calls FUN_14024a090, which stops climbing (the player falls).
   - Receipt: Descriptor 0x141dfecd0 (reads MovementVector, SlotSelection, Stamina, StaminaDepletionMod; writes Actor, Climb, StaminaDepletion). REA decompile ev_2800f695…. Call at 0x1402eb789 preceded by '33 c9'. FUN_14024a360 default [0x1413b6808] = 8.0f (bytes 00 00 00 41). StateFlag 6 = Exhausted.
-- [VERIFIED] Jumping off and interrupts: actor.JumpType 13 = FreeClimbing, 12 = LadderClimbing, 8 = Glider, 14 = Mountain. ecs.JumpRuntimeType 7 = FreeClimbing.
+- [VERIFIED] Jumping off and interrupts: actor.JumpType 13 = FreeClimbing, 12 = LadderClimbing, 8 = Glider, 14 = Mountain.
+  - Receipt: Enum descs 0x141b38270, 0x14187b260 and 0x141ad9be0. Program descriptor 0x141dc4de0.
+- [VERIFIED] ecs.JumpRuntimeType 7 = FreeClimbing.
   - Receipt: Enum descs 0x141b38270, 0x14187b260 and 0x141ad9be0. Program descriptor 0x141dc4de0.
 - [VERIFIED] The program actor_jump_abort_climbing (fn 0x140267650; Actor, ActorInput, Climb) ends a climb on jump.
   - Receipt: Enum descs 0x141b38270, 0x14187b260 and 0x141ad9be0. Program descriptor 0x141dc4de0.
@@ -588,7 +610,9 @@ These are supplied read-only spike results, transcribed without new reverse engi
   - Receipt: Descs 0x141933410 (GliderConfig) and 0x141ae9d50 (GliderTestId). Program descriptor 0x141df9210. Negative check: `python -I pestr.py enshrouded.exe 'glid|wingsuit|paraglid|…'` (ASCII ≥4 chars, whole exe, 103 hits, none 'wingsuit').
 - [HYPOTHESIS] A wall hit while gliding has no dedicated handler.
   - Receipt: Absence of any glider wall-exit test id or string. Not traced in code.
-- [HYPOTHESIS] The glider body collide-and-slides along walls through MovementCollider. A mod can detect the contact from MovementCollisionResults.spheroidNormal / hasSpheroidCollision.
+- [HYPOTHESIS] The glider body collide-and-slides along walls through MovementCollider.
+  - Receipt: Absence of any glider wall-exit test id or string. Not traced in code.
+- [HYPOTHESIS] A mod can detect the contact from MovementCollisionResults.spheroidNormal / hasSpheroidCollision.
   - Receipt: Absence of any glider wall-exit test id or string. Not traced in code.
 - [VERIFIED] Animation system: the anim graph runtime nodes include SampleAnimationClip, StateMachine, LayerBlend, LayerBlendCharacterSpace, IKSolver, BipedFeetIKSolver, GenericFeetIKSolver, RetargetSolver, RotateBone, OffsetBone, ConstraintOrientation, PostProcessInput, Save/UseCachedPose and LocalToCharacterPose.
   - Receipt: pestr.py '^anim_graph\.runtime_graph\..*NodeDefinition$' list. Descs 0x141ba35b0 (BipedFeetIKSolverNodeDefinition), 0x1416ca010 (IKChainItem_Runtime) and 0x141957380 (AutoHandIK_HandInfo). Program descriptor 0x141e06b30.
@@ -602,9 +626,15 @@ These are supplied read-only spike results, transcribed without new reverse engi
   - Receipt: pestr.py '^anim_graph\.runtime_graph\..*NodeDefinition$' list. Descs 0x141ba35b0 (BipedFeetIKSolverNodeDefinition), 0x1416ca010 (IKChainItem_Runtime) and 0x141957380 (AutoHandIK_HandInfo). Program descriptor 0x141e06b30.
 - [VERIFIED] Animation clips are the KFC resource JointAnimation: {hierarchyHash u64, positionFactor, positionTangent, scaleFactor, headers JointAnimationHeader[], data vf32_data[], fps u16, frameCount u16, jointCount u16, flags u16}.
   - Receipt: Descs 0x14184aa30 (JointAnimation) and 0x1418c6ec0 (Animation). xxd of enshrouded.kfc offset 0 = 4b 46 43 34. `rg -a -o -b 'JointAnimation|AnimationGraph|anim_graph|AnimationClip'` on kfc and kfc_resources: 0 hits.
-- [VERIFIED] The authoring type Animation has startFrame/endFrame, loopType, root-motion flags and retargetData. enshrouded.kfc starts with 'KFC4'. kfc and kfc_resources contain no plaintext animation type names.
+- [VERIFIED] The authoring type Animation has startFrame/endFrame, loopType, root-motion flags and retargetData.
   - Receipt: Descs 0x14184aa30 (JointAnimation) and 0x1418c6ec0 (Animation). xxd of enshrouded.kfc offset 0 = 4b 46 43 34. `rg -a -o -b 'JointAnimation|AnimationGraph|anim_graph|AnimationClip'` on kfc and kfc_resources: 0 hits.
-- [VERIFIED] Game data: 'climb' text appears only in enshrouded_053.dat (71 hits, all localisation text). kfc_resources holds compressed name fragments: ClimbingClaws at 18488409, climbingWall at 9970212, Climbing4x4 at 9092300, Climbing2x2 at 10152367, Climbingcorner_outer_2x2 at 8856684 and climb_ladder at 214125064 (these look like Climbing Wall building pieces).
+- [VERIFIED] enshrouded.kfc starts with 'KFC4'.
+  - Receipt: Descs 0x14184aa30 (JointAnimation) and 0x1418c6ec0 (Animation). xxd of enshrouded.kfc offset 0 = 4b 46 43 34. `rg -a -o -b 'JointAnimation|AnimationGraph|anim_graph|AnimationClip'` on kfc and kfc_resources: 0 hits.
+- [VERIFIED] kfc and kfc_resources contain no plaintext animation type names.
+  - Receipt: Descs 0x14184aa30 (JointAnimation) and 0x1418c6ec0 (Animation). xxd of enshrouded.kfc offset 0 = 4b 46 43 34. `rg -a -o -b 'JointAnimation|AnimationGraph|anim_graph|AnimationClip'` on kfc and kfc_resources: 0 hits.
+- [VERIFIED] Game data: 'climb' text appears only in enshrouded_053.dat (71 hits, all localisation text).
+  - Receipt: `rg -a -c -i 'climb' enshrouded_0*.dat` over all 55 .dat files: only enshrouded_053.dat:71. `rg -a -o -b -i '[a-z0-9_./]*climb[a-z0-9_./]*' enshrouded.kfc_resources` (14 hits). The reading of the fragments as building pieces is a hypothesis.
+- [VERIFIED] kfc_resources holds compressed name fragments: ClimbingClaws at 18488409, climbingWall at 9970212, Climbing4x4 at 9092300, Climbing2x2 at 10152367, Climbingcorner_outer_2x2 at 8856684 and climb_ladder at 214125064 (these look like Climbing Wall building pieces).
   - Receipt: `rg -a -c -i 'climb' enshrouded_0*.dat` over all 55 .dat files: only enshrouded_053.dat:71. `rg -a -o -b -i '[a-z0-9_./]*climb[a-z0-9_./]*' enshrouded.kfc_resources` (14 hits). The reading of the fragments as building pieces is a hypothesis.
 - [HYPOTHESIS] There is an unfinished or optional 'Climbing Claws / Climbing Tool' equipment slot.
   - Receipt: owner.py: desc 0x14198cc40 (+0x64 climbWall), 0x141be9c20, 0x14183f820. EquipmentSlot desc 0x141974e60 (27 members, none climb). Loca at enshrouded_053.dat byte 901022380 and 901681760.
@@ -616,7 +646,9 @@ These are supplied read-only spike results, transcribed without new reverse engi
   - Receipt: owner.py: desc 0x14198cc40 (+0x64 climbWall), 0x141be9c20, 0x14183f820. EquipmentSlot desc 0x141974e60 (27 members, none climb). Loca at enshrouded_053.dat byte 901022380 and 901681760.
 - [VERIFIED] ShroudForge is MIT (Copyright (c) 2026 bonsaibauer).
   - Receipt: shroudforge-src/LICENSE line 1. mods/sf-unlimited-flight/src/mod.lua lines 118, 130, 148, 155, 161, 164, 225 and 239. docs/website/data/enshrouded-1076226…/types.lua line 12385.
-- [VERIFIED] Its Lua API reads and writes any reflected component by name. sf-unlimited-flight uses runtime.ecs.read_fields(entity,'keen::ecs::Actor',…) with currentState flag 'HangGliding', runtime.ecs.query('keen::ecs::PlayerInput'), ActorInput 'desiredLocalMoveInput.z', CurrentTransform, Gravity and runtime.overrides.attribute(entity,'StaminaDepletionMod_Glider').
+- [VERIFIED] Its Lua API reads and writes any reflected component by name.
+  - Receipt: shroudforge-src/LICENSE line 1. mods/sf-unlimited-flight/src/mod.lua lines 118, 130, 148, 155, 161, 164, 225 and 239. docs/website/data/enshrouded-1076226…/types.lua line 12385.
+- [VERIFIED] sf-unlimited-flight uses runtime.ecs.read_fields(entity,'keen::ecs::Actor',…) with currentState flag 'HangGliding', runtime.ecs.query('keen::ecs::PlayerInput'), ActorInput 'desiredLocalMoveInput.z', CurrentTransform, Gravity and runtime.overrides.attribute(entity,'StaminaDepletionMod_Glider').
   - Receipt: shroudforge-src/LICENSE line 1. mods/sf-unlimited-flight/src/mod.lua lines 118, 130, 148, 155, 161, 164, 225 and 239. docs/website/data/enshrouded-1076226…/types.lua line 12385.
 - [VERIFIED] Its types.lua lists keen::ecs::Climb.
   - Receipt: shroudforge-src/LICENSE line 1. mods/sf-unlimited-flight/src/mod.lua lines 118, 130, 148, 155, 161, 164, 225 and 239. docs/website/data/enshrouded-1076226…/types.lua line 12385.
@@ -626,7 +658,11 @@ These are supplied read-only spike results, transcribed without new reverse engi
   - Receipt: Python json walk of sf-release-profiles/26082781.json (keys schemaVersion…resourceWriteLayout).
 - [VERIFIED] It names no Climb, Locomotion or Velocity offsets; component layouts come from reflection at run time.
   - Receipt: Python json walk of sf-release-profiles/26082781.json (keys schemaVersion…resourceWriteLayout).
-- [VERIFIED] The patch sites and signatures are identical and unique in the installed Steam exe. 'f3 0f 59 d1 c7 44 24 28 00 01 00 00 f3 0f 59 d9 44 89 6c 24' (mask site 0x14024acc8) occurs once. '0f 5c cc f3 44 0f 10 da c7 44 24 28 00 01 00 00 45 0f c6 db' (0x14024af4f) occurs once.
+- [VERIFIED] The patch sites and signatures are identical and unique in the installed Steam exe.
+  - Receipt: Python bytes compare of the old-build and Steam enshrouded.exe at file offsets 0x24a0c8, 0x24a34f, 0x24a182 and 0x418970, plus data.count(sig)==1 on the Steam exe.
+- [VERIFIED] 'f3 0f 59 d1 c7 44 24 28 00 01 00 00 f3 0f 59 d9 44 89 6c 24' (mask site 0x14024acc8) occurs once.
+  - Receipt: Python bytes compare of the old-build and Steam enshrouded.exe at file offsets 0x24a0c8, 0x24a34f, 0x24a182 and 0x418970, plus data.count(sig)==1 on the Steam exe.
+- [VERIFIED] '0f 5c cc f3 44 0f 10 da c7 44 24 28 00 01 00 00 45 0f c6 db' (0x14024af4f) occurs once.
   - Receipt: Python bytes compare of the old-build and Steam enshrouded.exe at file offsets 0x24a0c8, 0x24a34f, 0x24a182 and 0x418970, plus data.count(sig)==1 on the Steam exe.
 - [VERIFIED] The FUN_140419570 prologue '40 55 57 48 8d 6c 24 d8 48 81 ec 28 01 00 00 48 8b f9 48 8b 49 68 48 85' occurs once.
   - Receipt: Python bytes compare of the old-build and Steam enshrouded.exe at file offsets 0x24a0c8, 0x24a34f, 0x24a182 and 0x418970, plus data.count(sig)==1 on the Steam exe.
@@ -643,45 +679,131 @@ These are supplied read-only spike results, transcribed without new reverse engi
 
 These are the spike's proposed steps, including its then-pending documentation prerequisites. They are not work performed by this transcription.
 
-- [HYPOTHESIS] Proposed route **moderate**: P1a: widen the game's own probe. Patch the ClimbingWall mask 0x100 at the climb-probe sites (0x14024acc8, 0x14024af4f, then the update/exit sites 0x14024b238, 0x14024c688, 0x14024c73f once attributed) to also accept World/Solid (bits 0/3). Redirect the two 0.001 coplanarity loads (0x14024afb8, 0x14024afec → [0x1413b825c]) to a looser mod-owned constant. All native behaviour then stays: auto-latch by walking or sprinting into a wall, the Enter/Climb/Exit sequences, the mantle at the top, stamina and jump-off.
+- [HYPOTHESIS] Proposed route **moderate**: P1a: widen the game's own probe.
   - Receipt: Supplied climbing spike, Routes; proposal, not a tested result.
-- [HYPOTHESIS] P1a — cost: Small Rust .asi feature: about 5 checked immediate writes plus 2 RIP-displacement redirects with unique signatures, in the style of patch.rs and sigs.rs. Plus in-game testing on rock, voxel walls and building walls.
-  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
-- [HYPOTHESIS] P1a — risks: (1) Voxel terrain may answer collider queries differently from props, so World may not cover terrain. (2) Irregular rock normals may cause jitter, losing the wall (fall), or failed top exits. (3) Every probe in the climb cluster must get the same change, or the update drops the player. This may explain the 'wall becomes walkable' class of bug. (4) The climb programs read authoritative ECS (GameServer thread), so a client without the mod on a modded host, or the reverse, may desync. (5) The addresses are new: by the house rules they must go into docs/re-notes.md and sigs.rs before use.
-  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
-- [HYPOTHESIS] P1a — next: Resolve the containing functions of 0x14024b238, 0x14024c688 and 0x14024c73f (and FUN_14024c320, FUN_14024c9f0, FUN_140417d90). Decode FUN_1409fff60's argument order to confirm that the arg at [RSP+0x28] is the ColliderFlags mask. Check how voxel terrain answers queries with mask bit 0. Then build a debug-only test toggle and test in game.
-  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
-- [HYPOTHESIS] Proposed route **hard**: P1b: detour the start check FUN_140419570 (and the wall-lost check FUN_14024b390). Call the original first. If it does not latch, run a mod-owned probe through the game's raycast FUN_1409fff60 with a World|Solid mask and averaged normals. Then fill Climb.climbType=1 / climbState=1 / climbNormal and call the native FUN_14024b4c0 plus sequence 0xa17e05ee exactly as the native code does.
+- [HYPOTHESIS] Patch the ClimbingWall mask 0x100 at the climb-probe sites (0x14024acc8, 0x14024af4f, then the update/exit sites 0x14024b238, 0x14024c688, 0x14024c73f once attributed) to also accept World/Solid (bits 0/3).
   - Receipt: Supplied climbing spike, Routes; proposal, not a tested result.
-- [HYPOTHESIS] P1b — cost: A medium inline hook on the game's ECS worker path, plus re-implementing the probe and its tolerances. It needs the impact-iterator struct layout (param_1[...] slots) for FUN_140419570.
-  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
-- [HYPOTHESIS] P1b — risks: Calling internal functions with a wrong context struct crashes the game. The hook runs inside the per-entity program loop, so it must stay cheap (it runs every frame for every player). Wall loss during the climb is still decided by the native update unless that is hooked too.
-  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
-- [HYPOTHESIS] P1b — next: Map the 0x178-byte query-iterator struct (param_1 indices → component pointers) from FUN_1409b6e60 and the program's component list order. Then prototype read-only logging of the probe result codes (0x06, 0x15, 0x1e, 0x1f) to see why native starts fail.
-  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
-- [HYPOTHESIS] Proposed route **moderate**: P2: Zelda behaviours on top of P1. Ledge mantle = the native exit-top (FUN_14024bc90, sequence 0xc83e5552). Stamina = the native per-metre drain (8.0/m × attribute 0xb8388248), tunable through that attribute in the way ShroudForge overrides StaminaDepletionMod_Glider. Jump-climb = the start check has no grounded test, only |vy|<=20, so a mid-air latch may already work. Jump-off = the native FreeClimbing jump. Glider grab = allow the start while HangGliding (needs the CanClimb ability bit during the glider sequence, and an abort of the glider sequence).
+- [HYPOTHESIS] Redirect the two 0.001 coplanarity loads (0x14024afb8, 0x14024afec → [0x1413b825c]) to a looser mod-owned constant.
   - Receipt: Supplied climbing spike, Routes; proposal, not a tested result.
-- [HYPOTHESIS] P2 — cost: Mostly free once P1 works. The glider grab needs either a data change to the glider action-sequence ability flags or a hook that sets bit 16 in actor+0xc00/+0xbc8 and ends HangGliding.
+- [HYPOTHESIS] All native behaviour then stays: auto-latch by walking or sprinting into a wall, the Enter/Climb/Exit sequences, the mantle at the top, stamina and jump-off.
+  - Receipt: Supplied climbing spike, Routes; proposal, not a tested result.
+- [HYPOTHESIS] P1a — cost: Small Rust .asi feature: about 5 checked immediate writes plus 2 RIP-displacement redirects with unique signatures, in the style of patch.rs and sigs.rs.
   - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
-- [HYPOTHESIS] P2 — risks: Ability masks are written by the action-sequence system every frame, so a forced bit may be overwritten or may break other sequences. The glider sequence end and the climb Enter sequence may conflict. The water-only ledge grab (0x26de28ee) is not wired for land; reusing it on land is unproven.
+- [HYPOTHESIS] P1a — cost: Plus in-game testing on rock, voxel walls and building walls.
   - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
-- [HYPOTHESIS] P2 — next: In game: log the CanClimb bit and the |v.y| value while jumping or gliding at a ClimbingWall-flagged wall (the vanilla iron-lattice walls) to see whether native mid-air and glider latches already happen. Find where the AbilityFlag mask (actor+0xc00) is computed.
+- [HYPOTHESIS] P1a — risks: (1) Voxel terrain may answer collider queries differently from props, so World may not cover terrain.
   - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
-- [HYPOTHESIS] Proposed route **hard**: P3: IK so hands and feet sit on the surface. Foot IK exists (BipedFeetIKSolver node + client_biped_feet_ik_raycast fn 0x1402ffa70). Hand IK exists only as AutoHandIK to a target bone, and the generic IKSolver needs IK chains defined in the anim graph data. Option A: hook the feet-IK raycast program and feed wall hits while ClimbingWall. Option B: find the final pose output (RenderPoseHandleValue / skinToJointMatrices) and post-process the hand and foot chains with a Rust two-bone IK.
+- [HYPOTHESIS] P1a — risks: (2) Irregular rock normals may cause jitter, losing the wall (fall), or failed top exits.
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] P1a — risks: (3) Every probe in the climb cluster must get the same change, or the update drops the player.
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] P1a — risks: This may explain the 'wall becomes walkable' class of bug.
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] P1a — risks: (4) The climb programs read authoritative ECS (GameServer thread), so a client without the mod on a modded host, or the reverse, may desync.
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] P1a — risks: (5) The addresses are new: by the house rules they must go into docs/re-notes.md and sigs.rs before use.
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] P1a — next: Resolve the containing functions of 0x14024b238, 0x14024c688 and 0x14024c73f (and FUN_14024c320, FUN_14024c9f0, FUN_140417d90).
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] P1a — next: Decode FUN_1409fff60's argument order to confirm that the arg at [RSP+0x28] is the ColliderFlags mask.
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] P1a — next: Check how voxel terrain answers queries with mask bit 0.
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] P1a — next: Then build a debug-only test toggle and test in game.
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] Proposed route **hard**: P1b: detour the start check FUN_140419570 (and the wall-lost check FUN_14024b390).
+  - Receipt: Supplied climbing spike, Routes; proposal, not a tested result.
+- [HYPOTHESIS] Call the original first.
+  - Receipt: Supplied climbing spike, Routes; proposal, not a tested result.
+- [HYPOTHESIS] If it does not latch, run a mod-owned probe through the game's raycast FUN_1409fff60 with a World|Solid mask and averaged normals.
+  - Receipt: Supplied climbing spike, Routes; proposal, not a tested result.
+- [HYPOTHESIS] Then fill Climb.climbType=1 / climbState=1 / climbNormal and call the native FUN_14024b4c0 plus sequence 0xa17e05ee exactly as the native code does.
+  - Receipt: Supplied climbing spike, Routes; proposal, not a tested result.
+- [HYPOTHESIS] P1b — cost: A medium inline hook on the game's ECS worker path, plus re-implementing the probe and its tolerances.
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] P1b — cost: It needs the impact-iterator struct layout (param_1[...] slots) for FUN_140419570.
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] P1b — risks: Calling internal functions with a wrong context struct crashes the game.
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] P1b — risks: The hook runs inside the per-entity program loop, so it must stay cheap (it runs every frame for every player).
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] P1b — risks: Wall loss during the climb is still decided by the native update unless that is hooked too.
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] P1b — next: Map the 0x178-byte query-iterator struct (param_1 indices → component pointers) from FUN_1409b6e60 and the program's component list order.
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] P1b — next: Then prototype read-only logging of the probe result codes (0x06, 0x15, 0x1e, 0x1f) to see why native starts fail.
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] Proposed route **moderate**: P2: Zelda behaviours on top of P1.
+  - Receipt: Supplied climbing spike, Routes; proposal, not a tested result.
+- [HYPOTHESIS] Ledge mantle = the native exit-top (FUN_14024bc90, sequence 0xc83e5552).
+  - Receipt: Supplied climbing spike, Routes; proposal, not a tested result.
+- [HYPOTHESIS] Stamina = the native per-metre drain (8.0/m × attribute 0xb8388248), tunable through that attribute in the way ShroudForge overrides StaminaDepletionMod_Glider.
+  - Receipt: Supplied climbing spike, Routes; proposal, not a tested result.
+- [HYPOTHESIS] Jump-climb = the start check has no grounded test, only |vy|<=20, so a mid-air latch may already work.
+  - Receipt: Supplied climbing spike, Routes; proposal, not a tested result.
+- [HYPOTHESIS] Jump-off = the native FreeClimbing jump.
+  - Receipt: Supplied climbing spike, Routes; proposal, not a tested result.
+- [HYPOTHESIS] Glider grab = allow the start while HangGliding (needs the CanClimb ability bit during the glider sequence, and an abort of the glider sequence).
+  - Receipt: Supplied climbing spike, Routes; proposal, not a tested result.
+- [HYPOTHESIS] P2 — cost: Mostly free once P1 works.
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] P2 — cost: The glider grab needs either a data change to the glider action-sequence ability flags or a hook that sets bit 16 in actor+0xc00/+0xbc8 and ends HangGliding.
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] P2 — risks: Ability masks are written by the action-sequence system every frame, so a forced bit may be overwritten or may break other sequences.
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] P2 — risks: The glider sequence end and the climb Enter sequence may conflict.
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] P2 — risks: The water-only ledge grab (0x26de28ee) is not wired for land; reusing it on land is unproven.
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] P2 — next: In game: log the CanClimb bit and the |v.y| value while jumping or gliding at a ClimbingWall-flagged wall (the vanilla iron-lattice walls) to see whether native mid-air and glider latches already happen.
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] P2 — next: Find where the AbilityFlag mask (actor+0xc00) is computed.
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] Proposed route **hard**: P3: IK so hands and feet sit on the surface.
+  - Receipt: Supplied climbing spike, Routes; proposal, not a tested result.
+- [HYPOTHESIS] Foot IK exists (BipedFeetIKSolver node + client_biped_feet_ik_raycast fn 0x1402ffa70).
+  - Receipt: Supplied climbing spike, Routes; proposal, not a tested result.
+- [HYPOTHESIS] Hand IK exists only as AutoHandIK to a target bone, and the generic IKSolver needs IK chains defined in the anim graph data.
+  - Receipt: Supplied climbing spike, Routes; proposal, not a tested result.
+- [HYPOTHESIS] Option A: hook the feet-IK raycast program and feed wall hits while ClimbingWall.
+  - Receipt: Supplied climbing spike, Routes; proposal, not a tested result.
+- [HYPOTHESIS] Option B: find the final pose output (RenderPoseHandleValue / skinToJointMatrices) and post-process the hand and foot chains with a Rust two-bone IK.
   - Receipt: Supplied climbing spike, Routes; proposal, not a tested result.
 - [HYPOTHESIS] P3 — cost: Large. It needs the anim graph evaluation entry, the pose buffer layout, the skeleton joint indices of the player hierarchy, and a two-bone IK solver in Rust.
   - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
-- [HYPOTHESIS] P3 — risks: The hook point for pose post-processing is not found yet. Writing the pose buffer from the wrong thread or at the wrong time tears or crashes the render. The BipedFeetIK node may be disabled during climb sequences (disableIK parameter).
+- [HYPOTHESIS] P3 — risks: The hook point for pose post-processing is not found yet.
   - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
-- [HYPOTHESIS] P3 — next: Trace the BipedFeetIKSolver runtime node's evaluate function (via FUN_141097570, which references desc 0x141ba35b0, and the node-type dispatch). Find where RenderPoseHandleValue's pose is finalised. Decode the climb-sequence anim graph parameters.
+- [HYPOTHESIS] P3 — risks: Writing the pose buffer from the wrong thread or at the wrong time tears or crashes the render.
   - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
-- [HYPOTHESIS] Proposed route **blocked**: P4: better or new climb animations. Reuse the existing sequences now (wall enter 0x99ae6705 / 0xa17e05ee, exit 0xc83e5552 / 0xa524eca9, the climb loop through the anim graph, the water ledge grab 0x26de28ee, the ladder sequences). New clips would mean authoring JointAnimation (compressed vf32 data matching the player's hierarchyHash), adding a KFC4 resource (table entry plus .dat chunk), and referencing it from the anim graph and action-sequence resources.
+- [HYPOTHESIS] P3 — risks: The BipedFeetIK node may be disabled during climb sequences (disableIK parameter).
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] P3 — next: Trace the BipedFeetIKSolver runtime node's evaluate function (via FUN_141097570, which references desc 0x141ba35b0, and the node-type dispatch).
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] P3 — next: Find where RenderPoseHandleValue's pose is finalised.
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] P3 — next: Decode the climb-sequence anim graph parameters.
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] Proposed route **blocked**: P4: better or new climb animations.
   - Receipt: Supplied climbing spike, Routes; proposal, not a tested result.
-- [HYPOTHESIS] P4 — cost: Very large: a KFC4 writer, a vf32 encoder and anim-graph editing. No local tool covers it. ShroudForge validates only atomic scalar resource writes, and its kfc-parser submodule is empty in the clone.
+- [HYPOTHESIS] Reuse the existing sequences now (wall enter 0x99ae6705 / 0xa17e05ee, exit 0xc83e5552 / 0xa524eca9, the climb loop through the anim graph, the water ledge grab 0x26de28ee, the ladder sequences).
+  - Receipt: Supplied climbing spike, Routes; proposal, not a tested result.
+- [HYPOTHESIS] New clips would mean authoring JointAnimation (compressed vf32 data matching the player's hierarchyHash), adding a KFC4 resource (table entry plus .dat chunk), and referencing it from the anim graph and action-sequence resources.
+  - Receipt: Supplied climbing spike, Routes; proposal, not a tested result.
+- [HYPOTHESIS] P4 — cost: Very large: a KFC4 writer, a vf32 encoder and anim-graph editing.
   - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
-- [HYPOTHESIS] P4 — risks: Format errors corrupt the game data load. Every game patch changes the data build. The data are third-party derived assets.
+- [HYPOTHESIS] P4 — cost: No local tool covers it.
   - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
-- [HYPOTHESIS] P4 — next: The proposed next step was to shallow-clone bonsaibauer/kfc-parser (branch kfc4_compatibility), read it and check its licence. Until then, P4 = choose among the existing sequences only.
+- [HYPOTHESIS] P4 — cost: ShroudForge validates only atomic scalar resource writes, and its kfc-parser submodule is empty in the clone.
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] P4 — risks: Format errors corrupt the game data load.
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] P4 — risks: Every game patch changes the data build.
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] P4 — risks: The data are third-party derived assets.
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] P4 — next: The proposed next step was to shallow-clone bonsaibauer/kfc-parser (branch kfc4_compatibility), read it and check its licence.
+  - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] P4 — next: Until then, P4 = choose among the existing sequences only.
   - Receipt: Supplied climbing spike, Routes; untested cost, risk or next step.
 
 ### Climbing open questions
@@ -725,17 +847,23 @@ These are the spike's proposed steps, including its then-pending documentation p
 
 **Licence boundary:** the glass spike read kfc-parser, licensed GPL-3.0-or-later. No source code from it may be copied into this repository. It was shallow-cloned read-only. The source was read, not built or run. The supplied route text's shorter GPL-3.0 wording is retained below; the manifest receipt records GPL-3.0-or-later.
 
-- [VERIFIED] Evidence scope: spike `wf_cd1066c9-e7c`, 2026-10-26, installed build 26082781. The spike changed neither repository nor game files.
+- [VERIFIED] Evidence scope: spike `wf_cd1066c9-e7c`, 2026-10-26, installed build 26082781.
+  - Receipt: Supplied glass spike summary and section-hash comparison below.
+- [VERIFIED] The spike changed neither repository nor game files.
   - Receipt: Supplied glass spike summary and section-hash comparison below.
 - [VERIFIED] Helper and receipt filenames: kfc4.py, refl.py, mats.py, kw_scan.py, summary.txt, scan_glass.txt, scan_window.txt, iteminfo_strings.txt, block_items.txt, mats_census.txt, models_all.txt, models_window.txt, mats_glass_detail.txt and refl_*.txt.
   - Receipt: Supplied glass spike helper inventory.
 
-- [HYPOTHESIS] EML/kfc-parser data edits have the same visual ceiling as load-time material edits. A prop pane using the VFX forward-transparent path remains untested.
+- [HYPOTHESIS] EML/kfc-parser data edits have the same visual ceiling as load-time material edits.
+  - Receipt: Supplied glass summary and routes (a), (b) and (d).
+- [HYPOTHESIS] A prop pane using the VFX forward-transparent path remains untested.
   - Receipt: Supplied glass summary and routes (a), (b) and (d).
 
 ### Glass facts and receipts
 
-- [VERIFIED] There is no placeable glass building block. 74 Block_T*/Block_Roof_* building-block ItemInfo names exist; none contains glass, crystal, ice, clear or transp.
+- [VERIFIED] There is no placeable glass building block.
+  - Receipt: kfc4.py scan '[A-Za-z]' over all 4,262 keen::ItemInfo resources in the installed enshrouded.kfc_resources -> iteminfo_strings.txt (26,114 strings). grep -o -E 'Block_[A-Za-z0-9_]+' | sort -u -> block_items.txt (100 names). grep -i -E 'glass|crystal|ice|clear|transp' block_items.txt -> empty. Scope: ItemInfo debug names only; English display text is not in the KFC resources.
+- [VERIFIED] 74 Block_T*/Block_Roof_* building-block ItemInfo names exist; none contains glass, crystal, ice, clear or transp.
   - Receipt: kfc4.py scan '[A-Za-z]' over all 4,262 keen::ItemInfo resources in the installed enshrouded.kfc_resources -> iteminfo_strings.txt (26,114 strings). grep -o -E 'Block_[A-Za-z0-9_]+' | sort -u -> block_items.txt (100 names). grep -i -E 'glass|crystal|ice|clear|transp' block_items.txt -> empty. Scope: ItemInfo debug names only; English display text is not in the KFC resources.
 - [VERIFIED] Glass exists as a crafting material item (Material_T4_Glass, Material_T4_Glass_Shards) with recipes Material_T4_Recyled_Glass, Material_T4_Factory_Glass_SM and Material_T5_Factory_Glass_BF2.
   - Receipt: scan_glass.txt: ItemInfo res#54793 string 'Material_T4_Glass' at u0x9268de0; res#90877 'Material_T4_Glass_Shards' at u0x99d2700; RecipeRegistryResource res#48592 at u0x7d1b778, u0x7d1b80c, u0x7d1a378.
@@ -745,13 +873,17 @@ These are the spike's proposed steps, including its then-pending documentation p
   - Receipt: enshrouded.kfc bytes 0..3 = 4B 46 43 34 ('KFC4'). Output of 'kfc4.py summary' saved as summary.txt. Raw scan of the compressed file gave truncated names such as 'Window_FramR]' at file offset 0x9a7a2c.
 - [VERIFIED] Resources sit in enshrouded.kfc_resources as 58 zstd chunks (481,531,128 bytes uncompressed, 91,812 resources).
   - Receipt: enshrouded.kfc bytes 0..3 = 4B 46 43 34 ('KFC4'). Output of 'kfc4.py summary' saved as summary.txt. Raw scan of the compressed file gave truncated names such as 'Window_FramR]' at file offset 0x9a7a2c.
-- [VERIFIED] The container version string is '1273043|^/game38/branches/release_1.0|2026-10-20T14:55:29.904125Z'. A raw strings scan of the compressed file is not valid evidence.
+- [VERIFIED] The container version string is '1273043|^/game38/branches/release_1.0|2026-10-20T14:55:29.904125Z'.
+  - Receipt: enshrouded.kfc bytes 0..3 = 4B 46 43 34 ('KFC4'). Output of 'kfc4.py summary' saved as summary.txt. Raw scan of the compressed file gave truncated names such as 'Window_FramR]' at file offset 0x9a7a2c.
+- [VERIFIED] A raw strings scan of the compressed file is not valid evidence.
   - Receipt: enshrouded.kfc bytes 0..3 = 4B 46 43 34 ('KFC4'). Output of 'kfc4.py summary' saved as summary.txt. Raw scan of the compressed file gave truncated names such as 'Window_FramR]' at file offset 0x9a7a2c.
 - [VERIFIED] The reference exe and the installed exe have byte-identical .text, .rdata and .data.
   - Receipt: PE section sha256 prefixes: .text 44b331987bcf5fd5, .rdata c95a135bd7cb56fe, .data 9ae9c97559c3c834 are identical in both files. Only .bind differs (98e7bc4d vs b30f230e).
 - [VERIFIED] Reflection read from either file is valid for build 26082781.
   - Receipt: PE section sha256 prefixes: .text 44b331987bcf5fd5, .rdata c95a135bd7cb56fe, .data 9ae9c97559c3c834 are identical in both files. Only .bind differs (98e7bc4d vs b30f230e).
-- [VERIFIED] keen::SolidVoxelMaterial (size 304, 30 fields) has no opacity, alpha, transparency, refraction or IOR field. keen::VoxelMaterialType has only {0 Terrain, 1 Building}.
+- [VERIFIED] keen::SolidVoxelMaterial (size 304, 30 fields) has no opacity, alpha, transparency, refraction or IOR field.
+  - Receipt: refl.py on the reference exe: TypeMetadata VA 0x141af0300 (SolidVoxelMaterial) and VA 0x141aef130 (VoxelMaterialType). Each TypeMetadata is accepted only when FNV-1a32(qualified name) equals the u32 at +0x50. 12,646 types found.
+- [VERIFIED] keen::VoxelMaterialType has only {0 Terrain, 1 Building}.
   - Receipt: refl.py on the reference exe: TypeMetadata VA 0x141af0300 (SolidVoxelMaterial) and VA 0x141aef130 (VoxelMaterialType). Each TypeMetadata is accepted only when FNV-1a32(qualified name) equals the u32 at +0x50. 12,646 types found.
 - [VERIFIED] Voxel building blocks are drawn from keen::BuildingMaterialBlendingMaterialLayerTextureShaderData (size 60).
   - Receipt: refl.py: VA 0x1417f1120 (BuildingMaterialBlendingMaterialLayerTextureShaderData); VA 0x141a1b8f0 (PbrMaterialLayer .opacityMap @0x80).
@@ -771,7 +903,11 @@ These are the spike's proposed steps, including its then-pending documentation p
   - Receipt: models_window.txt and models_all.txt, for example 'MODEL res#82247 global_props_iron_window_frame_01_a -> slot0 res#66456 global_iron_02_a'. Template scan: TEMPLATE res#60008 Prop_Buildings_Iron_Window_Frame_01_A -> models ['global_props_iron_window_frame_01_a'].
 - [VERIFIED] Each Prop_Buildings_Iron_Window_* ECS template references exactly one such model.
   - Receipt: models_window.txt and models_all.txt, for example 'MODEL res#82247 global_props_iron_window_frame_01_a -> slot0 res#66456 global_iron_02_a'. Template scan: TEMPLATE res#60008 Prop_Buildings_Iron_Window_Frame_01_A -> models ['global_props_iron_window_frame_01_a'].
-- [VERIFIED] The glass-looking window panes are opaque deferred Pbr surfaces with light transmission. env_coldheights_window_01_translucent (res#66155): flags DisableShadows|Translucent, rfx FoliageTranslucency, translucencyStrength 1.0. ancients_props_windows_01_a (res#58625): AlphaTested|Translucent, SampleOpacity|FoliageTranslucency, translucencyStrength 1.0.
+- [VERIFIED] The glass-looking window panes are opaque deferred Pbr surfaces with light transmission.
+  - Receipt: mats_glass_detail.txt ('mats.py mat'). PbrRfxRenderMaterial layout from VA 0x141a89330: translucencyStrength @0xa0, flags @0xf0. PbrRfxRenderMaterialFlag VA 0x141a6b810.
+- [VERIFIED] env_coldheights_window_01_translucent (res#66155): flags DisableShadows|Translucent, rfx FoliageTranslucency, translucencyStrength 1.0.
+  - Receipt: mats_glass_detail.txt ('mats.py mat'). PbrRfxRenderMaterial layout from VA 0x141a89330: translucencyStrength @0xa0, flags @0xf0. PbrRfxRenderMaterialFlag VA 0x141a6b810.
+- [VERIFIED] ancients_props_windows_01_a (res#58625): AlphaTested|Translucent, SampleOpacity|FoliageTranslucency, translucencyStrength 1.0.
   - Receipt: mats_glass_detail.txt ('mats.py mat'). PbrRfxRenderMaterial layout from VA 0x141a89330: translucencyStrength @0xa0, flags @0xf0. PbrRfxRenderMaterialFlag VA 0x141a6b810.
 - [VERIFIED] Desert furniture glass env_desert_furniture_glass_01 (res#57327) is plain opaque Pbr.
   - Receipt: mats_glass_detail.txt ('mats.py mat'). PbrRfxRenderMaterial layout from VA 0x141a89330: translucencyStrength @0xa0, flags @0xf0. PbrRfxRenderMaterialFlag VA 0x141a6b810.
@@ -779,6 +915,8 @@ These are the spike's proposed steps, including its then-pending documentation p
   - Receipt: Inferred from F3. PbrRfxRenderMaterial (size 244) has no opacity scalar, no tint colour and no refraction/IOR field (VA 0x141a89330). The shader behaviour itself was not observed in-game.
 - [HYPOTHESIS] It is not a tunable opacity or refraction value.
   - Receipt: Inferred from F3. PbrRfxRenderMaterial (size 244) has no opacity scalar, no tint colour and no refraction/IOR field (VA 0x141a89330). The shader behaviour itself was not observed in-game.
+- [HYPOTHESIS] The supplied glass Summary says: "Their tint and roughness come from textures, not from scalar values." This is the summary's interpretation of the glass-looking panes, more assertive than the detailed F3 inference; the shader behaviour itself was not observed in-game.
+  - Receipt: Supplied 2026-10-26 glass spike, Summary; mats_glass_detail.txt ('mats.py mat') and the existing F3/PbrRfxRenderMaterial context (size 244, VA 0x141a89330: no opacity scalar, no tint colour and no refraction/IOR field). No new extraction or shader observation.
 - [VERIFIED] 'FrostedGlass' is the UI background blur, not window glass.
   - Receipt: refl.py: VA 0x141badb30 (FrostedGlassRenderParameters) and VA 0x141a507b0 (RenderSystemResource). scan_glass.txt: GpcResource res#68385 string 'game38_ui/frosted_glass.gpc' at u0x7fd1d88.
 - [VERIFIED] FrostedGlassRenderParameters = {downsampleSteps, sigma, useSoftClipping, threshold, shoulder} lives in RenderSystemResource.frostedGlass @0x10, and its shader pack is game38_ui/frosted_glass.gpc.
@@ -838,37 +976,95 @@ These are the spike's proposed steps, including its then-pending documentation p
 
 These are the spike's proposed steps, including its then-pending documentation prerequisites. None authorizes or records implementation.
 
-- [HYPOTHESIS] Proposed route **moderate**: (a) Edit the window/glass materials in game data before launch (EML Lua 'patch' mod, ShroudForge game-files, or our own clean-room KFC4 writer). Change the RenderMaterialResource flags and PbrRfxRenderMaterial values, or swap the albedo/material_map/opacity textures, for env_coldheights_window_01_translucent, ancients_props_windows_01_a and env_desert_furniture_glass_01.
+- [HYPOTHESIS] Proposed route **moderate**: (a) Edit the window/glass materials in game data before launch (EML Lua 'patch' mod, ShroudForge game-files, or our own clean-room KFC4 writer).
   - Receipt: Supplied glass spike, Routes; proposal, not a tested result.
-- [HYPOTHESIS] (a) — cost: Low to medium for a 'less frosted' or 'open pane' result: remove Translucent/FoliageTranslucency, lighten the textures, or set AlphaTested+SampleOpacity with an empty opacity map so the pane disappears. Real see-through glass is NOT reachable this way: no Pbr data path has alpha blending, and the loader ties the effect to the data signature.
-  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
-- [HYPOTHESIS] (a) — risks: Steam verify or updates overwrite the patched files. Patch tools rewrite 1 GB-class files. kfc-parser is GPL-3.0 and our repo is MIT, so its code cannot be reused; we can only point users to EML. EML's dinput8 proxy clashes with our ASI Loader dinput8.dll (dbghelp variant needed, HYPOTHESIS). Some panes share a material with banners and fences (ancients_props_windows_01_a), so an edit changes those props too.
-  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
-- [HYPOTHESIS] (a) — next: 1) Decide whether 'clear' may mean 'no pane' or 'lighter pane', since true transparency is not available. 2) Prototype on one material (env_coldheights_window_01_translucent, GUID 441116632b6bcc41843bcac29e725f7c) with EML in a throwaway copy of the game folder. 3) Look in-game; this needs the author and the game, outside this repo's scope (AGENTS.md: in-game work is elsewhere).
-  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
-- [HYPOTHESIS] Proposed route **moderate**: (b) Patch the material at load time from our .asi. Hook the material loader (FUN_1400cddd0 / FUN_1400cfca0), match the material GUID in param_2, and edit the RenderMaterialResource bytes (flags at +1, PbrRfxRenderMaterial translucencyStrength @0xa0, flags @0xf0) before the state-2 copy and upload.
+- [HYPOTHESIS] Change the RenderMaterialResource flags and PbrRfxRenderMaterial values, or swap the albedo/material_map/opacity textures, for env_coldheights_window_01_translucent, ancients_props_windows_01_a and env_desert_furniture_glass_01.
   - Receipt: Supplied glass spike, Routes; proposal, not a tested result.
-- [HYPOTHESIS] (b) — cost: Medium. Needs a new signature around 0x1400cdf3a (C7 44 24 30 4B 89 E1 AE), a hook that stays small, a GUID table and tests. The visual ceiling is the same as route (a): tweaks only, no see-through glass.
+- [HYPOTHESIS] (a) — cost: Low to medium for a 'less frosted' or 'open pane' result: remove Translucent/FoliageTranslucency, lighten the textures, or set AlphaTested+SampleOpacity with an empty opacity map so the pane disappears.
   - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
-- [HYPOTHESIS] (b) — risks: The addresses are new and not in docs/re-notes.md or src/sigs.rs; AGENTS.md rule 4 requires adding them with this evidence first. The hook runs in-process on the streaming/load path, so a bad write crashes the game. It is build-specific (unknown builds must turn it off). Editing after upload has no effect, because the data lives in a GPU buffer.
+- [HYPOTHESIS] (a) — cost: Real see-through glass is NOT reachable this way: no Pbr data path has alpha blending, and the loader ties the effect to the data signature.
   - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
-- [HYPOTHESIS] (b) — next: 1) Add FUN_1400cddd0/FUN_1400cfca0 and the signature bytes to docs/re-notes.md as a separate docs PR. 2) Confirm the in-memory layout of param_2 (+0x18 resource handle, +0x20 resource pointer) with a read-only probe build. 3) Only then propose a worksheet task. No code until the maintainer agrees.
+- [HYPOTHESIS] (a) — risks: Steam verify or updates overwrite the patched files.
+  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] (a) — risks: Patch tools rewrite 1 GB-class files.
+  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] (a) — risks: kfc-parser is GPL-3.0 and our repo is MIT, so its code cannot be reused; we can only point users to EML.
+  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] (a) — risks: EML's dinput8 proxy clashes with our ASI Loader dinput8.dll (dbghelp variant needed, HYPOTHESIS).
+  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] (a) — risks: Some panes share a material with banners and fences (ancients_props_windows_01_a), so an edit changes those props too.
+  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] (a) — next: 1) Decide whether 'clear' may mean 'no pane' or 'lighter pane', since true transparency is not available.
+  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] (a) — next: 2) Prototype on one material (env_coldheights_window_01_translucent, GUID 441116632b6bcc41843bcac29e725f7c) with EML in a throwaway copy of the game folder.
+  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] (a) — next: 3) Look in-game; this needs the author and the game, outside this repo's scope (AGENTS.md: in-game work is elsewhere).
+  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] Proposed route **moderate**: (b) Patch the material at load time from our .asi.
+  - Receipt: Supplied glass spike, Routes; proposal, not a tested result.
+- [HYPOTHESIS] Hook the material loader (FUN_1400cddd0 / FUN_1400cfca0), match the material GUID in param_2, and edit the RenderMaterialResource bytes (flags at +1, PbrRfxRenderMaterial translucencyStrength @0xa0, flags @0xf0) before the state-2 copy and upload.
+  - Receipt: Supplied glass spike, Routes; proposal, not a tested result.
+- [HYPOTHESIS] (b) — cost: Medium. Needs a new signature around 0x1400cdf3a (C7 44 24 30 4B 89 E1 AE), a hook that stays small, a GUID table and tests.
+  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] (b) — cost: The visual ceiling is the same as route (a): tweaks only, no see-through glass.
+  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] (b) — risks: The addresses are new and not in docs/re-notes.md or src/sigs.rs; AGENTS.md rule 4 requires adding them with this evidence first.
+  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] (b) — risks: The hook runs in-process on the streaming/load path, so a bad write crashes the game.
+  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] (b) — risks: It is build-specific (unknown builds must turn it off).
+  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] (b) — risks: Editing after upload has no effect, because the data lives in a GPU buffer.
+  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] (b) — next: 1) Add FUN_1400cddd0/FUN_1400cfca0 and the signature bytes to docs/re-notes.md as a separate docs PR.
+  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] (b) — next: 2) Confirm the in-memory layout of param_2 (+0x18 resource handle, +0x20 resource pointer) with a read-only probe build.
+  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] (b) — next: 3) Only then propose a worksheet task.
+  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] (b) — next: No code until the maintainer agrees.
   - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
 - [HYPOTHESIS] Proposed route **blocked**: (c) Add a NEW clear-glass voxel building block (new voxel material + PbrBuildingMaterial layer + GI entry + BuildingMaterialParameters + ItemInfo + recipe + blueprint material-pool entry).
   - Receipt: Supplied glass spike, Routes; proposal, not a tested result.
-- [HYPOTHESIS] (c) — cost: Very high. True transparency would need a new voxel render path, because the building-block GPU layer has no opacity/alpha and voxel chunks go through the GBuffer/PbrBuilding path. GI is opaque. An OPAQUE 'glass-look' block (glossy, tinted, emissive) is possible in principle: 85 of 128 GPU slots are used and ids are u8, so there is room. It would still need baked RenderDataBlock edits, a new building material layer, item, recipe and pool entries, and the location of the SolidVoxelMaterial definitions is unknown.
+- [HYPOTHESIS] (c) — cost: Very high. True transparency would need a new voxel render path, because the building-block GPU layer has no opacity/alpha and voxel chunks go through the GBuffer/PbrBuilding path.
   - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
-- [HYPOTHESIS] (c) — risks: Save files store voxel material GUIDs per world (materialGuids[256]); a removed or changed material could break saves. Multiplayer: every client and the server need the same data. No public tool (EML, ShroudForge) shows it has ever been done. Large binary blobs (RenderDataBlock patch points) must be rebuilt exactly.
+- [HYPOTHESIS] (c) — cost: GI is opaque.
   - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
-- [HYPOTHESIS] (c) — next: Do not start. If the author still wants an opaque glass-look block: 1) find where SolidVoxelMaterial definitions live at runtime (open question); 2) dump one existing block end to end (for example Block_T4_Metal_Iron_CRAFTING) across ItemInfo, pool, BuildingMaterialParameters, the blending layer and GI; 3) write a cost estimate.
+- [HYPOTHESIS] (c) — cost: An OPAQUE 'glass-look' block (glossy, tinted, emissive) is possible in principle: 85 of 128 GPU slots are used and ids are u8, so there is room.
+  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] (c) — cost: It would still need baked RenderDataBlock edits, a new building material layer, item, recipe and pool entries, and the location of the SolidVoxelMaterial definitions is unknown.
+  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] (c) — risks: Save files store voxel material GUIDs per world (materialGuids[256]); a removed or changed material could break saves.
+  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] (c) — risks: Multiplayer: every client and the server need the same data.
+  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] (c) — risks: No public tool (EML, ShroudForge) shows it has ever been done.
+  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] (c) — risks: Large binary blobs (RenderDataBlock patch points) must be rebuilt exactly.
+  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] (c) — next: Do not start.
+  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] (c) — next: If the author still wants an opaque glass-look block: 1) find where SolidVoxelMaterial definitions live at runtime (open question); 2) dump one existing block end to end (for example Block_T4_Metal_Iron_CRAFTING) across ItemInfo, pool, BuildingMaterialParameters, the blending layer and GI; 3) write a cost estimate.
   - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
 - [HYPOTHESIS] Proposed route **hard**: (d) Untested idea: a new prop window pane drawn through the engine's forward OIT transparent pipeline (renderer.gpc Transparent_Forward_Oit_Lit_Shaded), for example as a VFX mesh attached to a window prop template.
   - Receipt: Supplied glass spike, Routes; proposal, not a tested result.
 - [HYPOTHESIS] (d) — cost: High. It needs a VFX resource or mesh with a transparent material in the VFX data format (VfxResource / VfxMeshResource / TransparentInstanceData), wired into a prop ECS template, plus a new item and recipe if it is to be placeable.
   - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
-- [HYPOTHESIS] (d) — risks: Pure hypothesis: no shipped model uses this path for geometry. VFX meshes may not cast or receive the right lighting, and may be culled or depth-faded oddly. OIT cost on large panes. Needs a data writer (route a).
+- [HYPOTHESIS] (d) — risks: Pure hypothesis: no shipped model uses this path for geometry.
   - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
-- [HYPOTHESIS] (d) — next: 1) Find one shipped VFX that renders a lit transparent mesh (search VfxResource for flags that select the Lit/Shaded OIT variants). 2) Dump its data with our-build layouts. 3) Judge whether a static pane is expressible. Report back before any build work.
+- [HYPOTHESIS] (d) — risks: VFX meshes may not cast or receive the right lighting, and may be culled or depth-faded oddly.
+  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] (d) — risks: OIT cost on large panes.
+  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] (d) — risks: Needs a data writer (route a).
+  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] (d) — next: 1) Find one shipped VFX that renders a lit transparent mesh (search VfxResource for flags that select the Lit/Shaded OIT variants).
+  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] (d) — next: 2) Dump its data with our-build layouts.
+  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] (d) — next: 3) Judge whether a static pane is expressible.
+  - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
+- [HYPOTHESIS] (d) — next: Report back before any build work.
   - Receipt: Supplied glass spike, Routes; untested cost, risk or next step.
 
 ### Glass open questions
