@@ -120,10 +120,10 @@ fn sets_async_compute(cmdline: &str) -> bool {
 /// 1. `code_patches == false` gives `"unknown build"`;
 /// 2. `AsyncCompute = game` gives `"ini: game"`;
 /// 3. an argument of the command line that contains `async-compute` (see
-///    [`sets_async_compute`]) gives `"command line sets it"`. The program name is not an
+///    `sets_async_compute`) gives `"command line sets it"`. The program name is not an
 ///    argument.
 ///
-/// Otherwise `Patch`. Pure: the command line is passed in (see [`command_line`]).
+/// Otherwise `Patch`. Pure: the command line is passed in (see `command_line`).
 pub fn decide(cmdline: &str, cfg: &AsyncCompute, code_patches: bool) -> Decision {
     if !code_patches {
         return Decision::Skip("unknown build");

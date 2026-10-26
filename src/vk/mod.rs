@@ -33,7 +33,7 @@
 //! - Real pointers are kept first-value-wins (`compare_exchange` from 0): game threads may call the
 //!   wrappers at the same time. A wrapper is handed out only when the pointer it will call is right
 //!   for every call that can reach it; otherwise the game gets the real pointer back, unwrapped.
-//!   See [`hand_out`] and [`device_function`].
+//!   See `hand_out` and `device_function`.
 //! - `wrap_present` runs every frame, so it touches only atomics: no lock, no allocation, no log.
 //!   The one-time wrappers (device creation) may log.
 
@@ -186,7 +186,7 @@ pub fn classify_gipa(name: &[u8]) -> Option<Wrap> {
 ///
 /// `vkGetDeviceProcAddr` itself is mapped so a game that re-fetches it at device level stays in
 /// the chain; the loader then gives the top of the device's chain, so it goes through
-/// [`device_function`] like the other two (see [`gdpa_choose`]).
+/// `device_function` like the other two (see `gdpa_choose`).
 pub fn classify_gdpa(name: &[u8]) -> Option<Wrap> {
     match name {
         b"vkGetDeviceProcAddr" => Some(Wrap::Gdpa),
@@ -520,7 +520,7 @@ unsafe fn gpa_choose(
 /// Stands in for `vkGetInstanceProcAddr`.
 ///
 /// Every call goes to [`REAL_GIPA`] with the original arguments; the names [`classify_gipa`] knows
-/// get their wrapper (see [`hand_out`]). The first non-null instance is kept in
+/// get their wrapper (see `hand_out`). The first non-null instance is kept in
 /// [`GAME_INSTANCE`].
 ///
 /// # Safety
@@ -630,7 +630,7 @@ unsafe fn gipa_choose(
 ///
 /// Every call goes to [`REAL_GDPA`] with the original arguments; `vkQueuePresentKHR`,
 /// `vkCreateSwapchainKHR` and `vkGetDeviceProcAddr` itself get their wrappers (see
-/// [`gdpa_choose`] and [`device_function`]).
+/// `gdpa_choose` and `device_function`).
 ///
 /// # Safety
 ///
@@ -735,7 +735,7 @@ unsafe fn gdpa_choose(
 /// Calls the real one with the game's arguments, unchanged (Task 9 adds no extension, so the
 /// game's extension list goes through as it is). On the first device that is created it publishes
 /// the device and its physical device together (see [`game_device`]), logs `wrapper chain engaged
-/// (device created)`, and sizes the texture budget for the card (see [`texture_step`]).
+/// (device created)`, and sizes the texture budget for the card (see `texture_step`).
 ///
 /// # Safety
 ///
