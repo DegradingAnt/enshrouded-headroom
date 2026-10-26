@@ -228,8 +228,14 @@ fn start_up_logs_one_grass_distance_line_after_object_distance() {
     );
     let grass = at("grass distance:");
     let object = at("object distance:");
+    let probe = at("scatter probe:");
+    assert_eq!(probe.len(), 1, "one scatter probe line:\n{log}");
     assert_eq!(grass.len(), 1, "one grass distance line:\n{log}");
     assert_eq!(object.len(), 1, "one object distance line:\n{log}");
+    assert!(
+        grass[0] < probe[0],
+        "scatter probe follows grass distance:\n{log}"
+    );
     assert!(
         object[0] < grass[0],
         "grass distance comes after object distance:\n{log}"

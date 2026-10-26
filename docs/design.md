@@ -166,7 +166,7 @@ Rules:
    - it raises only while ≥ 95 % of frames make the display period that matches the effective target;
    - it undoes the last step as soon as more than 2 % of frames fall to the next multiple (for example 60 fps on a 120 Hz screen).
    - This replaces the p95 thresholds, which would see only 8.3 or 16.7 ms (review finding 5).
-5. **Raising.** It raises the next knob in priority order (section 7) that is below its maximum and not blocked, by one step. It only raises if `vram_budget` reports at least `MinVramFreeMiB` free, or if the budget extension is not available.
+5. **Raising.** It raises the next knob in priority order (section 7) that is below its maximum and not blocked, by one step. It only raises if `vram_budget` reports at least `MinVramFreeMiB` free, and does not raise a VRAM-costly knob when the budget is unknown.
 6. **Lowering.** It undoes the most recent raise first (last in, first out). A step that is undone is blocked for `BlockSeconds`.
 7. **Hitches after a raise.** Frames over `HitchFactor` × target in the settle and hold period after a raise count against that raise, including frames over 100 ms (review finding 6). Outside that period, frames over 100 ms are ignored as loading or alt-tab.
 8. **Menu changes.** The hooks publish the baseline they saw on each call. If a baseline changes, the player changed a menu setting: the governor drops that knob's added steps and starts again from the new baseline.
@@ -305,7 +305,7 @@ Each knob states:
 
 ### 7.2a Scatter counter probe (the author, 2026-10-25: "Add it to v1")
 
-- **Hook:** a minhook pre-hook on `FUN_1400767a0(_, pass)`. Its signature is the 14-byte prologue `48 89 54 24 10 55 53 57 41 55 41 56 41 57`, unique in build f68140a3 (checked 2026-10-26). Like the terrain signature it is fragile across updates; a mismatch leaves the probe off.
+- **Hook:** a minhook pre-hook on `FUN_1400767a0(rcx, pass, f32 in XMM2)`. Its signature is the 14-byte prologue `48 89 54 24 10 55 53 57 41 55 41 56 41 57`, unique in build f68140a3 (checked 2026-10-26). Like the terrain signature it is fragile across updates; a mismatch leaves the probe off.
 - **Pointer chain** (research write-up; a HYPOTHESIS until the runtime self-check passes):
   - obj = [pass+0x18];
   - pool = [[pass+0x8]+0x20];

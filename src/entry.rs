@@ -229,7 +229,9 @@ pub fn start() {
     log::info!("enshrouded-headroom {} loaded", env!("CARGO_PKG_VERSION"));
     log::info!("{}", settings_line(settings_file.as_deref()));
     for warning in &warnings {
-        log::warn!("{warning}");
+        if crate::governor_thread::warning_visible(cfg.general.log_level, warning) {
+            log::warn!("{warning}");
+        }
     }
 
     // 6. Which build is this, and 7. may code be patched in it. (`Enabled = 0` stops here, before

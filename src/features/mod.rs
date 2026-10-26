@@ -5,4 +5,5 @@ pub mod async_compute;
 pub mod hdr;
 pub mod priority;
 pub mod scatter_probe;
+pub mod startup_scales;
 pub mod texture_budget;
