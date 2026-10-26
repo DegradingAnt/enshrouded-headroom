@@ -179,12 +179,10 @@ The governor is a pure state machine with unit tests (section 10).
 
 ### 6.5 NVIDIA Reflex (experimental)
 
-**W23 review checkpoint: NEEDS_SCOPE.** The implementation below has fake-driver coverage, but
-two startup/runtime bridges are deliberately unwired: `entry.rs` must pass the parsed Reflex
-setting to `reflex::init`, and `guard.rs` needs a quiet feature-disable helper before
-`wrap_present` can call `reflex::on_present`. These files need the maintainer's narrow scope
-grant under issue #27. With the setting uninitialized, the real renderer remains unchanged.
-This checkpoint does not claim an active Reflex feature.
+Startup publishes the parsed Reflex mode before Vulkan interception. The real present wrapper
+runs the Reflex sequence for an eligible live swapchain. Driver failures set the Reflex disabled
+bit silently; no logging is scheduled from the present path. Fake-driver tests cover this wiring.
+In-game behavior and latency improvement remain unverified.
 
 Fact: the exe contains none of `vkLatencySleepNV`, `vkSetLatencySleepModeNV`, `vkSetLatencyMarkerNV`, `VK_NV_low_latency`, `low_latency2`, `NvAPI` or `nvapi64` (whole-file ASCII and UTF-16 search, 2026-10-25). The menu has a Reflex option (`nvidiaReflex`), but the Vulkan path cannot call Reflex, so the option is very likely inert.
 
@@ -445,7 +443,7 @@ roll-off remain hypotheses, with the limits recorded in `docs/re-notes.md`,
   - On an unknown build, only API-level features apply: the frame timer, the governor's timing, Reflex, and the texture budget, which needs a full 80-byte table match. Code patches and code hooks stay off, unless `AllowUnknownBuild = 1` (review finding 10). The log says which applied.
   - A game update therefore turns the knobs off until the mod is updated, instead of risking a crash.
 - **Driver refusals.** Changed `vkCreateDevice` and `vkCreateSwapchainKHR` calls are retried with the game's original arguments if they fail. The feature then stays off.
-- **No waits without timeouts** on game threads. The Reflex wait has a 100 ms hang-guard timeout (6.5).
+- **No waits without timeouts** on game threads. The Reflex present wait has a 10 ms timeout (6.5). Pending semaphore retirement can wait longer during teardown, as documented in 6.5.
 - **Panics.** Every extern function catches unwinds and falls back to the original.
 - **Memory access.** Hooks read only the arguments the game passes in, at that moment. The governor never reads game memory. Access violations cannot be caught by `catch_unwind`, so the design avoids the stale pointers that would cause them (review finding 11).
 - **Original bytes** are kept for every patch. They are not restored at process exit.

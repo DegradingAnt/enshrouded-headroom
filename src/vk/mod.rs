@@ -1037,11 +1037,12 @@ pub unsafe extern "system" fn wrap_create_swapchain(
 }
 
 /// Stands in for `vkQueuePresentKHR`: stamps [`FRAMES`] with [`qpc_now`], then calls the real
-/// present with the game's arguments and returns its result.
+/// present through Reflex with the game's arguments and returns its result.
 ///
 /// It never modifies the `VkPresentInfoKHR` or its `pNext` chain (ruling G12): the game chains its
 /// own `VkPresentId2KHR` (sType 1000479001) on every present, and the pointer is passed on as it
-/// came. It runs every frame, so it only touches atomics: no lock, no allocation, no log (the
+/// came. Reflex adds its bounded native calls (issue #27). Mod bookkeeping only touches stack
+/// values and atomics: no lock, no allocation, no normal-path log (the
 /// null-pointer warning cannot happen once a wrapper was handed out, and is logged once).
 ///
 /// # Safety
@@ -1052,16 +1053,35 @@ pub unsafe extern "system" fn wrap_present(
     info: *const vk::PresentInfoKHR<'_>,
 ) -> vk::Result {
     let real = REAL_PRESENT.load(Ordering::Acquire);
-    // SAFETY: `real` is 0 or the real vkQueuePresentKHR; the arguments are the game's own, passed
-    // on unchanged.
-    let original = move || unsafe { call_present(real, queue, info) };
+    // Keep the result outside both guards: a panic in post-work must not repeat presentation.
+    let completed = std::cell::Cell::new(None);
+    let original = || {
+        if let Some(result) = completed.get() {
+            return result;
+        }
+        // SAFETY: `real` is 0 or the matching native entry point; caller arguments are unchanged.
+        let result = unsafe { call_present(real, queue, info) };
+        completed.set(Some(result));
+        result
+    };
     guard(Feature::VkWrap, original, || {
         if real == 0 {
             warn_null_once(&NULL_PRESENT, "vkQueuePresentKHR");
             return vk::Result::ERROR_INITIALIZATION_FAILED;
         }
         FRAMES.push(qpc_now());
-        original()
+        // SAFETY: the original closure preserves the caller's info/chain and caches its result.
+        // The quiet callback sets only the Reflex feature bit, without allocation, lock or log.
+        let result = unsafe {
+            crate::reflex::on_present(info, original, || {
+                crate::guard::disable_silent(Feature::Reflex);
+            })
+        };
+        #[cfg(test)]
+        if present_tests::PANIC_AFTER_PRESENT.swap(false, Ordering::Relaxed) {
+            panic!("test outer post-present panic");
+        }
+        result
     })
 }
 
@@ -2869,5 +2889,60 @@ mod disabled_lifetime_tests {
         }
         assert_eq!(DESTROYS.load(Ordering::SeqCst), 1);
         assert_eq!(TOP_DESTROYS.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[cfg(test)]
+mod present_tests {
+    use super::*;
+    /// Inject only in Rust post-work, never unwind across a driver ABI boundary.
+    pub(super) static PANIC_AFTER_PRESENT: AtomicBool = AtomicBool::new(false);
+    /// Count original calls independently of wrapper fallback.
+    static PRESENTS: AtomicUsize = AtomicUsize::new(0);
+    /// # Safety
+    /// This fake ignores handles and pointers; it owns no native resources.
+    unsafe extern "system" fn original(
+        _: vk::Queue,
+        _: *const vk::PresentInfoKHR<'_>,
+    ) -> vk::Result {
+        let body = || {
+            PRESENTS.fetch_add(1, Ordering::Relaxed);
+            vk::Result::SUBOPTIMAL_KHR
+        };
+        guard(Feature::VkWrap, body, body)
+    }
+    /// A panic after Reflex returned must not repeat the completed native present.
+    #[test]
+    fn outer_post_present_panic_calls_driver_once() {
+        const NAME: &str = "vk::present_tests::outer_post_present_panic_calls_driver_once";
+        if std::env::var_os("W23_OUTER_PRESENT_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture"])
+                .env("W23_OUTER_PRESENT_CHILD", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        REAL_PRESENT.store(original as *const () as usize, Ordering::Release);
+        PANIC_AFTER_PRESENT.store(true, Ordering::Relaxed);
+        // SAFETY: fake original accepts these empty inputs; no runtime is armed.
+        assert_eq!(
+            unsafe { wrap_present(vk::Queue::null(), &vk::PresentInfoKHR::default()) },
+            vk::Result::SUBOPTIMAL_KHR
+        );
+        assert_eq!(PRESENTS.load(Ordering::Relaxed), 1);
+        assert!(crate::guard::is_disabled(Feature::VkWrap));
+        // SAFETY: the disabled outer fallback still forwards one original call with its result.
+        assert_eq!(
+            unsafe { wrap_present(vk::Queue::null(), &vk::PresentInfoKHR::default()) },
+            vk::Result::SUBOPTIMAL_KHR
+        );
+        assert_eq!(PRESENTS.load(Ordering::Relaxed), 2);
     }
 }

@@ -884,7 +884,6 @@ fn the_wrapper_chain_works_end_to_end() {
 /// Isolated fake-driver cases exercise the real create wrappers, including exact-pointer retries.
 mod reflex_driver {
     use super::*;
-    use enshrouded_headroom::config::ReflexMode;
     use enshrouded_headroom::{
         guard::{guard, Feature},
         reflex,
@@ -1109,6 +1108,7 @@ mod reflex_driver {
             to_void(match unsafe { CStr::from_ptr(name) }.to_bytes() {
                 b"vkDestroyDevice" => destroy_device as *const () as usize,
                 b"vkDestroySwapchainKHR" => destroy_swapchain as *const () as usize,
+                _ if PRESENT_CASE.load(Ordering::Relaxed) != 0 => present_entry(name),
                 _ => 0,
             })
         };
@@ -1232,8 +1232,378 @@ mod reflex_driver {
             },
         )
     }
+
+    /// Enable the complete fake table only for the actual-present child cases.
+    static PRESENT_CASE: AtomicUsize = AtomicUsize::new(0);
+    /// Inject native failures without unwinding across the ABI.
+    static PRESENT_RESULT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+    static WAIT_RESULT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+    /// Sleep failures stop before issuing any wait.
+    static SLEEP_RESULT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+    static PRESENT_INFO: AtomicUsize = AtomicUsize::new(0);
+    static PRESENT_TAIL: AtomicUsize = AtomicUsize::new(0);
+
+    /// Resolve only the native functions required to arm and exercise Reflex.
+    fn present_entry(name: *const c_char) -> usize {
+        // SAFETY: gdpa received a terminated Vulkan function name.
+        match unsafe { CStr::from_ptr(name) }.to_bytes() {
+            b"vkCreateSemaphore" => latency_semaphore as *const () as usize,
+            b"vkDestroySemaphore" => latency_destroy as *const () as usize,
+            b"vkSetLatencySleepModeNV" => latency_mode as *const () as usize,
+            b"vkSetLatencyMarkerNV" => latency_marker as *const () as usize,
+            b"vkLatencySleepNV" => latency_sleep as *const () as usize,
+            b"vkWaitSemaphores" | b"vkWaitSemaphoresKHR" => latency_wait as *const () as usize,
+            b"vkGetLatencyTimingsNV" => latency_timings as *const () as usize,
+            b"vkCreateSwapchainKHR" => latency_swapchain as *const () as usize,
+            b"vkQueuePresentKHR" => latency_present as *const () as usize,
+            _ => 0,
+        }
+    }
+    /// # Safety
+    /// The wrapper provides initialized semaphore input and writable output.
+    unsafe extern "system" fn latency_semaphore(
+        _: vk::Device,
+        info: *const vk::SemaphoreCreateInfo<'_>,
+        _: *const vk::AllocationCallbacks<'_>,
+        out: *mut vk::Semaphore,
+    ) -> vk::Result {
+        guard(
+            Feature::VkWrap,
+            || vk::Result::ERROR_UNKNOWN,
+            || {
+                // SAFETY: Runtime supplies this exact initialized timeline node and output.
+                unsafe {
+                    let timeline = &*((*info).p_next.cast::<vk::SemaphoreTypeCreateInfo<'_>>());
+                    assert!(timeline.semaphore_type == vk::SemaphoreType::TIMELINE);
+                    out.write(vk::Semaphore::from_raw(77));
+                }
+                vk::Result::SUCCESS
+            },
+        )
+    }
+    /// # Safety
+    /// The fake semaphore remains live until wrapped retirement.
+    unsafe extern "system" fn latency_destroy(
+        _: vk::Device,
+        _: vk::Semaphore,
+        _: *const vk::AllocationCallbacks<'_>,
+    ) {
+        let body = || note("destroy semaphore".into());
+        guard(Feature::VkWrap, body, body)
+    }
+    /// # Safety
+    /// The wrapper provides a live sleep-mode input.
+    unsafe extern "system" fn latency_mode(
+        _: vk::Device,
+        _: vk::SwapchainKHR,
+        info: *const vk::LatencySleepModeInfoNV<'_>,
+    ) -> vk::Result {
+        guard(
+            Feature::VkWrap,
+            || vk::Result::ERROR_UNKNOWN,
+            || {
+                // SAFETY: the native call borrows this initialized input.
+                let info = unsafe { &*info };
+                note(format!(
+                    "mode:{}:{}",
+                    info.low_latency_mode, info.low_latency_boost
+                ));
+                vk::Result::SUCCESS
+            },
+        )
+    }
+    /// # Safety
+    /// The wrapper supplies a valid marker input.
+    unsafe extern "system" fn latency_marker(
+        _: vk::Device,
+        _: vk::SwapchainKHR,
+        info: *const vk::SetLatencyMarkerInfoNV<'_>,
+    ) {
+        guard(
+            Feature::VkWrap,
+            || (),
+            || {
+                // SAFETY: live initialized input for this synchronous call.
+                let info = unsafe { &*info };
+                note(format!(
+                    "marker:{}:{}",
+                    info.present_id,
+                    info.marker.as_raw()
+                ));
+            },
+        )
+    }
+    /// # Safety
+    /// The wrapper supplies a valid sleep input.
+    unsafe extern "system" fn latency_sleep(
+        _: vk::Device,
+        _: vk::SwapchainKHR,
+        info: *const vk::LatencySleepInfoNV<'_>,
+    ) -> vk::Result {
+        guard(
+            Feature::VkWrap,
+            || vk::Result::ERROR_UNKNOWN,
+            || {
+                // SAFETY: live initialized input for this synchronous call.
+                note(format!("sleep:{}", unsafe { (*info).value }));
+                vk::Result::from_raw(SLEEP_RESULT.load(Ordering::Relaxed))
+            },
+        )
+    }
+    /// # Safety
+    /// The wrapper supplies valid wait arrays, retained through the call.
+    unsafe extern "system" fn latency_wait(
+        _: vk::Device,
+        _: *const vk::SemaphoreWaitInfo<'_>,
+        timeout: u64,
+    ) -> vk::Result {
+        guard(
+            Feature::VkWrap,
+            || vk::Result::ERROR_UNKNOWN,
+            || {
+                note(format!("wait:{timeout}"));
+                if timeout == u64::MAX {
+                    vk::Result::SUCCESS
+                } else {
+                    vk::Result::from_raw(WAIT_RESULT.load(Ordering::Relaxed))
+                }
+            },
+        )
+    }
+    /// # Safety
+    /// No timings are written; the initialized zero reports remain untouched.
+    unsafe extern "system" fn latency_timings(
+        _: vk::Device,
+        _: vk::SwapchainKHR,
+        _: *mut vk::GetLatencyMarkerInfoNV<'_>,
+    ) {
+        guard(Feature::VkWrap, || (), || ())
+    }
+    /// # Safety
+    /// The fake receives live Vulkan create info and writable output.
+    unsafe extern "system" fn latency_swapchain(
+        _: vk::Device,
+        _: *const vk::SwapchainCreateInfoKHR<'_>,
+        _: *const vk::AllocationCallbacks<'_>,
+        out: *mut vk::SwapchainKHR,
+    ) -> vk::Result {
+        guard(
+            Feature::VkWrap,
+            || vk::Result::ERROR_UNKNOWN,
+            || {
+                // SAFETY: caller supplies writable output.
+                unsafe { out.write(vk::SwapchainKHR::from_raw(SWAPCHAIN)) };
+                vk::Result::SUCCESS
+            },
+        )
+    }
+    /// # Safety
+    /// The actual present wrapper must forward the test's original live info unchanged.
+    unsafe extern "system" fn latency_present(
+        queue: vk::Queue,
+        info: *const vk::PresentInfoKHR<'_>,
+    ) -> vk::Result {
+        let body = || {
+            assert_eq!(queue.as_raw(), QUEUE);
+            assert_eq!(info as usize, PRESENT_INFO.load(Ordering::Relaxed));
+            // SAFETY: present_child retains the info and its chain through this call.
+            assert_eq!(
+                unsafe { (*info).p_next } as usize,
+                PRESENT_TAIL.load(Ordering::Relaxed)
+            );
+            note("present".into());
+            vk::Result::from_raw(PRESENT_RESULT.load(Ordering::Relaxed))
+        };
+        guard(Feature::VkWrap, body, body)
+    }
+    /// Drive the real lookup, swapchain and present wrappers after parsed-mode device creation.
+    fn present_child(case: &str, device: vk::Device) {
+        // SAFETY: the exact fake resolver returns these matching native signatures.
+        let (create, present) = unsafe {
+            wrap_gipa(
+                vk::Instance::from_raw(INSTANCE + 1),
+                c"vkGetDeviceProcAddr".as_ptr(),
+            );
+            let create = wrap_gdpa(device, c"vkCreateSwapchainKHR".as_ptr()).unwrap();
+            let present = wrap_gdpa(device, c"vkQueuePresentKHR".as_ptr()).unwrap();
+            (
+                std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkCreateSwapchainKHR>(
+                    create,
+                ),
+                std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkQueuePresentKHR>(
+                    present,
+                ),
+            )
+        };
+        assert_eq!(present as usize, wrap_present as *const () as usize);
+        let mut swapchain = vk::SwapchainKHR::null();
+        // SAFETY: initialized inputs and live fake device/output.
+        assert_eq!(
+            unsafe {
+                (if case == "present-no-runtime" {
+                    latency_swapchain
+                } else {
+                    create
+                })(
+                    device,
+                    &vk::SwapchainCreateInfoKHR::default(),
+                    std::ptr::null(),
+                    &mut swapchain,
+                )
+            },
+            vk::Result::SUCCESS
+        );
+        let setup = take_calls();
+        if matches!(case, "present-off" | "present-no-runtime") {
+            assert!(!setup.iter().any(|call| call.starts_with("mode:")));
+            assert_eq!(
+                CHANGED_OK.load(Ordering::Relaxed),
+                usize::from(case != "present-off")
+            );
+        } else {
+            assert!(setup.iter().any(|call| call == "mode:1:0"));
+        }
+        let result = match case {
+            "present-lost" => vk::Result::ERROR_DEVICE_LOST,
+            "present-outdated" => vk::Result::ERROR_OUT_OF_DATE_KHR,
+            _ => vk::Result::SUBOPTIMAL_KHR,
+        };
+        PRESENT_RESULT.store(result.as_raw(), Ordering::Relaxed);
+        WAIT_RESULT.store(
+            match case {
+                "present-timeout" => vk::Result::TIMEOUT,
+                "present-wait-lost" => vk::Result::ERROR_DEVICE_LOST,
+                "present-wait-error" => vk::Result::ERROR_UNKNOWN,
+                _ => vk::Result::SUCCESS,
+            }
+            .as_raw(),
+            Ordering::Relaxed,
+        );
+        SLEEP_RESULT.store(
+            if case == "present-sleep-error" {
+                vk::Result::ERROR_UNKNOWN.as_raw()
+            } else {
+                0
+            },
+            Ordering::Relaxed,
+        );
+        if case == "present-disabled" {
+            enshrouded_headroom::guard::disable(Feature::VkWrap, "test disabled forwarding");
+        }
+        let plain = matches!(
+            case,
+            "present-off" | "present-no-runtime" | "present-other-swapchain" | "present-disabled"
+        );
+        let swaps = [if case == "present-other-swapchain" {
+            vk::SwapchainKHR::from_raw(SWAPCHAIN + 1)
+        } else {
+            swapchain
+        }];
+        let indices = [7];
+        let tail = vk::BaseInStructure {
+            s_type: vk::StructureType::from_raw(1_000_479_001),
+            ..Default::default()
+        };
+        let mut info = vk::PresentInfoKHR::default()
+            .swapchains(&swaps)
+            .image_indices(&indices);
+        info.p_next = (&tail as *const vk::BaseInStructure<'_>).cast();
+        PRESENT_INFO.store(&info as *const _ as usize, Ordering::Relaxed);
+        PRESENT_TAIL.store(info.p_next as usize, Ordering::Relaxed);
+        let mut timestamps = Vec::new();
+        let before = FRAMES.read_since(0, &mut timestamps);
+        for frame in 1..=2 {
+            // SAFETY: live fake handles and immutable info/chain through the real wrapper.
+            assert_eq!(
+                unsafe { present(vk::Queue::from_raw(QUEUE), &info) },
+                result
+            );
+            let calls = take_calls();
+            if plain || (frame == 2 && case != "present-success") {
+                assert_eq!(calls, ["present"]);
+            } else {
+                let mut expected = vec![
+                    format!("marker:{frame}:4"),
+                    "present".into(),
+                    format!("marker:{frame}:5"),
+                ];
+                if !matches!(case, "present-lost" | "present-outdated") {
+                    expected.push(format!("sleep:{frame}"));
+                    if case != "present-sleep-error" {
+                        expected.push("wait:10000000".into());
+                    }
+                    if case == "present-success" {
+                        expected.extend([
+                            format!("marker:{}:0", frame + 1),
+                            format!("marker:{}:2", frame + 1),
+                        ]);
+                    }
+                }
+                assert_eq!(calls, expected);
+            }
+            assert_eq!(info.p_next as usize, PRESENT_TAIL.load(Ordering::Relaxed));
+            assert_eq!(tail.s_type.as_raw(), 1_000_479_001);
+            assert!(tail.p_next.is_null());
+            assert_eq!(indices, [7]);
+        }
+        let recorded = if case == "present-disabled" { 0 } else { 2 };
+        assert_eq!(
+            FRAMES.read_since(before, &mut timestamps),
+            before + recorded
+        );
+        assert_eq!(timestamps.len() as u64, recorded);
+        assert!(timestamps.iter().all(|t| *t != 0));
+        assert_eq!(
+            enshrouded_headroom::guard::is_disabled(Feature::Reflex),
+            !plain && case != "present-success"
+        );
+        // SAFETY: retire while fake device/semaphore handles remain live; timeout cleanup is outside present.
+        unsafe { enshrouded_headroom::vk::wrap_destroy_device(device, std::ptr::null()) };
+    }
+    /// Actual wrapper behavior, not a helper-only acceptance test; each mode/failure gets fresh globals.
+    #[test]
+    fn actual_present_uses_parsed_mode_and_preserves_native_call() {
+        const NAME: &str =
+            "reflex_driver::actual_present_uses_parsed_mode_and_preserves_native_call";
+        if let Ok(case) = std::env::var("W23_PRESENT_CHILD") {
+            child(&case);
+            return;
+        }
+        for case in [
+            "present-success",
+            "present-timeout",
+            "present-lost",
+            "present-outdated",
+            "present-wait-lost",
+            "present-wait-error",
+            "present-sleep-error",
+            "present-off",
+            "present-no-runtime",
+            "present-other-swapchain",
+            "present-disabled",
+        ] {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture"])
+                .env("W23_PRESENT_CHILD", case)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{case}: {}\\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
     fn child(case: &str) {
-        reflex::init(ReflexMode::Auto);
+        let (config, warnings) = enshrouded_headroom::config::parse(if case == "present-off" {
+            "[General]\nReflex = off\n"
+        } else {
+            "[General]\nReflex = auto\n"
+        });
+        assert!(warnings.is_empty());
+        reflex::init(config.general.reflex);
+        PRESENT_CASE.store(usize::from(case.starts_with("present-")), Ordering::Relaxed);
         REAL_GIPA.store(gipa as *const () as usize, Ordering::Release);
         GAME_INSTANCE.store(INSTANCE as usize, Ordering::Release);
         REAL_CREATE_DEVICE.store(create as *const () as usize, Ordering::Release);
@@ -1354,6 +1724,10 @@ mod reflex_driver {
         assert_eq!(v12.p_next, original_next);
         assert_eq!(v12.timeline_semaphore, vk::FALSE);
         assert_eq!(v12.buffer_device_address, vk::TRUE);
+        if case.starts_with("present-") {
+            present_child(case, device);
+            return;
+        }
         if case.starts_with("dispatch-conflict-") {
             assert_eq!(
                 enshrouded_headroom::vk::with_game_device(|_, _, _| ()).is_some(),

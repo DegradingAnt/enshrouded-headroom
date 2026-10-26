@@ -506,7 +506,7 @@ const GIB: u64 = 1 << 30;
   - The extern wrappers are `wrap_gpa`, `wrap_gipa`, `wrap_gdpa`, `wrap_create_device`, `wrap_create_swapchain` and `wrap_present`. Each body runs inside `guard(Feature::VkWrap, call_original, …)`.
     - `wrap_gpa` guards: ordinal names (`name as usize <= 0xFFFF`) pass through. Names are compared only when `hModule == GetModuleHandleW("vulkan-1.dll")`.
     - `wrap_create_device` calls `texture_budget::apply` once, on the first call. It reads `vkGetPhysicalDeviceMemoryProperties` (the largest `DEVICE_LOCAL` heap) and `vkGetPhysicalDeviceProperties` (`deviceType == INTEGRATED_GPU`).
-    - `wrap_present` pushes `qpc_now()` to `FRAMES`, then calls `reflex::on_present` (Task 16; a no-op until then), then calls the real present.
+    - `wrap_present` pushes `qpc_now()` to `FRAMES`, then delegates to `reflex::on_present` (Task 16), which calls the real present exactly once.
 - Produces from `vk/types.rs`: `#[repr(C)]` structs for any `VK_NV_low_latency2` / `VK_KHR_present_id2` types that ash 0.38.0 lacks. Each one gets a test asserting `size_of` against the Vulkan header value.
 
 - [ ] **Step 1: Write the failing tests:**
@@ -845,6 +845,8 @@ Task 15 consumes this module. The governor's knob 1 is enabled only while `SCATT
 
 **Files:** `src/reflex.rs`, `src/vk/mod.rs`, `src/knobs/object_distance.rs`, `tests/vk_chain.rs`, docs.
 Issue #27 authorizes this wiring and the Reflex present-path exception to AGENTS rule 5.
+The maintainer also approved `guard::disable_silent` in `src/guard.rs` and the parsed-mode
+initialization step in `src/entry.rs` before Vulkan interception.
 
 **Interfaces and maintained rulings:**
 - Preserve W19's `TimelineFix` and pure `plan_device` API.
@@ -862,7 +864,8 @@ Issue #27 authorizes this wiring and the Reflex present-path exception to AGENTS
 - Fake-driver `rearm_on_new_swapchain` and `timeout_disables_reflex` tests.
 - Real-wrapper `tests/vk_chain.rs` cases for listed extension injection, original input-chain pointer preservation, exact-original retry and non-NVIDIA bypass.
 - Guarded menu read and native post-hook tests; retain all Task 12 hook tests.
-- Post-present panic, ordered success markers and teardown/reader lifetime tests.
+- Actual present-wrapper tests for parsed modes, ordered markers, first-failure disable, unchanged input/timestamps and original-once fallback through both panic guards.
+- Preserve teardown/reader lifetime tests.
 - Compile and capture relevant failing mutations, then restore each implementation.
 - Fresh target directory: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, strict `cargo doc`, `cargo test`, then `cargo asi`.
 - Report: **not verified in game; the maintainer runs the boot test**.

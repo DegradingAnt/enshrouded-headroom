@@ -99,6 +99,14 @@ pub fn is_disabled(f: Feature) -> bool {
     has(&DISABLED, f)
 }
 
+/// Switch `f` off without formatting, allocation or logging.
+///
+/// Returns `true` only when this call first disabled the feature. A caller may report that
+/// change later from a safe point.
+pub fn disable_silent(f: Feature) -> bool {
+    mark(&DISABLED, f)
+}
+
 /// Switch `f` off for the rest of the session and log `why`. The reason is logged once; a
 /// second call for the same feature is silent.
 pub fn disable(f: Feature, why: &str) {
@@ -396,6 +404,82 @@ mod tests {
         assert_eq!(
             format_panic(None, None, "boom"),
             "panic in thread '<unnamed>' at <unknown location>: boom"
+        );
+    }
+
+    /// Public kill-switch behavior runs in a child because the mask and logger are global.
+    #[test]
+    fn silent_disable_sets_the_bit_without_logging_and_preserves_logged_disable() {
+        const CHILD_ENV: &str = "HEADROOM_GUARD_DISABLE_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "guard::tests::silent_disable_sets_the_bit_without_logging_and_preserves_logged_disable",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated guard test failed:\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        /// Record the log facade's public events only in this isolated child.
+        struct Recorder(std::sync::Mutex<Vec<(log::Level, String)>>);
+        impl log::Log for Recorder {
+            fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+                true
+            }
+            fn log(&self, record: &log::Record<'_>) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((record.level(), record.args().to_string()));
+            }
+            fn flush(&self) {}
+        }
+        static LOGGER: Recorder = Recorder(std::sync::Mutex::new(Vec::new()));
+        log::set_logger(&LOGGER).unwrap();
+        log::set_max_level(log::LevelFilter::Trace);
+
+        assert!(
+            !is_disabled(Feature::Reflex),
+            "the child starts with a fresh mask"
+        );
+        assert!(
+            disable_silent(Feature::Reflex),
+            "first call changes the bit"
+        );
+        assert!(is_disabled(Feature::Reflex));
+        assert!(
+            !disable_silent(Feature::Reflex),
+            "second call is not a change"
+        );
+        assert!(
+            LOGGER.0.lock().unwrap().is_empty(),
+            "silent disable must not log"
+        );
+        disable(Feature::Reflex, "already silently disabled");
+        assert!(
+            LOGGER.0.lock().unwrap().is_empty(),
+            "an already disabled feature stays silent"
+        );
+        assert!(!is_disabled(Feature::TextureBudget));
+        disable(Feature::TextureBudget, "legacy first reason");
+        disable(Feature::TextureBudget, "legacy second reason");
+        assert!(is_disabled(Feature::TextureBudget));
+        assert_eq!(
+            *LOGGER.0.lock().unwrap(),
+            [(
+                log::Level::Warn,
+                "TextureBudget disabled: legacy first reason".to_owned()
+            )]
         );
     }
 }

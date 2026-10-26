@@ -1,8 +1,8 @@
 //! NVIDIA Reflex decisions and Vulkan wiring.
 //!
-//! W23 checkpoint: parsed-setting startup initialization and the quiet-disable present callback
-//! are not connected until the maintainer grants the required entry.rs/guard.rs scope. An unset
-//! mode leaves device creation unchanged. The complete native paths are exercised by fakes.
+//! Startup publishes the parsed mode before Vulkan interception. The present wrapper calls this
+//! module with a quiet feature-disable callback. An unset mode leaves device creation unchanged.
+//! Fake drivers exercise the native paths; in-game behavior still needs the maintainer's boot test.
 
 use std::ffi::CStr;
 
@@ -985,7 +985,21 @@ mod runtime_tests {
     }
     /// Test-only panic injection is in Rust post-work, never across a native ABI boundary.
     pub(super) static PANIC_AFTER_PRESENT: AtomicBool = AtomicBool::new(false);
-    /// A panic after the driver returned preserves its result and never invokes it twice.
+    /// Native present calls counted independently of both wrapper guards.
+    static PANIC_PRESENTS: AtomicUsize = AtomicUsize::new(0);
+    /// # Safety
+    /// The test owns all fake handles and the input remains live through the wrapper.
+    unsafe extern "system" fn panic_present(
+        _: vk::Queue,
+        _: *const vk::PresentInfoKHR<'_>,
+    ) -> vk::Result {
+        let body = || {
+            PANIC_PRESENTS.fetch_add(1, Ordering::Relaxed);
+            vk::Result::SUBOPTIMAL_KHR
+        };
+        guard(Feature::VkWrap, body, body)
+    }
+    /// A panic after the driver returned preserves its result through the actual native wrapper.
     #[test]
     fn post_panic_preserves_original_once() {
         let name = "reflex::runtime_tests::post_panic_preserves_original_once";
@@ -1014,23 +1028,17 @@ mod runtime_tests {
         PANIC_AFTER_PRESENT.store(true, Ordering::Relaxed);
         let swaps = [vk::SwapchainKHR::from_raw(2)];
         let info = vk::PresentInfoKHR::default().swapchains(&swaps);
-        let count = std::cell::Cell::new(0);
-        // SAFETY: info references one live fake swapchain and original returns a Vulkan result.
-        let result = unsafe {
-            on_present(
-                &info,
-                || {
-                    count.set(count.get() + 1);
-                    vk::Result::SUBOPTIMAL_KHR
-                },
-                || (),
-            )
-        };
+        crate::vk::REAL_PRESENT.store(panic_present as *const () as usize, Ordering::Release);
+        // SAFETY: info references one live fake swapchain; the saved fake has the native signature.
+        let result = unsafe { crate::vk::wrap_present(vk::Queue::null(), &info) };
         assert_eq!(result, vk::Result::SUBOPTIMAL_KHR);
-        assert_eq!(count.get(), 1);
+        assert_eq!(PANIC_PRESENTS.load(Ordering::Relaxed), 1);
         assert!(crate::guard::is_disabled(Feature::Reflex));
         assert!(!ACTIVE.load(Ordering::SeqCst).is_null());
         assert_eq!(READERS.load(Ordering::SeqCst), 0);
+        let reader = Reader::enter();
+        assert!(!reader.runtime().unwrap().presenting.load(Ordering::Acquire));
+        drop(reader);
         replace_runtime(std::ptr::null_mut());
     }
     /// Exact original pointer and borrowed tail observed by the swapchain driver boundary.
