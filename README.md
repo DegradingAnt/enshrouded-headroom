@@ -20,6 +20,8 @@ A Windows x64 ASI plugin for Enshrouded's Vulkan renderer, loaded by Ultimate AS
 
 **FPS-target governor** defaults to a 75 fps target, limited by display refresh. Its background loop runs every 50 ms and spends available headroom on object, grass and terrain steps in that order. It undoes raises when frames are late and holds current steps when the world signal is absent. Live VRAM is queried every two seconds; unknown or insufficient memory blocks costly raises. The grass capacity ceiling still applies. `TargetFps=0` stops the governor thread.
 
+**Frame pacing reports** append `1% low N fps, hitches N` to the governor's 30-second info status. At `LogLevel=debug`, a `frames:` line every two seconds reports p50, p99, maximum frame time and hitches. Both use frame intervals ending in the last two seconds, bounded by the existing 4096-slot ring. To keep these debug reports with `TargetFps=0`, set `[Debug] FrameStats=1` and `[General] LogLevel=debug`; the same worker runs without GPU queries, governor planning or knob writes. FrameStats defaults to 0. Empty or one-frame windows report no data. Percentiles use nearest rank; 1% low is the reciprocal of the mean slowest ceil(1%) frame times. Hitches exceed both twice p50 and 25 ms. These are observed present intervals, not GPU timings.
+
 **NVIDIA Reflex** defaults to `auto` and requires NVIDIA plus the driver-listed extension and required capabilities. `auto` and `on` enable without boost; `boost` requests boost; `off` disables it. `game` follows saved off/on/boost values and uses auto while unknown. Runtime pacing uses present markers, driver sleep and a 10 ms semaphore-wait timeout; failures disable pacing. It has no submit hook. Available timings are logged every five seconds with debug output and a running governor; latency improvement remains unverified in game.
 
 **AMD Anti-Lag** defaults to `auto`. Its runtime is implemented but **experimental, not verified on AMD hardware**. Both `auto` and `on` require AMD, a driver-listed `VK_AMD_anti_lag` extension and the reported feature. Active Reflex takes precedence. It paces only associated native queues and swapchains; the approximate INPUT timing and stop conditions are described below.
@@ -90,7 +92,7 @@ Save the .ini as UTF-8. The plugin tries the first readable `enshrouded-headroom
 
 Missing or invalid keys use defaults. Numeric out-of-range values are clamped, except `PaperWhiteNits`, `DisplayPeakNits` and `[Shadows]` overrides, which use `game`. If `LowerAbove` is not greater than `RaiseBelow`, both reset to defaults. Names and choices are case-insensitive; boolean keys accept `0`, `1`, `false` and `true`. Numeric decimal commas are accepted. Unknown keys warn. Lines beginning with `;` or `#` are comments. GiB and MiB are binary units.
 
-The table is generated from the crate's `DEFAULT_INI`, with reviewed ranges and descriptions. Run `cargo run --example generate_readme_settings` after changing defaults; `cargo run --example generate_readme_settings -- --check` verifies it without editing. The table contains the 35 shipped default keys; the schema also describes four omitted Debug keys.
+The table is generated from the crate's `DEFAULT_INI`, with reviewed ranges and descriptions. Run `cargo run --example generate_readme_settings` after changing defaults; `cargo run --example generate_readme_settings -- --check` verifies it without editing. The table contains the 36 shipped default keys; the schema also describes four omitted Debug keys.
 
 <!-- BEGIN GENERATED SETTINGS -->
 | Section | Key | Default | Range or choices | Meaning |
@@ -130,6 +132,7 @@ The table is generated from the crate's `DEFAULT_INI`, with reviewed ranges and 
 | `Shadows` | `PointLightStaticDistance` | `game` | game, 101–400 metres | Experimental Ultra static-light distance; game preserves vanilla. |
 | `Shadows` | `PointLightTile` | `game` | game, 224, 256 | Experimental Ultra atlas tile; increases VRAM use. |
 | `Shadows` | `SunResolution` | `game` | game, 4096 | Experimental Ultra sun resolution; increases VRAM use. |
+| `Debug` | `FrameStats` | `0` | 0, 1 (also false, true) | Permit frame reports with the governor off; requires LogLevel=debug. |
 <!-- END GENERATED SETTINGS -->
 
 ## Logs, diagnostics and known limits
@@ -192,7 +195,7 @@ TODO: the author writes this section.
 
 `crates/emberkit` holds reusable native infrastructure as an MIT-licensed Rust library. New mods are separate crates depending on it; each declares its process targets. It has no ASI entry export. The root remains the default workspace member, so `cargo asi` keeps the existing artifact name and exports. Use `--workspace` for lint, docs and tests (`cargo fmt --all --check` for formatting). `cargo deny` traverses both workspace members from the workspace root.
 
-`enshrouded_headroom::config::schema()` returns all 39 read settings without file I/O. Entries describe types, accepted ranges or words, default spellings, and restart requirements. All settings currently require a restart. The four developer settings under `Debug` are deliberately absent from the 35-key default INI. The three force-step defaults are absent values, not a literal `none` spelling. No settings UI is included.
+`enshrouded_headroom::config::schema()` returns all 40 read settings without file I/O. Entries describe types, accepted ranges or words, default spellings, and restart requirements. All settings currently require a restart. The four developer settings under `Debug` are deliberately absent from the 36-key default INI. The three force-step defaults are absent values, not a literal `none` spelling. No settings UI is included.
 
 ### Shadow quality above Ultra (experimental)
 

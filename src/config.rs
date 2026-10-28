@@ -168,11 +168,13 @@ pub struct HdrCfg {
     pub display_peak_nits: Option<u16>,
 }
 
-/// The `[Debug]` section (design.md section 8). It is not in the default file, so every key is off
-/// unless the player adds it. It is for testing only: a consumer honours it only with
+/// The `[Debug]` section (design.md section 8). Only FrameStats is shipped; legacy controls remain
+/// omitted and off unless the player adds them. A consumer honours debug controls only with
 /// `LogLevel = debug`, and that check is the consumer's job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DebugCfg {
+    /// FrameStats: permit debug frame reports when the governor is disabled.
+    pub frame_stats: bool,
     /// `ScatterProbe`: read the game's scatter GPU counters (design.md 7.2a), so the governor can
     /// log them.
     pub scatter_probe: bool,
@@ -269,6 +271,7 @@ const BUILTIN: Config = Config {
         sun_resolution: ShadowValue::Game,
     },
     debug: DebugCfg {
+        frame_stats: false,
         scatter_probe: false,
         force_step_object: None,
         force_step_scatter: None,
@@ -448,6 +451,7 @@ pub fn parse(text: &str) -> (Config, Vec<String>) {
         display_peak_nits: r.display_peak_nits(),
     };
     let debug = DebugCfg {
+        frame_stats: r.boolean("Debug", "FrameStats", d.debug.frame_stats),
         scatter_probe: r.boolean("Debug", "ScatterProbe", d.debug.scatter_probe),
         force_step_object: r.force_step("ForceStepObjectDistance"),
         force_step_scatter: r.force_step("ForceStepScatterDistance"),
@@ -1221,7 +1225,7 @@ mod tests {
                 .lines()
                 .filter(|line| !line.starts_with(';') && line.contains('='))
                 .count(),
-            35
+            36
         );
     }
 
@@ -1701,6 +1705,7 @@ mod tests {
         assert_eq!(
             c.debug,
             DebugCfg {
+                frame_stats: false,
                 scatter_probe: true,
                 force_step_object: None,
                 force_step_scatter: Some(4),
@@ -1715,8 +1720,20 @@ mod tests {
     }
 
     #[test]
-    fn the_default_file_has_no_debug_section_and_gives_debug_off() {
-        assert!(!DEFAULT_INI.to_ascii_lowercase().contains("[debug]"));
+    fn the_default_file_ships_only_frame_stats_and_gives_debug_off() {
+        let mut ini = Ini::new();
+        ini.read(DEFAULT_INI.to_owned()).unwrap();
+        let debug = ini.get_map_ref().get("debug").unwrap();
+        assert_eq!(debug.len(), 1);
+        assert_eq!(ini.get("Debug", "FrameStats").as_deref(), Some("0"));
+        for key in [
+            "ScatterProbe",
+            "ForceStepObjectDistance",
+            "ForceStepScatterDistance",
+            "ForceStepTerrainDistance",
+        ] {
+            assert!(!debug.contains_key(&key.to_lowercase()));
+        }
         let (c, w) = parse(DEFAULT_INI);
         assert!(w.is_empty(), "{w:?}");
         assert_eq!(c.debug, DebugCfg::default());
@@ -1724,6 +1741,7 @@ mod tests {
         assert_eq!(
             DebugCfg::default(),
             DebugCfg {
+                frame_stats: false,
                 scatter_probe: false,
                 force_step_object: None,
                 force_step_scatter: None,
@@ -1833,6 +1851,7 @@ mod tests {
                     },
                 debug:
                     DebugCfg {
+                        frame_stats: _,
                         scatter_probe: _,
                         force_step_object,
                         force_step_scatter,
@@ -2640,6 +2659,14 @@ pub fn schema() -> &'static [emberkit::config::Setting] {
         },
         Setting {
             section: "Debug",
+            key: "FrameStats",
+            kind: SettingType::Bool,
+            default: Some("0"),
+            description: "Permit debug frame reports when TargetFps=0; requires LogLevel=debug.",
+            needs_restart: true,
+        },
+        Setting {
+            section: "Debug",
             key: "ScatterProbe",
             kind: SettingType::Bool,
             default: Some("0"),
@@ -2703,14 +2730,14 @@ mod schema_tests {
             .map(|s| (s.section.to_lowercase(), s.key.to_lowercase()))
             .collect();
         assert_eq!(requested, described);
-        assert_eq!(schema.len(), 39);
+        assert_eq!(schema.len(), 40);
         let mut ini = Ini::new();
         ini.read(DEFAULT_INI.into()).unwrap();
         let actual: BTreeSet<_> = schema
             .iter()
             .map(|s| (s.section.to_lowercase(), s.key.to_lowercase()))
             .collect();
-        assert_eq!(actual.len(), 39);
+        assert_eq!(actual.len(), 40);
         let defaults: BTreeSet<_> = ini
             .get_map_ref()
             .iter()
@@ -2743,5 +2770,21 @@ mod schema_tests {
         for entry in schema.iter().filter(|s| s.key.starts_with("ForceStep")) {
             assert_eq!(entry.default, None);
         }
+    }
+}
+
+#[cfg(test)]
+mod frame_stats_setting_tests {
+    use super::*;
+    #[test]
+    fn frame_stats_defaults_off_accepts_boolean_and_warns_on_invalid() {
+        assert!(!Config::default().debug.frame_stats);
+        let (cfg, warnings) = parse("[Debug]\nFrameStats=1\n");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(cfg.debug.frame_stats);
+        let (cfg, warnings) = parse("[Debug]\nFrameStats=garbage\n");
+        assert!(!cfg.debug.frame_stats);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("default 0"));
     }
 }

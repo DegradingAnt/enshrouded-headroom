@@ -42,6 +42,7 @@ fn description(section: &str, key: &str) -> Option<(&'static str, &'static str)>
         ("Shadows", "PointLightStaticDistance") => ("game, 101–400 metres", "Experimental Ultra static-light distance; game preserves vanilla."),
         ("Shadows", "PointLightTile") => ("game, 224, 256", "Experimental Ultra atlas tile; increases VRAM use."),
         ("Shadows", "SunResolution") => ("game, 4096", "Experimental Ultra sun resolution; increases VRAM use."),
+        ("Debug", "FrameStats") => ("0, 1 (also false, true)", "Permit frame reports with the governor off; requires LogLevel=debug."),
         _ => return None,
     })
 }

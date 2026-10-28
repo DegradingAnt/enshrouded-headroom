@@ -11,6 +11,8 @@ pub mod config;
 pub mod display;
 pub mod entry;
 pub mod features;
+/// Pure bounded frame-pacing statistics.
+pub mod frame_stats;
 pub mod frame_timer;
 pub mod governor;
 pub mod governor_thread;
