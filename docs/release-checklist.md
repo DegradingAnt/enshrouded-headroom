@@ -5,7 +5,7 @@ This is the author's future release procedure. W28 prepares documents and valida
 ## Integration prerequisites
 
 - [x] W23 (#27, Reflex), W24 (#30, governor) and W25 (#31, Anti-Lag) are merged and their runtime paths are implemented.
-- [x] Startup scales are implemented in 0.1.0; their 1.0 defaults leave original values unchanged. W32 supplies the shared library, process targeting and 35-key settings schema.
+- [x] Startup scales are implemented in 0.1.0; their 1.0 defaults leave original values unchanged. W32 supplies the shared library, process targeting and 39-key settings schema.
 - [ ] Preserve the grass ceiling until capacity measurements justify changing it. W27's background sampler is merged; the author's probe-on game validation and capacity evidence are still required.
 - [ ] Update README, descriptions and changelog from the final source; regenerate the settings table with `cargo run --example generate_readme_settings` and verify it with `-- --check`.
 - [ ] Keep Cargo.toml at 0.1.0 and verify the changelog top entry against the actual startup child log.
@@ -60,9 +60,9 @@ Preparation status: the governor, NVIDIA Reflex, AMD Anti-Lag and startup scales
 
 This client-only Windows x64 ASI plugin provides checked texture-budget sizing, async compute, governor-controlled distance steps, supported NVIDIA/AMD latency paths and optional HDR adjustments for Enshrouded's Vulkan renderer. It is designed around preserving the player's menu baseline and leaving mismatching game code alone. No measured performance gain is claimed here.
 
-Defaults: automatic texture budget with an 11 GiB reserve; async compute on; Above Normal priority; object/grass/terrain controls enabled with maximum configured step 4; governor target 75 fps, limited by display refresh; Reflex and Anti-Lag auto (driver/vendor requirements apply); HDR paper white game; HDR peak correction off. Grass remains capped at the game's 90 m until capacity is proven. Startup scales default to 1.0 and apply non-unit values through checked startup patches. There are no shadows-above-Ultra controls in this base.
+Defaults: automatic texture budget with an 11 GiB reserve; async compute on; Above Normal priority; object/grass/terrain controls enabled with maximum configured step 4; governor target 75 fps, limited by display refresh; Reflex and Anti-Lag auto (driver/vendor requirements apply); HDR paper white game; HDR peak correction off. Grass remains capped at the game's 90 m until capacity is proven. Startup scales default to 1.0 and apply non-unit values through checked startup patches. Experimental shadow overrides are available, with all four defaults set to game; no visual improvement is claimed.
 
-The Steam verification target is `f68140a3-steam`. An unrecognised game update disables code patches and hooks by default. `AllowUnknownBuild=1` permits attempts at the player's own risk; it does not establish compatibility. AMD Anti-Lag requires AMD plus the listed extension and feature, is blocked by active Reflex, and has not been verified on AMD hardware. The scatter probe is debug-only and off by default. The shared library exposes 35 read settings; the shipped default INI contains 31 and omits four developer keys.
+The Steam verification target is `f68140a3-steam`. An unrecognised game update disables code patches and hooks by default. `AllowUnknownBuild=1` permits attempts at the player's own risk; it does not establish compatibility. AMD Anti-Lag requires AMD plus the listed extension and feature, is blocked by active Reflex, and has not been verified on AMD hardware. The scatter probe is debug-only and off by default. The shared library exposes 39 read settings; the shipped default INI contains 35 and omits four developer keys.
 
 Install: close the game, browse its installed files through Steam, and extract the approved package beside the executable while preserving `plugins`. Do not replace another mod's shared loader without checking compatibility. Save the .ini as UTF-8, restart after edits, and check the mod log.
 

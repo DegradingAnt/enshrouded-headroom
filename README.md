@@ -28,7 +28,7 @@ A Windows x64 ASI plugin for Enshrouded's Vulkan renderer, loaded by Ultimate AS
 
 **Process priority** defaults to `above_normal`, requested once after the first Vulkan device is created. `normal` leaves the current priority unchanged; a failed Windows request is logged.
 
-Shadows above Ultra are not included in this base, and there is no shipped shadow setting.
+Experimental shadow overrides can raise the existing Ultra constants. All four settings default to `game`; their visual effect and shader limits still need in-game verification.
 
 ## Build under test and release gates
 
@@ -88,9 +88,9 @@ Close the game and back up your INI and any diagnostic log you need. Replace the
 
 Save the .ini as UTF-8. The plugin tries the first readable `enshrouded-headroom.ini` beside its ASI (normally `plugins`), then `%LOCALAPPDATA%\enshrouded-headroom`. If neither is readable, it creates defaults only where no INI exists and never overwrites an existing file. If neither location is usable, built-in defaults apply. The `settings:` log line names the selected file.
 
-Missing or invalid keys use defaults. Numeric out-of-range values are clamped, except `PaperWhiteNits` and `DisplayPeakNits`, which use `game`. If `LowerAbove` is not greater than `RaiseBelow`, both reset to defaults. Names and choices are case-insensitive; boolean keys accept `0`, `1`, `false` and `true`. Numeric decimal commas are accepted. Unknown keys warn. Lines beginning with `;` or `#` are comments. GiB and MiB are binary units.
+Missing or invalid keys use defaults. Numeric out-of-range values are clamped, except `PaperWhiteNits`, `DisplayPeakNits` and `[Shadows]` overrides, which use `game`. If `LowerAbove` is not greater than `RaiseBelow`, both reset to defaults. Names and choices are case-insensitive; boolean keys accept `0`, `1`, `false` and `true`. Numeric decimal commas are accepted. Unknown keys warn. Lines beginning with `;` or `#` are comments. GiB and MiB are binary units.
 
-The table is generated from the crate's `DEFAULT_INI`, with reviewed ranges and descriptions. Run `cargo run --example generate_readme_settings` after changing defaults; `cargo run --example generate_readme_settings -- --check` verifies it without editing. The table contains the 31 shipped default keys; the schema also describes four omitted Debug keys.
+The table is generated from the crate's `DEFAULT_INI`, with reviewed ranges and descriptions. Run `cargo run --example generate_readme_settings` after changing defaults; `cargo run --example generate_readme_settings -- --check` verifies it without editing. The table contains the 35 shipped default keys; the schema also describes four omitted Debug keys.
 
 <!-- BEGIN GENERATED SETTINGS -->
 | Section | Key | Default | Range or choices | Meaning |
@@ -126,6 +126,10 @@ The table is generated from the crate's `DEFAULT_INI`, with reviewed ranges and 
 | `Hdr` | `PaperWhiteNits` | `game` | game, 40–400 nits | Keep the game’s 250-nit paper white or apply a checked startup override. |
 | `Hdr` | `FixPeak` | `off` | on, off | Opt into HDR peak correction through the shared scene hook when a distance knob enables it. |
 | `Hdr` | `DisplayPeakNits` | `game` | game, whole number 80–10000 nits | Choose the game peak or panel target used only when FixPeak is on. |
+| `Shadows` | `PointLightRays` | `game` | game, 65–256 | Experimental Ultra ray limit; game preserves vanilla. |
+| `Shadows` | `PointLightStaticDistance` | `game` | game, 101–400 metres | Experimental Ultra static-light distance; game preserves vanilla. |
+| `Shadows` | `PointLightTile` | `game` | game, 224, 256 | Experimental Ultra atlas tile; increases VRAM use. |
+| `Shadows` | `SunResolution` | `game` | game, 4096 | Experimental Ultra sun resolution; increases VRAM use. |
 <!-- END GENERATED SETTINGS -->
 
 ## Logs, diagnostics and known limits
@@ -188,4 +192,10 @@ TODO: the author writes this section.
 
 `crates/emberkit` holds reusable native infrastructure as an MIT-licensed Rust library. New mods are separate crates depending on it; each declares its process targets. It has no ASI entry export. The root remains the default workspace member, so `cargo asi` keeps the existing artifact name and exports. Use `--workspace` for lint, docs and tests (`cargo fmt --all --check` for formatting). `cargo deny` traverses both workspace members from the workspace root.
 
-`enshrouded_headroom::config::schema()` returns all 35 read settings without file I/O. Entries describe types, accepted ranges or words, default spellings, and restart requirements. All settings currently require a restart. The four developer settings under `Debug` are deliberately absent from the 31-key default INI. The three force-step defaults are absent values, not a literal `none` spelling. No settings UI is included.
+`enshrouded_headroom::config::schema()` returns all 39 read settings without file I/O. Entries describe types, accepted ranges or words, default spellings, and restart requirements. All settings currently require a restart. The four developer settings under `Debug` are deliberately absent from the 35-key default INI. The three force-step defaults are absent values, not a literal `none` spelling. No settings UI is included.
+
+### Shadow quality above Ultra (experimental)
+
+Defaults unchanged; experimental; not verified in game. The four Shadows settings raise checked Ultra constants at startup and reserve requested extra texture VRAM. Invalid overrides use game. They do not add a menu quality level. Shader assumptions above 64 rays or 192-pixel tiles remain unverified. Compare High, Ultra and Ultra with PointLightRays=128 at the Polaris Falls bridge at night after restarting; record pop distance, VRAM and frame time.
+
+Opt-in shadow texture reservation reduces the native texture-budget tier selected for the GPU. Below 10 GiB it subtracts from the selected stock tier without enabling a higher texture policy. With no shadow reservation, the original top-row-only behavior is unchanged.

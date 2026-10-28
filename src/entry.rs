@@ -277,6 +277,7 @@ pub fn start() {
             // HDR paper white is a start-up code patch. Its step checks the effective build gate
             // before scanning or writing and publishes its effective value only after success.
             features::hdr::init(&cfg.hdr.paper_white_nits);
+            features::shadows::init(&cfg.shadows);
             // Peak correction reads the published effective paper white and runs on the scene hook.
             features::hdr_peak::init(&cfg.hdr, &cfg.knobs);
 
@@ -293,6 +294,7 @@ pub fn start() {
                 crate::vk::TextureSettings {
                     mode: cfg.general.texture_budget,
                     reserve_gib: cfg.general.texture_reserve_gib,
+                    shadow_reserve_bytes: features::shadows::extra_vram_bytes(&cfg.shadows),
                 },
                 cfg.general.priority,
             );

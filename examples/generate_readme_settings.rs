@@ -38,6 +38,10 @@ fn description(section: &str, key: &str) -> Option<(&'static str, &'static str)>
         ("Hdr", "PaperWhiteNits") => ("game, 40–400 nits", "Keep the game’s 250-nit paper white or apply a checked startup override."),
         ("Hdr", "FixPeak") => ("on, off", "Opt into HDR peak correction through the shared scene hook when a distance knob enables it."),
         ("Hdr", "DisplayPeakNits") => ("game, whole number 80–10000 nits", "Choose the game peak or panel target used only when FixPeak is on."),
+        ("Shadows", "PointLightRays") => ("game, 65–256", "Experimental Ultra ray limit; game preserves vanilla."),
+        ("Shadows", "PointLightStaticDistance") => ("game, 101–400 metres", "Experimental Ultra static-light distance; game preserves vanilla."),
+        ("Shadows", "PointLightTile") => ("game, 224, 256", "Experimental Ultra atlas tile; increases VRAM use."),
+        ("Shadows", "SunResolution") => ("game, 4096", "Experimental Ultra sun resolution; increases VRAM use."),
         _ => return None,
     })
 }

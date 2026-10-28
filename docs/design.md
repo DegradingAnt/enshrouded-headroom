@@ -391,6 +391,41 @@ Each knob states:
 
 The governor raises 7.1, then 7.2, then 7.3. The order is re-checked after the in-game cost test. 7.4 and 7.5 are start-up settings.
 
+### Shadow quality above Ultra (experimental)
+
+**defaults unchanged; experimental; not verified in game.** The four `[Shadows]` constants are
+optional and default to `game`. They replace existing Ultra constants at start-up, before scene
+allocation; they never request an out-of-range menu level. All code writes use the build gate and
+checked expected bytes. The point-light table must match all five vanilla rows, all 220 bytes,
+before any selected table field is changed. A mismatch refuses the table options.
+
+`PointLightRays` raises the Ultra ray budget above 64. `PointLightStaticDistance` raises the
+static-light threshold above 100 metres; it is not a proven shadow culling distance. `PointLightTile`
+raises 192-pixel atlas tiles to 224 or 256. `SunResolution` raises Ultra sun cascades from 2048 to
+4096 pixels. The GPU chooses lights for atlas tiles and rays. Shader limits above 64 rays or
+192-pixel tiles are unknown, and a pop-in improvement has not been verified.
+
+The atlas has 32 by 32 RGBA16F tiles, 8 bytes per texel. Integer arithmetic gives 104 MiB extra
+at 224 pixels and 224 MiB at 256 pixels. The six D32 sun cascades cost 288 MiB extra at 4096.
+Both larger choices reserve 512 MiB. The budget consumer subtracts requested extra bytes from
+its base target with saturating subtraction, for both auto and fixed GiB. The existing 2 to 8 GiB
+clamp describes the base target, before this reserve; no post-reserve floor discards it. With a
+nonzero reservation, auto also subtracts from the stock 2 GiB pool on the top tier when it previously returned
+no change: the 512 MiB combination sets 1.5 GiB even on the low-auto edge. With zero reservation,
+legacy behavior is exact, including auto's no-change edge. Off and integrated GPUs stay unchanged.
+The reservation is conservative when a requested patch refuses. It estimates texture storage,
+not measured allocation, and leaves out the two optional small sun textures noted in the RE notes.
+
+A/B protocol for the author, after a restart for each variant:
+1. At the Polaris Falls bridge at night, keep the camera route, time, weather, light sources and
+   other settings the same. Record the point-light shadow pop distance at High, then Ultra.
+2. With Ultra selected and the other shadow overrides at `game`, set `PointLightRays=128`.
+   Restart, check its outcome line, and repeat the same route. Compare pop distance with Ultra.
+3. Record VRAM use and frame time for every variant. Repeat the route to separate a stable change
+   from streaming or lighting variation. Restore `game` if behavior worsens or the result is unclear.
+4. Test static distance, tile size and sun resolution separately only after the ray-budget comparison.
+   Check the log order against first scene allocation. Visual results require the author's in-game test.
+
 ## 8. Settings file
 
 `[General]`:
@@ -416,6 +451,13 @@ The governor raises 7.1, then 7.2, then 7.3. The order is re-checked after the i
 - `EnableScatterDistance = 1`, `MaxScatterDistance = 4`
 - `EnableTerrainDistance = 1`, `MaxTerrainDistance = 4`
 - `DecoDistanceScale = 1.0`, `DistantObjectsScale = 1.0`, `TerrainRingScale = 1.0`
+
+`[Shadows]` (all default `game`; start-up only, Ultra only):
+- `PointLightRays = game | 65..=256` (whole number)
+- `PointLightStaticDistance = game | 101..=400` (metres; decimal point or comma)
+- `PointLightTile = game | 224 | 256`
+- `SunResolution = game | 4096`
+- Any invalid or out-of-range shadow value warns once and uses `game`; no clamping.
 
 `[Debug]` (debug only, needs `LogLevel = debug`; not in the default file; at any other log level the mod ignores these keys):
 - `ScatterProbe = 0 | 1` (default 0): enable the publish-only hook and its 500 ms sampler thread, and log the scatter counters (7.2a). Until r_max is measured, this key with `LogLevel = debug` is the only reason to install them.
@@ -552,3 +594,5 @@ In-game checks on the author's machine:
 4. Licence: MIT.
 5. Name: `enshrouded-headroom` for now; rename before the Nexus release.
 6. Spec v2: approved.
+
+With a nonzero shadow texture reservation, cards below the 10 GiB threshold retain their selected stock texture tier as the maximum base and subtract the requested reserve from that row. The native write targets that selected budget field, not the unused top row. At 8 GiB the stock field is `0x5f400000` bytes. The whole 80-byte vanilla table is rechecked before the selected-field write. Zero shadow reservation keeps the original top-row-only policy.
