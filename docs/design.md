@@ -149,7 +149,7 @@ The author's decision (2026-10-25): "more aggressive". All values are `.ini` key
 | Key | Default | Meaning |
 |---|---|---|
 | `TargetFps` | 75 | Target. `0` turns the governor off. |
-| `TrialFloorFps` | 0 | `0` keeps the legacy policy. Otherwise 30–360 FPS, below `TargetFps`: opt into measured quality trials above this rolling p95 FPS floor. |
+| `TrialFloorFps` | 0 | `0` keeps the legacy policy. Otherwise 30–360 FPS, below `TargetFps` when the target is enabled: opt into measured quality trials above this rolling p95 FPS floor. |
 | `TerrainFirst` | 0 | `1` raises terrain first and undoes it last during normal backoff. Safety and failed-trial rollback still win. |
 | `WindowSeconds` | 2 | Rolling window for the 95th-percentile frame time (p95). |
 | `RaiseBelow` | 0.90 | Raise when p95 < 90 % of the effective target frame time … |
@@ -161,7 +161,7 @@ The author's decision (2026-10-25): "more aggressive". All values are `.ini` key
 | `BlockSeconds` | 20 | Base block after an undo, and the probation duration. |
 | `MinVramFreeMiB` | 1024 | Do not raise while free VRAM (budget − usage) is below this. |
 
-The following frame-time rules describe the legacy policy (TrialFloorFps=0). The measured-trial policy below shares its world, memory, baseline, hitch, stall and step bounds.
+The following frame-time rules describe the legacy policy (`TrialFloorFps=0`). The measured-trial policy below shares its world, memory, baseline, hitch, stall and step bounds.
 
 1. Each knob has steps 0..N. Step 0 is the player's menu value. The governor never goes below it.
 2. **Only while the world is rendering.** The governor is active only when the 7.1 hook ran within the last 250 ms and presents came steadily, with no gap over 250 ms in the last 2 s. In menus, loading screens or pause it holds its current steps and decides nothing.
@@ -187,10 +187,11 @@ The floor uses `1000 / p95_ms` from the existing rolling frame intervals. It is 
 2. **Compare with a retained reference.** The first reference is the slower of the effective target time and pre-trial p95. With boosts present, later accepted trials cannot move that reference upward. Sustained faster observations can tighten it, including when memory or step limits prevent another raise. This prevents successive small steps from repeatedly spending the same tolerance. At step zero, the governor may learn a different CPU-limited baseline.
 3. **Accept stable performance.** Measure the trial after its own settle interval and fresh full window. Accept it only after `RaiseHoldSeconds` of stable observations above the floor. A stable 67 FPS CPU limit or a 75 FPS cap can keep a tested step. The next trial starts on a later tick. No GPU time is measured; unchanged FPS is an observation, not proof of spare GPU time.
 4. **Undo meaningful cost.** An increase in p95 greater than `max(0.5 ms, 3% of the retained reference)`, held for `LowerHoldSeconds` after a full window, undoes the pending trial. This applies even if the trial remains above 65 FPS. A pending trial at or below the floor also rolls back. Once accepted, boosts use the same retained-reference cost check; normal backoff tries to recover the target rather than deliberately spending FPS down to the floor. A CPU-bound 67 FPS baseline cannot promise 75 FPS.
-5. **Back off below the floor.** A full-window p95 slower than the floor, held for `LowerHoldSeconds`, releases one normal boost. Each cut restarts settling and measurement. New trials require stable above-floor observations and at least `BlockSeconds` since any undo. Per-knob exponential backoff still applies. This global probation prevents another knob from immediately restarting a failed trial cycle.
+5. **Back off below the floor.** A full-window p95 slower than the floor, held for `LowerHoldSeconds`, releases one normal boost. Each cut restarts settling and measurement. New trials require stable above-floor observations and at least `BlockSeconds` since any undo. Per-knob exponential backoff still applies. An unaccepted trial never resets its undo count. This global probation prevents another knob from immediately restarting a failed trial cycle.
 6. **Safety wins.** The existing long-frame overload, world/present activity, live-device memory, grass capacity, availability, menu baseline and debug-control gates remain authoritative. Hitch rollback stays armed throughout a pending trial; stall rollback remains active. Neither terrain priority nor the floor pins a boost against a safety decision. Step zero remains the player's menu baseline.
 
 `TerrainFirst=1` is independent of the trial policy. It raises terrain before objects and grass. A normal cut removes the latest non-terrain boost before any terrain boost, even when terrain was added later after a temporary block. Failed-trial and immediate safety rollback remove the affected latest trial first. No game address, capacity or hook behavior changes.
+
 VRAM budget: `vram_budget` queries `VkPhysicalDeviceMemoryBudgetPropertiesEXT` for the game's physical device every 2 s, when the driver lists `VK_EXT_memory_budget` (it does on the author's machine: game log line 502). The query holds the first device's live lease. The core command requires both the observed instance request and physical-device API version to support Vulkan 1.1. Otherwise, only an explicitly enabled `VK_KHR_get_physical_device_properties2` permits the KHR command. Unknown facts, a missing selected command or a retired device return unknown VRAM and block costly raises; the query never falls back to an unproven alias.
 
 The governor is a pure state machine with unit tests (section 10).

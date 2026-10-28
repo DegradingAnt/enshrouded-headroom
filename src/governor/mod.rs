@@ -1,5 +1,5 @@
 //! The fps governor (spec section 6.4): a pure state machine that raises draw-distance knobs one
-//! step at a time while the game has fps to spare, and undoes them when it has not.
+//! step at a time using legacy headroom thresholds or opt-in measured quality trials.
 //!
 //! Task 15 calls [`Governor::tick`] every 50 ms on the governor thread, inside
 //! `guard(Feature::Governor, ..)`, and applies the [`Action`]s it returns. The governor reads no
@@ -98,7 +98,7 @@ const LONG_SHARE_OVERLOAD: f64 = 0.02;
 /// ... or at least this many long frames in the window (R4).
 const LONG_COUNT_OVERLOAD: usize = 2;
 
-/// One draw-distance knob. Knobs are in priority order: the governor raises the first one it can.
+/// One draw-distance knob in runtime identity order. Configuration may give terrain first priority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KnobSpec {
     /// A disabled knob is never raised.
@@ -248,6 +248,7 @@ struct BandTrial {
     /// Target time or slower observed baseline, before spending any trial tolerance.
     reference_ms: f64,
 }
+
 /// The governor's state. See the module documentation.
 #[derive(Debug, Clone)]
 pub struct Governor {
@@ -548,7 +549,7 @@ impl Governor {
         let band_settling =
             self.cfg.trial_floor_fps != 0 && now - self.reset_at + EPS < self.cfg.settle_seconds;
         if !skip_window && !in_grace && !band_settling {
-            if frames.iter().any(|&ms| ms <= STALL_MS + EPS) {
+            if self.cfg.trial_floor_fps != 0 && frames.iter().any(|&ms| ms <= STALL_MS + EPS) {
                 self.band_window_since.get_or_insert(now);
             }
             self.window.extend(
@@ -640,8 +641,12 @@ impl Governor {
     /// already on the stack when its knob was undone never resets it (`undo` marks it held),
     /// because a lower step that was holding says nothing new about the step that failed.
     fn reset_held_backoff(&mut self, now: f64) {
+        let pending = self.band_trial.map(|trial| trial.id);
         for raise in &mut self.stack {
-            if !raise.held && now - raise.t + EPS >= self.cfg.block_seconds {
+            if !raise.held
+                && pending != Some(raise.id)
+                && now - raise.t + EPS >= self.cfg.block_seconds
+            {
                 raise.held = true;
                 if let Some(count) = self.undo_count.get_mut(raise.knob) {
                     *count = 0;
@@ -1038,6 +1043,7 @@ impl Governor {
         }
         None
     }
+
     /// R10: after an undo the governor is on probation until BlockSeconds pass with no undo. On
     /// probation a raise also needs BlockSeconds since the last raise.
     fn raise_allowed(&self, now: f64) -> bool {
@@ -1046,7 +1052,7 @@ impl Governor {
         !on_probation || self.t_last_raise.is_none_or(|t| now - t + EPS >= block)
     }
 
-    /// R11: raise the first knob, in index order, that is enabled, below its maximum and not
+    /// R11: raise the first knob, in configured priority order, that is below its maximum and not
     /// blocked. A reset point; opens the raise's post-raise period (R7).
     fn raise(&mut self, now: f64) -> Option<Action> {
         let available = |knob: usize| {
@@ -3265,5 +3271,59 @@ mod band_tests {
             ]
         );
         assert_eq!(governor.steps(), [0]);
+    }
+
+    /// An unaccepted trial cannot reset failure history merely by outlasting a short block setting.
+    #[test]
+    fn long_pending_trials_keep_exponential_failure_backoff() {
+        let (mut cfg, warnings) = crate::config::parse(
+            "[Governor]\nTrialFloorFps=65\nWindowSeconds=0.5\nSettleSeconds=0.1\nRaiseHoldSeconds=2\nLowerHoldSeconds=0.1\nBlockSeconds=1\n",
+        );
+        assert!(warnings.is_empty());
+        cfg.knobs.max_object_distance = 1;
+        let mut governor = Governor::new(
+            cfg.governor,
+            vec![KnobSpec {
+                enabled: true,
+                max_step: 1,
+            }],
+        );
+        let mut raised_at = None;
+        let mut raises = Vec::new();
+        let mut undos = Vec::new();
+        for n in 0..1_200 {
+            let now = f64::from(n) * 0.05;
+            let raised = governor.steps() == [1];
+            let fps = if raised && raised_at.is_some_and(|t| now - t > 1.2) {
+                68.0
+            } else {
+                75.0
+            };
+            for action in governor.tick(&Inputs {
+                now_s: now,
+                new_frames_ms: &[1000.0 / fps; 4],
+                world_active: true,
+                period_ms: 0.0,
+                vram_free_mib: Some(4096),
+                baseline_changed: &[],
+            }) {
+                match action {
+                    Action::Set { step: 1, .. } => {
+                        raises.push(now);
+                        raised_at = Some(now);
+                    }
+                    Action::Set { step: 0, .. } => {
+                        undos.push(now);
+                        raised_at = None;
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+        assert!(raises.len() >= 4 && undos.len() >= 3);
+        assert!(
+            raises[3] - undos[2] >= 4.0 - 1e-9,
+            "raises={raises:?}, undos={undos:?}"
+        );
     }
 }

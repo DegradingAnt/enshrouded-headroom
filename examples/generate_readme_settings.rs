@@ -17,7 +17,7 @@ fn description(section: &str, key: &str) -> Option<(&'static str, &'static str)>
         ("General", "AllowUnknownBuild") => ("0, 1 (also false, true)", "Permit checked code-patch attempts on unknown builds only at your own risk."),
         ("General", "LogLevel") => ("error, warn, info, debug", "Set the logging threshold."),
         ("Governor", "TargetFps") => ("0 (off), 30–360 fps", "Set the governor target, limited by display refresh; zero stops the governor thread."),
-        ("Governor", "TrialFloorFps") => ("0 (legacy), 30–360 fps; below TargetFps", "Opt into one-step quality trials above a rolling p95 FPS floor; retain stable CPU/cap-limited performance and undo meaningful cost."),
+        ("Governor", "TrialFloorFps") => ("0 (legacy), 30–360 fps; below an enabled TargetFps", "Opt into one-step quality trials above a rolling p95 FPS floor; retain stable CPU/cap-limited performance and undo meaningful cost."),
         ("Governor", "TerrainFirst") => ("0, 1 (also false, true)", "Raise terrain first and retain it until the final normal cut; failed trials and safety vetoes still win."),
         ("Governor", "WindowSeconds") => ("0.5–10 seconds", "Choose the rolling frame-time measurement window."),
         ("Governor", "RaiseBelow") => ("0.5–0.99", "Set legacy p95 headroom below this target-time fraction outside quantised vsync mode."),
