@@ -257,6 +257,7 @@ pub fn start() {
                 log::warn!("Enabled = 0 in {INI_FILE_NAME}: the mod does nothing");
                 return;
             };
+            crate::compatibility::report_tweaker(exe_path.as_deref());
             log::log!(build_level(build), "{}", build_line(build, *allowed));
             if let Some(advice) = unknown_build_advice(build, *allowed) {
                 log::warn!("{advice}");

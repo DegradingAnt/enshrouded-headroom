@@ -6,6 +6,7 @@
 
 pub mod antilag;
 pub mod build_id;
+mod compatibility;
 pub mod config;
 pub mod display;
 pub mod entry;
