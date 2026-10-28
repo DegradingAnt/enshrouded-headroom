@@ -4,7 +4,6 @@
 //! back to its default or is clamped, and each such case adds one line to the returned warnings.
 //! The caller logs the warnings. Section and key names are not case sensitive.
 
-use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
@@ -265,11 +264,7 @@ pub fn parse(text: &str) -> (Config, Vec<String>) {
         let warning = format!("the settings file cannot be read ({error}), using all defaults");
         return (BUILTIN, vec![warning]);
     }
-    let mut r = Reader {
-        ini,
-        used: HashSet::new(),
-        warnings: Vec::new(),
-    };
+    let mut r = Reader::new(ini);
     let d = BUILTIN;
 
     // Struct fields are evaluated in order, so warnings come out in file order of the spec.
@@ -371,7 +366,7 @@ pub fn parse(text: &str) -> (Config, Vec<String>) {
         ),
     };
     if governor.lower_above <= governor.raise_below {
-        r.warnings.push(format!(
+        r.warn(format!(
             "[Governor] LowerAbove ({}) must be above RaiseBelow ({}), using the defaults {} and {}",
             governor.lower_above, governor.raise_below, g.lower_above, g.raise_below
         ));
@@ -428,7 +423,7 @@ pub fn parse(text: &str) -> (Config, Vec<String>) {
         force_step_terrain: r.force_step("ForceStepTerrainDistance"),
     };
 
-    r.report_unknown();
+    r.report_unknown(&SECTIONS);
     (
         Config {
             general,
@@ -437,7 +432,7 @@ pub fn parse(text: &str) -> (Config, Vec<String>) {
             hdr,
             debug,
         },
-        r.warnings,
+        r.0.into_warnings(),
     )
 }
 
@@ -479,130 +474,31 @@ fn create_new_file(
     Ok(())
 }
 
-/// The most characters of the player's own text that one warning repeats.
-const MAX_ECHO_CHARS: usize = 64;
-
-/// `text`, cut to `MAX_ECHO_CHARS` characters (on a character boundary) with `…` added if it was
-/// cut. A value or key can be as long as the file, and a log line must not be.
-fn shorten(text: &str) -> String {
-    match text.char_indices().nth(MAX_ECHO_CHARS) {
-        Some((end, _)) => format!("{}…", &text[..end]),
-        None => text.to_owned(),
+use emberkit::config::parse_number;
+#[cfg(test)]
+use emberkit::config::{shorten, MAX_ECHO_CHARS};
+/// Headroom-specific typed readers over shared primitives.
+struct Reader(emberkit::config::Reader);
+impl std::ops::Deref for Reader {
+    type Target = emberkit::config::Reader;
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
-
-/// A number as a person types it. A decimal comma (`0,9`) counts. `nan` and `inf` do not.
-fn parse_number(text: &str) -> Option<f64> {
-    let value: f64 = text.trim().replace(',', ".").parse().ok()?;
-    value.is_finite().then_some(value)
+impl std::ops::DerefMut for Reader {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
 }
-
-/// The parsed file plus the warnings so far. The typed getters mark each key they ask for, so the
-/// keys left over at the end are the unknown ones.
-struct Reader {
-    ini: Ini,
-    /// Lower-case `(section, key)` pairs that a getter has asked for.
-    used: HashSet<(String, String)>,
-    warnings: Vec<String>,
-}
-
 impl Reader {
-    /// The text of `[section] key`, or `None` if the file does not have it. A key written without
-    /// `=` has no text, which reads as an empty value.
-    fn raw(&mut self, section: &str, key: &str) -> Option<String> {
-        // configparser stores section and key names in lower case.
-        let (section, key) = (section.to_lowercase(), key.to_lowercase());
-        let text = self
-            .ini
-            .get_map_ref()
-            .get(&section)?
-            .get(&key)?
-            .clone()
-            .unwrap_or_default();
-        self.used.insert((section, key));
-        Some(text)
+    fn new(ini: Ini) -> Self {
+        Self(emberkit::config::Reader::new(ini))
     }
-
-    /// Warn that `text` is not a valid value for `[section] key`.
-    fn not_valid(&mut self, section: &str, key: &str, text: &str, expected: &str, default: &str) {
-        let text = shorten(text);
-        self.warnings.push(format!(
-            "[{section}] {key}: \"{text}\" is not {expected}, using the default {default}"
-        ));
-    }
-
-    /// Clamp into `lo..=hi`, with a warning if that changed the value.
-    fn clamp(&mut self, section: &str, key: &str, value: f64, lo: f64, hi: f64) -> f64 {
-        let kept = value.clamp(lo, hi);
-        if !(lo..=hi).contains(&value) {
-            // `1e300` prints as 301 digits.
-            let value = shorten(&value.to_string());
-            self.warnings.push(format!(
-                "[{section}] {key}: {value} is outside {lo}..={hi}, using {kept}"
-            ));
-        }
-        kept
-    }
-
-    fn float(&mut self, section: &str, key: &str, default: f64, lo: f64, hi: f64) -> f64 {
-        let Some(text) = self.raw(section, key) else {
-            return default;
-        };
-        match parse_number(&text) {
-            Some(value) => self.clamp(section, key, value, lo, hi),
-            None => {
-                self.not_valid(section, key, &text, "a number", &default.to_string());
-                default
-            }
-        }
-    }
-
-    /// A whole number in `lo..=hi`. With `zero_ok`, `0` is allowed as well. A number with a zero
-    /// fraction counts as whole (`60.0`, `4,0`); `60.5` does not.
-    fn int(
-        &mut self,
-        section: &str,
-        key: &str,
-        default: u32,
-        lo: u32,
-        hi: u32,
-        zero_ok: bool,
-    ) -> u32 {
-        let Some(text) = self.raw(section, key) else {
-            return default;
-        };
-        let Some(number) = parse_number(&text).filter(|number| number.fract() == 0.0) else {
-            self.not_valid(section, key, &text, "a whole number", &default.to_string());
-            return default;
-        };
-        // A float-to-integer `as` cast saturates, so a huge number becomes `i64::MAX` or `i64::MIN`
-        // and is then clamped like any other number that is too big.
-        let value = number as i64;
-        let kept = if zero_ok && value == 0 {
-            0
-        } else {
-            value.clamp(i64::from(lo), i64::from(hi))
-        };
-        if kept != value {
-            let range = if zero_ok {
-                format!("0 or {lo}..={hi}")
-            } else {
-                format!("{lo}..={hi}")
-            };
-            self.warnings.push(format!(
-                "[{section}] {key}: {value} is outside {range}, using {kept}"
-            ));
-        }
-        // `kept` is between 0 and `hi`, so this cannot fail.
-        u32::try_from(kept).unwrap_or(default)
-    }
-
     /// A `[Knobs] Max*` key: a step from 0 to 4.
     fn max_step(&mut self, key: &str, default: u8) -> u8 {
         let step = self.int("Knobs", key, u32::from(default), 0, 4, false);
         u8::try_from(step).unwrap_or(default)
     }
-
     /// A `[Debug] ForceStep*` key: `None` when absent, else a step from 0 to 4. A whole number
     /// outside that range is clamped with a warning. Text that is not a whole number warns and
     /// counts as absent.
@@ -616,53 +512,12 @@ impl Reader {
         let value = number as i64;
         let kept = value.clamp(0, 4);
         if kept != value {
-            self.warnings.push(format!(
+            self.warn(format!(
                 "[Debug] {key}: {value} is outside 0..=4, using {kept}"
             ));
         }
         u8::try_from(kept).ok()
     }
-
-    fn boolean(&mut self, section: &str, key: &str, default: bool) -> bool {
-        let Some(text) = self.raw(section, key) else {
-            return default;
-        };
-        match text.to_ascii_lowercase().as_str() {
-            "1" | "true" => true,
-            "0" | "false" => false,
-            _ => {
-                let default_text = if default { "1" } else { "0" };
-                self.not_valid(section, key, &text, "0, 1, true or false", default_text);
-                default
-            }
-        }
-    }
-
-    /// One of the words in `options`, not case sensitive.
-    fn choice<T: Copy + PartialEq>(
-        &mut self,
-        section: &str,
-        key: &str,
-        default: T,
-        options: &[(&str, T)],
-    ) -> T {
-        let Some(text) = self.raw(section, key) else {
-            return default;
-        };
-        let word = text.to_ascii_lowercase();
-        if let Some(&(_, value)) = options.iter().find(|(name, _)| *name == word) {
-            return value;
-        }
-        let names: Vec<&str> = options.iter().map(|(name, _)| *name).collect();
-        let default_name = options
-            .iter()
-            .find(|(_, value)| *value == default)
-            .map_or("?", |(name, _)| *name);
-        let expected = format!("one of {}", names.join(", "));
-        self.not_valid(section, key, &text, &expected, default_name);
-        default
-    }
-
     /// `auto`, `off` or a number of GiB from 2 to 8.
     fn texture_budget(&mut self, default: TextureBudget) -> TextureBudget {
         let Some(text) = self.raw("General", "TextureBudget") else {
@@ -688,7 +543,6 @@ impl Reader {
             },
         }
     }
-
     /// `game` or a finite number from 40 through 400 nits; invalid values use `game`.
     fn paper_white_nits(&mut self) -> PaperWhiteNits {
         let Some(text) = self.raw("Hdr", "PaperWhiteNits") else {
@@ -709,7 +563,6 @@ impl Reader {
         );
         PaperWhiteNits::Game
     }
-
     /// `game` or a whole number from 80 through 10000; invalid values use `game`.
     fn display_peak_nits(&mut self) -> Option<u16> {
         let text = self.raw("Hdr", "DisplayPeakNits")?;
@@ -730,34 +583,7 @@ impl Reader {
         );
         None
     }
-
-    /// Warn about each section and key that no getter asked for.
-    fn report_unknown(&mut self) {
-        let mut unknown = Vec::new();
-        for (section, keys) in self.ini.get_map_ref() {
-            let Some(known) = SECTIONS.iter().find(|s| s.to_lowercase() == *section) else {
-                unknown.push(if section == "default" {
-                    // configparser files keys that come before any header under this name.
-                    "[default]: keys before the first section header, or a section called \
-                     default, are ignored"
-                        .to_owned()
-                } else {
-                    format!("[{}]: unknown section, ignored", shorten(section))
-                });
-                continue;
-            };
-            for key in keys.keys() {
-                if !self.used.contains(&(section.clone(), key.clone())) {
-                    unknown.push(format!("[{known}] {}: unknown key, ignored", shorten(key)));
-                }
-            }
-        }
-        // The map's order is not the file's order; sort so the log is the same every time.
-        unknown.sort();
-        self.warnings.extend(unknown);
-    }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1632,11 +1458,7 @@ mod tests {
             let mut ini = Ini::new();
             ini.read(format!("[General]\nTextureBudget={text}\n"))
                 .unwrap();
-            Reader {
-                ini,
-                used: HashSet::new(),
-                warnings: Vec::new(),
-            }
+            Reader::new(ini)
         };
         for (default, named) in [
             (TextureBudget::Auto, "default auto"),
@@ -1645,8 +1467,8 @@ mod tests {
         ] {
             let mut r = reader("lots");
             assert_eq!(r.texture_budget(default), default);
-            assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
-            assert!(r.warnings[0].contains(named), "{}", r.warnings[0]);
+            assert_eq!(r.warnings().len(), 1, "{:?}", r.warnings());
+            assert!(r.warnings()[0].contains(named), "{}", r.warnings()[0]);
         }
     }
 
@@ -2313,6 +2135,452 @@ mod tests {
                 assert!(warnings[0].contains("RaiseBelow") && warnings[0].contains("LowerAbove"));
                 assert_ranges(&config);
             }
+        }
+    }
+}
+
+/// Settings metadata, available without loading an INI file.
+pub fn schema() -> &'static [emberkit::config::Setting] {
+    use emberkit::config::{Setting, SettingType};
+    &[
+        Setting {
+            section: "General",
+            key: "Enabled",
+            kind: SettingType::Bool,
+            default: Some("1"),
+            description: "Enable this mod at startup.",
+            needs_restart: true,
+        },
+        Setting {
+            section: "General",
+            key: "TextureBudget",
+            kind: SettingType::Float {
+                min: 2.0,
+                max: 8.0,
+                words: &["auto", "off"],
+            },
+            default: Some("auto"),
+            description: "Select the texture-streaming budget.",
+            needs_restart: true,
+        },
+        Setting {
+            section: "General",
+            key: "TextureReserveGiB",
+            kind: SettingType::Float {
+                min: 4.0,
+                max: 16.0,
+                words: &[],
+            },
+            default: Some("11"),
+            description: "Reserve VRAM for other rendering.",
+            needs_restart: true,
+        },
+        Setting {
+            section: "General",
+            key: "AsyncCompute",
+            kind: SettingType::Choice(&["on", "game"]),
+            default: Some("on"),
+            description: "Enable async compute or follow the game.",
+            needs_restart: true,
+        },
+        Setting {
+            section: "General",
+            key: "Priority",
+            kind: SettingType::Choice(&["above_normal", "normal"]),
+            default: Some("above_normal"),
+            description: "Set priority after renderer creation.",
+            needs_restart: true,
+        },
+        Setting {
+            section: "General",
+            key: "Reflex",
+            kind: SettingType::Choice(&["game", "auto", "off", "on", "boost"]),
+            default: Some("auto"),
+            description: "Select supported NVIDIA latency mode.",
+            needs_restart: true,
+        },
+        Setting {
+            section: "General",
+            key: "AntiLag",
+            kind: SettingType::Choice(&["auto", "off", "on"]),
+            default: Some("auto"),
+            description: "Select experimental AMD Anti-Lag.",
+            needs_restart: true,
+        },
+        Setting {
+            section: "General",
+            key: "AllowUnknownBuild",
+            kind: SettingType::Bool,
+            default: Some("0"),
+            description: "Allow checked code patches on an unknown build.",
+            needs_restart: true,
+        },
+        Setting {
+            section: "General",
+            key: "LogLevel",
+            kind: SettingType::Choice(&["error", "warn", "info", "debug"]),
+            default: Some("info"),
+            description: "Select the highest written log level.",
+            needs_restart: true,
+        },
+        Setting {
+            section: "Governor",
+            key: "TargetFps",
+            kind: SettingType::Int {
+                min: 30,
+                max: 360,
+                zero: true,
+                words: &[],
+            },
+            default: Some("75"),
+            description: "Set target FPS;0 disables the governor.",
+            needs_restart: true,
+        },
+        Setting {
+            section: "Governor",
+            key: "WindowSeconds",
+            kind: SettingType::Float {
+                min: 0.5,
+                max: 10.0,
+                words: &[],
+            },
+            default: Some("2"),
+            description: "Set the measured frame window.",
+            needs_restart: true,
+        },
+        Setting {
+            section: "Governor",
+            key: "RaiseBelow",
+            kind: SettingType::Float {
+                min: 0.5,
+                max: 0.99,
+                words: &[],
+            },
+            default: Some("0.90"),
+            description: "Set p95 headroom threshold.",
+            needs_restart: true,
+        },
+        Setting {
+            section: "Governor",
+            key: "RaiseHoldSeconds",
+            kind: SettingType::Float {
+                min: 0.1,
+                max: 10.0,
+                words: &[],
+            },
+            default: Some("1.0"),
+            description: "Hold headroom before raising.",
+            needs_restart: true,
+        },
+        Setting {
+            section: "Governor",
+            key: "SettleSeconds",
+            kind: SettingType::Float {
+                min: 0.1,
+                max: 10.0,
+                words: &[],
+            },
+            default: Some("1.0"),
+            description: "Wait after a distance change.",
+            needs_restart: true,
+        },
+        Setting {
+            section: "Governor",
+            key: "LowerAbove",
+            kind: SettingType::Float {
+                min: 0.8,
+                max: 1.0,
+                words: &[],
+            },
+            default: Some("0.97"),
+            description: "Set overload threshold.",
+            needs_restart: true,
+        },
+        Setting {
+            section: "Governor",
+            key: "LowerHoldSeconds",
+            kind: SettingType::Float {
+                min: 0.1,
+                max: 10.0,
+                words: &[],
+            },
+            default: Some("0.3"),
+            description: "Hold overload before undoing.",
+            needs_restart: true,
+        },
+        Setting {
+            section: "Governor",
+            key: "HitchFactor",
+            kind: SettingType::Float {
+                min: 1.2,
+                max: 5.0,
+                words: &[],
+            },
+            default: Some("2.0"),
+            description: "Set the post-raise hitch multiplier.",
+            needs_restart: true,
+        },
+        Setting {
+            section: "Governor",
+            key: "BlockSeconds",
+            kind: SettingType::Float {
+                min: 1.0,
+                max: 300.0,
+                words: &[],
+            },
+            default: Some("20"),
+            description: "Set base undo block and probation duration.",
+            needs_restart: true,
+        },
+        Setting {
+            section: "Governor",
+            key: "MinVramFreeMiB",
+            kind: SettingType::Int {
+                min: 0,
+                max: 8192,
+                zero: false,
+                words: &[],
+            },
+            default: Some("1024"),
+            description: "Block costly raises below this free budget.",
+            needs_restart: true,
+        },
+        Setting {
+            section: "Knobs",
+            key: "EnableObjectDistance",
+            kind: SettingType::Bool,
+            default: Some("1"),
+            description: "Enable the object-distance knob.",
+            needs_restart: true,
+        },
+        Setting {
+            section: "Knobs",
+            key: "MaxObjectDistance",
+            kind: SettingType::Int {
+                min: 0,
+                max: 4,
+                zero: false,
+                words: &[],
+            },
+            default: Some("4"),
+            description: "Cap the object's added step.",
+            needs_restart: true,
+        },
+        Setting {
+            section: "Knobs",
+            key: "EnableScatterDistance",
+            kind: SettingType::Bool,
+            default: Some("1"),
+            description: "Enable the grass-distance knob.",
+            needs_restart: true,
+        },
+        Setting {
+            section: "Knobs",
+            key: "MaxScatterDistance",
+            kind: SettingType::Int {
+                min: 0,
+                max: 4,
+                zero: false,
+                words: &[],
+            },
+            default: Some("4"),
+            description: "Cap the grass added step.",
+            needs_restart: true,
+        },
+        Setting {
+            section: "Knobs",
+            key: "EnableTerrainDistance",
+            kind: SettingType::Bool,
+            default: Some("1"),
+            description: "Enable the terrain-distance knob.",
+            needs_restart: true,
+        },
+        Setting {
+            section: "Knobs",
+            key: "MaxTerrainDistance",
+            kind: SettingType::Int {
+                min: 0,
+                max: 4,
+                zero: false,
+                words: &[],
+            },
+            default: Some("4"),
+            description: "Cap the terrain added step.",
+            needs_restart: true,
+        },
+        Setting {
+            section: "Knobs",
+            key: "DecoDistanceScale",
+            kind: SettingType::Float {
+                min: 0.5,
+                max: 1.0,
+                words: &[],
+            },
+            default: Some("1.0"),
+            description: "Scale the decoration startup constant.",
+            needs_restart: true,
+        },
+        Setting {
+            section: "Knobs",
+            key: "DistantObjectsScale",
+            kind: SettingType::Float {
+                min: 0.5,
+                max: 1.0,
+                words: &[],
+            },
+            default: Some("1.0"),
+            description: "Scale the distant-object startup constant.",
+            needs_restart: true,
+        },
+        Setting {
+            section: "Knobs",
+            key: "TerrainRingScale",
+            kind: SettingType::Float {
+                min: 1.0,
+                max: 1.6,
+                words: &[],
+            },
+            default: Some("1.0"),
+            description: "Scale terrain startup rings.",
+            needs_restart: true,
+        },
+        Setting {
+            section: "Hdr",
+            key: "PaperWhiteNits",
+            kind: SettingType::Float {
+                min: 40.0,
+                max: 400.0,
+                words: &["game"],
+            },
+            default: Some("game"),
+            description: "Set HDR paper white.",
+            needs_restart: true,
+        },
+        Setting {
+            section: "Hdr",
+            key: "FixPeak",
+            kind: SettingType::Choice(&["on", "off"]),
+            default: Some("off"),
+            description: "Correct the HDR tonemapper peak.",
+            needs_restart: true,
+        },
+        Setting {
+            section: "Hdr",
+            key: "DisplayPeakNits",
+            kind: SettingType::Int {
+                min: 80,
+                max: 10000,
+                zero: false,
+                words: &["game"],
+            },
+            default: Some("game"),
+            description: "Override panel peak when FixPeak is on.",
+            needs_restart: true,
+        },
+        Setting {
+            section: "Debug",
+            key: "ScatterProbe",
+            kind: SettingType::Bool,
+            default: Some("0"),
+            description: "Request scatter diagnostics at debug log level.",
+            needs_restart: true,
+        },
+        Setting {
+            section: "Debug",
+            key: "ForceStepObjectDistance",
+            kind: SettingType::Int {
+                min: 0,
+                max: 4,
+                zero: false,
+                words: &[],
+            },
+            default: None,
+            description: "Hold an object step at debug log level.",
+            needs_restart: true,
+        },
+        Setting {
+            section: "Debug",
+            key: "ForceStepScatterDistance",
+            kind: SettingType::Int {
+                min: 0,
+                max: 4,
+                zero: false,
+                words: &[],
+            },
+            default: None,
+            description: "Hold a grass step at debug log level.",
+            needs_restart: true,
+        },
+        Setting {
+            section: "Debug",
+            key: "ForceStepTerrainDistance",
+            kind: SettingType::Int {
+                min: 0,
+                max: 4,
+                zero: false,
+                words: &[],
+            },
+            default: None,
+            description: "Hold a terrain step at debug log level.",
+            needs_restart: true,
+        },
+    ]
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+    #[test]
+    fn schema_matches_defaults_and_exact_debug_omissions() {
+        let schema = schema();
+        emberkit::config::take_requested_keys();
+        parse(DEFAULT_INI);
+        let requested = emberkit::config::take_requested_keys();
+        let described: BTreeSet<_> = schema
+            .iter()
+            .map(|s| (s.section.to_lowercase(), s.key.to_lowercase()))
+            .collect();
+        assert_eq!(requested, described);
+        assert_eq!(schema.len(), 35);
+        let mut ini = Ini::new();
+        ini.read(DEFAULT_INI.into()).unwrap();
+        let actual: BTreeSet<_> = schema
+            .iter()
+            .map(|s| (s.section.to_lowercase(), s.key.to_lowercase()))
+            .collect();
+        assert_eq!(actual.len(), 35);
+        let defaults: BTreeSet<_> = ini
+            .get_map_ref()
+            .iter()
+            .flat_map(|(section, keys)| keys.keys().map(move |key| (section.clone(), key.clone())))
+            .collect();
+        let omitted: BTreeSet<_> = [
+            "ScatterProbe",
+            "ForceStepObjectDistance",
+            "ForceStepScatterDistance",
+            "ForceStepTerrainDistance",
+        ]
+        .into_iter()
+        .map(|key| ("debug".to_owned(), key.to_lowercase()))
+        .collect();
+        assert_eq!(
+            actual
+                .difference(&defaults)
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            omitted
+        );
+        assert!(defaults.is_subset(&actual));
+        for entry in schema {
+            assert!(entry.needs_restart);
+            assert!(!entry.description.is_empty());
+            if defaults.contains(&(entry.section.to_lowercase(), entry.key.to_lowercase())) {
+                assert_eq!(ini.get(entry.section, entry.key).as_deref(), entry.default);
+            }
+        }
+        for entry in schema.iter().filter(|s| s.key.starts_with("ForceStep")) {
+            assert_eq!(entry.default, None);
         }
     }
 }

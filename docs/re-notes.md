@@ -1,7 +1,7 @@
 # Enshrouded reverse-engineering notes
 
 Target: `enshrouded.exe`, sha256 `b28b448a8dbf48c932b717f035031f5a89712a7cccfcc2d6cac0d47e6421c12a`, build `f68140a3`, image base `0x140000000`. The Steam exe of the same build has the same code at the same addresses (last section, "The Steam exe"); every virtual address in these notes holds for both.
-Tools: REA 6.3.0 + Ghidra 12.1.4, and capstone/pefile scratch probes (`xref.py`, `callers.py`, `func.py`, `stores.py` in the session scratchpad).
+Tools: REA 6.3.0 + Ghidra 12.1.4, and capstone/pefile scratch probes (`xref.py`, `callers.py`, `func.py`, `stores.py` used during analysis).
 Evidence labels: **VERIFIED** = read from bytes, decompile, or game log. **HYPOTHESIS** = inferred from names or neighbours.
 
 ## Shipped in the launcher ([performance findings](perf-findings.md), 2026-10-23)
@@ -70,7 +70,7 @@ Enum types: `keen::pc::RenderDistantObjectsSetting` and similar; member tables a
 - Writing an enum value above the top level does NOT help: `FUN_1400f72b0` writes only 0..3, and detail ≥4 reaches the fatal "invalid code path" at `0x140079536`.
 
 
-## Signature table for the build (scratchpad `sigs.py`, every one tested UNIQUE in build f68140a3)
+## Signature table for the build (analysis script `sigs.py`, every one tested UNIQUE in build f68140a3)
 
 | Site | Anchor | Signature (`??` = rel32 / rip disp32 wildcard) |
 |---|---|---|
@@ -107,7 +107,7 @@ Several signatures include the original constant, so a match also proves the exp
 
 ## Scatter capacity audit: first pass (controller, 2026-10-25 22:2x; pre-research for plan Task 13)
 
-Probe: scratchpad `capaudit.py`. It scanned 13 functions: the seeds FUN_140074b50 / FUN_1400744e0 / FUN_1400767a0 / 0x14007521d, plus their direct callees under 0x4000 bytes.
+Probe: analysis script `capaudit.py`. It scanned 13 functions: the seeds FUN_140074b50 / FUN_1400744e0 / FUN_1400767a0 / 0x14007521d, plus their direct callees under 0x4000 bytes.
 Hits, all in `FUN_1400744e0` (the allocation function):
 - `0x1400745e0` `mov [rsp+0x30], 0x14000` and `0x1400745ff` `mov [rsp+0x30], 0x14000`: the capacity argument for TWO scatter sets.
 - `0x1400745eb` / `0x14007460a` `mov [rsp+0x28], 0xf000`: a second size argument (61,440 = 0.75 × 0x14000), role unknown.
@@ -149,7 +149,7 @@ windowMode +0x0, windowPosition +0x4, windowSize +0xc, forceWindowClientSizeReso
 - Build for THIS install (build f68140a3) now; test on the Steam build when the author has it.
 - **Bundle** Ultimate ASI Loader v10.0.0 with its MIT licence. This is a choice the author made. The text for the project rules was given to the author to add.
 - Working name only for now; rename before release.
-- Public GitHub repo; project folder `C:\Modding\Enshrouded`.
+- Public GitHub repo; project folder `<repository>`.
 - Disclosure: joint work per project rule (human-designed, AI-written, human read and corrected), in the author's own words. The author reviews all code before upload.
 - ASI Loader facts (agent report): MIT; `InitializeASI()` export; loads from root/scripts/plugins/update; triggers on the exe's first kernel32 import call (before WinMain), so confirm with `DebugLog=1`. The loader DLL is signed by an untrusted cert `CN=FusionFix`, so expect AV/SmartScreen noise. Issue #215: "Disable fullscreen optimizations" makes Windows skip the local dinput8.dll. No compat-flag entry for enshrouded.exe on this machine (checked HKCU/HKLM Layers).
 - Present hook (agent notes): the game resolves vkQueuePresentKHR via vkGetDeviceProcAddr and stores it at deviceObj+0x5a0 (`0x140fe3c84`).

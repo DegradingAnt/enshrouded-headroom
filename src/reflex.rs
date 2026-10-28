@@ -430,27 +430,21 @@ chain_nodes! {
     Present2: crate::vk::types::PhysicalDevicePresentId2FeaturesKHR => crate::vk::types::STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_2_FEATURES_KHR,
     Group: vk::DeviceGroupDeviceCreateInfo<'static> => vk::StructureType::DEVICE_GROUP_DEVICE_CREATE_INFO,
     Sync2: vk::PhysicalDeviceSynchronization2Features<'static> => vk::StructureType::PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES,
+    AntiLag: crate::vk::types::PhysicalDeviceAntiLagFeaturesAMD => crate::vk::types::PHYSICAL_DEVICE_ANTI_LAG_FEATURES_AMD,
     Dynamic: vk::PhysicalDeviceDynamicRenderingFeatures<'static> => vk::StructureType::PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES,
 }
 
 /// Owns extensions and typed copies. Borrowed child arrays remain owned by the original call.
-struct DeviceCopy {
+pub(crate) struct DeviceCopy {
     nodes: Vec<Node>,
     extensions: Vec<*const std::ffi::c_char>,
 }
 
 impl DeviceCopy {
-    /// Build an immutable-input device plan. Unsupported or cyclic chains fail closed.
+    /// Copy a known, acyclic device chain and its extension list for either latency path.
     /// # Safety
-    /// `original` and its extension names and chain satisfy vkCreateDevice's input contract.
-    unsafe fn new(original: &vk::DeviceCreateInfo<'_>, caps: &Capabilities) -> Option<Self> {
-        if caps.vendor != 0x10de
-            || !caps.timeline
-            || !caps.lists(ash::nv::low_latency2::NAME)
-            || !caps.lists(ash::khr::timeline_semaphore::NAME)
-        {
-            return None;
-        }
+    /// All original inputs satisfy vkCreateDevice and remain live through the eventual call.
+    unsafe fn copy(original: &vk::DeviceCreateInfo<'_>) -> Option<Self> {
         let names = if original.enabled_extension_count == 0 {
             &[][..]
         } else {
@@ -462,14 +456,6 @@ impl DeviceCopy {
                 )
             }
         };
-        let mut exts = Vec::new();
-        for name in names {
-            // SAFETY: each device extension name is a NUL-terminated Vulkan input string.
-            exts.push(unsafe { CStr::from_ptr(*name) });
-        }
-        if !exts.contains(&ash::khr::swapchain::NAME) {
-            return None;
-        }
         let mut nodes = Vec::new();
         let mut cursor = original.p_next.cast::<vk::BaseInStructure<'_>>();
         let mut seen = Vec::new();
@@ -482,6 +468,89 @@ impl DeviceCopy {
             nodes.push(unsafe { Node::copy(cursor) }?);
             // SAFETY: cursor is the current live Vulkan common header.
             cursor = unsafe { (*cursor).p_next };
+        }
+        Some(Self {
+            nodes,
+            extensions: names.to_vec(),
+        })
+    }
+
+    /// Enable AMD Anti-Lag first in the owned chain, preserving the caller's entire chain.
+    /// # Safety
+    /// The original Vulkan inputs remain live through the synchronous native create call.
+    pub(crate) unsafe fn anti_lag(original: &vk::DeviceCreateInfo<'_>) -> Option<Self> {
+        // SAFETY: the caller supplies the common immutable Vulkan inputs.
+        let mut copied = unsafe { Self::copy(original) }?;
+        if copied
+            .nodes
+            .iter()
+            .any(|node| matches!(node, Node::Group(group) if group.physical_device_count > 1))
+        {
+            return None;
+        }
+        let mut names = Vec::new();
+        for name in &copied.extensions {
+            // SAFETY: extension pointers are borrowed from the valid original input.
+            names.push(unsafe { CStr::from_ptr(*name) });
+        }
+        if !names.contains(&ash::khr::swapchain::NAME) {
+            return None;
+        }
+        let has_feature = copied
+            .nodes
+            .iter()
+            .any(|node| matches!(node, Node::AntiLag(_)));
+        let plan = crate::antilag::plan_device(&names, has_feature, 1);
+        if plan.add_extension {
+            copied
+                .extensions
+                .push(crate::vk::types::AMD_ANTI_LAG_NAME.as_ptr());
+        }
+        let node = if plan.chain_feature {
+            Node::AntiLag(Box::new(
+                crate::vk::types::PhysicalDeviceAntiLagFeaturesAMD {
+                    s_type: crate::vk::types::PHYSICAL_DEVICE_ANTI_LAG_FEATURES_AMD,
+                    p_next: std::ptr::null_mut(),
+                    anti_lag: vk::TRUE,
+                },
+            ))
+        } else {
+            let position = copied
+                .nodes
+                .iter()
+                .position(|node| matches!(node, Node::AntiLag(_)))?;
+            let mut node = copied.nodes.remove(position);
+            if let Node::AntiLag(feature) = &mut node {
+                feature.anti_lag = vk::TRUE;
+            }
+            node
+        };
+        copied.nodes.insert(0, node);
+        Some(copied)
+    }
+
+    /// Build an immutable-input device plan. Unsupported or cyclic chains fail closed.
+    /// # Safety
+    /// `original` and its extension names and chain satisfy vkCreateDevice's input contract.
+    unsafe fn new(original: &vk::DeviceCreateInfo<'_>, caps: &Capabilities) -> Option<Self> {
+        if caps.vendor != 0x10de
+            || !caps.timeline
+            || !caps.lists(ash::nv::low_latency2::NAME)
+            || !caps.lists(ash::khr::timeline_semaphore::NAME)
+        {
+            return None;
+        }
+        // SAFETY: the shared copier preserves the caller's valid chain and names.
+        let copied = unsafe { Self::copy(original) }?;
+        let mut nodes = copied.nodes;
+        let names = copied.extensions;
+        let mut exts = Vec::new();
+        for name in &names {
+            // SAFETY: names remain borrowed from the valid original Vulkan input.
+            exts.push(unsafe { CStr::from_ptr(*name) });
+        }
+        if !exts.contains(&ash::khr::swapchain::NAME) {
+            return None;
         }
         let has_v12 = nodes.iter().any(|n| matches!(n, Node::V12(_)));
         let has_timeline = nodes.iter().any(|n| matches!(n, Node::Timeline(_)));
@@ -532,7 +601,10 @@ impl DeviceCopy {
     }
 
     /// Link only owned node headers, retaining their allocations through the driver call.
-    fn info<'a>(&mut self, original: &vk::DeviceCreateInfo<'a>) -> vk::DeviceCreateInfo<'a> {
+    pub(crate) fn info<'a>(
+        &mut self,
+        original: &vk::DeviceCreateInfo<'a>,
+    ) -> vk::DeviceCreateInfo<'a> {
         let mut next = std::ptr::null_mut();
         for node in self.nodes.iter_mut().rev() {
             let pointer = node.ptr();
@@ -554,7 +626,7 @@ impl DeviceCopy {
 /// # Safety
 /// `raw` is the real GIPA for the live, leased `instance`; use the result only for that
 /// instance or its children, at the named Vulkan type, before releasing the lease.
-unsafe fn instance_proc(
+pub(crate) unsafe fn instance_proc(
     raw: usize,
     instance: usize,
     name: &CStr,
@@ -566,6 +638,43 @@ unsafe fn instance_proc(
     let get = unsafe { std::mem::transmute::<usize, vk::PFN_vkGetInstanceProcAddr>(raw) };
     // SAFETY: the recorded live instance and a static NUL-terminated function name.
     unsafe { get(vk::Instance::from_raw(instance as u64), name.as_ptr()) }
+}
+
+/// Select only the alias permitted by successful creation facts and physical API support.
+pub(crate) fn feature_query_name(
+    physical_api: u32,
+    api: Option<crate::vk::InstanceApi>,
+) -> Option<&'static CStr> {
+    let api = api?;
+    if api.requested_api_version >= vk::API_VERSION_1_1 && physical_api >= vk::API_VERSION_1_1 {
+        Some(c"vkGetPhysicalDeviceFeatures2")
+    } else if api.properties2_enabled {
+        Some(c"vkGetPhysicalDeviceFeatures2KHR")
+    } else {
+        None
+    }
+}
+
+/// Try a copied device plan once, then retry the exact original pointer on refusal.
+/// # Safety
+/// Both create infos and their children obey vkCreateDevice and remain live for both calls.
+pub(crate) unsafe fn create_or_retry(
+    feature: Feature,
+    real: vk::PFN_vkCreateDevice,
+    phys: vk::PhysicalDevice,
+    original: *const vk::DeviceCreateInfo<'_>,
+    changed: &vk::DeviceCreateInfo<'_>,
+    allocator: *const vk::AllocationCallbacks<'_>,
+    out: *mut vk::Device,
+) -> (vk::Result, bool) {
+    // SAFETY: the caller owns the copied plan and retains every original child for this call.
+    let result = unsafe { real(phys, changed, allocator, out) };
+    if result == vk::Result::SUCCESS {
+        return (result, true);
+    }
+    crate::guard::disable(feature, "driver refused");
+    // SAFETY: refusal created no device; retry uses the exact original caller pointer.
+    (unsafe { real(phys, original, allocator, out) }, false)
 }
 
 /// Query only supported feature structures. No device is modified here.
@@ -601,16 +710,7 @@ unsafe fn capabilities(
     }
     // Core physical-device functionality requires both application and physical-device API
     // support. A non-null pointer never establishes permission to use that command alias.
-    let api = api?;
-    let features_name = if api.requested_api_version >= vk::API_VERSION_1_1
-        && properties_out.api_version >= vk::API_VERSION_1_1
-    {
-        c"vkGetPhysicalDeviceFeatures2"
-    } else if api.properties2_enabled {
-        c"vkGetPhysicalDeviceFeatures2KHR"
-    } else {
-        return None;
-    };
+    let features_name = feature_query_name(properties_out.api_version, api)?;
     // SAFETY: successful instance creation and the physical properties prove the selected route.
     // Both aliases have this exact signature. A missing selected pointer has no alias fallback.
     let features = unsafe {
@@ -769,12 +869,12 @@ pub unsafe fn create_device(
         // SAFETY: the original info is live and the owned nodes live through the next driver call.
         let changed = copied.info(unsafe { &*info });
         // SAFETY: changed keeps all original inputs alive and owns each changed node/list.
-        let result = unsafe { real(phys, &changed, allocator, out) };
-        if result != vk::Result::SUCCESS {
-            crate::guard::disable(Feature::Reflex, "driver refused");
-            return original();
-        }
+        let (result, enabled) =
+            unsafe { create_or_retry(Feature::Reflex, real, phys, info, &changed, allocator, out) };
         completed.set(Some(result));
+        if !enabled {
+            return result;
+        }
         guard(
             Feature::Reflex,
             || (),

@@ -47,6 +47,8 @@ try {
         throw "Loader SHA-256 mismatch: expected $loaderSha256, got $actualHash. Refusing to package. Delete $loaderZip and run again."
     }
 
+    Write-Output "Loader ZIP SHA-256 verified: $actualHash"
+
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $stage = Join-Path $distRoot "stage-$([guid]::NewGuid().ToString('N'))"
     New-Item -ItemType Directory -Path (Join-Path $stage 'plugins') | Out-Null
@@ -112,7 +114,13 @@ SOFTWARE.
             $sha256 = [System.Security.Cryptography.SHA256]::Create()
             try {
                 $asiHash = [BitConverter]::ToString($sha256.ComputeHash($stream)).Replace('-', '').ToLowerInvariant()
+                $sourceAsiHash = (Get-FileHash -LiteralPath (Join-Path $projectRoot 'target/release/enshrouded-headroom.asi') -Algorithm SHA256).Hash.ToLowerInvariant()
+                Write-Output "Source ASI SHA-256: $sourceAsiHash"
                 Write-Output "Inner ASI SHA-256: $asiHash"
+                if ($asiHash -ne $sourceAsiHash) {
+                    throw "ASI SHA-256 mismatch: source $sourceAsiHash, archived $asiHash. Refusing to publish package."
+                }
+                Write-Output 'ASI hash comparison: MATCH'
             }
             finally {
                 $sha256.Dispose()
@@ -124,6 +132,7 @@ SOFTWARE.
         }
         Move-Item -LiteralPath $stagedZip -Destination $packageZip -Force
         Write-Output "Package: $packageZip"
+        Write-Output ("Package ZIP SHA-256: " + (Get-FileHash -LiteralPath $packageZip -Algorithm SHA256).Hash.ToLowerInvariant())
     }
     finally {
         $resolvedDist = (Resolve-Path -LiteralPath $distRoot).ProviderPath.TrimEnd('\') + '\'

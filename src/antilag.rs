@@ -1,6 +1,4 @@
-//! Pure AMD Anti-Lag planning and call sequencing. No driver or operating-system calls.
-
-#![forbid(unsafe_code)]
+//! AMD Anti-Lag planning, capability gates and one serialized native present stream.
 
 use std::ffi::CStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
@@ -8,6 +6,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use ash::vk;
 
 use crate::config::AntiLagMode;
+
+/// Configuration published before Vulkan startup.
+static MODE: std::sync::OnceLock<AntiLagMode> = std::sync::OnceLock::new();
+
+/// Save the parsed Anti-Lag setting before installing Vulkan hooks.
+pub fn init(mode: AntiLagMode) {
+    let _ = MODE.set(mode);
+    log::info!("Anti-Lag: {mode:?}; experimental, not verified on AMD hardware");
+}
+
 use crate::vk::types::{
     AntiLagDataAMD, AntiLagModeAMD, AntiLagPresentationInfoAMD, AntiLagStageAMD, AMD_ANTI_LAG_NAME,
     ANTI_LAG_DATA_AMD, ANTI_LAG_PRESENTATION_INFO_AMD,
@@ -194,6 +202,532 @@ pub fn fill_data(call: Call, info: &mut AntiLagPresentationInfoAMD, data: &mut A
         max_fps: 0,
         p_presentation_info: std::ptr::from_ref(info),
     };
+}
+
+use crate::frame_timer::{qpc_now, qpc_to_ms};
+use crate::guard::{guard, Feature};
+use crate::vk::types::{
+    PFN_vkAntiLagUpdateAMD, PhysicalDeviceAntiLagFeaturesAMD, PHYSICAL_DEVICE_ANTI_LAG_FEATURES_AMD,
+};
+use ash::vk::Handle;
+use std::sync::{
+    atomic::{AtomicPtr, AtomicUsize},
+    OnceLock,
+};
+
+/// First eligible AMD device and its actual dispatchable queue handles.
+struct Fns {
+    device: vk::Device,
+    update: PFN_vkAntiLagUpdateAMD,
+    queues: Vec<vk::Queue>,
+}
+/// First admission only; raw handle reuse can never rearm this table.
+static FNS: OnceLock<Fns> = OnceLock::new();
+/// Set only after mandatory native teardown routing was proven and the table was published.
+static DEVICE_LIVE: AtomicBool = AtomicBool::new(false);
+/// Quiet stop cause, consumed once at a device/swapchain lifecycle safe point.
+static PENDING_STOP: AtomicU8 = AtomicU8::new(0);
+
+/// Whether this exact admitted device generation still has mandatory wrapped destruction.
+pub(crate) fn has_device_lifetime(device: usize) -> bool {
+    DEVICE_LIVE.load(Ordering::Acquire)
+        && FNS
+            .get()
+            .is_some_and(|f| f.device.as_raw() as usize == device)
+}
+
+/// Report a quiet present-path stop once; never call this from presentation.
+pub fn report_pending() {
+    let reason = PENDING_STOP.swap(0, Ordering::AcqRel);
+    if reason == 0 {
+        return;
+    }
+    // A host-supplied logger can unwind. Reporting must never interrupt mandatory native
+    // teardown or create a second device through a surrounding guard's fallback.
+    let _ = crate::guard::catch("Anti-Lag deferred report", || match reason {
+        1 => log::warn!("Anti-Lag disabled: three consecutive updates exceeded 100 ms"),
+        2 => log::warn!("Anti-Lag disabled: device lost"),
+        3 => log::warn!("Anti-Lag disabled: concurrent present streams"),
+        _ => (),
+    });
+}
+
+/// Resolve listed AMD support through the exact observed instance generation.
+/// # Safety
+/// The physical device and instance remain live under the caller's query lease.
+unsafe fn supported(
+    phys: vk::PhysicalDevice,
+    raw: usize,
+    instance: usize,
+    api: Option<crate::vk::InstanceApi>,
+) -> bool {
+    // SAFETY: the caller's lease protects this real resolver and its exact physical-device parent.
+    let properties =
+        unsafe { crate::reflex::instance_proc(raw, instance, c"vkGetPhysicalDeviceProperties") };
+    let Some(properties) = properties else {
+        return false;
+    };
+    // SAFETY: the name identifies this exact physical-device function signature.
+    let properties = unsafe {
+        std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkGetPhysicalDeviceProperties>(
+            properties,
+        )
+    };
+    let mut output = vk::PhysicalDeviceProperties::default();
+    // SAFETY: live physical device, initialized matching output.
+    unsafe { properties(phys, &mut output) };
+    if output.vendor_id != 0x1002 {
+        return false;
+    }
+    let Some(route) = crate::reflex::feature_query_name(output.api_version, api) else {
+        return false;
+    };
+    // SAFETY: the selected alias is proven by API/extension facts; no alias-pointer fallback.
+    let functions = unsafe {
+        (
+            crate::reflex::instance_proc(raw, instance, c"vkEnumerateDeviceExtensionProperties"),
+            crate::reflex::instance_proc(raw, instance, route),
+        )
+    };
+    let (Some(enumerate), Some(features)) = functions else {
+        return false;
+    };
+    // SAFETY: static names identify these exact native signatures.
+    let enumerate = unsafe {
+        std::mem::transmute::<
+            unsafe extern "system" fn(),
+            vk::PFN_vkEnumerateDeviceExtensionProperties,
+        >(enumerate)
+    };
+    // SAFETY: both legal Features2 aliases share this exact signature.
+    let features = unsafe {
+        std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkGetPhysicalDeviceFeatures2>(
+            features,
+        )
+    };
+    let mut count = 0;
+    // SAFETY: count-only query on the live leased physical device.
+    if unsafe { enumerate(phys, std::ptr::null(), &mut count, std::ptr::null_mut()) }
+        != vk::Result::SUCCESS
+        || count > 4096
+    {
+        return false;
+    }
+    let mut listed = vec![vk::ExtensionProperties::default(); count as usize];
+    // SAFETY: initialized array has the previously advertised capacity; INCOMPLETE fails closed.
+    if unsafe { enumerate(phys, std::ptr::null(), &mut count, listed.as_mut_ptr()) }
+        != vk::Result::SUCCESS
+    {
+        return false;
+    }
+    let Some(listed) = listed.get(..count as usize) else {
+        return false;
+    };
+    let extension = listed.iter().any(|entry| {
+        let bytes = entry.extension_name.map(|c| c as u8);
+        CStr::from_bytes_until_nul(&bytes).is_ok_and(|name| name == AMD_ANTI_LAG_NAME)
+    });
+    if !extension {
+        return false;
+    }
+    let mut anti = PhysicalDeviceAntiLagFeaturesAMD {
+        s_type: PHYSICAL_DEVICE_ANTI_LAG_FEATURES_AMD,
+        p_next: std::ptr::null_mut(),
+        anti_lag: vk::FALSE,
+    };
+    let mut query = vk::PhysicalDeviceFeatures2 {
+        p_next: std::ptr::from_mut(&mut anti).cast(),
+        ..Default::default()
+    };
+    // SAFETY: only the driver-listed AMD node is queried; all local outputs live through the call.
+    unsafe { features(phys, &mut query) };
+    MODE.get().is_some_and(|mode| {
+        decide_mode(
+            mode,
+            output.vendor_id,
+            extension,
+            anti.anti_lag == vk::TRUE,
+            false,
+        )
+    })
+}
+
+/// Load actual queues rather than inferring their device from common driver function pointers.
+/// # Safety
+/// Newly created device and original queue-create array obey their native Vulkan contracts.
+unsafe fn load(device: vk::Device, info: &vk::DeviceCreateInfo<'_>) -> Option<Fns> {
+    // SAFETY: mandatory GDPA was bound to the enumerated parent before device admission.
+    let (update, queue) = unsafe {
+        (
+            crate::vk::device_proc(device.as_raw() as usize, c"vkAntiLagUpdateAMD")?,
+            crate::vk::device_proc(device.as_raw() as usize, c"vkGetDeviceQueue")?,
+        )
+    };
+    // SAFETY: lookups name exactly these native signatures.
+    let update = unsafe { std::mem::transmute::<usize, PFN_vkAntiLagUpdateAMD>(update) };
+    // SAFETY: the core Vulkan 1.0 queue query has this signature.
+    let get_queue = unsafe { std::mem::transmute::<usize, vk::PFN_vkGetDeviceQueue>(queue) };
+    if info.queue_create_info_count == 0 || info.queue_create_info_count > 64 {
+        return None;
+    }
+    // SAFETY: valid original VkDeviceCreateInfo contains its advertised live queue-create array.
+    let creates = unsafe {
+        std::slice::from_raw_parts(
+            info.p_queue_create_infos,
+            info.queue_create_info_count as usize,
+        )
+    };
+    let mut queues = Vec::new();
+    for create in creates {
+        // vkGetDeviceQueue is legal only for a queue created with zero flags. Protected queues
+        // are left untouched instead of guessing an unproven vkGetDeviceQueue2 route.
+        if !create.flags.is_empty() || create.queue_count > 64 {
+            return None;
+        }
+        for index in 0..create.queue_count {
+            let mut queue = vk::Queue::null();
+            // SAFETY: this family/index was created with zero flags on this exact live device.
+            unsafe { get_queue(device, create.queue_family_index, index, &mut queue) };
+            if queue == vk::Queue::null() {
+                return None;
+            }
+            queues.push(queue);
+        }
+    }
+    if queues.is_empty() {
+        return None;
+    }
+    // Warm the Windows frequency cache off the present path.
+    let _ = qpc_to_ms(1);
+    Some(Fns {
+        device,
+        update,
+        queues,
+    })
+}
+
+/// Add Anti-Lag to eligible AMD devices, otherwise retain Reflex and the exact original call.
+/// # Safety
+/// The real function and all arguments obey vkCreateDevice's contract.
+pub unsafe fn create_device(
+    real: vk::PFN_vkCreateDevice,
+    phys: vk::PhysicalDevice,
+    info: *const vk::DeviceCreateInfo<'_>,
+    allocator: *const vk::AllocationCallbacks<'_>,
+    out: *mut vk::Device,
+) -> vk::Result {
+    report_pending();
+    let completed = std::cell::Cell::new(None);
+    let original = || {
+        if let Some(result) = completed.get() {
+            return result;
+        }
+        // SAFETY: unchanged original arguments; Reflex remains the existing fallback path.
+        let result = unsafe { crate::reflex::create_device(real, phys, info, allocator, out) };
+        completed.set(Some(result));
+        result
+    };
+    guard(Feature::AntiLag, original, || {
+        let Some(mode) = MODE.get() else {
+            return original();
+        };
+        if *mode == AntiLagMode::Off || info.is_null() || FNS.get().is_some() {
+            return original();
+        }
+        if !crate::vk::prepare_device_lifetime(phys, true) {
+            return original();
+        }
+        // SAFETY: synchronous query lease proves parentage and retains native handles throughout.
+        let eligible =
+            crate::vk::with_physical_device_capabilities(phys, |raw, instance, api| unsafe {
+                supported(phys, raw, instance, api)
+            })
+            .unwrap_or(false);
+        if !eligible {
+            log::info!(
+                "Anti-Lag: not listed, off (extension, feature or legal query route unavailable)"
+            );
+            let result = original();
+            if result == vk::Result::SUCCESS && !out.is_null() {
+                // SAFETY: successful original creation initialized the caller's output.
+                if crate::reflex::has_device_lifetime(unsafe { out.read() }.as_raw() as usize) {
+                    log::info!("Anti-Lag: Reflex active on this device, off");
+                }
+            }
+            return result;
+        }
+        // SAFETY: the input chain is live and valid for this synchronous native call.
+        let Some(mut copied) = (unsafe { crate::reflex::DeviceCopy::anti_lag(&*info) }) else {
+            return original();
+        };
+        // SAFETY: original inputs remain live while the owned typed copy is linked.
+        let changed = copied.info(unsafe { &*info });
+        // SAFETY: original and changed inputs satisfy the shared synchronous creation contract.
+        let (result, enabled) = unsafe {
+            crate::reflex::create_or_retry(
+                Feature::AntiLag,
+                real,
+                phys,
+                info,
+                &changed,
+                allocator,
+                out,
+            )
+        };
+        completed.set(Some(result));
+        if !enabled {
+            return result;
+        }
+        guard(
+            Feature::AntiLag,
+            || (),
+            || {
+                // SAFETY: native success initializes the device output and original queue info is live.
+                let device = unsafe { out.read() };
+                if crate::reflex::has_device_lifetime(device.as_raw() as usize) {
+                    log::info!("Anti-Lag: Reflex active on this device, off");
+                    return;
+                }
+                // SAFETY: this newly created device owns exactly the original queues.
+                if let Some(fns) = unsafe { load(device, &*info) } {
+                    if FNS.set(fns).is_ok() {
+                        DEVICE_LIVE.store(true, Ordering::Release);
+                        log::info!("Anti-Lag: on; experimental, not verified on AMD hardware");
+                    }
+                } else {
+                    crate::guard::disable(
+                        Feature::AntiLag,
+                        "missing device entry point or unsupported queues",
+                    );
+                }
+            },
+        );
+        result
+    })
+}
+
+/// Immutable association and serialized planner for one observed live swapchain.
+struct Runtime {
+    swapchain: vk::SwapchainKHR,
+    pacer: Pacer,
+    presenting: AtomicBool,
+    primed: AtomicBool,
+}
+/// Published runtime pointer, detached before waiting for existing readers.
+static ACTIVE: AtomicPtr<Runtime> = AtomicPtr::new(std::ptr::null_mut());
+/// SeqCst ordering with ACTIVE prevents reclamation while a reader can reach the old pointer.
+static READERS: AtomicUsize = AtomicUsize::new(0);
+/// Lifecycle work only; presentation never locks this mutex.
+static LIFECYCLE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Keeps the current immutable runtime alive through one present.
+struct Reader;
+impl Reader {
+    /// Enter before reading the published pointer.
+    fn enter() -> Self {
+        READERS.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+    /// Borrow at most for this reader's lifetime.
+    fn runtime(&self) -> Option<&Runtime> {
+        // SAFETY: writers detach first and wait for this reader count before reclaiming.
+        unsafe { ACTIVE.load(Ordering::SeqCst).as_ref() }
+    }
+}
+impl Drop for Reader {
+    fn drop(&mut self) {
+        READERS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+/// Release exclusive nonblocking present admission on every return or unwind.
+struct Admission<'a>(&'a AtomicBool);
+impl Drop for Admission<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+/// Replace a runtime only while LIFECYCLE is held; wait outside the game present path.
+fn replace(new: *mut Runtime) {
+    let old = ACTIVE.swap(new, Ordering::SeqCst);
+    if old.is_null() {
+        return;
+    }
+    while READERS.load(Ordering::SeqCst) != 0 {
+        std::thread::yield_now();
+    }
+    // SAFETY: old was allocated once with Box and no reader can still reach it.
+    drop(unsafe { Box::from_raw(old) });
+}
+/// Preserve one quiet disable transition for the next lifecycle safe point.
+fn stop(reason: u8) {
+    if crate::guard::disable_silent(Feature::AntiLag) {
+        let _ = PENDING_STOP.compare_exchange(0, reason, Ordering::AcqRel, Ordering::Relaxed);
+    }
+}
+impl Runtime {
+    /// Fill and time one update. No allocation, lock or logging occurs here.
+    fn update(&self, fns: &Fns, call: Call) {
+        if crate::guard::is_disabled(Feature::AntiLag) {
+            return;
+        }
+        let mut info = AntiLagPresentationInfoAMD {
+            s_type: ANTI_LAG_PRESENTATION_INFO_AMD,
+            p_next: std::ptr::null_mut(),
+            stage: AntiLagStageAMD::INPUT,
+            frame_index: 0,
+        };
+        let mut data = AntiLagDataAMD {
+            s_type: ANTI_LAG_DATA_AMD,
+            p_next: std::ptr::null(),
+            mode: AntiLagModeAMD::ON,
+            max_fps: 0,
+            p_presentation_info: std::ptr::null(),
+        };
+        fill_data(call, &mut info, &mut data);
+        let start = qpc_now();
+        // SAFETY: this reader retains the exact live admitted device; local data lives through return.
+        unsafe { (fns.update)(fns.device, &data) };
+        let elapsed = qpc_to_ms(qpc_now().saturating_sub(start)) * 1000.0;
+        if self.pacer.note_block(elapsed as u64) {
+            stop(1);
+        }
+    }
+    /// Serialize INPUT/PRESENT around exactly one native presentation without waiting.
+    fn present(&self, fns: &Fns, original: impl Fn() -> vk::Result) -> vk::Result {
+        if self
+            .presenting
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            stop(3);
+            return original();
+        }
+        let _admission = Admission(&self.presenting);
+        if crate::guard::is_disabled(Feature::AntiLag) {
+            return original();
+        }
+        if !self.primed.swap(true, Ordering::Relaxed) {
+            if let Some(call) = self.pacer.after_present(vk::Result::SUCCESS) {
+                self.update(fns, call);
+            }
+        }
+        if let Some(call) = self.pacer.before_present() {
+            self.update(fns, call);
+        }
+        let result = original();
+        if result == vk::Result::ERROR_DEVICE_LOST {
+            let _ = self.pacer.after_present(result);
+            stop(2);
+            return result;
+        }
+        if !crate::guard::is_disabled(Feature::AntiLag) {
+            if let Some(call) = self.pacer.after_present(result) {
+                self.update(fns, call);
+            }
+        }
+        result
+    }
+}
+
+/// Associate the successful original swapchain with its admitted AMD device.
+/// # Safety
+/// Success initialized out; the caller retains the native device and swapchain until wrapped teardown.
+pub unsafe fn after_create_swapchain(
+    device: vk::Device,
+    result: vk::Result,
+    out: *mut vk::SwapchainKHR,
+) {
+    report_pending();
+    if result != vk::Result::SUCCESS
+        || out.is_null()
+        || !has_device_lifetime(device.as_raw() as usize)
+        || crate::guard::is_disabled(Feature::AntiLag)
+    {
+        return;
+    }
+    guard(
+        Feature::AntiLag,
+        || (),
+        || {
+            let _writer = LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
+            if !has_device_lifetime(device.as_raw() as usize) {
+                return;
+            }
+            // SAFETY: successful creation initialized this caller-owned output.
+            let swapchain = unsafe { out.read() };
+            let runtime = Runtime {
+                swapchain,
+                pacer: Pacer::new(),
+                presenting: AtomicBool::new(false),
+                primed: AtomicBool::new(false),
+            };
+            replace(Box::into_raw(Box::new(runtime)));
+        },
+    );
+}
+/// Retire before native teardown, even after a feature guard has disabled ordinary work.
+/// # Safety
+/// Called synchronously before destruction with Vulkan external synchronization obeyed.
+pub unsafe fn before_destroy(device: vk::Device, swapchain: Option<vk::SwapchainKHR>) {
+    report_pending();
+    if !FNS.get().is_some_and(|f| f.device == device) {
+        return;
+    }
+    let _writer = LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
+    if swapchain.is_none() {
+        DEVICE_LIVE.store(false, Ordering::Release);
+    }
+    let matches = {
+        let reader = Reader::enter();
+        reader
+            .runtime()
+            .is_some_and(|r| swapchain.is_none_or(|swapchain| r.swapchain == swapchain))
+    };
+    if matches {
+        replace(std::ptr::null_mut());
+    }
+}
+/// Pace only actual queues and the live swapchain of the admitted AMD device generation.
+/// # Safety
+/// The original closure passes the same valid Vulkan present arguments exactly once.
+pub unsafe fn on_present(
+    queue: vk::Queue,
+    info: *const vk::PresentInfoKHR<'_>,
+    original: impl Fn() -> vk::Result,
+) -> vk::Result {
+    let completed = std::cell::Cell::new(None);
+    let once = || {
+        if let Some(result) = completed.get() {
+            return result;
+        }
+        let result = original();
+        completed.set(Some(result));
+        result
+    };
+    guard(Feature::AntiLag, once, || {
+        if info.is_null() || !DEVICE_LIVE.load(Ordering::Acquire) {
+            return once();
+        }
+        let reader = Reader::enter();
+        let Some(runtime) = reader.runtime() else {
+            return once();
+        };
+        let Some(fns) = FNS.get() else {
+            return once();
+        };
+        if !DEVICE_LIVE.load(Ordering::Acquire) || !fns.queues.contains(&queue) {
+            return once();
+        }
+        // SAFETY: live native input; exactly one swapchain pointer is read only after checking count.
+        let info = unsafe { &*info };
+        if info.swapchain_count != 1 || info.p_swapchains.is_null() {
+            return once();
+        }
+        // SAFETY: native contract supplies at least the one checked array entry.
+        if unsafe { info.p_swapchains.read() } != runtime.swapchain {
+            return once();
+        }
+        runtime.present(fns, once)
+    })
 }
 
 #[cfg(test)]
