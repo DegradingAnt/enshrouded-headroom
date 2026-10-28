@@ -16,7 +16,7 @@ fn description(section: &str, key: &str) -> Option<(&'static str, &'static str)>
         ("General", "AntiLag") => ("auto, off, on", "Select experimental AMD Anti-Lag; enabled modes require AMD and driver support, and Reflex takes priority."),
         ("General", "AllowUnknownBuild") => ("0, 1 (also false, true)", "Permit checked code-patch attempts on unknown builds only at your own risk."),
         ("General", "LogLevel") => ("error, warn, info, debug", "Set the logging threshold."),
-        ("Governor", "TargetFps") => ("0 (off), 30–360 fps", "Set the governor target, limited by display refresh; zero stops the governor thread."),
+        ("Governor", "TargetFps") => ("0 (off), 30–360 fps", "Set the target, limited by display refresh; 0 disables governor control, while FrameStats=1 plus debug logging permits log-only sampling."),
         ("Governor", "TrialFloorFps") => ("0 (legacy), 30–360 fps; below an enabled TargetFps", "Opt into one-step quality trials above a rolling p95 FPS floor; retain stable CPU/cap-limited performance and undo meaningful cost."),
         ("Governor", "TerrainFirst") => ("0, 1 (also false, true)", "Raise terrain first and retain it until the final normal cut; failed trials and safety vetoes still win."),
         ("Governor", "WindowSeconds") => ("0.5–10 seconds", "Choose the rolling frame-time measurement window."),
