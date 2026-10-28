@@ -1,10 +1,12 @@
 # W16 pure-module audit. Run on Windows with cargo-mutants 27.1.0.
-# cargo mutants --timeout 30 --build-timeout 180 --jobs 4
+# cargo mutants --workspace --timeout 30 --build-timeout 180 --jobs 4
 # Per-module counts: use --no-config --file <path> --cargo-arg=--lib
 # with the same timeouts/jobs; config and CLI file lists are additive.
 examine_globs = [
     "src/config.rs",
     "src/scan.rs",
+    "crates/emberkit/src/config.rs",
+    "crates/emberkit/src/scan.rs",
     "src/frame_timer.rs",
     "src/governor/**",
     "src/knobs/**",
@@ -23,7 +25,8 @@ exclude_re = [
 # cargo-mutants 27.1.0 skips unsafe functions, cfg(test) bodies, and new constructors.
 # The generated population is not exhaustive source coverage; no orderings are changed.
 # Keep the tool's default with_capacity call exclusion: capacity is not observable behavior.
-# Other crates/modules and cfg(test) bodies are outside the generated population.
+# Other modules and cfg(test) bodies are outside the generated population.
+# Emberkit paths preserve the pre-extraction config/scanner population.
 timeout_multiplier = 5.0
 minimum_test_timeout = 30.0
 build_timeout_multiplier = 15.0
