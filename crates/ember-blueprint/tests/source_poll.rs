@@ -134,3 +134,41 @@ fn reorder_does_not_rename_objects_and_ambiguous_legacy_walls_stay_references() 
         assert!(!object.omissions.is_empty());
     }
 }
+
+#[test]
+fn declared_null_floor_regions_rejects_refresh_and_keeps_the_visible_revision() {
+    let source = include_bytes!("fixtures/highcrown-recorded.json");
+    let file = FileFixture::new(source);
+    let first = convert_highcrown(source, "test:null-mask-refresh", 1, Limits::default()).unwrap();
+    let mut session = Session::new(first);
+    session
+        .select(SelectionKind::Object, "keep_stage36")
+        .unwrap();
+    let previous = session.snapshot();
+    let mut malformed: serde_json::Value = serde_json::from_slice(source).unwrap();
+    let floor = malformed["content"]["guide"]["measurements"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|object| object["id"] == "keep_stage36")
+        .unwrap();
+    floor["floor_regions"] = serde_json::Value::Null;
+    std::fs::write(&file.0, serde_json::to_vec(&malformed).unwrap()).unwrap();
+    let error = session
+        .poll_highcrown(&file.0, Limits::default())
+        .unwrap_err();
+    assert_eq!(error.kind, ember_blueprint::ErrorKind::InvalidJson);
+    let rejected = session.snapshot();
+    assert_eq!(rejected.model(), previous.model());
+    assert_eq!(
+        rejected.selection(SelectionKind::Object),
+        previous.selection(SelectionKind::Object)
+    );
+    assert!(matches!(rejected.freshness(), Freshness::Rejected(_)));
+    std::fs::write(&file.0, source).unwrap();
+    assert_eq!(
+        session.poll_highcrown(&file.0, Limits::default()).unwrap(),
+        RefreshOutcome::Unchanged
+    );
+    assert_eq!(session.snapshot().freshness(), &Freshness::Current);
+}

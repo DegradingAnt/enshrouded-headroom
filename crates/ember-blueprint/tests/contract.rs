@@ -973,3 +973,88 @@ fn guide_mask_change_removes_the_unsupported_floor_selection_in_one_valid_refres
         .iter()
         .all(|primitive| !matches!(primitive.geometry, Geometry::Slab { .. })));
 }
+
+#[test]
+fn declared_floor_regions_reject_null_and_malformed_arrays_but_allow_absence() {
+    let absent =
+        convert_highcrown(HIGHCROWN, "test:region-presence", 1, Limits::default()).unwrap();
+    let floor = absent
+        .document()
+        .objects
+        .iter()
+        .find(|object| object.id == "keep_stage36")
+        .unwrap();
+    assert!(floor
+        .primitives
+        .iter()
+        .any(|primitive| primitive.fidelity == Fidelity::ExactLayer
+            && matches!(primitive.geometry, Geometry::Slab { .. })));
+    for malformed in [
+        serde_json::Value::Null,
+        serde_json::json!(false),
+        serde_json::json!({}),
+        serde_json::json!([]),
+        serde_json::json!([null]),
+        serde_json::json!([{"x":80,"y":95,"w":-1,"d":1}]),
+        serde_json::json!([{"x":79,"y":95,"w":1,"d":1}]),
+        serde_json::json!([{"x":80.25,"y":95,"w":1,"d":1}]),
+        serde_json::json!([{"x":80,"y":95,"w":1,"d":1,"shape":"round"}]),
+        serde_json::Value::Array(vec![serde_json::json!({"x":80,"y":95,"w":1,"d":1}); 65]),
+    ] {
+        let mut source: serde_json::Value = serde_json::from_slice(HIGHCROWN).unwrap();
+        let floor = source["content"]["guide"]["measurements"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|object| object["id"] == "keep_stage36")
+            .unwrap();
+        floor["floor_regions"] = malformed.clone();
+        assert!(
+            convert_highcrown(
+                &serde_json::to_vec(&source).unwrap(),
+                "test:region-presence",
+                2,
+                Limits::default()
+            )
+            .is_err(),
+            "declared malformed floor_regions: {malformed}"
+        );
+    }
+}
+
+#[test]
+fn null_truthiness_masks_keep_the_source_contracts_absent_semantics() {
+    let baseline = convert_highcrown(HIGHCROWN, "test:null-masks", 1, Limits::default()).unwrap();
+    let baseline = baseline
+        .document()
+        .objects
+        .iter()
+        .find(|object| object.id == "keep_stage36")
+        .unwrap();
+    // The guide checks these fields by truthiness, unlike own-present floor_regions.
+    for field in ["cutouts", "holes", "voids", "floor_pattern"] {
+        let mut source: serde_json::Value = serde_json::from_slice(HIGHCROWN).unwrap();
+        let floor = source["content"]["guide"]["measurements"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|object| object["id"] == "keep_stage36")
+            .unwrap();
+        floor[field] = serde_json::Value::Null;
+        let converted = convert_highcrown(
+            &serde_json::to_vec(&source).unwrap(),
+            "test:null-masks",
+            2,
+            Limits::default(),
+        )
+        .unwrap();
+        let floor = converted
+            .document()
+            .objects
+            .iter()
+            .find(|object| object.id == "keep_stage36")
+            .unwrap();
+        assert_eq!(floor.primitives, baseline.primitives, "{field}");
+        assert_eq!(floor.omissions, baseline.omissions, "{field}");
+    }
+}

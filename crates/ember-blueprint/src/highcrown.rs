@@ -399,8 +399,9 @@ struct PlanObject {
     floor_openings: Vec<PlanOpening>,
     /// Unsupported cutout semantics prevent an exact slab claim.
     cutouts: Option<serde_json::Value>,
-    /// Positive region unions need their own mask adapter.
-    floor_regions: Option<serde_json::Value>,
+    /// Absent is allowed; a declared region union must be a valid nonempty array.
+    #[serde(default, deserialize_with = "deserialize_floor_regions")]
+    floor_regions: Option<Vec<PlanRegion>>,
     /// Alternate negative masks must not disappear during conversion.
     holes: Option<serde_json::Value>,
     /// Alternate reserved voids must not disappear during conversion.
@@ -414,6 +415,51 @@ struct PlanObject {
     /// Explicit substructure records.
     #[serde(default)]
     parts: Vec<PlanObject>,
+}
+
+/// A positive floor region with the shape accepted by the source mask contract.
+#[derive(Deserialize)]
+struct PlanRegion {
+    /// Absolute plan east coordinate.
+    x: f64,
+    /// Absolute plan north coordinate.
+    y: f64,
+    /// Positive east extent.
+    w: f64,
+    /// Positive north extent.
+    d: f64,
+    /// Missing/null is rectangular, as in the guide; specialized shapes are invalid.
+    shape: Option<String>,
+}
+
+/// Preserve declared-field presence: an explicit null must not deserialize as absence.
+fn deserialize_floor_regions<'de, D>(deserializer: D) -> Result<Option<Vec<PlanRegion>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let regions = Vec::<PlanRegion>::deserialize(deserializer)?;
+    let on_grid = |value: f64| {
+        value.is_finite()
+            && value.abs() <= 1_000_000.0
+            && (value * 2.0 - (value * 2.0).round()).abs() < 1e-7
+    };
+    if regions.is_empty()
+        || regions.len() > 64
+        || regions.iter().any(|region| {
+            ![region.x, region.y, region.w, region.d]
+                .into_iter()
+                .all(on_grid)
+                || region.w <= 0.0
+                || region.d <= 0.0
+                || !matches!(
+                    region.shape.as_deref(),
+                    None | Some("rect" | "rectangle" | "square")
+                )
+        })
+    {
+        return Err(serde::de::Error::custom("declared floor_regions must contain 1 to 64 positive, finite, grid-aligned rectangular regions"));
+    }
+    Ok(Some(regions))
 }
 
 /// One source opening. Shape and clipping determine whether a rectangular cutout is faithful.
@@ -808,6 +854,21 @@ impl Converter {
         }
         if requests.is_empty() {
             return Ok(());
+        }
+        if let Some(regions) = &raw.floor_regions {
+            let [x, y, w, d] = bounds;
+            if regions.iter().any(|region| {
+                region.x < x
+                    || region.y < y
+                    || region.x + region.w > x + w
+                    || region.y + region.d > y + d
+            }) {
+                return Err(Error::new(
+                    ErrorKind::InvalidValue,
+                    "highcrown.floor_regions",
+                    "declared regions must stay within the source floor footprint",
+                ));
+            }
         }
         let unsupported_masks: Vec<&str> = [
             ("floor_regions", raw.floor_regions.is_some()),

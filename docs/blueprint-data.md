@@ -123,8 +123,12 @@ The implementation follows the measured guide contracts:
   remain supported. The actual quarter paving and clipped lakewalk reservations
   are covered by the [round/clip fixture](../crates/ember-blueprint/tests/fixtures/highcrown-round-clip.json).
 - Positive floor_regions unions and alternate holes/voids masks need their own
-  adapter. Their floor layers remain references with omission notes. Source
-  kinds hollow, water and reference likewise do not define solid floor layers.
+  adapter. Their floor layers remain references with omission notes. A declared
+  floor_regions field must be a valid nonempty region array; null, non-arrays
+  and malformed regions reject the source revision. An absent field is allowed.
+  Null cutouts/holes/voids and floor_pattern retain the source truthiness contract
+  and mean no such mask. Source kinds hollow, water and reference likewise do
+  not define solid floor layers.
 - Source labels may be empty for diagram elements. Those objects keep their
   existing stable ID as the display label. No geometry is invented for a label.
 
