@@ -1,5 +1,5 @@
 //! The fps governor (spec section 6.4): a pure state machine that raises draw-distance knobs one
-//! step at a time while the game has fps to spare, and undoes them when it has not.
+//! step at a time using legacy headroom thresholds or opt-in measured quality trials.
 //!
 //! Task 15 calls [`Governor::tick`] every 50 ms on the governor thread, inside
 //! `guard(Feature::Governor, ..)`, and applies the [`Action`]s it returns. The governor reads no
@@ -40,6 +40,14 @@ const EPS: f64 = 1e-9;
 /// A frame longer than this (ms) is "long": kept in the window, but not in p95 or the
 /// quantised test (R4).
 const LONG_MS: f64 = 100.0;
+
+/// Trials tolerate the larger of a half millisecond and three percent of reference frame time.
+const TRIAL_NOISE_MS: f64 = 0.5;
+/// Relative part of the fixed trial-noise allowance.
+const TRIAL_NOISE_SHARE: f64 = 0.03;
+
+/// Terrain keeps its runtime identity when the optional priority order changes.
+const TERRAIN_KNOB: usize = 2;
 
 /// A frame longer than this (ms) is a gap (R2) and, in the world, a stall (R8). It never enters
 /// the window.
@@ -90,7 +98,7 @@ const LONG_SHARE_OVERLOAD: f64 = 0.02;
 /// ... or at least this many long frames in the window (R4).
 const LONG_COUNT_OVERLOAD: usize = 2;
 
-/// One draw-distance knob. Knobs are in priority order: the governor raises the first one it can.
+/// One draw-distance knob in runtime identity order. Configuration may give terrain first priority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KnobSpec {
     /// A disabled knob is never raised.
@@ -232,10 +240,25 @@ struct ProposedRaise {
     previous_time: Option<f64>,
 }
 
+/// One unaccepted quality step, measured against the retained pre-trial performance reference.
+#[derive(Debug, Clone, Copy)]
+struct BandTrial {
+    /// Identity of the only pending step on the raise stack.
+    id: u64,
+    /// Target time or slower observed baseline, before spending any trial tolerance.
+    reference_ms: f64,
+}
+
 /// The governor's state. See the module documentation.
 #[derive(Debug, Clone)]
 pub struct Governor {
     cfg: GovernorCfg,
+    /// Fastest sustained reference with boosts present; accepted steps never move it upward.
+    band_reference_ms: Option<f64>,
+    /// At most one added step may be awaiting post-settle measurement.
+    band_trial: Option<BandTrial>,
+    /// First fresh frame tick after the current settle interval.
+    band_window_since: Option<f64>,
     knobs: Vec<KnobSpec>,
     /// One per knob, in `0..=max_step`.
     steps: Vec<u8>,
@@ -285,6 +308,9 @@ impl Governor {
             .fold(0usize, |sum, k| sum.saturating_add(usize::from(k.max_step)));
         Governor {
             cfg,
+            band_reference_ms: None,
+            band_trial: None,
+            band_window_since: None,
             knobs,
             steps: vec![0; n],
             blocked_until: vec![f64::NEG_INFINITY; n],
@@ -336,6 +362,8 @@ impl Governor {
         }
         // A later explicit control supersedes the previous tick's pending proposal.
         self.proposed = None;
+        self.band_trial = None;
+        self.band_reference_ms = None;
         if let Some(held) = self.forced.get_mut(knob) {
             *held = step;
         }
@@ -374,6 +402,7 @@ impl Governor {
             return false;
         }
         self.stack.pop();
+        self.band_trial = None;
         if let Some(step) = self.steps.get_mut(knob) {
             *step = step.saturating_sub(1);
         }
@@ -517,7 +546,12 @@ impl Governor {
         let in_grace = self
             .t_last_undo
             .is_some_and(|t| now - t <= UNDO_GRACE_S + EPS);
-        if !skip_window && !in_grace {
+        let band_settling =
+            self.cfg.trial_floor_fps != 0 && now - self.reset_at + EPS < self.cfg.settle_seconds;
+        if !skip_window && !in_grace && !band_settling {
+            if self.cfg.trial_floor_fps != 0 && frames.iter().any(|&ms| ms <= STALL_MS + EPS) {
+                self.band_window_since.get_or_insert(now);
+            }
             self.window.extend(
                 frames
                     .iter()
@@ -598,6 +632,7 @@ impl Governor {
         self.headroom_since = None;
         self.overload_since = None;
         self.reset_at = now;
+        self.band_window_since = None;
     }
 
     /// R9: a raise that has stayed on the stack for BlockSeconds resets its knob's undo count.
@@ -606,8 +641,12 @@ impl Governor {
     /// already on the stack when its knob was undone never resets it (`undo` marks it held),
     /// because a lower step that was holding says nothing new about the step that failed.
     fn reset_held_backoff(&mut self, now: f64) {
+        let pending = self.band_trial.map(|trial| trial.id);
         for raise in &mut self.stack {
-            if !raise.held && now - raise.t + EPS >= self.cfg.block_seconds {
+            if !raise.held
+                && pending != Some(raise.id)
+                && now - raise.t + EPS >= self.cfg.block_seconds
+            {
                 raise.held = true;
                 if let Some(count) = self.undo_count.get_mut(raise.knob) {
                     *count = 0;
@@ -640,6 +679,12 @@ impl Governor {
                 self.last_raise = None;
             }
         }
+        if self
+            .band_trial
+            .is_some_and(|trial| !self.stack.iter().any(|raise| raise.id == trial.id))
+        {
+            self.band_trial = None;
+        }
     }
 
     /// R3: true if `period` is valid and more than 5 % away from the last valid period.
@@ -665,7 +710,7 @@ impl Governor {
     ) -> Option<Action> {
         let (id, t_raise) = self.last_raise?;
         let period_end = t_raise + self.cfg.settle_seconds + self.cfg.raise_hold_seconds;
-        if now > period_end + EPS {
+        if now > period_end + EPS && self.band_trial.is_none_or(|trial| trial.id != id) {
             return None;
         }
         let limit = self.hitch_limit(base_ms, period);
@@ -727,13 +772,32 @@ impl Governor {
     /// R9: undo the most recent raise and block its knob. A reset point; starts the undo grace
     /// (T2) and the probation (R10). An empty stack gives `None`.
     fn undo(&mut self, now: f64) -> Option<Action> {
-        while let Some(index) = self
-            .stack
-            .iter()
-            .rposition(|r| self.forced.get(r.knob).is_none_or(Option::is_none))
+        self.undo_with_priority(now, false)
+    }
+
+    /// Normal backoff retains terrain until every other automatic boost has been undone.
+    fn undo_normal(&mut self, now: f64) -> Option<Action> {
+        self.undo_with_priority(now, self.cfg.terrain_first)
+    }
+
+    /// Remove one automatic stack entry. Immediate safety and failed-trial rollback use LIFO.
+    fn undo_with_priority(&mut self, now: f64, terrain_last: bool) -> Option<Action> {
+        let forced = &self.forced;
+        let automatic = |r: &Raise| forced.get(r.knob).is_none_or(Option::is_none);
+        while let Some(index) = terrain_last
+            .then(|| {
+                self.stack
+                    .iter()
+                    .rposition(|r| r.knob != TERRAIN_KNOB && automatic(r))
+            })
+            .flatten()
+            .or_else(|| self.stack.iter().rposition(automatic))
         {
             // rposition returned an index in this same, unmodified vector.
             let raise = self.stack.remove(index);
+            if self.band_trial.is_some_and(|trial| trial.id == raise.id) {
+                self.band_trial = None;
+            }
             // The entry leaves the stack on every path below, the skips included (R7).
             if self.last_raise.is_some_and(|(id, _)| id == raise.id) {
                 self.last_raise = None;
@@ -866,6 +930,9 @@ impl Governor {
         sorted: &mut Vec<f64>,
     ) -> Option<Action> {
         let target = effective_target(base_ms, period);
+        if self.cfg.trial_floor_fps != 0 {
+            return self.decide_band_with(now, target, period, vram_free_mib, non_long, sorted);
+        }
         let (headroom, overload) = self.assess_with(target, period, non_long, sorted);
         // T4: a timer starts on the first tick its condition is true and stops when it is false.
         self.headroom_since = headroom.then(|| self.headroom_since.unwrap_or(now));
@@ -876,7 +943,7 @@ impl Governor {
             return None;
         }
         if held(self.overload_since, now, self.cfg.lower_hold_seconds) {
-            if let Some(action) = self.undo(now) {
+            if let Some(action) = self.undo_normal(now) {
                 return Some(action);
             }
         }
@@ -893,6 +960,89 @@ impl Governor {
         None
     }
 
+    /// Probe one step using fresh p95 observations. The floor stops trials; the retained reference
+    /// prevents deliberately trading target FPS down to the floor or spending tolerance repeatedly.
+    fn decide_band_with(
+        &mut self,
+        now: f64,
+        target: f64,
+        period: Option<f64>,
+        vram_free_mib: Option<u64>,
+        non_long: &mut Vec<f64>,
+        sorted: &mut Vec<f64>,
+    ) -> Option<Action> {
+        // Preserve remembered vsync mode for the independent hitch safety check.
+        self.assess_with(target, period, non_long, sorted);
+        let total = self.window.len();
+        let long_count = total.saturating_sub(non_long.len());
+        let long_overload = long_count >= LONG_COUNT_OVERLOAD
+            || (total > 0 && long_count as f64 / total as f64 > LONG_SHARE_OVERLOAD + EPS);
+        let full_window = held(self.band_window_since, now, self.cfg.window_seconds);
+        let p95 = (!non_long.is_empty()).then(|| stats::p95_with(non_long, sorted));
+        let floor = 1000.0 / f64::from(self.cfg.trial_floor_fps);
+        let baseline = self.steps.iter().all(|&step| step == 0);
+        let reference = self
+            .band_trial
+            .map(|trial| trial.reference_ms)
+            .or_else(|| (!baseline).then_some(self.band_reference_ms).flatten())
+            .or(p95)
+            .unwrap_or(target)
+            .max(target);
+        let cost_limit = reference + TRIAL_NOISE_MS.max(reference * TRIAL_NOISE_SHARE);
+        let costly = p95.is_some_and(|ms| ms > cost_limit + EPS);
+        let at_or_below_floor = p95.is_some_and(|ms| ms + EPS >= floor);
+        let overload = long_overload || (full_window && (at_or_below_floor || costly));
+        let stable =
+            full_window && long_count == 0 && !costly && p95.is_some_and(|ms| ms < floor - EPS);
+        self.headroom_since = stable.then(|| self.headroom_since.unwrap_or(now));
+        self.overload_since = overload.then(|| self.overload_since.unwrap_or(now));
+        if now - self.reset_at + EPS < self.cfg.settle_seconds {
+            return None;
+        }
+        if held(self.overload_since, now, self.cfg.lower_hold_seconds) {
+            let action = if self.band_trial.is_some() {
+                self.undo(now)
+            } else {
+                self.undo_normal(now)
+            };
+            if action.is_some() {
+                return action;
+            }
+        }
+        if self.band_trial.is_some() {
+            if held(self.headroom_since, now, self.cfg.raise_hold_seconds) {
+                self.band_trial = None;
+                self.band_reference_ms = p95.map(|ms| reference.min(ms.max(target)));
+            }
+            // Accepting a step never proposes a second step on the same tick.
+            return None;
+        }
+        if held(self.headroom_since, now, self.cfg.raise_hold_seconds) {
+            // Recovering the target tightens the reference even when no new step can be tried.
+            self.band_reference_ms = p95.map(|ms| reference.min(ms.max(target)));
+        }
+        let probation = self
+            .t_last_undo
+            .is_some_and(|t| now - t + EPS < self.cfg.block_seconds);
+        if stable
+            && held(self.headroom_since, now, self.cfg.raise_hold_seconds)
+            && !probation
+            && vram_free_mib.is_some_and(|free| free >= u64::from(self.cfg.min_vram_free_mib))
+            && self.raise_allowed(now)
+        {
+            self.band_reference_ms = p95.map(|ms| reference.min(ms.max(target)));
+            let action = self.raise(now)?;
+            if let Some((id, _)) = self.last_raise {
+                self.band_trial = Some(BandTrial {
+                    id,
+                    reference_ms: self.band_reference_ms.unwrap_or(reference),
+                });
+            }
+            return Some(action);
+        }
+        None
+    }
+
     /// R10: after an undo the governor is on probation until BlockSeconds pass with no undo. On
     /// probation a raise also needs BlockSeconds since the last raise.
     fn raise_allowed(&self, now: f64) -> bool {
@@ -901,22 +1051,27 @@ impl Governor {
         !on_probation || self.t_last_raise.is_none_or(|t| now - t + EPS >= block)
     }
 
-    /// R11: raise the first knob, in index order, that is enabled, below its maximum and not
+    /// R11: raise the first knob, in configured priority order, that is below its maximum and not
     /// blocked. A reset point; opens the raise's post-raise period (R7).
     fn raise(&mut self, now: f64) -> Option<Action> {
+        let available = |knob: usize| {
+            self.knobs
+                .get(knob)
+                .zip(self.steps.get(knob))
+                .zip(self.blocked_until.get(knob))
+                .is_some_and(|((spec, &step), &until)| {
+                    self.forced.get(knob).is_none_or(Option::is_none)
+                        && spec.enabled
+                        && step < spec.max_step
+                        && !blocked(now, until)
+                })
+        };
         let knob = self
-            .knobs
-            .iter()
-            .zip(&self.steps)
-            .zip(&self.blocked_until)
-            .enumerate()
-            .position(|(knob, ((spec, &step), &until))| {
-                self.forced.get(knob).is_none_or(Option::is_none)
-                    && spec.enabled
-                    && spec.max_step > 0
-                    && step < spec.max_step
-                    && !blocked(now, until)
-            })?;
+            .cfg
+            .terrain_first
+            .then_some(TERRAIN_KNOB)
+            .filter(|&knob| available(knob))
+            .or_else(|| (0..self.knobs.len()).find(|&knob| available(knob)))?;
         self.proposed = Some(ProposedRaise {
             knob,
             previous_raise: self.last_raise,
@@ -2617,5 +2772,585 @@ mod control_tests {
             Some(Action::Set { knob: 0, step: 0 })
         );
         assert_eq!(g.steps(), &[0]);
+    }
+}
+
+#[cfg(test)]
+mod band_tests {
+    use super::*;
+
+    /// Run the opt-in policy through the same public parser and tick boundary as the runtime.
+    fn band_governor(maxima: &[u8]) -> Governor {
+        let (cfg, _) = crate::config::parse("[Governor]\nTrialFloorFps=65\n");
+        Governor::new(
+            cfg.governor,
+            maxima
+                .iter()
+                .map(|&max_step| KnobSpec {
+                    enabled: true,
+                    max_step,
+                })
+                .collect(),
+        )
+    }
+
+    /// Supply steady 50 ms ticks with frame times chosen from the currently applied quality.
+    fn drive(
+        governor: &mut Governor,
+        now: &mut f64,
+        seconds: f64,
+        frame_ms: impl Fn(&[u8]) -> f64,
+    ) -> Vec<Action> {
+        let mut actions = Vec::new();
+        for _ in 0..(seconds / 0.05).round() as usize {
+            *now += 0.05;
+            let frames = [frame_ms(governor.steps()); 4];
+            actions.extend(governor.tick(&Inputs {
+                now_s: *now,
+                new_frames_ms: &frames,
+                world_active: true,
+                period_ms: 0.0,
+                vram_free_mib: Some(4096),
+                baseline_changed: &[],
+            }));
+        }
+        actions
+    }
+
+    /// CPU-limited frames above the opt-in floor may test quality without pretending to measure GPU time.
+    #[test]
+    fn unchanged_67fps_accepts_a_quality_trial_without_target_threshold_bounce() {
+        let mut governor = band_governor(&[1]);
+        let mut now = 0.0;
+        let actions = drive(&mut governor, &mut now, 12.0, |_| 1000.0 / 67.0);
+        assert_eq!(actions, [Action::Set { knob: 0, step: 1 }]);
+        assert_eq!(governor.steps(), [1]);
+    }
+
+    /// The opt-in ordering spends terrain quality first and releases it only after other boosts.
+    #[test]
+    fn terrain_first_is_added_first_and_is_the_final_normal_cut() {
+        let (cfg, _) = crate::config::parse("[Governor]\nTrialFloorFps=65\nTerrainFirst=1\n");
+        let mut governor = Governor::new(
+            cfg.governor,
+            vec![
+                KnobSpec {
+                    enabled: true,
+                    max_step: 1
+                };
+                3
+            ],
+        );
+        let mut now = 0.0;
+        assert_eq!(
+            drive(&mut governor, &mut now, 13.0, |_| 1000.0 / 75.0),
+            [
+                Action::Set { knob: 2, step: 1 },
+                Action::Set { knob: 0, step: 1 },
+                Action::Set { knob: 1, step: 1 },
+            ]
+        );
+        assert_eq!(
+            drive(&mut governor, &mut now, 15.0, |_| 20.0),
+            [
+                Action::Set { knob: 1, step: 0 },
+                Action::Set { knob: 0, step: 0 },
+                Action::Set { knob: 2, step: 0 },
+            ]
+        );
+        assert_eq!(governor.steps(), [0; 3]);
+    }
+
+    /// A quality cost that still stays above the floor must be rolled back to recover the target.
+    #[test]
+    fn a_75_to_68fps_trial_rolls_back_and_blocks_all_knobs_during_probation() {
+        let mut governor = band_governor(&[1, 1]);
+        let mut now = 0.0;
+        let actions = drive(&mut governor, &mut now, 10.0, |steps| {
+            1000.0
+                / if steps.iter().any(|&step| step > 0) {
+                    68.0
+                } else {
+                    75.0
+                }
+        });
+        assert_eq!(
+            actions,
+            [
+                Action::Set { knob: 0, step: 1 },
+                Action::Set { knob: 0, step: 0 },
+            ]
+        );
+        assert!(drive(&mut governor, &mut now, 16.0, |_| 1000.0 / 75.0).is_empty());
+        assert_eq!(governor.steps(), [0, 0]);
+        assert!(!drive(&mut governor, &mut now, 4.0, |_| 1000.0 / 75.0).is_empty());
+    }
+
+    /// The floor stops all raises and repeatedly releases existing quality without crossing step zero.
+    #[test]
+    fn below_65fps_backs_off_to_baseline_and_recovers_after_stable_frames_and_cooldown() {
+        let mut governor = band_governor(&[1]);
+        let mut now = 0.0;
+        drive(&mut governor, &mut now, 10.0, |_| 1000.0 / 75.0);
+        assert_eq!(governor.steps(), [1]);
+        assert_eq!(
+            drive(&mut governor, &mut now, 8.0, |_| 1000.0 / 60.0),
+            [Action::Set { knob: 0, step: 0 }]
+        );
+        assert!(drive(&mut governor, &mut now, 10.0, |_| 1000.0 / 60.0).is_empty());
+        assert_eq!(governor.steps(), [0]);
+        assert_eq!(
+            drive(&mut governor, &mut now, 10.0, |_| 1000.0 / 75.0),
+            [Action::Set { knob: 0, step: 1 }]
+        );
+        for fps in [64.0, 65.0] {
+            let mut stopped = band_governor(&[4]);
+            let mut clock = 0.0;
+            assert!(drive(&mut stopped, &mut clock, 20.0, |_| 1000.0 / fps).is_empty());
+            assert_eq!(stopped.steps(), [0]);
+        }
+    }
+
+    /// Accepted small steps share a reference, so they cannot repeatedly spend the same noise budget.
+    #[test]
+    fn repeated_small_quality_costs_do_not_walk_fps_down_to_the_floor() {
+        let mut governor = band_governor(&[4]);
+        let mut now = 0.0;
+        assert_eq!(
+            drive(&mut governor, &mut now, 20.0, |steps| 1000.0 / 75.0
+                + 0.3 * f64::from(steps[0])),
+            [
+                Action::Set { knob: 0, step: 1 },
+                Action::Set { knob: 0, step: 2 },
+                Action::Set { knob: 0, step: 1 },
+            ]
+        );
+        assert_eq!(governor.steps(), [1]);
+    }
+
+    /// Terrain priority does not depend on the order in which enabled knobs became available.
+    #[test]
+    fn terrain_readded_after_an_object_boost_is_still_the_final_normal_cut() {
+        let (cfg, _) = crate::config::parse("[Governor]\nTrialFloorFps=65\nTerrainFirst=1\n");
+        let mut governor = Governor::new(
+            cfg.governor,
+            vec![
+                KnobSpec {
+                    enabled: true,
+                    max_step: 1,
+                },
+                KnobSpec {
+                    enabled: false,
+                    max_step: 0,
+                },
+                KnobSpec {
+                    enabled: false,
+                    max_step: 1,
+                },
+            ],
+        );
+        let mut now = 0.0;
+        assert_eq!(
+            drive(&mut governor, &mut now, 10.0, |_| 1000.0 / 75.0),
+            [Action::Set { knob: 0, step: 1 }]
+        );
+        governor.set_enabled(2, true);
+        assert_eq!(
+            drive(&mut governor, &mut now, 10.0, |_| 1000.0 / 75.0),
+            [Action::Set { knob: 2, step: 1 }]
+        );
+        assert_eq!(
+            drive(&mut governor, &mut now, 12.0, |_| 20.0),
+            [
+                Action::Set { knob: 0, step: 0 },
+                Action::Set { knob: 2, step: 0 },
+            ]
+        );
+    }
+
+    /// Terrain is a preference, so a failed terrain step is undone even while other boosts remain.
+    #[test]
+    fn a_failed_terrain_trial_is_rolled_back_before_an_older_object_boost() {
+        let (cfg, _) = crate::config::parse("[Governor]\nTrialFloorFps=65\nTerrainFirst=1\n");
+        let mut governor = Governor::new(
+            cfg.governor,
+            vec![
+                KnobSpec {
+                    enabled: true,
+                    max_step: 1,
+                },
+                KnobSpec {
+                    enabled: false,
+                    max_step: 0,
+                },
+                KnobSpec {
+                    enabled: false,
+                    max_step: 1,
+                },
+            ],
+        );
+        let mut now = 0.0;
+        drive(&mut governor, &mut now, 10.0, |_| 1000.0 / 75.0);
+        governor.set_enabled(2, true);
+        assert_eq!(
+            drive(&mut governor, &mut now, 8.0, |steps| if steps[2] > 0 {
+                1000.0 / 68.0
+            } else {
+                1000.0 / 75.0
+            }),
+            [
+                Action::Set { knob: 2, step: 1 },
+                Action::Set { knob: 2, step: 0 }
+            ]
+        );
+        assert_eq!(governor.steps(), [1, 0, 0]);
+    }
+
+    /// A newly recovered target becomes the reference even if VRAM or maximum steps prevent raises.
+    #[test]
+    fn recovered_75fps_is_retained_as_reference_while_memory_blocks_new_trials() {
+        let mut governor = band_governor(&[1]);
+        let mut now = 0.0;
+        drive(&mut governor, &mut now, 10.0, |_| 1000.0 / 67.0);
+        for _ in 0..100 {
+            now += 0.05;
+            assert!(governor
+                .tick(&Inputs {
+                    now_s: now,
+                    new_frames_ms: &[1000.0 / 75.0; 4],
+                    world_active: true,
+                    period_ms: 0.0,
+                    vram_free_mib: None,
+                    baseline_changed: &[],
+                })
+                .is_empty());
+        }
+        let mut actions = Vec::new();
+        for _ in 0..100 {
+            now += 0.05;
+            actions.extend(governor.tick(&Inputs {
+                now_s: now,
+                new_frames_ms: &[1000.0 / 68.0; 4],
+                world_active: true,
+                period_ms: 0.0,
+                vram_free_mib: None,
+                baseline_changed: &[],
+            }));
+        }
+        assert_eq!(actions, [Action::Set { knob: 0, step: 0 }]);
+    }
+
+    /// A slower display may limit the target, but cannot silently weaken the configured safety floor.
+    #[test]
+    fn a_60hz_display_does_not_allow_a_trial_below_the_65fps_floor() {
+        let mut governor = band_governor(&[1]);
+        let mut actions = Vec::new();
+        for n in 0..400 {
+            actions.extend(governor.tick(&Inputs {
+                now_s: f64::from(n) * 0.05,
+                new_frames_ms: &[1000.0 / 64.0; 4],
+                world_active: true,
+                period_ms: 1000.0 / 60.0,
+                vram_free_mib: Some(4096),
+                baseline_changed: &[],
+            }));
+        }
+        assert!(actions.is_empty(), "{actions:?}");
+    }
+
+    /// Cap-limited 75 FPS trials remain at most one unaccepted step apart, including quantised vsync.
+    #[test]
+    fn capped_75fps_accepts_steps_only_after_fresh_window_and_hold() {
+        let mut governor = band_governor(&[4]);
+        let mut now = 0.0;
+        assert_eq!(
+            drive(&mut governor, &mut now, 4.1, |_| 1000.0 / 75.0),
+            [Action::Set { knob: 0, step: 1 }]
+        );
+        assert!(drive(&mut governor, &mut now, 3.9, |_| 1000.0 / 75.0).is_empty());
+        assert_eq!(governor.steps(), [1]);
+        assert_eq!(
+            drive(&mut governor, &mut now, 0.2, |_| 1000.0 / 75.0),
+            [Action::Set { knob: 0, step: 2 }]
+        );
+        let mut quantised = band_governor(&[4]);
+        let mut actions = Vec::new();
+        for n in 0..410 {
+            actions.extend(quantised.tick(&Inputs {
+                now_s: f64::from(n) * 0.05,
+                new_frames_ms: &[1000.0 / 75.0; 4],
+                world_active: true,
+                period_ms: 1000.0 / 75.0,
+                vram_free_mib: Some(4096),
+                baseline_changed: &[],
+            }));
+        }
+        assert_eq!(
+            actions,
+            (1..=4)
+                .map(|step| Action::Set { knob: 0, step })
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(quantised.steps(), [4]);
+    }
+
+    /// Quality may spend performance that is still faster than the target without spending the FPS band.
+    #[test]
+    fn quality_cost_above_the_target_is_allowed() {
+        let mut governor = band_governor(&[1]);
+        let mut now = 0.0;
+        assert_eq!(
+            drive(&mut governor, &mut now, 20.0, |steps| if steps[0] == 0 {
+                6.0
+            } else {
+                12.0
+            }),
+            [Action::Set { knob: 0, step: 1 }]
+        );
+    }
+
+    /// Settling frames do not poison a trial; small persistent jitter does not cause a raise/undo loop.
+    #[test]
+    fn settling_and_ordinary_noise_do_not_reject_a_stable_trial() {
+        let mut governor = band_governor(&[1]);
+        let mut now = 0.0;
+        drive(&mut governor, &mut now, 4.1, |_| 1000.0 / 67.0);
+        assert!(drive(&mut governor, &mut now, 0.7, |_| 25.0).is_empty());
+        let tick = std::cell::Cell::new(0usize);
+        let actions = drive(&mut governor, &mut now, 45.0, |_| {
+            tick.set(tick.get() + 1);
+            1000.0 / 67.0
+                + if tick.get().is_multiple_of(2) {
+                    0.2
+                } else {
+                    -0.2
+                }
+        });
+        assert!(actions.is_empty(), "{actions:?}");
+        assert_eq!(governor.steps(), [1]);
+    }
+
+    /// Hitch safety is immediate even late in an unaccepted trial and despite terrain preference.
+    #[test]
+    fn a_hitch_undoes_pending_terrain_without_waiting_for_the_normal_hold() {
+        let (cfg, _) = crate::config::parse("[Governor]\nTrialFloorFps=65\nTerrainFirst=1\n");
+        let mut governor = Governor::new(
+            cfg.governor,
+            vec![
+                KnobSpec {
+                    enabled: true,
+                    max_step: 1
+                };
+                3
+            ],
+        );
+        let mut now = 0.0;
+        drive(&mut governor, &mut now, 6.5, |_| 1000.0 / 75.0);
+        now += 0.05;
+        assert_eq!(
+            governor.tick(&Inputs {
+                now_s: now,
+                new_frames_ms: &[35.0],
+                world_active: true,
+                period_ms: 0.0,
+                vram_free_mib: Some(4096),
+                baseline_changed: &[],
+            }),
+            [Action::Set { knob: 2, step: 0 }]
+        );
+        assert_eq!(governor.steps(), [0; 3]);
+    }
+
+    /// World, live-device memory, availability and maxima remain hard vetoes above the trial floor.
+    #[test]
+    fn world_memory_and_capacity_vetoes_prevent_trials() {
+        for (world_active, vram_free_mib) in [(false, Some(4096)), (true, None), (true, Some(1023))]
+        {
+            let mut governor = band_governor(&[4, 4, 4]);
+            for n in 0..400 {
+                assert!(governor
+                    .tick(&Inputs {
+                        now_s: f64::from(n) * 0.05,
+                        new_frames_ms: &[1000.0 / 75.0; 4],
+                        world_active,
+                        period_ms: 0.0,
+                        vram_free_mib,
+                        baseline_changed: &[],
+                    })
+                    .is_empty());
+            }
+            assert_eq!(governor.steps(), [0; 3]);
+        }
+        let mut governor = band_governor(&[0, 0, 0]);
+        let mut now = 0.0;
+        assert!(drive(&mut governor, &mut now, 20.0, |_| 5.0).is_empty());
+        assert_eq!(governor.steps(), [0; 3]);
+    }
+
+    /// A capacity veto must discard the pending trial and allow a later valid proposal.
+    #[test]
+    fn vetoed_and_menu_reset_trials_leave_no_orphaned_probation() {
+        let mut governor = band_governor(&[1]);
+        let mut now = 0.0;
+        drive(&mut governor, &mut now, 4.05, |_| 1000.0 / 75.0);
+        assert!(governor.veto_raise(0));
+        assert_eq!(governor.steps(), [0]);
+        assert_eq!(
+            drive(&mut governor, &mut now, 4.1, |_| 1000.0 / 67.0),
+            [Action::Set { knob: 0, step: 1 }]
+        );
+        now += 0.05;
+        assert_eq!(
+            governor.tick(&Inputs {
+                now_s: now,
+                new_frames_ms: &[1000.0 / 67.0; 4],
+                world_active: true,
+                period_ms: 0.0,
+                vram_free_mib: Some(4096),
+                baseline_changed: &[true],
+            }),
+            [Action::Set { knob: 0, step: 0 }]
+        );
+        assert_eq!(
+            drive(&mut governor, &mut now, 5.0, |_| 1000.0 / 67.0),
+            [Action::Set { knob: 0, step: 1 }]
+        );
+    }
+
+    /// With both opt-ins off, the original p95 thresholds and object/grass/terrain stack still apply.
+    #[test]
+    fn disabled_trial_policy_preserves_legacy_thresholds_and_action_order() {
+        let (cfg, warnings) = crate::config::parse("[Governor]\nTrialFloorFps=0\nTerrainFirst=0\n");
+        assert!(warnings.is_empty());
+        assert_eq!(cfg, crate::config::Config::default());
+        let mut governor = Governor::new(
+            cfg.governor,
+            vec![
+                KnobSpec {
+                    enabled: true,
+                    max_step: 1
+                };
+                3
+            ],
+        );
+        let mut now = 0.0;
+        assert!(drive(&mut governor, &mut now, 10.0, |_| 1000.0 / 67.0).is_empty());
+        assert!(drive(&mut governor, &mut now, 10.0, |_| 1000.0 / 75.0).is_empty());
+        assert_eq!(
+            drive(&mut governor, &mut now, 10.0, |_| 6.0),
+            [
+                Action::Set { knob: 0, step: 1 },
+                Action::Set { knob: 1, step: 1 },
+                Action::Set { knob: 2, step: 1 },
+            ]
+        );
+        assert_eq!(
+            drive(&mut governor, &mut now, 10.0, |_| 20.0),
+            [
+                Action::Set { knob: 2, step: 0 },
+                Action::Set { knob: 1, step: 0 },
+                Action::Set { knob: 0, step: 0 },
+            ]
+        );
+        assert_eq!(governor.steps(), [0; 3]);
+    }
+
+    /// Accepted quality reaching the stop boundary backs off even inside the frame-noise allowance.
+    #[test]
+    fn an_accepted_boost_at_exactly_the_floor_is_undone_and_blocks_new_trials() {
+        let mut governor = band_governor(&[1]);
+        let mut now = 0.0;
+        assert_eq!(
+            drive(&mut governor, &mut now, 12.0, |_| 1000.0 / 67.0),
+            [Action::Set { knob: 0, step: 1 }]
+        );
+        assert!(
+            governor.band_trial.is_none(),
+            "the boost must already be accepted"
+        );
+        // 67 -> 65 FPS costs less than 0.5 ms, so only the floor boundary can trigger this undo.
+        assert!(1000.0 / 65.0 < governor.band_reference_ms.unwrap() + TRIAL_NOISE_MS);
+        assert_eq!(
+            drive(&mut governor, &mut now, 8.0, |_| 1000.0 / 65.0),
+            [Action::Set { knob: 0, step: 0 }]
+        );
+        assert_eq!(governor.steps(), [0]);
+        assert!(drive(&mut governor, &mut now, 10.0, |_| 1000.0 / 67.0).is_empty());
+        assert_eq!(
+            governor.steps(),
+            [0],
+            "floor backoff must preserve probation"
+        );
+    }
+
+    /// Reaching the stop boundary cannot leave a trial permanently pending without enough FPS to accept.
+    #[test]
+    fn a_trial_that_reaches_exactly_the_floor_is_rolled_back() {
+        let mut governor = band_governor(&[2]);
+        let mut now = 0.0;
+        assert_eq!(
+            drive(&mut governor, &mut now, 12.0, |steps| {
+                1000.0 / if steps[0] == 0 { 67.0 } else { 65.0 }
+            }),
+            [
+                Action::Set { knob: 0, step: 1 },
+                Action::Set { knob: 0, step: 0 }
+            ]
+        );
+        assert_eq!(governor.steps(), [0]);
+    }
+
+    /// An unaccepted trial cannot reset failure history merely by outlasting a short block setting.
+    #[test]
+    fn long_pending_trials_keep_exponential_failure_backoff() {
+        let (mut cfg, warnings) = crate::config::parse(
+            "[Governor]\nTrialFloorFps=65\nWindowSeconds=0.5\nSettleSeconds=0.1\nRaiseHoldSeconds=2\nLowerHoldSeconds=0.1\nBlockSeconds=1\n",
+        );
+        assert!(warnings.is_empty());
+        cfg.knobs.max_object_distance = 1;
+        let mut governor = Governor::new(
+            cfg.governor,
+            vec![KnobSpec {
+                enabled: true,
+                max_step: 1,
+            }],
+        );
+        let mut raised_at = None;
+        let mut raises = Vec::new();
+        let mut undos = Vec::new();
+        for n in 0..1_200 {
+            let now = f64::from(n) * 0.05;
+            let raised = governor.steps() == [1];
+            let fps = if raised && raised_at.is_some_and(|t| now - t > 1.2) {
+                68.0
+            } else {
+                75.0
+            };
+            for action in governor.tick(&Inputs {
+                now_s: now,
+                new_frames_ms: &[1000.0 / fps; 4],
+                world_active: true,
+                period_ms: 0.0,
+                vram_free_mib: Some(4096),
+                baseline_changed: &[],
+            }) {
+                match action {
+                    Action::Set { step: 1, .. } => {
+                        raises.push(now);
+                        raised_at = Some(now);
+                    }
+                    Action::Set { step: 0, .. } => {
+                        undos.push(now);
+                        raised_at = None;
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+        assert!(raises.len() >= 4 && undos.len() >= 3);
+        assert!(
+            raises[3] - undos[2] >= 4.0 - 1e-9,
+            "raises={raises:?}, undos={undos:?}"
+        );
     }
 }
