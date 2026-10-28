@@ -1090,3 +1090,605 @@ These are the spike's proposed steps, including its then-pending documentation p
   - Receipt: mats_glass_detail.txt, scan_window.txt, scan_gpc.txt and TransparentInstanceData reflection.
 - [HYPOTHESIS] The supplied 128-slot calculation is recorded as VERIFIED data, but reading it as fixed capacity is expressly an inference. The proposed opaque block's available-room argument does not prove that adding a material works.
   - Receipt: BuildingMaterialBlendingResource and GiVoxelBuildingMaterialResource dumps, plus route (c).
+
+## Flame Altar close/reactivate and map markers (2026-10-26 spike)
+
+
+### Altar spike scope, method and build identity
+
+- [VERIFIED] The spike used read-only static analysis of the game exe and game data.
+  - Receipt: Supplied W35 spike, Scope and Status; static analysis only.
+- [VERIFIED] No third-party mod DLL was opened, disassembled or string-dumped during the spike.
+  - Receipt: Supplied W35 spike, Clean-room scope; no third-party binary analysis.
+- [VERIFIED] The spike was complete for static analysis; nothing was run in game.
+  - Receipt: Supplied W35 spike, Status.
+- [VERIFIED] In these sections, VERIFIED means support from bytes, disassembly or a file offset; HYPOTHESIS means an inference that is not yet proven.
+  - Receipt: Supplied W35 spike, evidence-label definition.
+- [VERIFIED] The spike used REA MCP and read-only helpers pestr.py, rtype.py, owner.py, prog.py, xref.py and dump.py, run with `python -I`.
+  - Receipt: Supplied W35 spike, Method log.
+- [VERIFIED] The spike also used new helper scripts for the altar analysis.
+  - Receipt: Supplied W35 spike, Method log.
+- [VERIFIED] The target was the reference-build `enshrouded.exe`, with .text/.rdata/.data identical to Steam build 26082781.
+  - Receipt: Supplied W35 spike, Target and Build identity; `python -I secdiff.py <old> <steam>` (both whole files).
+- [VERIFIED] The old-build exe SHA-256 is b28b448a8dbf48c932b717f035031f5a89712a7cccfcc2d6cac0d47e6421c12a.
+  - Receipt: `python -I secdiff.py <old> <steam>` (both whole files).
+- [VERIFIED] The Steam exe SHA-256 is d64966e23b1a458ee6f147bcbceac0b577fa7e39a212f371287d8cc119817882.
+  - Receipt: `python -I secdiff.py <old> <steam>` (both whole files).
+- [VERIFIED] Sections .text, .rdata, .data, .pdata, .reloc and .rsrc have identical SHA-256.
+  - Receipt: `python -I secdiff.py <old> <steam>` (both whole files).
+- [VERIFIED] Only .bind differs.
+  - Receipt: `python -I secdiff.py <old> <steam>` (both whole files).
+
+### Altar request path: client input to server
+
+- [VERIFIED] `ecs.FlameAltarActionType` (u8) = {Abandon 0, Reclaim 1, RemoveWater 2, SetAsPreferredSpawnAltar 3}.
+  - Receipt: enum desc 0x141759830, members table 0x141758f10 (stride 0x28). Second copy desc 0x1418a9680. `rtype.py ecs.FlameAltarActionType`.
+- [VERIFIED] `ecs.FlameAltarAction` (size 0xc) = {baseEntityId ecs.EntityId +0x0, versionData VersionedData +0x4, type FlameAltarActionType +0x8}.
+  - Receipt: desc 0x14175a390, field table 0x14175a170. Second copy desc 0x1418aa9a0.
+- [VERIFIED] `ecs.FlameAltarEvent` (size 0x18) = {playerEntityId +0x8, baseEntityId +0xc, type FlameAltarActionType +0x10}.
+  - Receipt: desc 0x1416e0a10, fields 0x1416e0670.
+- [VERIFIED] A client player-input struct holds `flameAltarAction : ecs.FlameAltarAction` at +0x20c.
+  - Receipt: field table found by `owner.py flameAltarAction`; inventoryTransferAction row at 0x14179a6e0 (owner name resolved below).
+- [VERIFIED] The same struct holds `logicEntityConfigAction : ecs.ChangeLogicEntityConfigAction` at +0x218, `teleportAction` +0x16c, `waypointAction` +0x238, `camera` +0x20, `cursorInput` +0x2f8, `mask` +0x3a0 and about 30 other `...Action` fields.
+  - Receipt: field table found by `owner.py flameAltarAction`; inventoryTransferAction row at 0x14179a6e0 (owner name resolved below).
+- [VERIFIED] `ecs.ServerConsumedPlayerInput` (size 0xe0) holds `consumedFlameAltarAction : VersionedData` at +0x84 and `consumedLogicEntityConfigAction : VersionedData` at +0x94, next to one consumed-version slot per client action.
+  - Receipt: desc 0x1419edb80 (second copy 0x1418ea0c0). `owner.py consumedFlameAltarAction`.
+- [VERIFIED] The client struct is `keen::ecs::ClientPlayerInputData` (size 0x3b8, 40 fields, hash 0x7bf86f5b867d938b).
+  - Receipt: owner desc 0x14179fb80 (field table 0x14179a6e0, referenced from 0x14179fbd8 = desc+0x58). `rtype.py ecs.ClientPlayerInput ecs.PlayerInput`: descs 0x1418de010 / 0x1418e0300.
+- [VERIFIED] The client component `ecs.ClientPlayerInput` (size 0x600) holds it as `data` at +0x0.
+  - Receipt: owner desc 0x14179fb80 (field table 0x14179a6e0, referenced from 0x14179fbd8 = desc+0x58). `rtype.py ecs.ClientPlayerInput ecs.PlayerInput`: descs 0x1418de010 / 0x1418e0300.
+- [VERIFIED] The server component `ecs.PlayerInput` (size 0x5c0) holds the same struct as `fromClient` at +0x8, after `serverTime` at +0x0.
+  - Receipt: owner desc 0x14179fb80 (field table 0x14179a6e0, referenced from 0x14179fbd8 = desc+0x58). `rtype.py ecs.ClientPlayerInput ecs.PlayerInput`: descs 0x1418de010 / 0x1418e0300.
+- [VERIFIED] On the server, PlayerInput+0x214 = flameAltarAction.baseEntityId, +0x218 = versionData, and +0x21c = type.
+  - Receipt: owner desc 0x14179fb80 (field table 0x14179a6e0, referenced from 0x14179fbd8 = desc+0x58). `rtype.py ecs.ClientPlayerInput ecs.PlayerInput`: descs 0x1418de010 / 0x1418e0300.
+- [VERIFIED] The server consumer is the ECS program `base_player_action`, function 0x1402cf7b0.
+  - Receipt: descriptor 0x141e006d0 (name 0x141e02360, fn 0x1402cf7b0), name lists 0x141e00608..0x141e006c8 (`dump.py 0x141e00608 26`).
+- [VERIFIED] Lists: read CurrentTransform, PlayerInput; write Actor, ServerConsumedPlayerInput; read services BalancingRegistry, BasicPlayerInfos, PlayerBasesSystemServer; write services WaterSimulationServer, ecs::ServerProgressSystem; random-access read BaseIdComponent; deferred write BaseIdComponent, DynamicServerProgress.
+  - Receipt: descriptor 0x141e006d0 (name 0x141e02360, fn 0x1402cf7b0), name lists 0x141e00608..0x141e006c8 (`dump.py 0x141e00608 26`).
+- [VERIFIED] `if (PlayerInput+0x218 != ServerConsumedPlayerInput+0x84)` then it first stores the new version (`*(local_420+0x84) = iVar1`).
+  - Receipt: Ghidra decompile ev_c36f1882… (FUN_1402cf7b0); supplied W35 spike A1.
+- [VERIFIED] The consumer marks every new request consumed once, even if it then refuses the action.
+  - Receipt: Ghidra decompile ev_c36f1882… (FUN_1402cf7b0); supplied W35 spike A1.
+- [VERIFIED] FUN_1402cf7b0 runs the action only if permission bit 0x10 is set (`FUN_1403b1cc0(local_res10, playerId, local_3e8)`, then `(local_res10[0] & 0x10) != 0`).
+  - Receipt: Ghidra decompile ev_c36f1882… (FUN_1402cf7b0); supplied W35 spike A1.
+- [VERIFIED] type 0 Abandon: wasAbandoned := 1 and endOfTimeout := now + 30000000000 (`local_498 + 30000000000`, now from FUN_1409b9490).
+  - Receipt: Ghidra decompile ev_c36f1882… (FUN_1402cf7b0); supplied W35 spike A1.
+- [VERIFIED] The Abandon branch has no altar-count check.
+  - Receipt: Ghidra decompile ev_c36f1882… (FUN_1402cf7b0); supplied W35 spike A1.
+- [VERIFIED] type 1 Reclaim: only if `*(local_3d0+0x1c) < FUN_140e7fc30(local_3f0, *(local_3d0+0x14))`; then wasAbandoned := 0, endOfTimeout := 0, and `*(local_3d0+0x1c) += 1`.
+  - Receipt: Ghidra decompile ev_c36f1882… (FUN_1402cf7b0); supplied W35 spike A1.
+- [VERIFIED] type 2 RemoveWater: a water query at the player's CurrentTransform position (fixed point * 2^-32).
+  - Receipt: Ghidra decompile ev_c36f1882… (FUN_1402cf7b0); supplied W35 spike A1.
+- [VERIFIED] type 3 SetAsPreferredSpawnAltar: writes 0x10 bytes (a BaseId) at offset 0 of DynamicServerProgress.
+  - Receipt: Ghidra decompile ev_c36f1882… (FUN_1402cf7b0); supplied W35 spike A1.
+- [VERIFIED] The action writes use FUN_140953b30(&rec, fieldOffset, size, src), then FUN_1409546c0(cmdBuffer, entity, &rec).
+  - Receipt: Ghidra decompile ev_c36f1882… (FUN_1402cf7b0); supplied W35 spike A1.
+- [VERIFIED] The write record uses rec.entity = PlayerInput+0x214, the requested baseEntityId.
+  - Receipt: Ghidra decompile ev_c36f1882… (FUN_1402cf7b0); supplied W35 spike A1.
+- [VERIFIED] Abandon/Reclaim write offset 0x28 size 1 and offset 0x20 size 8.
+  - Receipt: Ghidra decompile ev_c36f1882… (FUN_1402cf7b0); supplied W35 spike A1.
+- [VERIFIED] The summary writes the Abandon timeout as now + 30e9.
+  - Receipt: Supplied W35 spike, Summary; decompile ev_c36f1882… (FUN_1402cf7b0).
+- [VERIFIED] `ecs.BaseIdComponent` (server, size 0x30) = {baseId BaseId +0x0, buildZoneSize float3 +0x10, endOfTimeout Time +0x20, wasAbandoned bool +0x28}.
+  - Receipt: desc 0x141804af0 (fields 0x141804090); second copy 0x1419e30b0.
+- [VERIFIED] Abandon/Reclaim write endOfTimeout and wasAbandoned on the altar base entity.
+  - Receipt: desc 0x141804af0 (fields 0x141804090); second copy 0x1419e30b0.
+- [VERIFIED] `ecs.ClientBaseIdComponent` (client mirror, size 0x38) = {endOfTimeout +0x0, baseId +0x8, wasAbandoned +0x18, isPreferredSpawnAltar +0x19, craftingProps +0x20, animal/bed counts +0x28..+0x34}.
+  - Receipt: desc 0x141807b00 (fields 0x141807400).
+- [VERIFIED] `ecs.DynamicServerProgress` (size 0x10) = {preferredSpawnAltar BaseId +0x0}; its descriptor is 0x1417ebd20.
+  - Receipt: ecs.DynamicServerProgress desc 0x1417ebd20; supplied W35 spike A1.
+- [VERIFIED] The "goes out" step is the server program `home_base` (fn 0x1403339c0; reads BaseIdComponent, CurrentTransform; writes ClientBaseIdComponent; services PlayerBasesSystemServer, ecs::ServerProgressSystem).
+  - Receipt: decompile ev_91008dc7… (FUN_1403339c0): `if (local_f0[4] < *plVar5) { … FUN_1409554c0(uVar6,*puVar7,uVar2); }`.
+- [VERIFIED] For each base entity, home_base mirrors baseId, wasAbandoned and isPreferredSpawnAltar into ClientBaseIdComponent.
+  - Receipt: decompile ev_91008dc7… (FUN_1403339c0): `if (local_f0[4] < *plVar5) { … FUN_1409554c0(uVar6,*puVar7,uVar2); }`.
+- [VERIFIED] If wasAbandoned == 0 it clears the client endOfTimeout and refreshes the base counters.
+  - Receipt: decompile ev_91008dc7… (FUN_1403339c0): `if (local_f0[4] < *plVar5) { … FUN_1409554c0(uVar6,*puVar7,uVar2); }`.
+- [VERIFIED] If wasAbandoned != 0 it copies endOfTimeout to the client and, when `BaseIdComponent.endOfTimeout < now`, calls FUN_1409554c0(cmdBuffer, entity, entity).
+  - Receipt: decompile ev_91008dc7… (FUN_1403339c0): `if (local_f0[4] < *plVar5) { … FUN_1409554c0(uVar6,*puVar7,uVar2); }`.
+- [HYPOTHESIS, strong] FUN_1409554c0 queues "destroy entity" (command kind 1, 0x10 bytes).
+  - Receipt: REA procedure_callers 0x1409554c0 (ev_ec2b5263…), mapped to program names with `allprogs.py` (861 program descriptors).
+- [HYPOTHESIS, strong] The destroy-entity interpretation rests on 68 direct callers, including conditional_despawn, despawn_after_sequence, despawn_link, despawn_on_logic_turn_off, destroy_entity_on_loot, destroy_entity_on_parent_respawn, destroy_on_state, destructible, lifetime and pickup_loot.
+  - Receipt: REA procedure_callers 0x1409554c0 (ev_ec2b5263…), mapped to program names with `allprogs.py` (861 program descriptors).
+- [HYPOTHESIS, strong] The base entity is therefore inferred to be destroyed when the countdown ends.
+  - Receipt: REA procedure_callers 0x1409554c0 (ev_ec2b5263…), mapped to program names with `allprogs.py` (861 program descriptors).
+- [HYPOTHESIS, strong] The command executor was not traced.
+  - Receipt: REA procedure_callers 0x1409554c0 (ev_ec2b5263…), mapped to program names with `allprogs.py` (861 program descriptors).
+- [VERIFIED] The active altar count is recomputed by `home_base_count` (fn 0x140333f90): for each BaseIdComponent with wasAbandoned == 0 it does `*(ServerProgressSystem+0x1c) += 1`.
+  - Receipt: decompile ev_91008dc7… (FUN_140333f90): `if (*(char *)(local_a0 + 0x28) == '\0' && (*(int *)(local_58 + 0x1c) = *(int *)(local_58 + 0x1c) + 1, …`.
+- [VERIFIED] home_base_count keeps the highest altar level at +0x20 (attributes 0x724bf568, 0x638a979a).
+  - Receipt: decompile ev_91008dc7… (FUN_140333f90): `if (*(char *)(local_a0 + 0x28) == '\0' && (*(int *)(local_58 + 0x1c) = *(int *)(local_58 + 0x1c) + 1, …`.
+- [VERIFIED] The code stops counting an abandoned altar at once.
+  - Receipt: decompile ev_91008dc7… (FUN_140333f90): `if (*(char *)(local_a0 + 0x28) == '\0' && (*(int *)(local_58 + 0x1c) = *(int *)(local_58 + 0x1c) + 1, …`.
+- [VERIFIED] Reclaim is refused when the active count is at the flame-level limit.
+  - Receipt: decompile ev_91008dc7… (FUN_140333f90): `if (*(char *)(local_a0 + 0x28) == '\0' && (*(int *)(local_58 + 0x1c) = *(int *)(local_58 + 0x1c) + 1, …`.
+- [VERIFIED] English loca text in enshrouded_053.dat says "The Flame of this Flame Altar will be extinguished, allowing the Altar to be removed." at byte 926381574.
+  - Receipt: `python -I datgrep.py enshrouded_053.dat 'extinguish' 30 160` (whole file, 11 hits).
+- [VERIFIED] The permission-denial text is "You do not have the permission to extinguish Altars." at byte 925699926.
+  - Receipt: `python -I datgrep.py enshrouded_053.dat 'extinguish' 30 160` (whole file, 11 hits).
+- [VERIFIED] The permission text is "Can place flame altars, extinguish flames, and upgrade bases" at byte 926454788.
+  - Receipt: `python -I datgrep.py enshrouded_053.dat 'extinguish' 30 160` (whole file, 11 hits).
+- [VERIFIED] Older copies occur at bytes 901580881 and 901092651.
+  - Receipt: `python -I datgrep.py enshrouded_053.dat 'extinguish' 30 160` (whole file, 11 hits).
+
+### In-person altar action: UI command to event to input
+
+- [VERIFIED] Game UI code queues an 8-byte command {u8 id @+0, u32 entityId @+4} into a queue at `[[[0x14281e498]+0xd0]+0x33cc0]`.
+  - Receipt: `python -I dis.py … f_flamealtarmenu.asm 0x140bb5001` (whole function via .pdata), lines around 0x140bb73a8..0x140bb7412.
+- [VERIFIED] Example in the Flame Altar menu FUN_140bb4e40: `mov byte ptr [rdi],0x77` at 0x140bb73fa, push via FUN_140d57f20 at 0x140bb7408, then `mov dword ptr [rdi+4],ebx` with ebx = `[r14+0x2c50]` (the entity the player is interacting with).
+  - Receipt: `python -I dis.py … f_flamealtarmenu.asm 0x140bb5001` (whole function via .pdata), lines around 0x140bb73a8..0x140bb7412.
+- [VERIFIED] Command 0x76 is queued at 0x140bb7868.
+  - Receipt: `python -I dis.py … f_flamealtarmenu.asm 0x140bb5001` (whole function via .pdata), lines around 0x140bb73a8..0x140bb7412.
+- [VERIFIED] FUN_140852760 dispatches UI commands with a switch on cmd[0]-1 (0x99 cases; byte index table 0x140854630; offset table 0x1408544c8).
+  - Receipt: `dis.py … f_140852760.asm 0x140852760`: 0x1408529d3/0x140853364..0x140853379 (`mov byte ptr [rbx+0x10],0`), 0x1408529f0/0x14085408c..0x1408540a1 (`…,1`), 0x140854005..0x14085402b (`…,2`), 0x14085403b..0x140854061 (`…,3`). Case mapping: `python -I jt.py <exe> 0x140854630 0x1408544c8 0x99 1 0x1408529cc 0x1408529e9 0x140853ffe 0x140854034`.
+- [VERIFIED] Cases 72, 73, 118 and 119 call FUN_140825930, which allocates a 0x18-byte event of the type id stored at [0x14150e504] (FUN_1409566f0).
+  - Receipt: `dis.py … f_140852760.asm 0x140852760`: 0x1408529d3/0x140853364..0x140853379 (`mov byte ptr [rbx+0x10],0`), 0x1408529f0/0x14085408c..0x1408540a1 (`…,1`), 0x140854005..0x14085402b (`…,2`), 0x14085403b..0x140854061 (`…,3`). Case mapping: `python -I jt.py <exe> 0x140854630 0x1408544c8 0x99 1 0x1408529cc 0x1408529e9 0x140853ffe 0x140854034`.
+- [VERIFIED] The altar event cases set +0x8 to the local player entity id from FUN_1403afb80(this+0x466b44), and +0xc to cmd.u32@+4.
+  - Receipt: `dis.py … f_140852760.asm 0x140852760`: 0x1408529d3/0x140853364..0x140853379 (`mov byte ptr [rbx+0x10],0`), 0x1408529f0/0x14085408c..0x1408540a1 (`…,1`), 0x140854005..0x14085402b (`…,2`), 0x14085403b..0x140854061 (`…,3`). Case mapping: `python -I jt.py <exe> 0x140854630 0x1408544c8 0x99 1 0x1408529cc 0x1408529e9 0x140853ffe 0x140854034`.
+- [VERIFIED] The cases set event type at +0x10: case 72 → 0 Abandon, 73 → 1 Reclaim, 118 → 2 RemoveWater, 119 → 3 SetAsPreferredSpawnAltar.
+  - Receipt: `dis.py … f_140852760.asm 0x140852760`: 0x1408529d3/0x140853364..0x140853379 (`mov byte ptr [rbx+0x10],0`), 0x1408529f0/0x14085408c..0x1408540a1 (`…,1`), 0x140854005..0x14085402b (`…,2`), 0x14085403b..0x140854061 (`…,3`). Case mapping: `python -I jt.py <exe> 0x140854630 0x1408544c8 0x99 1 0x1408529cc 0x1408529e9 0x140853ffe 0x140854034`.
+- [VERIFIED] The 0x18-byte event matches `ecs.FlameAltarEvent` {playerEntityId +0x8, baseEntityId +0xc, type +0x10}.
+  - Receipt: `dis.py … f_140852760.asm 0x140852760`: 0x1408529d3/0x140853364..0x140853379 (`mov byte ptr [rbx+0x10],0`), 0x1408529f0/0x14085408c..0x1408540a1 (`…,1`), 0x140854005..0x14085402b (`…,2`), 0x14085403b..0x140854061 (`…,3`). Case mapping: `python -I jt.py <exe> 0x140854630 0x1408544c8 0x99 1 0x1408529cc 0x1408529e9 0x140853ffe 0x140854034`.
+- [VERIFIED] FUN_1403a90e0 walks the FlameAltarEvent queue (type id [0x14150e504], 0x18-byte records in 0x800-byte pages).
+  - Receipt: `f_1403a90e0.asm` lines 1861..1915: 0x1403aadeb `mov edx,[0x14150e504]`, 0x1403aae9d `mov [r14+0x210],eax`, 0x1403aaea7 `mov [r14+0x20c],eax`, 0x1403aaeb3 `mov byte ptr [r14+0x214],al`. The same function fills unlockSkillAction (+0x178/+0x17c/+0x180) from event id [0x14150e484].
+- [VERIFIED] For a record whose +0x8 equals the local player, it writes ClientPlayerInputData: +0x210 versionData = FUN_1409b21f0(ctx), +0x20c baseEntityId = record+0xc, +0x214 type = record+0x10.
+  - Receipt: `f_1403a90e0.asm` lines 1861..1915: 0x1403aadeb `mov edx,[0x14150e504]`, 0x1403aae9d `mov [r14+0x210],eax`, 0x1403aaea7 `mov [r14+0x20c],eax`, 0x1403aaeb3 `mov byte ptr [r14+0x214],al`. The same function fills unlockSkillAction (+0x178/+0x17c/+0x180) from event id [0x14150e484].
+- [VERIFIED] ClientPlayerInputData reaches the server as PlayerInput.fromClient, and `base_player_action` runs it (the request path above).
+  - Receipt: Decompile ev_c36f1882… (FUN_1402cf7b0); rtype.py ecs.ClientPlayerInput ecs.PlayerInput; supplied W35 spike A1/A1b.
+- [VERIFIED] In FUN_1402cf7b0, the Abandon/Reclaim request checks are a new version number and permission bit 0x10; the Reclaim count limit is recorded above.
+  - Receipt: decompile ev_c36f1882… (FUN_1402cf7b0) branches cVar5 == 0 / 1 (no position or BaseIdComponent read); CurrentTransform is used only in branch 2.
+- [VERIFIED] The Abandon/Reclaim branches do not read target position, player distance or the target BaseIdComponent.
+  - Receipt: decompile ev_c36f1882… (FUN_1402cf7b0) branches cVar5 == 0 / 1 (no position or BaseIdComponent read); CurrentTransform is used only in branch 2.
+- [VERIFIED] The random-access BaseIdComponent read is used only by type 3 (FUN_1409a7200 with baseEntityId).
+  - Receipt: decompile ev_c36f1882… (FUN_1402cf7b0) branches cVar5 == 0 / 1 (no position or BaseIdComponent read); CurrentTransform is used only in branch 2.
+- [HYPOTHESIS] Client and server use the same EntityId value for a replicated base entity.
+  - Receipt: In-person client id [r14+0x2c50]; f_flamealtarmenu.asm and decompile ev_c36f1882… (FUN_1402cf7b0); supplied W35 spike A1b.
+- [HYPOTHESIS] Basis: the in-person path sends the client-side id `[r14+0x2c50]` unchanged, and the server patches that id.
+  - Receipt: In-person client id [r14+0x2c50]; f_flamealtarmenu.asm and decompile ev_c36f1882… (FUN_1402cf7b0); supplied W35 spike A1b.
+- [HYPOTHESIS] A mod that sends the id of another altar should therefore work on a host or dedicated server without a server mod.
+  - Receipt: In-person client id [r14+0x2c50]; f_flamealtarmenu.asm and decompile ev_c36f1882… (FUN_1402cf7b0); supplied W35 spike A1b.
+- [HYPOTHESIS] Sending another altar id through this path was not tested in game.
+  - Receipt: In-person client id [r14+0x2c50]; f_flamealtarmenu.asm and decompile ev_c36f1882… (FUN_1402cf7b0); supplied W35 spike A1b.
+- [VERIFIED] The permission mask is one byte per player: FUN_1403b1cc0(out, playerId, BasicPlayerInfos) returns `BasicPlayerInfos[(playerId-1)*0xa0 + 0x9d]` when the slot's id matches (max 0x3ff slots).
+  - Receipt: decompile ev_b3da5f4d… (FUN_1403b1cc0); `dump.py 0x141b7d0a8 48`.
+- [VERIFIED] `keen::ds::PlayerPermissions` members (table 0x141b7d120, stride 0x28) are CanKickBan 0, CanAccessInventories 1, CanEditBase 2, CanEditWorld 3, CanExtendBase 4, CanReceiveEXP 5.
+  - Receipt: decompile ev_b3da5f4d… (FUN_1403b1cc0); `dump.py 0x141b7d0a8 48`.
+- [HYPOTHESIS, strong] Bit 0x10 = 1 << CanExtendBase.
+  - Receipt: Decompile ev_b3da5f4d… (FUN_1403b1cc0); dump.py 0x141b7d0a8 48; enshrouded_053.dat byte 926454788; supplied W35 spike A1b.
+- [HYPOTHESIS, strong] The loca text "Can place flame altars, extinguish flames, and upgrade bases" fits that role.
+  - Receipt: Decompile ev_b3da5f4d… (FUN_1403b1cc0); dump.py 0x141b7d0a8 48; enshrouded_053.dat byte 926454788; supplied W35 spike A1b.
+- [HYPOTHESIS, strong] The permission mapping suggests a remote close would use CanExtendBase, the same server-role rule as in person.
+  - Receipt: Decompile ev_b3da5f4d… (FUN_1403b1cc0); dump.py 0x141b7d0a8 48; enshrouded_053.dat byte 926454788; supplied W35 spike A1b.
+
+### World-map markers, selection and entity identity
+
+- [VERIFIED] Altar map icons come from the ECS `MapMarker` component.
+  - Receipt: decompile ev_1ed01c22… (FUN_140310cb0). Program descriptor 0x141e0f970 (`progs_using.py --prog replicate_map_markers_for_ui`). `ecs.MapMarker` desc 0x141a007d0 = {markerId LocaTagReference +0x0, markerType MapMarkerTypeReference +0x10, dungeonId +0x20, isInBigDungeon +0x24}.
+- [VERIFIED] The client program `replicate_map_markers_for_ui` (fn 0x140310cb0; config EntityTagContainer, LocaTagComponent; read MapMarker, RenderTransform; optional CustomPlayerString, MapMarkerVisibilityState, NetworkLevel, SpawnTime, TriggerShape, UsedItem; write service G38UiPlayData) appends one 0xa0-byte entry per marker entity to a list in G38UiPlayData (+0x36ea00 list, +0x36ea08 count; two other lists at +0x3bea50 and +0x3e6a78 for two marker-type GUIDs).
+  - Receipt: decompile ev_1ed01c22… (FUN_140310cb0). Program descriptor 0x141e0f970 (`progs_using.py --prog replicate_map_markers_for_ui`). `ecs.MapMarker` desc 0x141a007d0 = {markerId LocaTagReference +0x0, markerType MapMarkerTypeReference +0x10, dungeonId +0x20, isInBigDungeon +0x24}.
+- [VERIFIED] A marker entry stores the marker entity id at +0x0 (`*puVar8 = *FUN_1409b4230(param_1, …)`).
+  - Receipt: decompile ev_1ed01c22… (FUN_140310cb0). Program descriptor 0x141e0f970 (`progs_using.py --prog replicate_map_markers_for_ui`). `ecs.MapMarker` desc 0x141a007d0 = {markerId LocaTagReference +0x0, markerType MapMarkerTypeReference +0x10, dungeonId +0x20, isInBigDungeon +0x24}.
+- [VERIFIED] The entry stores a second id from FUN_1409b7700 at +0x4.
+  - Receipt: decompile ev_1ed01c22… (FUN_140310cb0). Program descriptor 0x141e0f970 (`progs_using.py --prog replicate_map_markers_for_ui`). `ecs.MapMarker` desc 0x141a007d0 = {markerId LocaTagReference +0x0, markerType MapMarkerTypeReference +0x10, dungeonId +0x20, isInBigDungeon +0x24}.
+- [VERIFIED] The entry stores FNV-1a32 of MapMarker.markerId at +0x8.
+  - Receipt: decompile ev_1ed01c22… (FUN_140310cb0). Program descriptor 0x141e0f970 (`progs_using.py --prog replicate_map_markers_for_ui`). `ecs.MapMarker` desc 0x141a007d0 = {markerId LocaTagReference +0x0, markerType MapMarkerTypeReference +0x10, dungeonId +0x20, isInBigDungeon +0x24}.
+- [VERIFIED] The entry stores RenderTransform position at +0x10..+0x27.
+  - Receipt: decompile ev_1ed01c22… (FUN_140310cb0). Program descriptor 0x141e0f970 (`progs_using.py --prog replicate_map_markers_for_ui`). `ecs.MapMarker` desc 0x141a007d0 = {markerId LocaTagReference +0x0, markerType MapMarkerTypeReference +0x10, dungeonId +0x20, isInBigDungeon +0x24}.
+- [VERIFIED] The entry stores TriggerShape size at +0x28/+0x2c.
+  - Receipt: decompile ev_1ed01c22… (FUN_140310cb0). Program descriptor 0x141e0f970 (`progs_using.py --prog replicate_map_markers_for_ui`). `ecs.MapMarker` desc 0x141a007d0 = {markerId LocaTagReference +0x0, markerType MapMarkerTypeReference +0x10, dungeonId +0x20, isInBigDungeon +0x24}.
+- [VERIFIED] The entry stores FNV-1a32 of MapMarker.markerType at +0x30.
+  - Receipt: decompile ev_1ed01c22… (FUN_140310cb0). Program descriptor 0x141e0f970 (`progs_using.py --prog replicate_map_markers_for_ui`). `ecs.MapMarker` desc 0x141a007d0 = {markerId LocaTagReference +0x0, markerType MapMarkerTypeReference +0x10, dungeonId +0x20, isInBigDungeon +0x24}.
+- [VERIFIED] The entry stores visibility at +0x34.
+  - Receipt: decompile ev_1ed01c22… (FUN_140310cb0). Program descriptor 0x141e0f970 (`progs_using.py --prog replicate_map_markers_for_ui`). `ecs.MapMarker` desc 0x141a007d0 = {markerId LocaTagReference +0x0, markerType MapMarkerTypeReference +0x10, dungeonId +0x20, isInBigDungeon +0x24}.
+- [VERIFIED] The entry stores SpawnTime or UsedItem value at +0x40.
+  - Receipt: decompile ev_1ed01c22… (FUN_140310cb0). Program descriptor 0x141e0f970 (`progs_using.py --prog replicate_map_markers_for_ui`). `ecs.MapMarker` desc 0x141a007d0 = {markerId LocaTagReference +0x0, markerType MapMarkerTypeReference +0x10, dungeonId +0x20, isInBigDungeon +0x24}.
+- [VERIFIED] The entry stores the teleporter tag at +0x48 (1 or 2 from EntityTagContainer).
+  - Receipt: decompile ev_1ed01c22… (FUN_140310cb0). Program descriptor 0x141e0f970 (`progs_using.py --prog replicate_map_markers_for_ui`). `ecs.MapMarker` desc 0x141a007d0 = {markerId LocaTagReference +0x0, markerType MapMarkerTypeReference +0x10, dungeonId +0x20, isInBigDungeon +0x24}.
+- [VERIFIED] The entry stores the custom name at +0x50/+0x58/+0x60 (ptr, len, FNV-64).
+  - Receipt: decompile ev_1ed01c22… (FUN_140310cb0). Program descriptor 0x141e0f970 (`progs_using.py --prog replicate_map_markers_for_ui`). `ecs.MapMarker` desc 0x141a007d0 = {markerId LocaTagReference +0x0, markerType MapMarkerTypeReference +0x10, dungeonId +0x20, isInBigDungeon +0x24}.
+- [VERIFIED] The entry stores NetworkLevel at +0x8c.
+  - Receipt: decompile ev_1ed01c22… (FUN_140310cb0). Program descriptor 0x141e0f970 (`progs_using.py --prog replicate_map_markers_for_ui`). `ecs.MapMarker` desc 0x141a007d0 = {markerId LocaTagReference +0x0, markerType MapMarkerTypeReference +0x10, dungeonId +0x20, isInBigDungeon +0x24}.
+- [VERIFIED] G38UiPlayData is the same object the UI reaches as `PUD = *(*(*([0x14281e498]+0xd0)) + 0x38)`.
+  - Receipt: FUN_140d8f270 at 0x140d8f2a4..0x140d8f450; FUN_140b375f0 at 0x140b379fc; supplied W35 spike A3.
+- [VERIFIED] The map code reads PUD+0x36ea00 (FUN_140d8f270 line 0x140d8f2a4..0x140d8f450), and the altar menu reads PUD+0x2c50 (FUN_140b375f0 at 0x140b379fc).
+  - Receipt: FUN_140d8f270 at 0x140d8f2a4..0x140d8f450; FUN_140b375f0 at 0x140b379fc; supplied W35 spike A3.
+- [VERIFIED] The map legend builder FUN_140d8f270 sorts the PUD+0x36ea00 entries by the type info that FUN_140d1fcc0(map, entry) returns: type hash (+0x10) 0x813080bc, 0xa447cba3 or 0x6a56c5b3 goes to `submenuAltarMarkers` (map+0x2138 list), 0xa17072be to towers (map+0x4160), and (flag +0x18 == 0) 0x4293eae5 to water sources (map+0x6188).
+  - Receipt: `f_map_markers.asm` lines 116..242 (0x140d8f4e2..0x140d8f6e3), string "[game_ui] Too many Flame Altar markers being added to submenuAltarMarkers" at 0x140d8f61e.
+- [VERIFIED] The map screen FUN_140c201b0 keeps a pointer to the selected or hovered POI entry at `mapScreen+0x56310` (`mov r14,[rdx+0x56310]` at 0x140c20210).
+  - Receipt: `f_teleport_callers.asm` lines 230..244 and 420..443 and 857..870. FUN_140d5ffb0 queues UI command 77 (0x4d) = teleport; dispatcher case 77 at 0x140853393 fills a 0x20-byte event (type id [0x14150e4c8]) that becomes ClientPlayerInputData.teleportAction (`ecs.TeleportAction` {target EntityId +0x0, teleporterType +0x4, versionData +0x8}) in FUN_1403a90e0 at 0x1403aac20..0x1403aac36.
+- [VERIFIED] On the travel input it calls the teleport helper FUN_140d5ffb0([0x14281e498], target = *(u32*)entry (entry+0x0), type = entry+0x48) at 0x140c20609.
+  - Receipt: `f_teleport_callers.asm` lines 230..244 and 420..443 and 857..870. FUN_140d5ffb0 queues UI command 77 (0x4d) = teleport; dispatcher case 77 at 0x140853393 fills a 0x20-byte event (type id [0x14150e4c8]) that becomes ClientPlayerInputData.teleportAction (`ecs.TeleportAction` {target EntityId +0x0, teleporterType +0x4, versionData +0x8}) in FUN_1403a90e0 at 0x1403aac20..0x1403aac36.
+- [VERIFIED] A second path teleports to `PUD+0xc` after a confirm prompt (FUN_140d911a0(r15,2,1,0)) at 0x140c20d01.
+  - Receipt: `f_teleport_callers.asm` lines 230..244 and 420..443 and 857..870. FUN_140d5ffb0 queues UI command 77 (0x4d) = teleport; dispatcher case 77 at 0x140853393 fills a 0x20-byte event (type id [0x14150e4c8]) that becomes ClientPlayerInputData.teleportAction (`ecs.TeleportAction` {target EntityId +0x0, teleporterType +0x4, versionData +0x8}) in FUN_1403a90e0 at 0x1403aac20..0x1403aac36.
+- [VERIFIED] A map icon carries the marker entity id, and the existing fast-travel code sends that id to the server.
+  - Receipt: Decompile ev_1ed01c22… (FUN_140310cb0); f_teleport_callers.asm lines 230..244, 420..443 and 857..870.
+- [HYPOTHESIS] The Flame Altar MapMarker entity may be the same entity that has BaseIdComponent.
+  - Receipt: Decompile ev_1ed01c22…; supplied W35 spike A3, entity-identity inference.
+- [HYPOTHESIS] Both replicate_map_markers_for_ui and ui_base_name/add_buildzones_* read TriggerShape, NetworkLevel and CustomPlayerString on the base entity; the spike reasons that the altar teleport target must be the altar entity.
+  - Receipt: Supplied W35 spike A3, basis for the entity-identity hypothesis.
+- [VERIFIED] The Abandon timeout is a hard-coded double 30000000000.0 (bytes 00 00 00 b0 8e f0 1b 42 at 0x141503bd0), loaded at 0x1402cf860 (`movsd xmm7,[0x141503bd0]`) and converted at 0x1402cfbe9 (`cvttsd2si rbx,xmm7`).
+  - Receipt: Constant bytes at 0x141503bd0; loads/conversion at 0x1402cf860 and 0x1402cfbe9; supplied W35 spike A3.
+- [VERIFIED] The Abandon timeout constant is not game data.
+  - Receipt: Constant bytes at 0x141503bd0; loads/conversion at 0x1402cf860 and 0x1402cfbe9; supplied W35 spike A3.
+- [HYPOTHESIS, strong] Time is a signed 64-bit nanosecond count, so the countdown is 30 s.
+  - Receipt: 430 RIP-relative references to 1e-9; constants 0x1413b9b74 and 0x1413b5670; reflected Time default; enshrouded_053.dat and FbUiLocaMenuFlameAltar desc 0x141772260; supplied W35 spike A3.
+- [HYPOTHESIS, strong] Basis: 430 RIP-relative code references to the f32/f64 constants 1e-9 (0x1413b9b74, 0x1413b5670), and a reflected Time default "60000000000.0f" for a sound cooldown.
+  - Receipt: 430 RIP-relative references to 1e-9; constants 0x1413b9b74 and 0x1413b5670; reflected Time default; enshrouded_053.dat and FbUiLocaMenuFlameAltar desc 0x141772260; supplied W35 spike A3.
+- [HYPOTHESIS, strong] The UI calls this phase "deactivated": loca "This altar is deactivated. The afterglow of the Flame offers lingering protection that will wear off soon:" (enshrouded_053.dat byte 926126268), "Reactivate Altar", and "Altar cannot be reactivated due to too many active Flame Altars." (byte 926399905).
+  - Receipt: 430 RIP-relative references to 1e-9; constants 0x1413b9b74 and 0x1413b5670; reflected Time default; enshrouded_053.dat and FbUiLocaMenuFlameAltar desc 0x141772260; supplied W35 spike A3.
+- [HYPOTHESIS, strong] Menu loca struct FbUiLocaMenuFlameAltar (desc 0x141772260) has actionDeactivate +0x2b0, actionReactivate +0x2d0, deactivateAltarDesc +0x2e0, inactiveStateDesc +0x2f0, reactivationProhibited +0x300, deactivationExplanation +0x360.
+  - Receipt: 430 RIP-relative references to 1e-9; constants 0x1413b9b74 and 0x1413b5670; reflected Time default; enshrouded_053.dat and FbUiLocaMenuFlameAltar desc 0x141772260; supplied W35 spike A3.
+
+### Altar authority on hosts and dedicated servers
+
+- [VERIFIED] The client never changes BaseIdComponent itself.
+  - Receipt: Decompile ev_c36f1882… (FUN_1402cf7b0); ClientPlayerInputData / PlayerInput.fromClient reflection; supplied W35 spike A2.
+- [VERIFIED] The client sends the versioned FlameAltarAction inside ClientPlayerInputData.
+  - Receipt: Decompile ev_c36f1882… (FUN_1402cf7b0); ClientPlayerInputData / PlayerInput.fromClient reflection; supplied W35 spike A2.
+- [VERIFIED] The server program base_player_action (server-side component ServerConsumedPlayerInput, server-side PlayerInput.fromClient) makes the change.
+  - Receipt: Decompile ev_c36f1882… (FUN_1402cf7b0); ClientPlayerInputData / PlayerInput.fromClient reflection; supplied W35 spike A2.
+- [VERIFIED] On a listen host the host runs the same program for remote clients.
+  - Receipt: Decompile ev_c36f1882… (FUN_1402cf7b0); ClientPlayerInputData / PlayerInput.fromClient reflection; supplied W35 spike A2.
+- [VERIFIED] The installed Dedicated Server (Steam app 2278520, buildid 26083076, `enshrouded_server.exe` sha256 D7BAA768EB00AA895D9F5A1CD8747CCF66858C7B542F50983092B2E3261588EE) has the same path: program `base_player_action` (desc 0x14136d090, fn 0x1400bcaa0) with identical component lists; `home_base` (fn 0x1400f47d0) and `home_base_count` (fn 0x1400f4da0); identical ecs.FlameAltarAction, ecs.FlameAltarActionType, ecs.BaseIdComponent and ServerConsumedPlayerInput.consumedFlameAltarAction (+0x84) layouts.
+  - Receipt: `progs_using.py <server.exe> --prog base_player_action home_base home_base_count`; `rtype.py`/`owner.py` on the server exe; `dis.py` → `srv_base_player_action.asm` vs `cli_base_player_action.asm` (client 0x1402cf970/0x1402cf977/0x1402cf9ae/0x1402cf9b4/0x1402cf9c1).
+- [VERIFIED] The consumer has the same instructions: 0x1400bcc60 `mov ebx,[r14+0x218]`, 0x1400bcc67 `cmp ebx,[rax+0x84]`, 0x1400bcc9e store, 0x1400bcca4 `test byte ptr [rbp+0x3e8],0x10`, 0x1400bccb1 `movzx ecx,byte ptr [r14+0x21c]`, and the same 30000000000.0 constant at 0x140bd0910.
+  - Receipt: `progs_using.py <server.exe> --prog base_player_action home_base home_base_count`; `rtype.py`/`owner.py` on the server exe; `dis.py` → `srv_base_player_action.asm` vs `cli_base_player_action.asm` (client 0x1402cf970/0x1402cf977/0x1402cf9ae/0x1402cf9b4/0x1402cf9c1).
+- [HYPOTHESIS] A client-only remote mod may need no server-side mod if the server drops no request elsewhere; this was not tested in game.
+  - Receipt: Supplied W35 spike A2; static dedicated-server comparison and the bounded negative search below.
+- [HYPOTHESIS] The proposed server rule is a new version number plus CanExtendBase (bit 0x10), matching an in-person click; an interaction-range check elsewhere in the input pipeline remains possible.
+  - Receipt: Supplied W35 spike A2; decompile ev_c36f1882… and dedicated-server comparison.
+- [VERIFIED] The server input programs server_player_input_begin_frame (0x1402e67e0), server_player_input_end_frame (0x1402e6900) and network_consumed_player_input (0x1402d2910) had no action-offset hits in the stated disassembly search.
+  - Receipt: `dis.py` → `f_server_input.asm`, then `Select-String '0x214\]|0x218\]|0x21c\]|0x84\]|0x20c\]'` = 0 hits; scope: the three whole functions named here.
+- [HYPOTHESIS] The network receive path that fills PlayerInput.fromClient was not traced.
+  - Receipt: Supplied W35 spike A2, negative-receipt limits.
+- [HYPOTHESIS, strong] The signed 64-bit Time interpretation also rests on the saturating add on INT64_MAX/INT64_MIN in the decompile and a reflected default "60000000000.0f" next to "do not play sound again until _ time has passed"; the Time type itself was not proven.
+  - Receipt: Supplied W35 spike A2, Time basis appended to the negative receipt.
+
+### Proposed remote Deactivate / Reactivate design and feasibility
+
+- [HYPOTHESIS] The proposed design calls existing exe code; every address needs documentation and a signature-table entry before use under house rule 4.
+  - Receipt: Supplied W35 spike A4, unimplemented clean-room design.
+- [HYPOTHESIS] Detour the map screen function FUN_140c201b0 (prologue at 0x140c201b0; it runs on the UI thread while the map is open).
+  - Receipt: Supplied W35 spike A4, proposed design; supporting static path receipts in A1, A1b and A3 above.
+- [HYPOTHESIS] Call the original first.
+  - Receipt: Supplied W35 spike A4, proposed design; supporting static path receipts in A1, A1b and A3 above.
+- [HYPOTHESIS] After the original returns, read `entry = *(void**)(mapScreen + 0x56310)` (mapScreen = 2nd argument, RDX).
+  - Receipt: Supplied W35 spike A4, proposed design; supporting static path receipts in A1, A1b and A3 above.
+- [HYPOTHESIS] If entry is null, do nothing.
+  - Receipt: Supplied W35 spike A4, proposed design; supporting static path receipts in A1, A1b and A3 above.
+- [HYPOTHESIS] Decide "is this a Flame Altar marker" with the game's own lookup: `info = FUN_140d1fcc0(mapScreen, entry)`; accept only `info->+0x18 != 0` and `info->+0x10` in {0x813080bc, 0xa447cba3, 0x6a56c5b3} (the hashes FUN_140d8f270 routes to submenuAltarMarkers).
+  - Receipt: Supplied W35 spike A4, proposed design; supporting static path receipts in A1, A1b and A3 above.
+- [HYPOTHESIS] On a mod key (or a hold-to-confirm), take `id = *(u32*)entry` and queue the same 8-byte UI command the altar menu queues: Deactivate = command 72 (0x48), Reactivate = command 73 (0x49), entity id at +4.
+  - Receipt: Supplied W35 spike A4, proposed design; supporting static path receipts in A1, A1b and A3 above.
+- [HYPOTHESIS] The exe contains standalone, unreferenced copies of exactly this push: FUN_140d57570(GameUi, id) for 72 and FUN_140d5d1d0(GameUi, id) for 73, with GameUi = `*(void**)0x14281e498`.
+  - Receipt: Supplied W35 spike A4, proposed design; supporting static path receipts in A1, A1b and A3 above.
+- [HYPOTHESIS] The two proposed push helpers return a bool, false when the queue is full.
+  - Receipt: Supplied W35 spike A4, proposed design; supporting static path receipts in A1, A1b and A3 above.
+- [HYPOTHESIS] The rest is vanilla: dispatcher case 72/73 → FlameAltarEvent → ClientPlayerInputData.flameAltarAction → server base_player_action.
+  - Receipt: Supplied W35 spike A4, proposed design; supporting static path receipts in A1, A1b and A3 above.
+- [HYPOTHESIS] The spike rates request feasibility HIGH because all four hops are verified statically, with no proposed server mod; overall feasibility is MEDIUM until tested because of the listed risks.
+  - Receipt: Supplied W35 spike A4, static feasibility assessment.
+
+### Remote altar risks and remaining checks
+
+- [HYPOTHESIS] The map entry id equals the BaseIdComponent entity id for altars.
+  - Receipt: Supplied W35 spike A4, risks; static support in A1/A1b/A2/A3; no in-game remote-request test.
+- [HYPOTHESIS] If not, the server patches BaseIdComponent on an entity that lacks it; the result of such a patch is unknown (not traced).
+  - Receipt: Supplied W35 spike A4, risks; static support in A1/A1b/A2/A3; no in-game remote-request test.
+- [HYPOTHESIS] Test: deactivate from the map, then check in person that the altar shows "This altar is deactivated…".
+  - Receipt: Supplied W35 spike A4, risks; static support in A1/A1b/A2/A3; no in-game remote-request test.
+- [HYPOTHESIS] Thread and timing: the UI command queue is not locked.
+  - Receipt: Supplied W35 spike A4, risks; static support in A1/A1b/A2/A3; no in-game remote-request test.
+- [HYPOTHESIS] Push only from inside the UI-thread detour, never from another thread.
+  - Receipt: Supplied W35 spike A4, risks; static support in A1/A1b/A2/A3; no in-game remote-request test.
+- [HYPOTHESIS] One request per frame: the input builder writes the version from FUN_1409b21f0(ctx) (a frame or tick number).
+  - Receipt: Supplied W35 spike A4, risks; static support in A1/A1b/A2/A3; no in-game remote-request test.
+- [HYPOTHESIS] Two altar commands in one frame are inferred to collapse into one input action.
+  - Receipt: Supplied W35 spike A4, risks; static support in A1/A1b/A2/A3; no in-game remote-request test.
+- [HYPOTHESIS] Space requests by at least one frame.
+  - Receipt: Supplied W35 spike A4, risks; static support in A1/A1b/A2/A3; no in-game remote-request test.
+- [HYPOTHESIS] Reactivate is refused by the server when the active altar count is at the flame-level limit (no feedback to a remote caller; the UI string reactivationProhibited exists).
+  - Receipt: Supplied W35 spike A4, risks; static support in A1/A1b/A2/A3; no in-game remote-request test.
+- [HYPOTHESIS, strong] After 30 s (HYPOTHESIS: ns Time), home_base may destroy the base entity, making later Reactivate impossible; destruction is the strong hypothesis from A1, and its command executor was not traced.
+  - Receipt: Supplied W35 spike A4, risks; static support in A1/A1b/A2/A3; no in-game remote-request test.
+- [HYPOTHESIS] Unknown build: the map screen layout offsets (0x56310), GameUi global and helper addresses change with every patch.
+  - Receipt: Supplied W35 spike A4, risks; static support in A1/A1b/A2/A3; no in-game remote-request test.
+- [HYPOTHESIS] Gate on the known exe SHA-256 like src/build_id.rs does.
+  - Receipt: Supplied W35 spike A4, risks; static support in A1/A1b/A2/A3; no in-game remote-request test.
+- [HYPOTHESIS] The spike infers that any co-op player with CanExtendBase (bit 0x10) could close an altar remotely where the server accepts the request without a distance check; the untraced network receive path still limits this claim.
+  - Receipt: Supplied W35 spike A4, risks; static support in A1/A1b/A2/A3; no in-game remote-request test.
+- [HYPOTHESIS] The proposed mod should act only on the local player's explicit input.
+  - Receipt: Supplied W35 spike A4, risks; static support in A1/A1b/A2/A3; no in-game remote-request test.
+- [VERIFIED] The dedicated-server static checks found the same program, layouts and instructions.
+  - Receipt: Supplied W35 spike A4; dedicated-server comparison in A2.
+- [HYPOTHESIS] A far-away client request still needs an in-game dedicated-server test; a hidden check in the untraced network receive path is unresolved.
+  - Receipt: Supplied W35 spike A4, outstanding dedicated-server check.
+
+### Altar open questions
+
+- [HYPOTHESIS] Is the Flame Altar MapMarker entity the same entity as the BaseIdComponent entity? (Static support only. In-game test: deactivate from the map and check the altar in person.)
+  - Receipt: Supplied W35 spike, Open questions; unresolved at the spike.
+- [HYPOTHESIS] Is Time in nanoseconds (30 s countdown)? 430 references to 1e-9 support it; time it in game.
+  - Receipt: Supplied W35 spike, Open questions; unresolved at the spike.
+- [HYPOTHESIS] Does any network-receive code on the host or dedicated server drop a FlameAltarAction for range or ownership? Not traced (base_player_action and the three server input programs have no such check).
+  - Receipt: Supplied W35 spike, Open questions; unresolved at the spike.
+- [HYPOTHESIS] What does the server do with a BaseIdComponent patch for an entity that lacks the component? Not traced; the mod must only send altar ids.
+  - Receipt: Supplied W35 spike, Open questions; unresolved at the spike.
+- [HYPOTHESIS] Which of the three altar marker type hashes (0x813080bc, 0xa447cba3, 0x6a56c5b3) is which altar kind? Not resolved.
+  - Receipt: Supplied W35 spike, Open questions; unresolved at the spike.
+
+## Logic graph (Sparkworks) internals (2026-10-26 spike)
+
+
+### Logic-graph spike scope and internal names
+
+- [VERIFIED] These logic-graph findings come from the same read-only static spike on build 26082781; nothing was run in game.
+  - Receipt: Supplied W35 spike, Scope and Status; build identity and method in the altar section above.
+- [VERIFIED] The spike claims no S1 or S2 fix.
+  - Receipt: Supplied W35 spike, Summary; static findings only.
+- [VERIFIED] The string "Sparkworks" did not occur in the scanned exe.
+  - Receipt: `python -I pestr.py enshrouded.exe 'spark'` (all printable ASCII runs >= 4 chars, whole exe): 16 hits, none 'sparkworks'.
+- [VERIFIED] The only "spark" strings were the building-spark camera and ECS names PlayerBuildingSpark, PlayerCameraBuildingFlySparkMode and player_building_spark_sfx.
+  - Receipt: `python -I pestr.py enshrouded.exe 'spark'` (all printable ASCII runs >= 4 chars, whole exe): 16 hits, none 'sparkworks'.
+- [HYPOTHESIS] The string results suggest that Sparkworks uses other internal names.
+  - Receipt: `python -I pestr.py enshrouded.exe 'spark'` (all printable ASCII runs >= 4 chars, whole exe): 16 hits, none 'sparkworks'.
+- [VERIFIED] Sparkworks is the "logic graph" system.
+  - Receipt: `python -I strdump.py` → `logic_strings.txt` (507 lines); `allprogs.tsv`.
+- [VERIFIED] Systems: `LogicGraphServer` (string 0x1415135e8), `LogicGraphClient` (0x14150e9a0), `LogicGraphEntityBinding`, `LogicSystemDataRegistry`, `LogicEntityOrders`.
+  - Receipt: `python -I strdump.py` → `logic_strings.txt` (507 lines); `allprogs.tsv`.
+- [VERIFIED] `LogicGraphMessageType` contains SubscribeGraph, UnsubscribeGraph, SendFullGraph, SendGraphCommands, SendMultiNodeGraphCommands, SendGraphList, SetGraphName, RequestLogicEntityConnections and SendLogicEntityConnections (strings 0x141512460..0x141512680).
+  - Receipt: `python -I strdump.py` → `logic_strings.txt` (507 lines); `allprogs.tsv`.
+- [VERIFIED] Payload types include LogicGraphCommandMessage, LogicGraphMultiNodeCommandMessage, SetLogicGraphNameMessage, LogicGraphListEntryMessage, LogicGraphListMessage, LogicGraphEditMessage, LogicGraphNodeDataMessage, LogicGraphCompileResult and LogicEntityConnectionsMessage.
+  - Receipt: `python -I strdump.py` → `logic_strings.txt` (507 lines); `allprogs.tsv`.
+- [VERIFIED] `LogicGraphCommandType` {CreateGraph, DestroyGraph, CreateNode, CreateLink, MoveNode, SetNodeData, RemoveLink, RemoveNode, GraphResult}.
+  - Receipt: `python -I strdump.py` → `logic_strings.txt` (507 lines); `allprogs.tsv`.
+- [VERIFIED] `LogicGraphNodeType` {LogicEntity, Hold, Clock, And, Or, Not, NAnd, XOr, DFlipFlop, Toggle, TimedTrigger, WriteRegister, ReadRegister, True, False, Flank, GlobalReset}.
+  - Receipt: `python -I strdump.py` → `logic_strings.txt` (507 lines); `allprogs.tsv`.
+- [VERIFIED] The Sparkworks tool is the "logic screwdriver": strings IsInLogicScrewdriverMode (0x141c27198), InteractionLogicScrewdriver (0x141c74a90), VfxLogicScrewdriverComponent, screwdriverCategoryLogicObjects, enterLogicObjectPlacementMode (0x141c67568).
+  - Receipt: `python -I strdump.py` → `logic_strings.txt` (507 lines); `allprogs.tsv`.
+- [VERIFIED] Editor UI: FbUiLogicGraphManager (graph list; `doLogicGraphManager` 0x141d6e478, `doLogicGraphManagerPopup` 0x141d6e440, hudMenuLogicGraphManager), FbUiLogicEditor (`logicEditorContainer` 0x141d6f6f8, `doTimeBasedLogicNodeProperties` 0x141d6f7f8), sounds logicEditorOpen/logicEditorClose.
+  - Receipt: `python -I strdump.py` → `logic_strings.txt` (507 lines); `allprogs.tsv`.
+- [VERIFIED] Error/log strings: "[logic_ui] error while deserializeing Graph" (0x141d92ea8), "[ logic_graph ] Failed to Insert Graph from save" (0x141d92ed8), "[client] Received LogicGraph message after shutdown of ECS System." (0x141d49f40).
+  - Receipt: `python -I strdump.py` → `logic_strings.txt` (507 lines); `allprogs.tsv`.
+- [VERIFIED] Client action: `ClientPlayerInputData.logicEntityConfigAction : ecs.ChangeLogicEntityConfigAction` {logicEntityId +0x0, dataBuffer u8[20] +0x4, versionData +0x18} (desc 0x1417719d0); server mark `consumedLogicEntityConfigAction` (+0x94).
+  - Receipt: `python -I strdump.py` → `logic_strings.txt` (507 lines); `allprogs.tsv`.
+- [VERIFIED] Programs: logic_graph_ui (fn 0x14030ba40), logic_graph_state, logic_entity_init, logic_entities_in_range, logic_trigger_shape, update_logic_entity_binding, update_logic_graph_system, register_logic_entity_in_base_client (fn 0x14030eed0), notify_logic_state_change, despawn_on_logic_turn_off, plus the older signal programs (transmit_signal, receive_signal, …).
+  - Receipt: `python -I strdump.py` → `logic_strings.txt` (507 lines); `allprogs.tsv`.
+- [VERIFIED] "[logic] To many nodes in Graph" is at 0x141d92e88, with its single code reference at 0x140efe1af in FUN_140efdb30.
+  - Receipt: Supplied W35 spike B0, exe log strings and their single code references.
+- [VERIFIED] "[logic] Failed to serialize Graph %k" is at 0x141d92f10, with its single code reference at 0x140f0ba22 in FUN_140f0b880.
+  - Receipt: Supplied W35 spike B0, exe log strings and their single code references.
+- [VERIFIED] "[logic] Could Not Apply old runtime State to Logic Graph: '%k'" has its single code reference at 0x140f11fa7 in FUN_140f118e0.
+  - Receipt: Supplied W35 spike B0, exe log strings and their single code references.
+- [VERIFIED] "[Logic] Graph failed to load runtime State: '%k'" has its single code reference at 0x140efeb06 in FUN_140efe9d0.
+  - Receipt: Supplied W35 spike B0, exe log strings and their single code references.
+- [VERIFIED] "[ logic_graph ] Failed to Insert Graph from save" has its single code reference at 0x140efe6df in FUN_140efe540.
+  - Receipt: Supplied W35 spike B0, exe log strings and their single code references.
+- [VERIFIED] "[logic_ui] error while deserializeing Graph" has its single code reference at 0x140f064a7 in FUN_140f06290.
+  - Receipt: Supplied W35 spike B0, exe log strings and their single code references.
+
+### Graph storage and loading
+
+- [VERIFIED] FUN_140efdb30 is the one graph deserializer.
+  - Receipt: decompile ev_57708f82… (FUN_140efdb30).
+- [VERIFIED] The graph stream starts with u32 graphId; if flags&1 and version>2, it includes two u64 values, preceded at version>3 by one extra value via FUN_1403ba460.
+  - Receipt: decompile ev_57708f82… (FUN_140efdb30).
+- [VERIFIED] The stream has u32 nodeCount, then per node u32 id, u32, u32, u8 nodeType and u8 hasData.
+  - Receipt: decompile ev_57708f82… (FUN_140efdb30).
+- [VERIFIED] Node data is type-dependent: 0: u32; 1, 2: u64; 10: 2×u64; 11, 12: u8.
+  - Receipt: decompile ev_57708f82… (FUN_140efdb30).
+- [VERIFIED] The stream has u32 linkCount, then per link u32, u32, and at version>1 u8, u8.
+  - Receipt: decompile ev_57708f82… (FUN_140efdb30).
+- [VERIFIED] Nodes go into a 0x14-byte array, node data into a 0x10-byte array, links into a 0xc-byte array.
+  - Receipt: decompile ev_57708f82… (FUN_140efdb30).
+- [VERIFIED] Node cap: a node WITH data is appended only while the node array holds fewer than 200 entries (`if (*(uint *)(param_3 + 1) < 200)`); otherwise it is skipped and "[logic] To many nodes in Graph" is logged.
+  - Receipt: decompile ev_57708f82… (FUN_140efdb30).
+- [VERIFIED] Nodes without data are appended without this check.
+  - Receipt: decompile ev_57708f82… (FUN_140efdb30).
+- [VERIFIED] Links are still read and appended, so links can point at a dropped node.
+  - Receipt: decompile ev_57708f82… (FUN_140efdb30).
+- [VERIFIED] A failed allocation returns error 0x27; a stream error returns the stream's error byte.
+  - Receipt: decompile ev_57708f82… (FUN_140efdb30).
+- [VERIFIED] FUN_140f0b880 writes all graphs from this+0x145ce0 (0x60-byte records; count at this+0x145ce8).
+  - Receipt: decompile ev_e04789ef… (FUN_140f0b880).
+- [VERIFIED] The writer uses stream version 6 and calls FUN_140f0b1e0 once per graph.
+  - Receipt: decompile ev_e04789ef… (FUN_140f0b880).
+- [VERIFIED] On a stream error, FUN_140f0b880 logs "[logic] Failed to serialize Graph %k" and continues with the next graph.
+  - Receipt: decompile ev_e04789ef… (FUN_140f0b880).
+- [VERIFIED] Client side, FUN_140f06290 (called every frame from logic_graph_ui) either applies queued incremental commands (types 2..8 → FUN_140efce00, FUN_140efc220, inline move, FUN_140f0ec00, FUN_140f0a090, FUN_140f0a360, and type 8 sets a u64 at +0x118) or, when a full graph is pending (+0x1148 != 0), rebuilds the graph with FUN_140efdb30(version 6) from the received buffer (+0x1128, size +0x113c).
+  - Receipt: decompile ev_e04789ef… (FUN_140f06290).
+- [VERIFIED] A FUN_140efdb30 error in FUN_140f06290 logs "[logic_ui] error while deserializeing Graph"; the pending flag is still cleared.
+  - Receipt: decompile ev_e04789ef… (FUN_140f06290).
+- [VERIFIED] The client code drops a bad full graph with only the log line.
+  - Receipt: decompile ev_e04789ef… (FUN_140f06290).
+
+### Editor graph list and subscription
+
+- [VERIFIED] `logic_graph_ui` (fn 0x14030ba40; read services CustomPlayerStringsSystem, LocalPlayerData, LogicSystemDataRegistry, PlayerBasesSystemClient, ecs::ServerProgressSystem; write services G38UiPlayData, LogicEntityOrders, LogicGraphClient; random reads CurrentTransform, CustomPlayerString, LogicGraphComponent, DynamicLogicGraphNodeComponent, LogicGraphNodeConnected, LogicGraphTrigger, LogicTriggerShape, TriggerShape, TriggerSpawner) runs on the client every frame.
+  - Receipt: decompile ev_d8afc107… (FUN_14030ba40); program lists via `progs_using.py --prog logic_graph_ui`.
+- [VERIFIED] logic_graph_ui clears the UI graph list (G38UiPlayData+0x447870 = 0).
+  - Receipt: decompile ev_d8afc107… (FUN_14030ba40); program lists via `progs_using.py --prog logic_graph_ui`.
+- [VERIFIED] It refills the list from LogicGraphClient via FUN_140f04ba0, using 0x28-byte source records and 0x40-byte UI rows (id, flag, name string, …).
+  - Receipt: decompile ev_d8afc107… (FUN_14030ba40); program lists via `progs_using.py --prog logic_graph_ui`.
+- [VERIFIED] logic_graph_ui calls FUN_140f06290, FUN_140f067e0 and FUN_140f0a9d0 for client graph processing.
+  - Receipt: decompile ev_d8afc107… (FUN_14030ba40); program lists via `progs_using.py --prog logic_graph_ui`.
+- [VERIFIED] logic_graph_ui chooses a graph id from UI events, or from the interacted entity's LogicGraphComponent at PUD+0x2c50 when PUD+0x1cd8 == 0x14.
+  - Receipt: decompile ev_d8afc107… (FUN_14030ba40); program lists via `progs_using.py --prog logic_graph_ui`.
+- [VERIFIED] It calls FUN_140f0fe50(LogicGraphClient, graphId, …) to subscribe, or FUN_140f11850 to unsubscribe when PUD+0x1cd8 == 1.
+  - Receipt: decompile ev_d8afc107… (FUN_14030ba40); program lists via `progs_using.py --prog logic_graph_ui`.
+- [VERIFIED] The UI list storage is an inline array of 100 rows at G38UiPlayData+0x447890 (ptr +0x447868, count +0x447870, capacity +0x447878 = 0x64, grow fn +0x447880 = 0x140836fb0).
+  - Receipt: G38UiPlayData init at 0x14082dbb6..0x14082dbea (capstone dump); grow fn disassembly at 0x140836fb0; `f_logic_ui.asm` lines 616..643.
+- [VERIFIED] The grow function doubles the capacity and tail-calls 0x1408608c0, so the list is NOT capped at 100.
+  - Receipt: G38UiPlayData init at 0x14082dbb6..0x14082dbea (capstone dump); grow fn disassembly at 0x140836fb0; `f_logic_ui.asm` lines 616..643.
+- [VERIFIED] The graph manager screen FUN_140c0eb80 ("doLogicGraphManager") prints "%u / %u" from count (+0x447870) and capacity (+0x447878).
+  - Receipt: G38UiPlayData init at 0x14082dbb6..0x14082dbea (capstone dump); grow fn disassembly at 0x140836fb0; `f_logic_ui.asm` lines 616..643.
+- [HYPOTHESIS] "%u / %u" shows count / capacity, so the screen reads "N / 100" until the list grows past 100.
+  - Receipt: FUN_140c0eb80; f_logic_ui.asm lines 616..643; supplied W35 spike B2.
+- [HYPOTHESIS] Whether 100 is also a server-side graph limit is not shown.
+  - Receipt: FUN_140c0eb80; f_logic_ui.asm lines 616..643; supplied W35 spike B2.
+
+### Client network path for graph data
+
+- [VERIFIED] The client message handler FUN_14086a7e0 forwards LogicGraph messages to FUN_140f09880(clientNet = [client+0x47d568], msg, …) (call at 0x14086b93c).
+  - Receipt: decompile ev_d9bb5cab… (FUN_140f09880).
+- [VERIFIED] FUN_14086a7e0 drops a message after client ECS shutdown and logs "[client] Received LogicGraph message after shutdown of ECS System." at 0x14086b8f9.
+  - Receipt: decompile ev_d9bb5cab… (FUN_140f09880).
+- [VERIFIED] FUN_140f09880 decodes one `LogicGraphEditMessage` (reflection decode FUN_1411d9c50 into a 0x26b8-byte struct) and switches on the first byte (LogicGraphMessageType): 2 SendFullGraph, 3 SendGraphCommands → FUN_140f09290(net+0x70), 4 SendMultiNodeGraphCommands → FUN_140f09470(net+0xe8), 5 SendGraphList → FUN_140f090c0(net), 8 SendLogicEntityConnections.
+  - Receipt: decompile ev_d9bb5cab… (FUN_140f09880).
+- [VERIFIED] SendFullGraph is chunked: chunk index is a u8, chunk size 900 bytes, plus total size and an FNV-1a32 hash.
+  - Receipt: decompile ev_d9bb5cab… (FUN_140f09880).
+- [VERIFIED] A new (hash,size) pair resets the receive state.
+  - Receipt: decompile ev_d9bb5cab… (FUN_140f09880).
+- [VERIFIED] A chunk is copied only if `total size <= capacity (net+0x1130)` and `idx*900 + chunkLen <= capacity`.
+  - Receipt: decompile ev_d9bb5cab… (FUN_140f09880).
+- [VERIFIED] The graph is marked complete (net+0x1148 = 1) only when the FNV-1a32 of the whole buffer equals the hash.
+  - Receipt: decompile ev_d9bb5cab… (FUN_140f09880).
+- [VERIFIED] The code cannot complete a graph larger than the client buffer or larger than 256*900 = 230,400 bytes.
+  - Receipt: decompile ev_d9bb5cab… (FUN_140f09880).
+- [VERIFIED] The editor then receives no graph, with no log line on that code path.
+  - Receipt: decompile ev_d9bb5cab… (FUN_140f09880).
+- [VERIFIED] SendGraphList (FUN_140f090c0): header bytes at msg+0x2008 = list version (u8), +0x2009 = total graph count (u8), +0x200a = start index (u8), u32 entries-in-this-message at +0x2010, entries (0x28 bytes) from +0x2018.
+  - Receipt: decompile ev_2650a4ea… (FUN_140f090c0).
+- [VERIFIED] If the version differs from the client's (net+0x10f8): when `(int8)(msgVersion - localVersion) < 1` the message is IGNORED (treated as older); otherwise the client clears its received-bitmap, sets received = 0, adopts the version and resizes its list to the total count.
+  - Receipt: decompile ev_2650a4ea… (FUN_140f090c0).
+- [VERIFIED] Each entry is stored at index start+i once (bitmap net+0x10d8, received count net+0x10f0).
+  - Receipt: decompile ev_2650a4ea… (FUN_140f090c0).
+- [VERIFIED] The UI copy happens in FUN_140f06290: the list (net+0x110, count net+0x118) is copied to LogicGraphClient+0x1d8/+0x1e0 only when the version changed AND `count <= received`.
+  - Receipt: Decompile ev_e04789ef… (FUN_140f06290); decompile ev_2650a4ea… (FUN_140f090c0); supplied W35 spike B3.
+- [VERIFIED] Until every entry of the new version has arrived, the editor keeps showing the previous list (an empty list right after joining).
+  - Receipt: Decompile ev_e04789ef… (FUN_140f06290); decompile ev_2650a4ea… (FUN_140f090c0); supplied W35 spike B3.
+- [HYPOTHESIS] The list count and indices are u8, so the list can describe at most 255 graphs; more than 255 would wrap the count and the indices.
+  - Receipt: Supplied W35 spike B3, possible S2 consequences; static only; decompiles ev_d9bb5cab… and ev_2650a4ea….
+- [HYPOTHESIS] The u8 version uses a signed-difference test.
+  - Receipt: Supplied W35 spike B3, possible S2 consequences; static only; decompiles ev_d9bb5cab… and ev_2650a4ea….
+- [HYPOTHESIS] If the server's version counter is 128 or more steps "behind" the client's (for example a counter that restarts while the client keeps its old value), every new list is ignored until the counter catches up.
+  - Receipt: Supplied W35 spike B3, possible S2 consequences; static only; decompiles ev_d9bb5cab… and ev_2650a4ea….
+- [HYPOTHESIS] One lost or missing list entry (a hole in start+i coverage) blocks the whole new list; the editor shows the old or empty list, while the server keeps running the graphs (levers still work).
+  - Receipt: Supplied W35 spike B3, possible S2 consequences; static only; decompiles ev_d9bb5cab… and ev_2650a4ea….
+
+### Server graph-list protocol and client receive storage
+
+- [VERIFIED] Sender FUN_140f01720(result, stream, server, playerIndex): per-player slot = server + (playerIndex & 0x3f)*0x250 (64 slots; +0x8c last sent list version, +0x90 entries already sent).
+  - Receipt: decompile ev_5d650e00… (FUN_140f01720); size estimator FUN_140ef8fd0 (same file) returns 0 when the slot is up to date.
+- [VERIFIED] If the slot's version differs from the server list version (server+0x3d88), the sent count restarts at 0.
+  - Receipt: decompile ev_5d650e00… (FUN_140f01720); size estimator FUN_140ef8fd0 (same file) returns 0 when the slot is up to date.
+- [VERIFIED] The message is type 5 with: version = server+0x3d88 (u8), total = `(u8)server+0x2dc8` (the u64 graph count truncated to one byte), start = `(u8)slot+0x90`, then up to min(remaining, stream space / 0x110 bits, 0x20) entries of 0x28 bytes from server+0x2dc0.
+  - Receipt: decompile ev_5d650e00… (FUN_140f01720); size estimator FUN_140ef8fd0 (same file) returns 0 when the slot is up to date.
+- [VERIFIED] On success the slot's sent count += n and its version is updated.
+  - Receipt: decompile ev_5d650e00… (FUN_140f01720); size estimator FUN_140ef8fd0 (same file) returns 0 when the slot is up to date.
+- [VERIFIED] The server list (server+0x2dc0 ptr, +0x2dc8 count, +0x2dd0 initial capacity 0x64, +0x2dd8 grow fn) is rebuilt from all graph records (0x60 bytes each) in FUN_140f118e0 (block 0x140f11be0..0x140f11d2b) and the list version byte is incremented (`inc byte ptr [rbx+0x3d88]` at 0x140f11d2b; also FUN_140f0ebc0 at 0x140f0ebef).
+  - Receipt: `f_logic_errs.asm`; decompile ev_c54e96ea… (FUN_140f0ebc0); `disp_2dc8.txt` (writes of 0x64 to +0x2dd0 at 0x140ef6bed and 0x140efd4a5).
+- [VERIFIED] The server sends the same graph list to every player.
+  - Receipt: `f_logic_errs.asm`; decompile ev_c54e96ea… (FUN_140f0ebc0); `disp_2dc8.txt` (writes of 0x64 to +0x2dd0 at 0x140ef6bed and 0x140efd4a5).
+- [VERIFIED] FUN_140efb860 initializes the client list at +0x110/+0x118/+0x120 = capacity 0x64 (100), with its grow function at +0x128.
+  - Receipt: `f_lgclient_init.asm` (0x140efb987, 0x140efba40/0x140efbaa9, 0x140efbcae/0x140efbcb8).
+- [VERIFIED] It initializes the received bitmap at +0x10d8 with size +0x10e0 = 0x64 bits, and received count at +0x10f0.
+  - Receipt: `f_lgclient_init.asm` (0x140efb987, 0x140efba40/0x140efbaa9, 0x140efbcae/0x140efbcb8).
+- [VERIFIED] It initializes the full-graph buffer at +0x1128 with capacity +0x1130 = 0x3807c (229,500 = 255 × 900 bytes).
+  - Receipt: `f_lgclient_init.asm` (0x140efb987, 0x140efba40/0x140efbaa9, 0x140efbcae/0x140efbcb8).
+- [VERIFIED] FUN_140f090c0 sets bitmap bit start+i with no bound check (start u8 up to 255, i < 32).
+  - Receipt: FUN_140f090c0; allocation at 0x140efba5d / 0x140efba6d; mask at 0x140efbab4; supplied W35 spike B4.
+- [VERIFIED] The bitmap is a 16-byte allocation (0x140efba5d `mov edx,0x10`, followed by the allocator at 0x140efba6d).
+  - Receipt: FUN_140f090c0; allocation at 0x140efba5d / 0x140efba6d; mask at 0x140efbab4; supplied W35 spike B4.
+- [VERIFIED] The size field is 0x64 bits; bits 100..127 are masked at 0x140efbab4.
+  - Receipt: FUN_140f090c0; allocation at 0x140efba5d / 0x140efba6d; mask at 0x140efbab4; supplied W35 spike B4.
+- [HYPOTHESIS] With 129 or more graphs on the server, those writes may pass the 16-byte block and risk heap corruption.
+  - Receipt: Supplied W35 spike B4, inferred impact of the verified bitmap code; not tested at runtime.
+- [HYPOTHESIS] With 256 or more graphs, the u8 total and start wrap.
+  - Receipt: Supplied W35 spike B4, inferred impact of the verified bitmap code; not tested at runtime.
+- [HYPOTHESIS] The source reports no log on either path; no runtime occurrence was observed.
+  - Receipt: Supplied W35 spike B4, inferred impact of the verified bitmap code; not tested at runtime.
+
+### S1: screwdriver build-mode freeze, static map
+
+- [VERIFIED] HUD screens (`keen::HudScreenType`, member table 0x141b46f80): InGame 1, FlameAltar 12, AltarUpgrade 13, AltarDeactivate 15, AltarReskill 16, AltarItemPickup 17, LogicEditor 20, BlueprintMultiTool 29, BlueprintMultiToolMaterialCatalog 30, OvergrowthMultiTool 31, DecayMultiTool 32, ScrewdriverMultiToolBuildingMode 33, ScrewdriverMultiToolGraphManager 34, ScrewdriverMultiToolEntityConfig 35.
+  - Receipt: `enumof.py <exe> 0x141b474a8 enum`.
+- [VERIFIED] The current screen is the byte PUD+0x1cd8 (logic_graph_ui compares it with 0x14 LogicEditor and 1 InGame).
+  - Receipt: `enumof.py <exe> 0x141b474a8 enum`.
+- [VERIFIED] FUN_140d60260(GameUi, screen) switches screens.
+  - Receipt: `enumof.py <exe> 0x141b474a8 enum`.
+- [VERIFIED] The client input mask includes ecs.ClientPlayerFlags: IsInMultiToolBuildingMenu 0, IsInBlueprintMenu 1, IsInLogicScrewdriverMode 2 and IsInLootingMenu 3.
+  - Receipt: Supplied W35 spike B5, reflected ecs.ClientPlayerFlags, keen::ItemFlag, ColliderFlags and FbUiLocaGameplayActionLabels; B0 strings/reflection.
+- [VERIFIED] The tool item has keen::ItemFlag IsBuildingScrewdriverTool 6.
+  - Receipt: Supplied W35 spike B5, reflected ecs.ClientPlayerFlags, keen::ItemFlag, ColliderFlags and FbUiLocaGameplayActionLabels; B0 strings/reflection.
+- [VERIFIED] Logic entities use collider flag ColliderFlags 14 = InteractionLogicScrewdriver.
+  - Receipt: Supplied W35 spike B5, reflected ecs.ClientPlayerFlags, keen::ItemFlag, ColliderFlags and FbUiLocaGameplayActionLabels; B0 strings/reflection.
+- [VERIFIED] HUD hint labels include enterBuildingMode (+0x870) and enterLogicObjectPlacementMode (+0x880) in FbUiLocaGameplayActionLabels.
+  - Receipt: Supplied W35 spike B5, reflected ecs.ClientPlayerFlags, keen::ItemFlag, ColliderFlags and FbUiLocaGameplayActionLabels; B0 strings/reflection.
+- [VERIFIED] The menu is `doMultiToolMenu` FUN_140c2f760.
+  - Receipt: `f_multitool.asm` lines 163..217 and 452..516; jump table 0x140c31c40 (python decode above); decompile ev_a798998c… (FUN_140d26a60, FUN_140e7ecb0); `f_logic_registry.asm`.
+- [VERIFIED] doMultiToolMenu maps screens to tools: 29/30 → 1 (Blueprints), 31 → 2 (Overgrowth), 32 → 3 (Decay), 33/34/35 → 4 (Screwdriver), 37 → 5.
+  - Receipt: `f_multitool.asm` lines 163..217 and 452..516; jump table 0x140c31c40 (python decode above); decompile ev_a798998c… (FUN_140d26a60, FUN_140e7ecb0); `f_logic_registry.asm`.
+- [VERIFIED] Any other screen logs "[game_ui] MultiTool called with incompatible screen type " at 0x140c2fb46 and returns to InGame.
+  - Receipt: `f_multitool.asm` lines 163..217 and 452..516; jump table 0x140c31c40 (python decode above); decompile ev_a798998c… (FUN_140d26a60, FUN_140e7ecb0); `f_logic_registry.asm`.
+- [VERIFIED] doMultiToolMenu logs "[GameUi] Building Menu opened: %s" with Invalid/Npc/Screwdriver/Decay/Overgrowth/Blueprints at 0x140c30be8.
+  - Receipt: `f_multitool.asm` lines 163..217 and 452..516; jump table 0x140c31c40 (python decode above); decompile ev_a798998c… (FUN_140d26a60, FUN_140e7ecb0); `f_logic_registry.asm`.
+- [VERIFIED] For the screwdriver (branch 0x140c300b7) the tab list comes from `FUN_140e7ecb0(FUN_140d26a60())` = a blob array at `(*(PUD+0x4667b8))+0x20 → +0x28/+0x2c`; if that resource pointer is null the list is empty (ptr 4, count 0).
+  - Receipt: `f_multitool.asm` lines 163..217 and 452..516; jump table 0x140c31c40 (python decode above); decompile ev_a798998c… (FUN_140d26a60, FUN_140e7ecb0); `f_logic_registry.asm`.
+- [VERIFIED] The logic data registry (resource type hash 0xdddc9acd) is created in FUN_140efcc80, which logs "[logic] Failed to create Logiy System data registry" on failure.
+  - Receipt: `f_multitool.asm` lines 163..217 and 452..516; jump table 0x140c31c40 (python decode above); decompile ev_a798998c… (FUN_140d26a60, FUN_140e7ecb0); `f_logic_registry.asm`.
+- [VERIFIED] The inspected shipped game logs contain "[GameUi] toggleHudScreen to <ScreenName>" (for example "AltarDeactivate" and "BlueprintMultiTool").
+  - Receipt: `Select-String 'toggleHudScreen to'` on reference-build enshrouded.log (27,427 lines) and the Steam enshrouded.log (5,726 lines).
+- [VERIFIED] The inspected logs also contain "[GameUi] Building Menu opened: Blueprints/Npc".
+  - Receipt: `Select-String 'toggleHudScreen to'` on reference-build enshrouded.log (27,427 lines) and the Steam enshrouded.log (5,726 lines).
+- [HYPOTHESIS] S1 = the screen switches to 33 (input captured, view frozen) but the screwdriver menu has nothing to draw, or the screen byte is a value doMultiToolMenu rejects.
+  - Receipt: Supplied W35 spike B5, S1 inference; requires the logs and debug reads below.
+- [HYPOTHESIS] The S1 explanation is unproven and needs the log lines below.
+  - Receipt: Supplied W35 spike B5, S1 inference; requires the logs and debug reads below.
+
+### Client-mod detection and mitigation feasibility
+
+- [HYPOTHESIS] S1: detection is easy and safe (read PUD+0x1cd8, the tool type, the category count, and whether the logic data registry exists; or just read enshrouded.log).
+  - Receipt: Supplied W35 spike B6, untested S1 feasibility and mitigation proposal.
+- [HYPOTHESIS] A mitigation is plausible: if the screen is 33/34/35 and the menu produced no content for N frames, switch back to InGame with the game's own FUN_140d60260(GameUi, 1), the same call doMultiToolMenu uses on its error path.
+  - Receipt: Supplied W35 spike B6, untested S1 feasibility and mitigation proposal.
+- [HYPOTHESIS] An S1 fix needs the cause first.
+  - Receipt: Supplied W35 spike B6, untested S1 feasibility and mitigation proposal.
+- [HYPOTHESIS] The S1 rating is detect HIGH, mitigate MEDIUM and fix UNKNOWN.
+  - Receipt: Supplied W35 spike B6, untested S1 feasibility and mitigation proposal.
+- [HYPOTHESIS] S2: detection is easy on the client: compare the net-state list version (+0x10f8), total (+0x118) and received count (+0x10f0) with the UI list; a stuck list shows `received < total` or ignored versions; full-graph failures leave +0x1148 = 0 or log "[logic_ui] error while deserializeing Graph".
+  - Receipt: Supplied W35 spike B6, untested S2 feasibility and client/server limits.
+- [HYPOTHESIS] Client-side fixes are possible only for client-side causes: (a) a bound check on the bitmap index in FUN_140f090c0 (prevents heap writes; does not make >255 graphs work), (b) accepting any changed list version (risky: drops the ordering guard).
+  - Receipt: Supplied W35 spike B6, untested S2 feasibility and client/server limits.
+- [HYPOTHESIS] If the server never sends a complete list, or the save lost graphs ("Failed to Insert Graph from save", "Failed to serialize Graph"), the fix must be on the host or dedicated server.
+  - Receipt: Supplied W35 spike B6, untested S2 feasibility and client/server limits.
+- [HYPOTHESIS] The S2 rating is detect HIGH, client fix LOW-MEDIUM and root cause UNKNOWN.
+  - Receipt: Supplied W35 spike B6, untested S2 feasibility and client/server limits.
+
+### Evidence required before an S1 reproduction or fix
+
+- [HYPOTHESIS] Exact build (exe SHA-256), host or client role, controller or keyboard.
+  - Receipt: Supplied W35 spike B7, S1 evidence to record first; not a completed reproduction.
+- [HYPOTHESIS] The enshrouded.log lines from equip to LT/Tab: every "toggleHudScreen to …", any "Building Menu opened: …", any "[game_ui] MultiTool called with incompatible screen type", any "[logic] Failed to create Logiy System data registry".
+  - Receipt: Supplied W35 spike B7, S1 evidence to record first; not a completed reproduction.
+- [HYPOTHESIS] Whether the other multi-tools (blueprint, overgrowth, decay) open their menus in the same session.
+  - Receipt: Supplied W35 spike B7, S1 evidence to record first; not a completed reproduction.
+- [HYPOTHESIS] Debug read (no writes): PUD+0x1cd8, the screwdriver tab count from FUN_140e7ecb0(PUD+0x4667b8), and whether the HUD returns to InGame on Esc.
+  - Receipt: Supplied W35 spike B7, S1 evidence to record first; not a completed reproduction.
+
+### Evidence required before an S2 reproduction or fix
+
+- [HYPOTHESIS] Graph count on the host (all players) before and after the problem; host or client role.
+  - Receipt: Supplied W35 spike B7, S2 evidence to record first; not a completed reproduction.
+- [HYPOTHESIS] enshrouded.log on host and client: "[logic] To many nodes in Graph", "[logic_ui] error while deserializeing Graph", "[ logic_graph ] Failed to Insert Graph from save", "[logic] Failed to serialize Graph", "[Logic] Graph failed to load runtime State", "[client] Received LogicGraph message after shutdown of ECS System.".
+  - Receipt: Supplied W35 spike B7, S2 evidence to record first; not a completed reproduction.
+- [HYPOTHESIS] Client debug read of the list state (version +0x10f8, total +0x118, received +0x10f0, client list count LogicGraphClient+0x1e0) right after login and after one press of the create button.
+  - Receipt: Supplied W35 spike B7, S2 evidence to record first; not a completed reproduction.
+- [HYPOTHESIS] A save before and after: does the graph exist on the host (levers still work) while the client list is empty?
+  - Receipt: Supplied W35 spike B7, S2 evidence to record first; not a completed reproduction.
+- [HYPOTHESIS] Test single player versus a remote client.
+  - Receipt: Supplied W35 spike B7, S2 evidence to record first; not a completed reproduction.
+
+### Logic-graph open questions
+
+- [HYPOTHESIS] S1: which value does the screen byte hold when the freeze happens, and does the screwdriver tab list come back empty? Needs the log lines and the debug reads in B7.
+  - Receipt: Supplied W35 spike, Open questions; unresolved at the spike.
+- [HYPOTHESIS] S2: does the world have more than 128 (or 255) graphs when the list breaks?
+  - Receipt: Supplied W35 spike, Open questions; unresolved at the spike.
+- [HYPOTHESIS] Is the client list stuck (received < total) or ignored (version test)?
+  - Receipt: Supplied W35 spike, Open questions; unresolved at the spike.
+- [HYPOTHESIS] Who sends CreateGraph from the client, and does the UI resend while the list is stale (would explain "18 blank graphs per press")?
+  - Receipt: Supplied W35 spike, Open questions; unresolved at the spike.
+- [HYPOTHESIS] The UI create path was not traced; FUN_140d5ae60 queues UI command 0x72 with a graph id (open graph), not create.
+  - Receipt: Supplied W35 spike, Open questions; unresolved at the spike.
+- [HYPOTHESIS] The FUN_140f0b880 "Failed to serialize Graph" path continues with the next graph; whether the stream is still valid after one failure was not checked.
+  - Receipt: Supplied W35 spike, Open questions; unresolved at the spike.
