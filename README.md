@@ -146,6 +146,10 @@ For more detail, set `LogLevel=debug` and restart. Setting `Enabled=0` keeps set
 
 If there is no mod log, check both locations and their write permissions, then check that the x64 loader and `.asi` are in the intended folders. A missing log alone does not prove whether the loader ran. Keep the log when reporting a problem, along with the game build and relevant settings.
 
+## Using with Extended Graphics and Physics Tweaker
+
+Headroom leaves Tweaker's fog, GI, resource and shader settings under Tweaker's control. A startup notice detects only its two installation files, not active patches. Combined runtime and performance checks remain pending; see [Tweaker compatibility](docs/tweaker-compatibility.md) for ownership, workload limits and the test matrix.
+
 ## Uninstall
 
 Close the game. Remove `plugins\enshrouded-headroom.asi`, its `enshrouded-headroom.ini` and its `enshrouded-headroom.log`. Remove the same INI and log from `%LOCALAPPDATA%\enshrouded-headroom\` if they were created there and are no longer needed. Keep a copy of the INI if you want to reuse your settings.
