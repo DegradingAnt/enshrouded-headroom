@@ -990,9 +990,8 @@ impl Governor {
             .max(target);
         let cost_limit = reference + TRIAL_NOISE_MS.max(reference * TRIAL_NOISE_SHARE);
         let costly = p95.is_some_and(|ms| ms > cost_limit + EPS);
-        let below_floor = p95.is_some_and(|ms| ms > floor + EPS);
-        let trial_at_floor = self.band_trial.is_some() && p95.is_some_and(|ms| ms + EPS >= floor);
-        let overload = long_overload || (full_window && (below_floor || trial_at_floor || costly));
+        let at_or_below_floor = p95.is_some_and(|ms| ms + EPS >= floor);
+        let overload = long_overload || (full_window && (at_or_below_floor || costly));
         let stable =
             full_window && long_count == 0 && !costly && p95.is_some_and(|ms| ms < floor - EPS);
         self.headroom_since = stable.then(|| self.headroom_since.unwrap_or(now));
@@ -3254,6 +3253,34 @@ mod band_tests {
             ]
         );
         assert_eq!(governor.steps(), [0; 3]);
+    }
+
+    /// Accepted quality reaching the stop boundary backs off even inside the frame-noise allowance.
+    #[test]
+    fn an_accepted_boost_at_exactly_the_floor_is_undone_and_blocks_new_trials() {
+        let mut governor = band_governor(&[1]);
+        let mut now = 0.0;
+        assert_eq!(
+            drive(&mut governor, &mut now, 12.0, |_| 1000.0 / 67.0),
+            [Action::Set { knob: 0, step: 1 }]
+        );
+        assert!(
+            governor.band_trial.is_none(),
+            "the boost must already be accepted"
+        );
+        // 67 -> 65 FPS costs less than 0.5 ms, so only the floor boundary can trigger this undo.
+        assert!(1000.0 / 65.0 < 1000.0 / 67.0 + TRIAL_NOISE_MS);
+        assert_eq!(
+            drive(&mut governor, &mut now, 8.0, |_| 1000.0 / 65.0),
+            [Action::Set { knob: 0, step: 0 }]
+        );
+        assert_eq!(governor.steps(), [0]);
+        assert!(drive(&mut governor, &mut now, 10.0, |_| 1000.0 / 67.0).is_empty());
+        assert_eq!(
+            governor.steps(),
+            [0],
+            "floor backoff must preserve probation"
+        );
     }
 
     /// Reaching the stop boundary cannot leave a trial permanently pending without enough FPS to accept.
