@@ -1,0 +1,17 @@
+{
+  "id": "example:centimetre-cabin",
+  "version": "1",
+  "unit": "centimetres",
+  "structures": [
+    {
+      "id": "cabin",
+      "name": "A cabin authored in centimetres",
+      "east": 100,
+      "north": 200,
+      "width": 600,
+      "depth": 400,
+      "floor": 0,
+      "wall_top": 300
+    }
+  ]
+}

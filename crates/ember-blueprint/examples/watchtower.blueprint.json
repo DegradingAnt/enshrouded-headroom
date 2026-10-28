@@ -1,0 +1,156 @@
+{
+  "schema_version": "1.0",
+  "title": "Generic watchtower example",
+  "source": {
+    "id": "example:watchtower",
+    "adapter": "direct-v1",
+    "content_version": "example-1",
+    "revision": {
+      "sequence": 1,
+      "content_sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    }
+  },
+  "frame": {
+    "units": "metres",
+    "axes": "right_handed_x_east_y_up_z_south",
+    "source_mapping": "Authored directly in canonical axes. Origin is the local altar support. No engine mapping is implied."
+  },
+  "stages": [
+    {
+      "id": "shell",
+      "name": "Build the shell",
+      "order": 1
+    },
+    {
+      "id": "floor",
+      "name": "Lay the upper floor",
+      "order": 2
+    }
+  ],
+  "layers": [
+    {
+      "id": "ground",
+      "name": "Ground",
+      "elevation": 0
+    },
+    {
+      "id": "upper",
+      "name": "Upper floor",
+      "elevation": 4
+    }
+  ],
+  "anchors": [
+    {
+      "id": "altar",
+      "name": "Local altar support",
+      "point": [
+        0,
+        0,
+        0
+      ]
+    }
+  ],
+  "objects": [
+    {
+      "id": "watchtower",
+      "name": "Watchtower shell",
+      "source_ref": "example/watchtower/shell",
+      "stages": [
+        "shell"
+      ],
+      "omissions": [
+        "Envelope only. Doors, windows and individual blocks are not specified."
+      ],
+      "primitives": [
+        {
+          "id": "watchtower/envelope",
+          "layer": "ground",
+          "fidelity": "recorded_envelope",
+          "note": "Recorded outer bounds.",
+          "geometry": {
+            "kind": "box",
+            "min": [
+              2,
+              0,
+              -8
+            ],
+            "size": [
+              6,
+              8,
+              6
+            ]
+          }
+        },
+        {
+          "id": "watchtower/roof-profile",
+          "layer": "upper",
+          "fidelity": "reference_outline",
+          "note": "A cross section only.",
+          "geometry": {
+            "kind": "polyline",
+            "points": [
+              [
+                2,
+                8,
+                -8
+              ],
+              [
+                5,
+                11,
+                -8
+              ],
+              [
+                8,
+                8,
+                -8
+              ]
+            ],
+            "closed": false
+          }
+        }
+      ]
+    },
+    {
+      "id": "watchtower-floor",
+      "name": "Upper floor with a stair opening",
+      "source_ref": "example/watchtower/floor",
+      "stages": [
+        "floor"
+      ],
+      "omissions": [],
+      "primitives": [
+        {
+          "id": "watchtower-floor/slab",
+          "layer": "upper",
+          "fidelity": "exact_layer",
+          "note": "One explicit slab. A block palette is separate.",
+          "geometry": {
+            "kind": "slab",
+            "min": [
+              2,
+              3.5,
+              -8
+            ],
+            "size": [
+              6,
+              0.5,
+              6
+            ],
+            "openings": [
+              {
+                "min": [
+                  2,
+                  -5
+                ],
+                "size": [
+                  2,
+                  2
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}
