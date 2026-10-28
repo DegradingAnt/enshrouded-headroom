@@ -813,6 +813,12 @@ fn first_time(flag: &AtomicBool) -> bool {
     !flag.swap(true, Ordering::Relaxed)
 }
 
+/// Contain diagnostic formatting/logger failures without changing native decisions or feature flags.
+/// Call only after securing any mandatory native work, or where the caller retains its fallback.
+pub(crate) fn log_diagnostic(body: impl FnOnce()) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+}
+
 /// The warning for a device-level function handed back unwrapped. Without it, a probe device
 /// created first would leave the frame timer dead with no clue in the log.
 fn unwrapped_line(name: &str, device: usize, game: usize) -> String {
@@ -940,7 +946,23 @@ unsafe fn gdpa_choose(
         _ => device_function(slot, found_addr, wrapper, device, game),
     };
     if out != wrapper && first_time(logged) {
-        log::warn!("{}", unwrapped_line(what, device, observed_game));
+        if matches!(
+            classify_gdpa(name),
+            Some(Wrap::DestroyDevice | Wrap::DestroySwapchain)
+        ) {
+            // Diagnostic-time observations are not additional permission to substitute endpoints.
+            // Keep this after the unchanged dispatch decision and inside wrap_gdpa's panic guard.
+            let held = slot.load(Ordering::Acquire);
+            let reflex = crate::reflex::has_device_lifetime(device);
+            let antilag = crate::antilag::has_device_lifetime(device);
+            let query = DEVICE_QUERIES.protects(device);
+            log_diagnostic(|| {
+                log::warn!("{}; held={held:#x} found={found_addr:#x} same_device={} reflex_lifetime_observed={reflex} antilag_lifetime_observed={antilag} query_lifetime_observed={query} decision=preserve-native-endpoint",
+                unwrapped_line(what, device, observed_game), device == observed_game)
+            });
+        } else {
+            log::warn!("{}", unwrapped_line(what, device, observed_game));
+        }
     }
     to_void(out)
 }
