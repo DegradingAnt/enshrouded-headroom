@@ -186,3 +186,11 @@ Ultimate ASI Loader by ThirteenAG.
 ## About AI assistance
 
 TODO: the author writes this section.
+
+### Workspace and process targets
+
+`enshrouded-headroom` targets the Enshrouded **client only**. A positively identified dedicated server writes one skip line and installs no rendering features or hooks. Identification uses a case-insensitive executable filename and the shared known-build table. The server hash in that table is maintainer-supplied evidence. Unknown executable names remain `Unknown`; development hosts retain the existing build and byte-check guards.
+
+`crates/emberkit` holds reusable native infrastructure as an MIT-licensed Rust library. New mods are separate crates depending on it; each declares its process targets. It has no ASI entry export. The root remains the default workspace member, so `cargo asi` keeps the existing artifact name and exports. Use `--workspace` for lint, docs and tests (`cargo fmt --all --check` for formatting). `cargo deny` traverses both workspace members from the workspace root.
+
+`enshrouded_headroom::config::schema()` returns all 35 read settings without file I/O. Entries describe types, accepted ranges or words, default spellings, and restart requirements. All settings currently require a restart. The four developer settings under `Debug` are deliberately absent from the 31-key default INI. The three force-step defaults are absent values, not a literal `none` spelling. No settings UI is included.

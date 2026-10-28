@@ -21,6 +21,7 @@ The plugin runs inside the game process. A panic or a bad memory write crashes t
 | `docs/plan.md` | The task-by-task plan (Tasks 1-18). |
 | `docs/re-notes.md` | Reverse-engineering evidence: every game address, signature and struct offset, with its source. |
 | `docs/codex-worksheet.md` | Tasks for you, with acceptance criteria. |
+| `crates/emberkit/` | Reusable native guard, logging, scan, patch, IAT, build identity, INI primitives/schema, process targeting and MinHook queue. |
 | `src/entry.rs` | Start-up order (`InitializeASI` → `entry::start`). |
 | `src/config.rs` | The `.ini` parser and defaults (`DEFAULT_INI` must match `enshrouded-headroom.default.ini`). |
 | `src/guard.rs` | The panic guard. Every extern function body runs inside `guard(...)`. |
@@ -33,6 +34,8 @@ The plugin runs inside the game process. A panic or a bad memory write crashes t
 | `src/build_id.rs` | The known game builds (exe SHA-256). An unknown build turns code patches off. |
 | `tests/` | Integration tests: `startup_logging.rs`, and `vk_chain.rs` (a fake `vulkan-1.dll` driven through the real import slot). |
 | `examples/asi_host.rs` | A small host that loads the built `.asi` (used for smoke tests). |
+
+New mods are new crates under `crates/` and depend on `emberkit`.
 
 ## How to build and test
 

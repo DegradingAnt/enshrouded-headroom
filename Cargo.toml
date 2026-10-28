@@ -1,3 +1,8 @@
+[workspace]
+members = [".", "crates/emberkit"]
+default-members = ["."]
+resolver = "2"
+
 [package]
 name = "enshrouded-headroom"
 version = "0.1.0"
@@ -12,6 +17,7 @@ name = "enshrouded_headroom"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+emberkit = { path = "crates/emberkit" }
 windows-sys = { version = "=0.61.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
@@ -46,6 +52,7 @@ opt-level = 3
 debug = "line-tables-only"
 
 [dev-dependencies]
+emberkit = { path = "crates/emberkit", features = ["test-support"] }
 iced-x86 = { version = "=1.21.0", default-features = false, features = ["std", "decoder", "intel"] }
 object = { version = "=0.40.0", default-features = false, features = ["read_core", "pe"] }
 proptest = { version = "=1.12.0", default-features = false, features = ["handle-panics", "std"] }

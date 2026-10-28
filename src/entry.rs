@@ -199,6 +199,9 @@ fn build_level(build: &Result<Build, String>) -> log::Level {
 /// Set once the first call to [`start`] has begun.
 static STARTED: AtomicBool = AtomicBool::new(false);
 
+/// Rendering features run only in the client; unknown development hosts retain build guards.
+pub const TARGETS: &[emberkit::Process] = &[emberkit::Process::Client];
+
 /// Run the start-up steps in order. Called once, from `InitializeASI`, which catches any panic.
 ///
 /// A panic part-way leaves the later steps undone and [`code_patches_allowed`] unset, so `false`.
@@ -222,100 +225,114 @@ pub fn start() {
         .unwrap_or(Path::new(""));
     crate::log::init(log_dir, cfg.general.log_level.into());
 
-    // 4. From here on a panic goes to the log, not to a stderr that nobody reads.
-    guard::install_panic_hook();
-
-    // 5. What has been learned so far.
-    log::info!("enshrouded-headroom {} loaded", env!("CARGO_PKG_VERSION"));
-    log::info!("{}", settings_line(settings_file.as_deref()));
-    for warning in &warnings {
-        if crate::governor_thread::warning_visible(cfg.general.log_level, warning) {
-            log::warn!("{warning}");
-        }
-    }
-
-    // 6. Which build is this, and 7. may code be patched in it. (`Enabled = 0` stops here, before
-    // the exe is read.) Nothing reads the answer between `judge` and `record`.
-    let verdict = judge(&cfg, || identify(crate::exe_path().as_deref()));
-    record(&verdict, &CODE_PATCHES);
-    let Verdict::Checked { build, allowed } = &verdict else {
-        log::warn!("Enabled = 0 in {INI_FILE_NAME}: the mod does nothing");
-        return;
+    let exe_path = crate::exe_path();
+    let verdict = judge(&cfg, || identify(exe_path.as_deref()));
+    let build = match &verdict {
+        Verdict::Checked { build, .. } => build.as_ref().ok(),
+        Verdict::Disabled => None,
     };
-    log::log!(build_level(build), "{}", build_line(build, *allowed));
-    if let Some(advice) = unknown_build_advice(build, *allowed) {
-        log::warn!("{advice}");
-    }
+    let process = emberkit::process::classify(exe_path.as_deref(), build);
+    emberkit::process::start_for_target(
+        process,
+        TARGETS,
+        "enshrouded-headroom",
+        |line| log::warn!("{line}"),
+        || {
+            // 4. From here on a panic goes to the log, not to a stderr that nobody reads.
+            guard::install_panic_hook();
 
-    // Later tasks add their start-up steps below this line, in the order the plan gives.
+            // 5. What has been learned so far.
+            log::info!("enshrouded-headroom {} loaded", env!("CARGO_PKG_VERSION"));
+            log::info!("{}", settings_line(settings_file.as_deref()));
+            for warning in &warnings {
+                if crate::governor_thread::warning_visible(cfg.general.log_level, warning) {
+                    log::warn!("{warning}");
+                }
+            }
 
-    // 8. The texture budget. It patches data (a table in `.rdata`), not code, so it does not wait
-    // for `code_patches_allowed`: on any build it needs the whole 80-byte table to match. It logs
-    // its own line, including why it is off.
-    features::texture_budget::init(&cfg.general.texture_budget);
+            // 6. Which build is this, and 7. may code be patched in it. (`Enabled = 0` stops here, before
+            // the exe is read.) Nothing reads the answer between `judge` and `record`.
+            record(&verdict, &CODE_PATCHES);
+            let Verdict::Checked { build, allowed } = &verdict else {
+                log::warn!("Enabled = 0 in {INI_FILE_NAME}: the mod does nothing");
+                return;
+            };
+            log::log!(build_level(build), "{}", build_line(build, *allowed));
+            if let Some(advice) = unknown_build_advice(build, *allowed) {
+                log::warn!("{advice}");
+            }
 
-    // 9. Async compute. It patches code, so it asks `code_patches_allowed` (set above) before it
-    // touches the game, and it logs its own line, including why it is off.
-    features::async_compute::init(&cfg.general.async_compute);
+            // Later tasks add their start-up steps below this line, in the order the plan gives.
 
-    // HDR paper white is a start-up code patch. Its step checks the effective build gate
-    // before scanning or writing and publishes its effective value only after success.
-    features::hdr::init(&cfg.hdr.paper_white_nits);
-    // Peak correction reads the published effective paper white and runs on the scene hook.
-    features::hdr_peak::init(&cfg.hdr, &cfg.knobs);
+            // 8. The texture budget. It patches data (a table in `.rdata`), not code, so it does not wait
+            // for `code_patches_allowed`: on any build it needs the whole 80-byte table to match. It logs
+            // its own line, including why it is off.
+            features::texture_budget::init(&cfg.general.texture_budget);
 
-    // 10. Publish both parsed latency modes before Vulkan wrappers can create a device or swapchain.
-    crate::reflex::init(cfg.general.reflex);
-    crate::antilag::init(cfg.general.anti_lag);
+            // 9. Async compute. It patches code, so it asks `code_patches_allowed` (set above) before it
+            // touches the game, and it logs its own line, including why it is off.
+            features::async_compute::init(&cfg.general.async_compute);
 
-    // 11. The Vulkan wrapper chain (present timer, device hook). It swaps the exe's
-    // `GetProcAddress` import slot, not code, so it does not wait for `code_patches_allowed` and
-    // runs on unknown builds too. It runs after step 8, whose table the first device's hook writes,
-    // and logs `vk wrapper installed`, or why it is off.
-    // The first device's hook also applies `Priority` (features::priority).
-    crate::vk::init(
-        crate::vk::TextureSettings {
-            mode: cfg.general.texture_budget,
-            reserve_gib: cfg.general.texture_reserve_gib,
+            // HDR paper white is a start-up code patch. Its step checks the effective build gate
+            // before scanning or writing and publishes its effective value only after success.
+            features::hdr::init(&cfg.hdr.paper_white_nits);
+            // Peak correction reads the published effective paper white and runs on the scene hook.
+            features::hdr_peak::init(&cfg.hdr, &cfg.knobs);
+
+            // 10. Publish both parsed latency modes before Vulkan wrappers can create a device or swapchain.
+            crate::reflex::init(cfg.general.reflex);
+            crate::antilag::init(cfg.general.anti_lag);
+
+            // 11. The Vulkan wrapper chain (present timer, device hook). It swaps the exe's
+            // `GetProcAddress` import slot, not code, so it does not wait for `code_patches_allowed` and
+            // runs on unknown builds too. It runs after step 8, whose table the first device's hook writes,
+            // and logs `vk wrapper installed`, or why it is off.
+            // The first device's hook also applies `Priority` (features::priority).
+            crate::vk::init(
+                crate::vk::TextureSettings {
+                    mode: cfg.general.texture_budget,
+                    reserve_gib: cfg.general.texture_reserve_gib,
+                },
+                cfg.general.priority,
+            );
+
+            // 12. The scene-settings hook: object draw distance, the detail-scattering level and the
+            // governor's world-rendering signal. It hooks code, so it asks `code_patches_allowed`; it is
+            // installed when any distance knob is on, and logs its own line, including why it is off. It
+            // is only created and queued here: the last step enables it.
+            knobs::object_distance::init(&cfg.knobs);
+
+            // 13. The grass distance redirect: both High-level grass distance loads are pointed at a float
+            // in the mod's own page, which holds the game's 90 m. It patches code (two disp32s, no hook),
+            // so it asks `code_patches_allowed`; it runs only with `EnableScatterDistance = 1` and logs its
+            // own line, including why it is off. It must run before the game builds a scene, which holds
+            // here: `InitializeASI` runs before `WinMain`.
+            knobs::scatter_distance::init(&cfg.knobs);
+
+            // 14. The scatter counter probe: the grass-pass pre-hook only publishes its pass pointer
+            // and a call counter. A detached sampler copies seven blocks with ReadProcessMemory every
+            // 500 ms while calls continue. Nine transient misses are tolerated; the tenth or a copied
+            // self-check mismatch latches failure (design.md 7.2a). No sampling runs on the game thread.
+            // It asks code_patches_allowed and stays off by default: Debug ScatterProbe with debug
+            // logging, or an enabled scatter knob whose ceiling permits a raise. After installation it
+            // starts the sampler and logs its outcome. The final batch below enables the queued hook.
+            features::scatter_probe::init(&cfg);
+
+            // 15. The terrain detail distance: a checked pre-hook on the terrain update function. It is
+            // only created and queued here: the last step enables it.
+            knobs::terrain_distance::init(&cfg.knobs);
+
+            // Later code hooks are created and queued above this line, so they join the one batch below.
+
+            // 16. Enable every queued hook at once (MinHook's queued enable). This is the only place that
+            // enables hooks. It logs one line if any hook was queued.
+            knobs::enable_queued_hooks();
+
+            // 16. Verified startup scales precede the governor, whose loop observes only atomics.
+            features::startup_scales::init(&cfg.knobs);
+            crate::governor_thread::spawn(cfg);
         },
-        cfg.general.priority,
     );
-
-    // 12. The scene-settings hook: object draw distance, the detail-scattering level and the
-    // governor's world-rendering signal. It hooks code, so it asks `code_patches_allowed`; it is
-    // installed when any distance knob is on, and logs its own line, including why it is off. It
-    // is only created and queued here: the last step enables it.
-    knobs::object_distance::init(&cfg.knobs);
-
-    // 13. The grass distance redirect: both High-level grass distance loads are pointed at a float
-    // in the mod's own page, which holds the game's 90 m. It patches code (two disp32s, no hook),
-    // so it asks `code_patches_allowed`; it runs only with `EnableScatterDistance = 1` and logs its
-    // own line, including why it is off. It must run before the game builds a scene, which holds
-    // here: `InitializeASI` runs before `WinMain`.
-    knobs::scatter_distance::init(&cfg.knobs);
-
-    // 14. The scatter counter probe: the grass-pass pre-hook only publishes its pass pointer
-    // and a call counter. A detached sampler copies seven blocks with ReadProcessMemory every
-    // 500 ms while calls continue. Nine transient misses are tolerated; the tenth or a copied
-    // self-check mismatch latches failure (design.md 7.2a). No sampling runs on the game thread.
-    // It asks code_patches_allowed and stays off by default: Debug ScatterProbe with debug
-    // logging, or an enabled scatter knob whose ceiling permits a raise. After installation it
-    // starts the sampler and logs its outcome. The final batch below enables the queued hook.
-    features::scatter_probe::init(&cfg);
-
-    // 15. The terrain detail distance: a checked pre-hook on the terrain update function. It is
-    // only created and queued here: the last step enables it.
-    knobs::terrain_distance::init(&cfg.knobs);
-
-    // Later code hooks are created and queued above this line, so they join the one batch below.
-
-    // 16. Enable every queued hook at once (MinHook's queued enable). This is the only place that
-    // enables hooks. It logs one line if any hook was queued.
-    knobs::enable_queued_hooks();
-
-    // 16. Verified startup scales precede the governor, whose loop observes only atomics.
-    features::startup_scales::init(&cfg.knobs);
-    crate::governor_thread::spawn(cfg);
 }
 
 #[cfg(test)]
