@@ -2,7 +2,7 @@
 
 A Windows x64 ASI plugin for Enshrouded's Vulkan renderer, loaded by Ultimate ASI Loader v10.0.0.
 
-**0.1.0 release preparation, not a ready-to-release build.** The governor, NVIDIA Reflex and AMD Anti-Lag runtime integrations are pending. The author still needs to complete the in-game checks; there are no claimed performance or stability results. See the [release checklist and Nexus draft](docs/release-checklist.md).
+**0.1.0 release preparation.** The governor, NVIDIA Reflex and AMD Anti-Lag runtime paths are implemented. In-game verification and final-package validation remain release gates; no performance or stability result is claimed. See the [release checklist and Nexus draft](docs/release-checklist.md).
 
 ## What the mod does
 
@@ -10,37 +10,39 @@ A Windows x64 ASI plugin for Enshrouded's Vulkan renderer, loaded by Ultimate AS
 
 **Async compute** defaults to `on`. It uses the game's checked override path on an allowed build. `game`, or any launch argument containing `async-compute`, leaves the game in charge. The argument check ignores ASCII case and quotes and excludes the executable path.
 
-**Object distance** defaults to enabled, with maximum step 4. The scene hook captures the player's baseline and supports object-distance factors, but the current startup leaves the step at zero: automatic changes await the governor.
+**Object distance** defaults to enabled, with maximum step 4. The scene hook captures the player's menu baseline. The governor starts at step zero and can raise the step when frame-time, world-signal and memory conditions permit; it never requests a step below the baseline. The visible distance direction still needs in-game confirmation.
 
 **Grass and detail-scatter distance** defaults to enabled, with configured maximum step 4. The checked redirect is implemented, but the effective ceiling remains the game's 90 m while capacity headroom is unproven. A configured maximum does not bypass that ceiling.
 
-**Terrain detail distance** defaults to enabled, with maximum step 4. The checked terrain hook is implemented and starts at the menu baseline; automatic raises await the governor. The separate decoration, distant-object and terrain-ring startup scale settings default to `1.0` and are parsed but not applied on this base.
+**Terrain detail distance** defaults to enabled, with maximum step 4. Its checked hook starts at the menu baseline and applies governor-controlled steps when conditions permit. The visible result still needs in-game confirmation.
 
-**FPS-target governor** defaults to a planned target of 75 fps. Its decision logic is implemented; its runtime thread is not integrated here. It is intended to spend spare frame time on objects, grass, then terrain, undoing raises when frames are late without going below the player's menu settings. `TargetFps=0` will disable that controller.
+**Startup scales** for High decoration distance, distant objects and terrain rings default to `1.0`, leaving the original immediates unchanged. Non-unit values apply at startup through build, signature and original-value checks. The log reports applied, skipped or incomplete writes. These settings require a restart.
 
-**NVIDIA Reflex** defaults to `auto`. The pure mode/device-planning layer exists, but this base has no active runtime Reflex calls. Pending integration must support `game`, `auto`, `off`, `on` and `boost`; `game` follows saved off/on/boost values and uses auto while unknown. Do not expect a latency change from this preparation build.
+**FPS-target governor** defaults to a 75 fps target, limited by display refresh. Its background loop runs every 50 ms and spends available headroom on object, grass and terrain steps in that order. It undoes raises when frames are late and holds current steps when the world signal is absent. Live VRAM is queried every two seconds; unknown or insufficient memory blocks costly raises. The grass capacity ceiling still applies. `TargetFps=0` stops the governor thread.
 
-**AMD Anti-Lag** defaults to `auto`. The experimental pure layer exists; its runtime integration is pending and it is **not verified on AMD hardware**. Its planned automatic mode requires AMD plus the extension and feature; active Reflex takes precedence.
+**NVIDIA Reflex** defaults to `auto` and requires NVIDIA plus the driver-listed extension and required capabilities. `auto` and `on` enable without boost; `boost` requests boost; `off` disables it. `game` follows saved off/on/boost values and uses auto while unknown. Runtime pacing uses present markers, driver sleep and a 10 ms semaphore-wait timeout; failures disable pacing. It has no submit hook. Available timings are logged every five seconds with debug output and a running governor; latency improvement remains unverified in game.
 
-**HDR paper white** defaults to `game`, retaining 250 nits. A finite 40–400 nit override is a checked startup code patch. **HDR peak correction** defaults to `FixPeak=off`, with `DisplayPeakNits=game`. Opting in uses the shared scene hook and verified effective paper white; at least one distance knob must enable that hook. A failed paper-white read-back leaves peak correction off. SDR is unchanged. Both visible results await the author's HDR comparison.
+**AMD Anti-Lag** defaults to `auto`. Its runtime is implemented but **experimental, not verified on AMD hardware**. Both `auto` and `on` require AMD, a driver-listed `VK_AMD_anti_lag` extension and the reported feature. Active Reflex takes precedence. It paces only associated native queues and swapchains; the approximate INPUT timing and stop conditions are described below.
+
+**HDR paper white** defaults to `game`, retaining 250 nits. A finite 40–400 nit override is a checked startup code patch. **HDR peak correction** defaults to `FixPeak=off`, with `DisplayPeakNits=game`. Opting in uses the shared scene hook and verified effective paper white; at least one distance knob must enable that hook. A failed paper-white read-back leaves peak correction off. HDR and SDR comparisons remain release gates.
 
 **Process priority** defaults to `above_normal`, requested once after the first Vulkan device is created. `normal` leaves the current priority unchanged; a failed Windows request is logged.
 
 Shadows above Ultra are not included in this base, and there is no shipped shadow setting.
 
-## Build under test and pending integration
+## Build under test and release gates
 
-The Steam verification target is **`f68140a3-steam`**. Executable SHA-256 recognition is implemented for that build and `f68140a3`; see [the build table](src/build_id.rs). Recognition is not proof of a successful game boot or feature validation.
+The Steam verification target is **`f68140a3-steam`**. Executable SHA-256 recognition is implemented for that build and `f68140a3`; see [the shared build table](crates/emberkit/src/build_id.rs). Recognition is not proof of a successful game boot or feature validation.
 
 After an unrecognised game update, code patches and hooks stay off until the build is known. Checked texture data and Vulkan API wrappers still run. `AllowUnknownBuild=1` permits attempts at your own risk; signatures and original-byte checks still apply.
 
-Before release, update these preparation notes against the integrated source and rerun validation:
+The runtime features and startup scales are implemented. Release still requires:
 
-- W23 / [#27](https://github.com/DegradingAnt/enshrouded-headroom/issues/27): Reflex runtime, lifecycle limitations and actual enable/disable log messages.
-- W24 / [#30](https://github.com/DegradingAnt/enshrouded-headroom/issues/30): governor thread, VRAM query, reports and actual knob control.
-- W25 / [#31](https://github.com/DegradingAnt/enshrouded-headroom/issues/31): Anti-Lag runtime, precedence and explicit AMD verification status.
-- Resolve the currently unapplied startup scales, the unmeasured grass ceiling and any still-pending validation work before describing finished v1 behavior.
-- Regenerate the settings table if defaults grow, confirm startup/version agreement, repackage, and record the author's game results.
+- Final workspace checks, settings-table/version checks and package validation from the exact intended source.
+- The author's Steam boot, distance-direction, Reflex, vsync/VRR, HDR and 30-minute soak checks, with recorded results.
+- Capacity evidence before any grass ceiling above 90 m, and AMD hardware testing or retention of the explicit unverified limitation.
+
+The perf mod targets the client only. A positively identified dedicated server logs a skip and installs no rendering features or hooks; see [workspace and process targets](#workspace-and-process-targets).
 
 ## Install
 
@@ -88,7 +90,7 @@ Save the .ini as UTF-8. The plugin tries the first readable `enshrouded-headroom
 
 Missing or invalid keys use defaults. Numeric out-of-range values are clamped, except `PaperWhiteNits` and `DisplayPeakNits`, which use `game`. If `LowerAbove` is not greater than `RaiseBelow`, both reset to defaults. Names and choices are case-insensitive; boolean keys accept `0`, `1`, `false` and `true`. Numeric decimal commas are accepted. Unknown keys warn. Lines beginning with `;` or `#` are comments. GiB and MiB are binary units.
 
-The table is generated from the crate's `DEFAULT_INI`, with reviewed ranges and descriptions. Run `cargo run --example generate_readme_settings` after changing defaults; `cargo run --example generate_readme_settings -- --check` verifies it without editing. Governor descriptions remain planned until runtime integration lands.
+The table is generated from the crate's `DEFAULT_INI`, with reviewed ranges and descriptions. Run `cargo run --example generate_readme_settings` after changing defaults; `cargo run --example generate_readme_settings -- --check` verifies it without editing. The table contains the 31 shipped default keys; the schema also describes four omitted Debug keys.
 
 <!-- BEGIN GENERATED SETTINGS -->
 | Section | Key | Default | Range or choices | Meaning |
@@ -98,29 +100,29 @@ The table is generated from the crate's `DEFAULT_INI`, with reviewed ranges and 
 | `General` | `TextureReserveGiB` | `11` | 4–16 GiB | Subtract this amount from the largest device-local heap in auto mode. |
 | `General` | `AsyncCompute` | `on` | on, game | Attempt the checked async-compute patch unless a launch argument mentions async-compute. |
 | `General` | `Priority` | `above_normal` | above_normal, normal | Request Above Normal priority once after device creation, or leave priority unchanged. |
-| `General` | `Reflex` | `auto` | game, auto, off, on, boost | Select the NVIDIA Reflex mode; runtime integration is pending. |
-| `General` | `AntiLag` | `auto` | auto, off, on | Select the experimental Anti-Lag mode; runtime integration and AMD verification are pending. |
+| `General` | `Reflex` | `auto` | game, auto, off, on, boost | Select a supported NVIDIA Reflex mode; game follows saved off/on/boost values. |
+| `General` | `AntiLag` | `auto` | auto, off, on | Select experimental AMD Anti-Lag; enabled modes require AMD and driver support, and Reflex takes priority. |
 | `General` | `AllowUnknownBuild` | `0` | 0, 1 (also false, true) | Permit checked code-patch attempts on unknown builds only at your own risk. |
 | `General` | `LogLevel` | `info` | error, warn, info, debug | Set the logging threshold. |
-| `Governor` | `TargetFps` | `75` | 0 (off), 30–360 fps | Set the planned governor target, capped by display refresh when runtime integration lands. |
-| `Governor` | `WindowSeconds` | `2` | 0.5–10 seconds | Choose the planned frame-time measurement window. |
-| `Governor` | `RaiseBelow` | `0.90` | 0.5–0.99 | Allow a planned raise when the 95th-percentile frame time is below this target-time fraction. |
-| `Governor` | `RaiseHoldSeconds` | `1.0` | 0.1–10 seconds | Require the planned raise condition to hold for this long. |
-| `Governor` | `SettleSeconds` | `1.0` | 0.1–10 seconds | Wait this long after a planned distance change before deciding again. |
-| `Governor` | `LowerAbove` | `0.97` | 0.8–1.0; greater than RaiseBelow | Undo a planned raise when the 95th-percentile frame time exceeds this target-time fraction. |
-| `Governor` | `LowerHoldSeconds` | `0.3` | 0.1–10 seconds | Require the planned lower condition to hold for this long. |
-| `Governor` | `HitchFactor` | `2.0` | 1.2–5 | Undo a recent planned raise if a frame exceeds this multiple of the target frame time. |
-| `Governor` | `BlockSeconds` | `20` | 1–300 seconds | Delay retrying a planned raise that was undone. |
-| `Governor` | `MinVramFreeMiB` | `1024` | 0–8192 MiB | Require this free VRAM before a planned distance raise. |
-| `Knobs` | `EnableObjectDistance` | `1` | 0, 1 (also false, true) | Enable the object-distance hook path; automatic step changes await the governor. |
-| `Knobs` | `MaxObjectDistance` | `4` | 0–4 | Limit the planned object-distance step, with zero preserving the menu baseline. |
+| `Governor` | `TargetFps` | `75` | 0 (off), 30–360 fps | Set the governor target, limited by display refresh; zero stops the governor thread. |
+| `Governor` | `WindowSeconds` | `2` | 0.5–10 seconds | Choose the rolling frame-time measurement window. |
+| `Governor` | `RaiseBelow` | `0.90` | 0.5–0.99 | Require p95 headroom below this target-time fraction outside quantised vsync mode. |
+| `Governor` | `RaiseHoldSeconds` | `1.0` | 0.1–10 seconds | Require the raise condition to hold for this long. |
+| `Governor` | `SettleSeconds` | `1.0` | 0.1–10 seconds | Wait this long after a distance change before normal raise/lower decisions. |
+| `Governor` | `LowerAbove` | `0.97` | 0.8–1.0; greater than RaiseBelow | Set the p95 overload fraction for undoing the latest distance raise. |
+| `Governor` | `LowerHoldSeconds` | `0.3` | 0.1–10 seconds | Require the normal overload condition to hold before undoing a raise. |
+| `Governor` | `HitchFactor` | `2.0` | 1.2–5 | Set the post-raise hitch multiplier, with a display-period margin in quantised mode. |
+| `Governor` | `BlockSeconds` | `20` | 1–300 seconds | Set the base undo block and probation duration; repeated undos can extend the block. |
+| `Governor` | `MinVramFreeMiB` | `1024` | 0–8192 MiB | Block costly raises below this free VRAM; unknown VRAM also blocks them. |
+| `Knobs` | `EnableObjectDistance` | `1` | 0, 1 (also false, true) | Allow governor-controlled object-distance steps above the menu baseline. |
+| `Knobs` | `MaxObjectDistance` | `4` | 0–4 | Cap the object-distance step, with zero preserving the menu baseline. |
 | `Knobs` | `EnableScatterDistance` | `1` | 0, 1 (also false, true) | Enable the checked grass-distance redirect, currently held at the game’s 90 m ceiling. |
-| `Knobs` | `MaxScatterDistance` | `4` | 0–4 | Limit the planned scatter step, further restricted by proven capacity headroom. |
-| `Knobs` | `EnableTerrainDistance` | `1` | 0, 1 (also false, true) | Enable the terrain-distance hook path; automatic step changes await the governor. |
-| `Knobs` | `MaxTerrainDistance` | `4` | 0–4 | Limit the planned terrain-distance step, with zero preserving the menu baseline. |
-| `Knobs` | `DecoDistanceScale` | `1.0` | 0.5–1.0 | Select the parsed decoration threshold scale; startup application is not wired on this base. |
-| `Knobs` | `DistantObjectsScale` | `1.0` | 0.5–1.0 | Select the parsed distant-object threshold scale; startup application is not wired on this base. |
-| `Knobs` | `TerrainRingScale` | `1.0` | 1.0–1.6 | Select the parsed terrain-ring scale; startup application is not wired on this base. |
+| `Knobs` | `MaxScatterDistance` | `4` | 0–4 | Cap the scatter step, further restricted by proven capacity headroom. |
+| `Knobs` | `EnableTerrainDistance` | `1` | 0, 1 (also false, true) | Enable the terrain-distance hook and its governor-controlled steps. |
+| `Knobs` | `MaxTerrainDistance` | `4` | 0–4 | Cap the terrain-distance step, with zero preserving the menu baseline. |
+| `Knobs` | `DecoDistanceScale` | `1.0` | 0.5–1.0 | Scale the verified High decoration threshold at startup; 1.0 keeps the original. |
+| `Knobs` | `DistantObjectsScale` | `1.0` | 0.5–1.0 | Scale the verified High distant-object threshold at startup; 1.0 keeps the original. |
+| `Knobs` | `TerrainRingScale` | `1.0` | 1.0–1.6 | Scale the verified High terrain rings at startup; 1.0 keeps the originals. |
 | `Hdr` | `PaperWhiteNits` | `game` | game, 40–400 nits | Keep the game’s 250-nit paper white or apply a checked startup override. |
 | `Hdr` | `FixPeak` | `off` | on, off | Opt into HDR peak correction through the shared scene hook when a distance knob enables it. |
 | `Hdr` | `DisplayPeakNits` | `game` | game, whole number 80–10000 nits | Choose the game peak or panel target used only when FixPeak is on. |
@@ -130,9 +132,9 @@ The table is generated from the crate's `DEFAULT_INI`, with reviewed ranges and 
 
 See the [troubleshooting guide](docs/troubleshooting.md) for log messages and next steps. The log is written beside the ASI, then in `%LOCALAPPDATA%\enshrouded-headroom` if needed; it is replaced each run. Save it before restarting when reporting a problem. If neither location is writable, file logging remains off. A missing log alone does not prove whether the loader ran.
 
-At `LogLevel=info`, check `settings:`, `game build:`, `texture budget:`, `async compute:`, `wrapper chain engaged`, HDR and distance-hook outcomes, and `priority:`. `Enabled=0` keeps settings and logging but skips feature startup. See the [bug-report form](.github/ISSUE_TEMPLATE/bug_report.yml) for the required evidence.
+At `LogLevel=info`, check `settings:`, `game build:`, `texture budget:`, `async compute:`, `wrapper chain engaged`, HDR, distance-hook and `startup scales:` outcomes, `Anti-Lag:`, and `priority:`. The governor logs `started; inactive`, step changes and a 30-second status line. `Enabled=0` keeps settings and logging but skips feature startup. See the [bug-report form](.github/ISSUE_TEMPLATE/bug_report.yml) for the required evidence.
 
-The scatter probe is a developer diagnostic, off by default. `[Debug] ScatterProbe=1` also requires `LogLevel=debug`; sampling is limited to once every 500 ms. Hidden debug keys are not part of the shipped default table. The grass ceiling remains 90 m until measured capacity allows more. Debug forced-step tests are for the author's verification, not a supported way to bypass the ceiling.
+The scatter probe is a developer diagnostic, off by default. `[Debug] ScatterProbe=1` also requires `LogLevel=debug`; sampling is limited to once every 500 ms. The running governor reports configured scatter counters every two seconds and retains the largest scene peak A it observes across scene resets. All four hidden Debug keys remain outside the shipped default table. The grass ceiling remains 90 m until measured capacity allows more. Debug forced-step tests are for the author's verification, not a supported way to bypass the ceiling.
 
 Anti-Lag approximates INPUT after the previous present, with a seed before the first present.
 It does not hook the game's actual input processing. Three consecutive driver updates over
@@ -144,7 +146,7 @@ RTX 5080, `AntiLag=on` logs "not listed, off" and adds no AMD extension. See
 
 The texture feature requires a unique match for the game's original table. If another tool changed its top budget value, the plugin leaves it alone. Changes affect process memory only; the plugin does not rewrite game files on disk.
 
-AMD Anti-Lag is unverified on AMD hardware. Runtime governor/Reflex/Anti-Lag integration, distance-direction tests, HDR comparisons and the game soak test are still release gates. Source tests and a correctly hashed zip do not establish runtime results or performance gains.
+AMD Anti-Lag is unverified on AMD hardware. In-game governor and latency validation, distance-direction tests, HDR/SDR comparisons and the soak test remain release gates. Source tests and a correctly hashed zip do not establish game results or performance gains.
 
 ## Using with Extended Graphics and Physics Tweaker
 
@@ -159,15 +161,16 @@ Close the game. Remove only `plugins\enshrouded-headroom.asi`, its INI and its l
 Use Windows x64, the pinned [Rust toolchain](rust-toolchain.toml), and Visual Studio C++ build tools with the Windows SDK. From the repository root:
 
 ```powershell
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
 $env:RUSTDOCFLAGS='-D warnings'
-cargo doc --no-deps
-cargo test
+cargo doc --no-deps --workspace
+cargo test --workspace
+cargo run --example generate_readme_settings -- --check
 pwsh -File scripts/package.ps1
 ```
 
-The packager runs `cargo asi`, verifies the pinned loader archive, requires exactly six zip entries and compares the archived ASI with `target/release/enshrouded-headroom.asi` before publishing the local zip. It prints both hashes and the zip hash. Building or packaging does not install the mod or authorize release. A development preparation zip still contains the current incomplete implementation.
+The packager runs `cargo asi`, verifies the pinned loader archive, requires exactly six zip entries and compares the archived ASI with `target/release/enshrouded-headroom.asi` before publishing the local zip. It prints both hashes and the zip hash. Building or packaging does not install the mod or authorize release. A preparation archive still needs the game and hardware verification listed above.
 
 `pwsh -File scripts/test-package.ps1 -LoaderZip dist/cache/Ultimate-ASI-Loader_x64-v10.0.0.zip` tests staged-ASI corruption refusal in an isolated fixture without rebuilding. The fixture must use a verified loader cache. Leave ignored game/desktop tests ignored; see [AGENTS.md](AGENTS.md) for Windows and Linux cross-check commands.
 
