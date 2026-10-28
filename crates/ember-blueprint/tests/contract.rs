@@ -420,11 +420,32 @@ fn highcrown_preserves_actual_dimensions_axes_and_envelope_fidelity() {
         assert_eq!(height, 12.0); // height_total is absolute plan top +17, base +5.
         assert_eq!(thickness, 3.0);
     }
-    assert!(!converted
-        .to_json()
+    let sentinel = b"987654.25";
+    let contains_anchor = |candidate: &[u8]| {
+        candidate
+            .windows(sentinel.len())
+            .any(|window| window == sentinel)
+    };
+    assert!(
+        contains_anchor(&bytes),
+        "positive control: source must contain the synthetic world anchor"
+    );
+    let exported = converted.to_json().unwrap();
+    let mut controlled_leak = converted.document().clone();
+    controlled_leak.anchors[0].point[0] = input["world"]["private_anchor"][0].as_f64().unwrap();
+    let controlled_leak = controlled_leak
+        .validate(Limits::default())
         .unwrap()
-        .windows(6)
-        .any(|x| x == b"987654.25"));
+        .to_json()
+        .unwrap();
+    assert!(
+        contains_anchor(&controlled_leak),
+        "positive control: matcher must detect a synthetic anchor leaked into a valid model"
+    );
+    assert!(
+        !contains_anchor(&exported),
+        "source world anchor must not leak into the interchange"
+    );
 }
 
 #[test]
