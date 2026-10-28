@@ -35,6 +35,8 @@ pub fn calculate_in_place(scratch: &mut [u64]) -> Option<FrameStats> {
             count = count.checked_add(1)?;
         }
     }
+    // Keep ignored zeros in the unused tail so repeated calls retain the same sample multiset.
+    scratch.get_mut(count..)?.fill(0);
     let sorted = scratch.get_mut(..count)?;
     if count < 2 {
         return None;
@@ -69,7 +71,7 @@ pub fn calculate_in_place(scratch: &mut [u64]) -> Option<FrameStats> {
     })
 }
 
-/// Debug report text. Allocation occurs only when the caller emits a report.
+/// Format debug report text. This allocates; the worker calls it only when emitting.
 pub fn debug_line(stats: Option<&FrameStats>) -> String {
     match stats {
         Some(s) => format!(
@@ -167,5 +169,11 @@ mod tests {
         assert_eq!(extreme.low_1_percent_fps, extreme.average_fps);
         let fast = calculate(&[1, 1], &mut [0; 2]).unwrap();
         assert_eq!(fast.average_fps, 1_000_000.0);
+    }
+    #[test]
+    fn repeating_in_place_calculation_preserves_zero_filtered_samples() {
+        let mut scratch = [0, 10_000, 20_000, 0];
+        let first = calculate_in_place(&mut scratch).unwrap();
+        assert_eq!(calculate_in_place(&mut scratch), Some(first));
     }
 }
