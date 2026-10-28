@@ -116,6 +116,15 @@ The implementation follows the measured guide contracts:
   documented one-small thin-floor rule uses its declared 0.5 m grid. Applicable
   at_floors openings stay empty. Building floor envelopes without complete
   opening masks retain envelope fidelity.
+- Opening shape and clipping flags are preserved as interpretation gates.
+  Only absent/rect/rectangle opening shapes without requested clipping become
+  rectangular Cutouts. Round, other specialized or clipped openings omit the
+  applicable floor layer with an explicit reason; other at_floors surfaces can
+  remain supported. The actual quarter paving and clipped lakewalk reservations
+  are covered by the [round/clip fixture](../crates/ember-blueprint/tests/fixtures/highcrown-round-clip.json).
+- Positive floor_regions unions and alternate holes/voids masks need their own
+  adapter. Their floor layers remain references with omission notes. Source
+  kinds hollow, water and reference likewise do not define solid floor layers.
 - Source labels may be empty for diagram elements. Those objects keep their
   existing stable ID as the display label. No geometry is invented for a label.
 

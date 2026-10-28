@@ -399,6 +399,12 @@ struct PlanObject {
     floor_openings: Vec<PlanOpening>,
     /// Unsupported cutout semantics prevent an exact slab claim.
     cutouts: Option<serde_json::Value>,
+    /// Positive region unions need their own mask adapter.
+    floor_regions: Option<serde_json::Value>,
+    /// Alternate negative masks must not disappear during conversion.
+    holes: Option<serde_json::Value>,
+    /// Alternate reserved voids must not disappear during conversion.
+    voids: Option<serde_json::Value>,
     /// Special floor patterns are never silently filled solid.
     floor_pattern: Option<String>,
     /// Only explicitly solid feature bases use z0 as absolute.
@@ -410,7 +416,7 @@ struct PlanObject {
     parts: Vec<PlanObject>,
 }
 
-/// One source rectangular floor opening.
+/// One source opening. Shape and clipping determine whether a rectangular cutout is faithful.
 #[derive(Deserialize)]
 struct PlanOpening {
     /// Absolute plan east.
@@ -421,6 +427,10 @@ struct PlanOpening {
     w: f64,
     /// Depth.
     d: f64,
+    /// Absent or rect/rectangle is rectangular; other shapes need a mask adapter.
+    shape: Option<String>,
+    /// Clipping against the floor boundary needs a mask adapter.
+    clip: Option<bool>,
     /// Applicable floor surfaces; absent applies to all recorded floors.
     at_floors: Option<Vec<f64>>,
 }
@@ -799,6 +809,22 @@ impl Converter {
         if requests.is_empty() {
             return Ok(());
         }
+        let unsupported_masks: Vec<&str> = [
+            ("floor_regions", raw.floor_regions.is_some()),
+            ("holes", raw.holes.is_some()),
+            ("voids", raw.voids.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(field, present)| present.then_some(field))
+        .collect();
+        if !unsupported_masks.is_empty() {
+            out.omissions.push(format!("Floor layer omitted: source {} requires a positive/negative mask adapter; its geometry is not replaced by a filled rectangle.", unsupported_masks.join(", ")));
+            return Ok(());
+        }
+        if matches!(raw.kind.as_deref(), Some("hollow" | "water" | "reference")) {
+            out.omissions.push("Floor layer omitted: the source kind is hollow, water or reference; its bounds are not a solid floor mask.".to_owned());
+            return Ok(());
+        }
         if !matches!(
             raw.shape.as_deref(),
             None | Some("rectangle" | "square" | "rect")
@@ -810,6 +836,23 @@ impl Converter {
         }
         let [x, y, w, d] = bounds;
         for (key, (top, thickness, explicit)) in requests {
+            let applicable_openings: Vec<&PlanOpening> = raw
+                .floor_openings
+                .iter()
+                .filter(|opening| {
+                    opening
+                        .at_floors
+                        .as_ref()
+                        .is_none_or(|floors| floors.contains(&top))
+                })
+                .collect();
+            if applicable_openings.iter().any(|opening| {
+                !matches!(opening.shape.as_deref(), None | Some("rect" | "rectangle"))
+                    || opening.clip == Some(true)
+            }) {
+                out.omissions.push(format!("Floor at {top} m omitted: a nonrectangular opening shape or requested clipping needs the source mask adapter. It is not replaced by rectangular cutouts; only reference bounds remain."));
+                continue;
+            }
             let layer_id = format!("floor/{}/{key}", out.id);
             if self.layers.contains_key(&layer_id) {
                 return Err(Error::new(
@@ -831,15 +874,8 @@ impl Converter {
                     elevation: top,
                 },
             );
-            let openings = raw
-                .floor_openings
-                .iter()
-                .filter(|opening| {
-                    opening
-                        .at_floors
-                        .as_ref()
-                        .is_none_or(|floors| floors.contains(&top))
-                })
+            let openings = applicable_openings
+                .into_iter()
                 .map(|opening| Cutout {
                     min: [opening.x, -(opening.y + opening.d)],
                     size: [opening.w, opening.d],

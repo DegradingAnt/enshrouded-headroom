@@ -700,3 +700,276 @@ fn generated_floor_layer_ids_cannot_overwrite_declared_source_layers() {
     );
     assert_eq!(result.unwrap_err().kind, ErrorKind::DuplicateId);
 }
+
+#[test]
+fn authentic_round_clipped_openings_never_become_rectangular_exact_layers() {
+    let bytes = include_bytes!("fixtures/highcrown-round-clip.json");
+    let input: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+    let round = &input["zones"][0]["floor_openings"][2];
+    assert_eq!(round["shape"], "round");
+    assert_eq!(round["clip"], true);
+    // materials.js preserves this 0.5 m cell centre outside the radius-2 stair opening.
+    let corner = [38.25_f64, 34.25_f64];
+    assert!((corner[0] - 40.0).hypot(corner[1] - 36.0) > 2.0);
+    let converted = convert_highcrown(bytes, "test:round-clip", 1, Limits::default()).unwrap();
+    for id in ["z_q_sw", "z_q_se", "z_q_nw", "z_q_ne"] {
+        let object = converted
+            .document()
+            .objects
+            .iter()
+            .find(|object| object.id == id)
+            .unwrap();
+        assert!(
+            object
+                .primitives
+                .iter()
+                .all(|primitive| !matches!(primitive.geometry, Geometry::Slab { .. })),
+            "{id}: a round/clipped opening must not become a rectangular cutout"
+        );
+        assert!(object
+            .primitives
+            .iter()
+            .any(|primitive| primitive.fidelity == Fidelity::ReferenceOutline));
+        assert!(
+            object
+                .omissions
+                .iter()
+                .any(|reason| reason.contains("opening") && reason.contains("clip")),
+            "{id}: unsupported mask needs an explicit reason"
+        );
+    }
+}
+
+#[test]
+fn opening_shape_and_clip_are_independent_unsupported_mask_discriminators() {
+    for (shape, clip, omitted) in [
+        ("round", false, true),
+        ("rectangle", true, true),
+        ("polygon", false, true),
+        ("rectangle", false, false),
+        ("rect", false, false),
+    ] {
+        let mut source: serde_json::Value =
+            serde_json::from_slice(include_bytes!("fixtures/highcrown-round-clip.json")).unwrap();
+        source["zones"][0]["floor_openings"][2]["shape"] = serde_json::json!(shape);
+        source["zones"][0]["floor_openings"][2]["clip"] = serde_json::json!(clip);
+        let model = convert_highcrown(
+            &serde_json::to_vec(&source).unwrap(),
+            "test:discriminators",
+            1,
+            Limits::default(),
+        )
+        .unwrap();
+        let object = model
+            .document()
+            .objects
+            .iter()
+            .find(|object| object.id == "z_q_sw")
+            .unwrap();
+        assert_eq!(
+            object
+                .primitives
+                .iter()
+                .all(|primitive| !matches!(primitive.geometry, Geometry::Slab { .. })),
+            omitted,
+            "shape={shape} clip={clip}"
+        );
+    }
+}
+
+#[test]
+fn clipped_opening_outside_actual_lakewalk_bounds_is_omitted_without_invented_clipping() {
+    let mut source: serde_json::Value =
+        serde_json::from_slice(include_bytes!("fixtures/highcrown-round-clip.json")).unwrap();
+    let lakewalk = &mut source["content"]["guide"]["measurements"][0];
+    assert_eq!(lakewalk["id"], "measure_lakewalk_s");
+    assert_eq!(lakewalk["floor_openings"][0]["clip"], true);
+    assert!(lakewalk["floor_openings"][0]["d"].as_f64().unwrap() > lakewalk["d"].as_f64().unwrap());
+    // Request a layer of this authentic measured object to exercise the clipping boundary.
+    lakewalk["floor_levels"] = serde_json::json!([-19.5]);
+    let model = convert_highcrown(
+        &serde_json::to_vec(&source).unwrap(),
+        "test:lakewalk-clip",
+        1,
+        Limits::default(),
+    )
+    .unwrap();
+    let object = model
+        .document()
+        .objects
+        .iter()
+        .find(|object| object.id == "measure_lakewalk_s")
+        .unwrap();
+    assert!(object
+        .primitives
+        .iter()
+        .all(|primitive| !matches!(primitive.geometry, Geometry::Slab { .. })));
+    assert!(object
+        .omissions
+        .iter()
+        .any(|reason| reason.contains("clip")));
+}
+
+#[test]
+fn other_positive_or_negative_floor_masks_cannot_be_silently_filled_as_rectangles() {
+    for discriminator in ["floor_regions", "holes", "voids"] {
+        let mut source: serde_json::Value = serde_json::from_slice(HIGHCROWN).unwrap();
+        let floor = source["content"]["guide"]["measurements"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|object| object["id"] == "keep_stage36")
+            .unwrap();
+        floor[discriminator] = serde_json::json!([{"x":80,"y":95,"w":1,"d":1}]);
+        let model = convert_highcrown(
+            &serde_json::to_vec(&source).unwrap(),
+            "test:other-floor-mask",
+            1,
+            Limits::default(),
+        )
+        .unwrap();
+        let object = model
+            .document()
+            .objects
+            .iter()
+            .find(|object| object.id == "keep_stage36")
+            .unwrap();
+        assert!(
+            object
+                .primitives
+                .iter()
+                .all(|primitive| !matches!(primitive.geometry, Geometry::Slab { .. })),
+            "{discriminator}"
+        );
+        assert!(
+            object
+                .omissions
+                .iter()
+                .any(|reason| reason.contains(discriminator)),
+            "{discriminator}"
+        );
+    }
+}
+
+#[test]
+fn unsupported_opening_only_omits_the_floor_surfaces_it_applies_to() {
+    let mut source: serde_json::Value =
+        serde_json::from_slice(include_bytes!("fixtures/highcrown-round-clip.json")).unwrap();
+    source["zones"][0]["floor_levels"] = serde_json::json!([0, 10]);
+    source["zones"][0]["floor_openings"][2]["at_floors"] = serde_json::json!([0]);
+    let model = convert_highcrown(
+        &serde_json::to_vec(&source).unwrap(),
+        "test:per-floor-mask",
+        1,
+        Limits::default(),
+    )
+    .unwrap();
+    let object = model
+        .document()
+        .objects
+        .iter()
+        .find(|object| object.id == "z_q_sw")
+        .unwrap();
+    assert!(!object
+        .primitives
+        .iter()
+        .any(|primitive| primitive.id == "z_q_sw/floor/0"));
+    let valid = object
+        .primitives
+        .iter()
+        .find(|primitive| primitive.id == "z_q_sw/floor/10")
+        .unwrap();
+    if let Geometry::Slab { openings, .. } = &valid.geometry {
+        assert_eq!(openings.len(), 2);
+    } else {
+        panic!("unaffected rectangular layer must remain a slab");
+    }
+}
+
+#[test]
+fn bounds_only_source_kinds_never_become_solid_floor_layers() {
+    for kind in ["hollow", "water", "reference"] {
+        let mut source: serde_json::Value = serde_json::from_slice(HIGHCROWN).unwrap();
+        let floor = source["content"]["guide"]["measurements"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|object| object["id"] == "keep_stage36")
+            .unwrap();
+        floor["kind"] = serde_json::json!(kind);
+        let model = convert_highcrown(
+            &serde_json::to_vec(&source).unwrap(),
+            "test:bounds-only-kind",
+            1,
+            Limits::default(),
+        )
+        .unwrap();
+        let object = model
+            .document()
+            .objects
+            .iter()
+            .find(|object| object.id == "keep_stage36")
+            .unwrap();
+        assert!(
+            object
+                .primitives
+                .iter()
+                .all(|primitive| !matches!(primitive.geometry, Geometry::Slab { .. })),
+            "{kind}"
+        );
+        assert!(object
+            .omissions
+            .iter()
+            .any(|reason| reason.contains("source kind")));
+    }
+}
+
+#[test]
+fn guide_mask_change_removes_the_unsupported_floor_selection_in_one_valid_refresh() {
+    let authentic = include_bytes!("fixtures/highcrown-round-clip.json");
+    let mut rectangular: serde_json::Value = serde_json::from_slice(authentic).unwrap();
+    rectangular["zones"][0]["floor_openings"][2]["shape"] = serde_json::json!("rectangle");
+    rectangular["zones"][0]["floor_openings"][2]["clip"] = serde_json::json!(false);
+    let first = convert_highcrown(
+        &serde_json::to_vec(&rectangular).unwrap(),
+        "test:mask-refresh",
+        1,
+        Limits::default(),
+    )
+    .unwrap();
+    let mut session = Session::new(first);
+    session.select(SelectionKind::Object, "z_q_sw").unwrap();
+    session
+        .select(SelectionKind::Layer, "floor/z_q_sw/0")
+        .unwrap();
+    let previous = session.snapshot();
+    let changed = convert_highcrown(authentic, "test:mask-refresh", 2, Limits::default()).unwrap();
+    assert_eq!(
+        session.apply(previous.model().revision(), changed).unwrap(),
+        RefreshOutcome::Replaced
+    );
+    let visible = session.snapshot();
+    assert_eq!(
+        visible.selection(SelectionKind::Object),
+        &IdState::Active("z_q_sw".to_owned())
+    );
+    assert_eq!(
+        visible.selection(SelectionKind::Layer),
+        &IdState::Removed {
+            id: "floor/z_q_sw/0".to_owned(),
+            sequence: 2
+        }
+    );
+    assert_eq!(visible.freshness(), &Freshness::Current);
+    let object = visible
+        .model()
+        .document()
+        .objects
+        .iter()
+        .find(|object| object.id == "z_q_sw")
+        .unwrap();
+    assert!(object
+        .primitives
+        .iter()
+        .all(|primitive| !matches!(primitive.geometry, Geometry::Slab { .. })));
+}
