@@ -886,7 +886,8 @@ unsafe fn gdpa_choose(
         .filter(|game| {
             FIRST_DEVICE_DISPATCH_LIVE.load(Ordering::Acquire)
                 && (DEVICE_QUERIES.protects(game.device)
-                    || crate::reflex::has_device_lifetime(game.device))
+                    || crate::reflex::has_device_lifetime(game.device)
+                    || crate::antilag::has_device_lifetime(game.device))
         })
         .filter(|game| {
             let held = slot.load(Ordering::Acquire);
@@ -916,13 +917,16 @@ unsafe fn gdpa_choose(
             slot,
             found_addr,
             wrapper,
-            DEVICE_QUERIES.protects(device) || crate::reflex::has_device_lifetime(device),
+            DEVICE_QUERIES.protects(device)
+                || crate::reflex::has_device_lifetime(device)
+                || crate::antilag::has_device_lifetime(device),
         ),
         Some(Wrap::DestroySwapchain) => hand_out(
             slot,
             found_addr,
             wrapper,
-            crate::reflex::has_device_lifetime(device),
+            crate::reflex::has_device_lifetime(device)
+                || crate::antilag::has_device_lifetime(device),
         ),
         // Keep other devices from filling an empty first-device slot, even when substitution
         // for the first device itself has no lifetime/parent proof.
@@ -1081,7 +1085,7 @@ pub unsafe extern "system" fn wrap_create_device(
         }
         // SAFETY: nonzero real is the saved vkCreateDevice; arguments retain the native contract.
         let result = unsafe {
-            crate::reflex::create_device(
+            crate::antilag::create_device(
                 std::mem::transmute::<usize, vk::PFN_vkCreateDevice>(real),
                 phys,
                 info,
@@ -1140,7 +1144,10 @@ unsafe fn after_create_device(
     }
     // Only this first-generation publication can grant the shortcut. A later Reflex-eligible
     // device may reuse these raw bits after an unobserved destruction, but cannot grant it anew.
-    if DEVICE_QUERIES.protects(device) || crate::reflex::has_device_lifetime(device) {
+    if DEVICE_QUERIES.protects(device)
+        || crate::reflex::has_device_lifetime(device)
+        || crate::antilag::has_device_lifetime(device)
+    {
         FIRST_DEVICE_DISPATCH_LIVE.store(true, Ordering::Release);
     }
     // SAFETY: `phys` is the physical device the first device was just created on.
@@ -1217,7 +1224,7 @@ pub unsafe extern "system" fn wrap_create_swapchain(
             return vk::Result::ERROR_INITIALIZATION_FAILED;
         }
         // SAFETY: saved native function and unchanged Vulkan caller arguments.
-        unsafe {
+        let result = unsafe {
             crate::reflex::create_swapchain(
                 std::mem::transmute::<usize, vk::PFN_vkCreateSwapchainKHR>(real),
                 device,
@@ -1225,7 +1232,17 @@ pub unsafe extern "system" fn wrap_create_swapchain(
                 allocator,
                 swapchain,
             )
-        }
+        };
+        crate::antilag::report_pending();
+        guard(
+            Feature::AntiLag,
+            || (),
+            || {
+                // SAFETY: native success initialized swapchain; this does not alter the original result.
+                unsafe { crate::antilag::after_create_swapchain(device, result, swapchain) };
+            },
+        );
+        result
     })
 }
 
@@ -1266,8 +1283,10 @@ pub unsafe extern "system" fn wrap_present(
         // SAFETY: the original closure preserves the caller's info/chain and caches its result.
         // The quiet callback sets only the Reflex feature bit, without allocation, lock or log.
         let result = unsafe {
-            crate::reflex::on_present(info, original, || {
-                crate::guard::disable_silent(Feature::Reflex);
+            crate::antilag::on_present(queue, info, || {
+                crate::reflex::on_present(info, original, || {
+                    crate::guard::disable_silent(Feature::Reflex);
+                })
             })
         };
         #[cfg(test)]
@@ -2024,6 +2043,8 @@ pub unsafe extern "system" fn wrap_destroy_device(
         // SAFETY: called before native destruction, including the disabled-feature fallback.
         DEVICE_QUERIES.retire(raw_device);
         unsafe { crate::reflex::before_destroy(device, None) };
+        // SAFETY: this is still before native device destruction, including disabled fallbacks.
+        unsafe { crate::antilag::before_destroy(device, None) };
         let real = REAL_DESTROY_DEVICE.load(Ordering::Acquire);
         if real != 0 {
             // SAFETY: the saved function matches this signature; original caller arguments.
@@ -2050,6 +2071,8 @@ pub unsafe extern "system" fn wrap_destroy_swapchain(
         }
         // SAFETY: native swapchain remains live until the call below.
         unsafe { crate::reflex::before_destroy(device, Some(swapchain)) };
+        // SAFETY: this is still before native swapchain destruction, including disabled fallbacks.
+        unsafe { crate::antilag::before_destroy(device, Some(swapchain)) };
         let real = REAL_DESTROY_SWAPCHAIN.load(Ordering::Acquire);
         if real != 0 {
             // SAFETY: the saved function has this signature and receives original arguments.
