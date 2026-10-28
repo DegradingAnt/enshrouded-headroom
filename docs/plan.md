@@ -13,7 +13,7 @@
 ## Global Constraints
 
 **Project and build**
-- Repo: `C:\Modding\Enshrouded`, a new git repo, MIT licence, public on GitHub only at release (Task 18, with the author's go-ahead).
+- Repo: `<repository>`, a new git repo, MIT licence, public on GitHub only at release (Task 18, with the author's go-ahead).
 - Toolchain: pinned in `rust-toolchain.toml` to `1.99.1`, target `x86_64-pc-windows-msvc`.
 - Output file: `enshrouded-headroom.asi`. Settings: `enshrouded-headroom.ini`. Log: `enshrouded-headroom.log`. Both sit next to the `.asi` in `<game>\plugins\`, with a fallback to `%LOCALAPPDATA%\enshrouded-headroom\`.
 - Profile:
@@ -81,7 +81,7 @@
 ## File structure
 
 ```
-C:\Modding\Enshrouded\
+<repository>\
   Cargo.toml                      crate `enshrouded-headroom`, cdylib + rlib (rlib so examples/tests link)
   rust-toolchain.toml             channel = "1.99.1"
   .cargo\config.toml              +crt-static; alias `asi`
@@ -131,14 +131,14 @@ C:\Modding\Enshrouded\
 - Produces: `cargo asi`. It is an alias for `rustc --release --lib -- -C link-arg=/OUT:target/release/enshrouded-headroom.asi`.
 
 - [ ] **Step 1:** `rustup update stable` and `rustup install 1.99.1` (the author asked for the latest versions; on 2026-10-25 only `stable` = 1.98.0 was installed). Check: `rustc +1.99.1 --version` prints `1.99.1`. Do not rely on `link.exe` from PATH: rustc finds the MSVC linker itself (VS 2022 Community, MSVC 14.44.35207).
-- [ ] **Step 2:** `git init C:\Modding\Enshrouded`. Copy the spec, the re-notes and this plan into `docs/`. Add the MIT `LICENSE` (copyright: DegradingAnt), `.gitignore` (`target/`, `dist/`), and `Cargo.toml`:
+- [ ] **Step 2:** `git init <repository>`. Copy the spec, the re-notes and this plan into `docs/`. Add the MIT `LICENSE` (copyright: DegradingAnt), `.gitignore` (`target/`, `dist/`), and `Cargo.toml`:
   - `[lib] crate-type = ["cdylib", "rlib"]`, name `enshrouded_headroom`;
   - the dependencies at the exact versions in Global Constraints;
   - the release profile from Global Constraints.
 - [ ] **Step 3: Write `examples/asi_host.rs`.** It takes an `.asi` path, `LoadLibraryW`s it, calls `InitializeASI`, sleeps 500 ms, and exits 0.
 - [ ] **Step 4: Run it.** `cargo asi`, then `cargo run --release --example asi_host -- target/release/enshrouded-headroom.asi`.
   - Expected: exit 0, and `target/release/enshrouded-headroom.log` contains `loaded`.
-- [ ] **Step 5: Verify the artefact, not the build log.** `dumpbin` is NOT on PATH on the author's machine (checked 2026-10-25), and Git's own `link.exe` comes first on PATH. So use `python -I -c "import pefile; ..."` (pefile 2024.8.26 is installed). Alternatively use the full path from `vswhere` (`C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64\dumpbin.exe`). Check that the `InitializeASI` export is present and that `VCRUNTIME140.dll` is absent from the imports.
+- [ ] **Step 5: Verify the artefact, not the build log.** Use `dumpbin` from a Visual Studio developer prompt, or locate the installed toolchain with `vswhere`; do not accidentally use Git's unrelated `link.exe`. A PE inspection tool such as `pefile` is another option. Check that the `InitializeASI` export is present and that `VCRUNTIME140.dll` is absent from the imports.
 - [ ] **Step 6:** Commit: `chore: scaffold enshrouded-headroom plugin`.
 
 ### Task 2: Settings file
@@ -897,10 +897,10 @@ supply the maintained rules. The author also approved the parsed startup initial
 
 ### Task 17: In-game verification on the author's machine
 
-**Install** (needs the author's go-ahead; deploying into the game folder is the author's). The game is now the Steam install, `C:\Program Files (x86)\Steam\steamapps\common\Enshrouded\` (the old `C:\Games\Enshrouded` is being deleted):
-- copy the loader v10.0.0 `dinput8.dll` (zip sha256 `3d5f2f2a…`) to `C:\Program Files (x86)\Steam\steamapps\common\Enshrouded\`;
-- copy `enshrouded-headroom.asi` to `C:\Program Files (x86)\Steam\steamapps\common\Enshrouded\plugins\`;
-- create `C:\Program Files (x86)\Steam\steamapps\common\Enshrouded\global.ini` with `[GlobalSets] DebugLog=1`;
+**Install** (needs the author's go-ahead; deployment is the author's). Locate `<Steam game folder>` through Steam Properties → Installed Files → Browse:
+- copy the loader v10.0.0 `dinput8.dll` (zip sha256 `3d5f2f2a…`) to `<Steam game folder>\`;
+- copy `enshrouded-headroom.asi` to `<Steam game folder>\plugins\`;
+- create `<Steam game folder>\global.ini` with `[GlobalSets] DebugLog=1`;
 - do not use the old `_perf\Launch-Enshrouded.ps1` launcher at the same time (a copy of the `_perf` files is in `reference\old-build\_perf`; the Steam folder has no `_perf`);
 - the old install had a `winmm.dll` (an unknown loader). The Steam folder has none (no `winmm.dll`, `dinput8.dll`, `plugins` or `global.ini` there, checked 2026-10-26). So there is one loader only, and nothing to remove.
 

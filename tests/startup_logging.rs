@@ -179,6 +179,29 @@ fn message(line: &str) -> &str {
     line.split_once("] ").map_or(line, |(_, text)| text)
 }
 
+/// Check the first changelog entry against the package version.
+fn changelog_version_matches(changelog: &str, version: &str) -> bool {
+    changelog
+        .lines()
+        .find(|line| line.starts_with("## ["))
+        .and_then(|heading| heading.strip_prefix("## ["))
+        .and_then(|entry| entry.split_once("] - "))
+        .is_some_and(|(entry_version, _status)| entry_version == version)
+}
+
+/// Setting the release date must preserve agreement; an older matching entry cannot hide drift.
+#[test]
+fn release_date_preserves_version_agreement_but_a_different_top_version_fails() {
+    let dated = "# Changelog\n\n## [0.1.0] - 2026-10-26\n\n### Added\n- Release.\n";
+    assert!(changelog_version_matches(dated, "0.1.0"));
+    let wrong_top = "# Changelog\n\n## [0.1.1] - 2026-10-26\n\n## [0.1.0] - 2026-10-25\n";
+    assert!(!changelog_version_matches(wrong_top, "0.1.0"));
+    assert!(!changelog_version_matches(
+        "## [0.1.00] - unreleased",
+        "0.1.0"
+    ));
+}
+
 #[test]
 fn start_up_logs_one_grass_distance_line_after_object_distance() {
     if let Some(dir) = std::env::var_os(START_CHILD_ENV) {
@@ -213,6 +236,32 @@ fn start_up_logs_one_grass_distance_line_after_object_distance() {
     );
 
     let messages: Vec<&str> = log.lines().map(message).collect();
+    // Release version agreement uses the actual loaded child's log, not source-code text.
+    let manifest = include_str!("../Cargo.toml");
+    let package = manifest
+        .split_once("[package]")
+        .unwrap()
+        .1
+        .split("\n[")
+        .next()
+        .unwrap();
+    let version = package
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("version = "))
+        .unwrap()
+        .trim_matches('"');
+    assert_eq!(version, "0.1.0", "W28 does not change the package version");
+    assert!(
+        changelog_version_matches(include_str!("../CHANGELOG.md"), version),
+        "the top changelog entry must match package version {version}"
+    );
+    let loaded = format!("enshrouded-headroom {version} loaded");
+    assert_eq!(
+        messages.iter().filter(|line| **line == loaded).count(),
+        1,
+        "actual startup version: {log}"
+    );
+
     let at = |prefix: &str| -> Vec<usize> {
         (0..messages.len())
             .filter(|&i| messages[i].starts_with(prefix))
