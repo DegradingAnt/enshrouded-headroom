@@ -28,7 +28,7 @@ Out of scope for version 1:
 - An in-game menu or overlay.
 - Any setting below the player's menu choice.
 
-Test-environment note: the test machine is the Steam install of the game (`C:\Program Files (x86)\Steam\steamapps\common\Enshrouded`). Its exe starts in Steam's DRM stub, the `.bind` section, and the folder has no `winmm.dll`. After the loader install step in plan Task 17, the folder holds one loader (Ultimate ASI Loader) and nothing else that could change what sits in the import slots. (The old install, which is being deleted, had an unexplained `winmm.dll`, 577,024 bytes, "ACME Corporation".) Ultimate ASI Loader handles `.bind`: it ignores calls from that section as triggers (from loader source v10.0.0, unconfirmed in game). The first in-game run uses the loader's `DebugLog=1`.
+Test-environment note: the test machine is the Steam install of the game (`<Steam game folder>`). Its exe starts in Steam's DRM stub, the `.bind` section, and the folder has no `winmm.dll`. After the loader install step in plan Task 17, the folder holds one loader (Ultimate ASI Loader) and nothing else that could change what sits in the import slots. (An earlier install had an unexplained `winmm.dll`, 577,024 bytes, "ACME Corporation".) Ultimate ASI Loader handles `.bind`: it ignores calls from that section as triggers (from loader source v10.0.0, unconfirmed in game). The first in-game run uses the loader's `DebugLog=1`.
 
 ## 3. Constraints
 
@@ -72,6 +72,7 @@ The `_perf\Launch-Enshrouded.ps1` launcher from 2026-10-23 is replaced by this m
 | `async_compute` | Reproduces the game's own `--enable-async-compute` override (6.2). |
 | `frame_timer` | Records present-to-present times (6.3). |
 | `reflex` | NVIDIA Reflex through `VK_NV_low_latency2` (6.5). |
+| `antilag` | Pure AMD Anti-Lag 2 planning and sequencing (6.6); wiring is separate. |
 | `vram_budget` | Reads the live VRAM budget and usage through `VK_EXT_memory_budget` when available (6.4). |
 | `governor` | Pure control logic: frame times and VRAM headroom in, knob steps out. It never reads game memory (6.4). |
 | `knobs` | The game-side hooks for 7.1–7.3 and the start-up patches for 7.4 and 7.5. |
@@ -154,29 +155,43 @@ The author's decision (2026-10-25): "more aggressive". All values are `.ini` key
 | `SettleSeconds` | 1.0 | Wait after any change before the next decision. |
 | `LowerAbove` | 0.97 | Undo the last step when p95 > 97 % of the target frame time … |
 | `LowerHoldSeconds` | 0.3 | … for this long. |
-| `HitchFactor` | 2.0 | Undo the last step if any single frame within `SettleSeconds + RaiseHoldSeconds` after a raise is longer than 2 × the target frame time. |
-| `BlockSeconds` | 20 | A step that was undone is blocked for this long. |
+| `HitchFactor` | 2.0 | Base multiplier for the post-raise hitch threshold described below. |
+| `BlockSeconds` | 20 | Base block after an undo, and the probation duration. |
 | `MinVramFreeMiB` | 1024 | Do not raise while free VRAM (budget − usage) is below this. |
 
 Rules:
 1. Each knob has steps 0..N. Step 0 is the player's menu value. The governor never goes below it.
 2. **Only while the world is rendering.** The governor is active only when the 7.1 hook ran within the last 250 ms and presents came steadily, with no gap over 250 ms in the last 2 s. In menus, loading screens or pause it holds its current steps and decides nothing.
 3. **Effective target.** The target frame time is `max(1000/TargetFps, display period)`. The display period is the refresh period of the swapchain's monitor (`EnumDisplaySettingsW` for the window's monitor). If the target fps is higher than the refresh rate, the governor holds the refresh rate instead.
-4. **Fixed-refresh vsync (FIFO without VRR).** If at least 90 % of the frame intervals in the window sit within ±5 % of a whole multiple of the display period, frame times are quantised. In that mode:
-   - it raises only while ≥ 95 % of frames make the display period that matches the effective target;
-   - it undoes the last step as soon as more than 2 % of frames fall to the next multiple (for example 60 fps on a 120 Hz screen).
+4. **Fixed-refresh vsync (FIFO without VRR).** The display period must be at least half the effective target frame time. If at least 90 % of the non-long frame intervals in the window sit within ±5 % of one to four display periods, frame times are quantised. In that mode:
+   - a non-long frame is on time at or below 1.05 × the effective target frame time;
+   - it raises only while at least 99 % of non-long frames are on time and the window contains no long frames;
+   - more than 2 % late non-long frames count as overload. The normal `LowerHoldSeconds` and `SettleSeconds` rules still apply.
    - This replaces the p95 thresholds, which would see only 8.3 or 16.7 ms (review finding 5).
-5. **Raising.** It raises the next knob in priority order (section 7) that is below its maximum and not blocked, by one step. It only raises if `vram_budget` reports at least `MinVramFreeMiB` free, or if the budget extension is not available.
-6. **Lowering.** It undoes the most recent raise first (last in, first out). A step that is undone is blocked for `BlockSeconds`.
-7. **Hitches after a raise.** Frames over `HitchFactor` × target in the settle and hold period after a raise count against that raise, including frames over 100 ms (review finding 6). Outside that period, frames over 100 ms are ignored as loading or alt-tab.
+5. **Raising.** It raises the next knob in priority order (section 7) that is below its maximum and not blocked, by one step. It only raises if `vram_budget` reports at least `MinVramFreeMiB` free, and does not raise a VRAM-costly knob when the budget is unknown.
+6. **Lowering.** It undoes the most recent raise first (last in, first out). An undo blocks that knob for `BlockSeconds`, doubling on repeated undos up to 8 × `BlockSeconds`. A later raise that holds for `BlockSeconds`, or a menu reset, resets that knob's undo count.
+7. **Hitches and long frames.** During `SettleSeconds + RaiseHoldSeconds` after a raise, a frame over the hitch threshold undoes that raise at once if it is still the most recent raise. The p95-mode threshold is `HitchFactor` × the effective target. In quantised mode it is at least one display period beyond the on-time multiple, with the 5 % margin. Frames over 100 ms and at most 250 ms stay in the window but are excluded from p95 and the quantised test. They prevent a raise. At least two such frames, or more than 2 % of the window, count as overload under the normal settle and lower-hold rules. Frames over 250 ms are stalls and never enter the window. A second stall within 10 s while the world is active undoes the latest raise.
 8. **Menu changes.** The hooks publish the baseline they saw on each call. If a baseline changes, the player changed a menu setting: the governor drops that knob's added steps and starts again from the new baseline.
-9. **Runaway guard.** The steps are bounded by [0, max]. If frame time does not respond to steps, the governor makes no more than one raise per `BlockSeconds`.
+9. **Bounds and probation.** The steps are bounded by [0, max]. After an undo, raises are on probation until `BlockSeconds` pass without another undo. During probation, a raise also needs `BlockSeconds` since the last raise. Outside probation, raises follow the normal settle and hold rules.
 
-VRAM budget: `vram_budget` queries `VkPhysicalDeviceMemoryBudgetPropertiesEXT` for the game's physical device every 2 s, when the driver lists `VK_EXT_memory_budget` (it does on the author's machine: game log line 502).
+VRAM budget: `vram_budget` queries `VkPhysicalDeviceMemoryBudgetPropertiesEXT` for the game's physical device every 2 s, when the driver lists `VK_EXT_memory_budget` (it does on the author's machine: game log line 502). The query holds the first device's live lease. The core command requires both the observed instance request and physical-device API version to support Vulkan 1.1. Otherwise, only an explicitly enabled `VK_KHR_get_physical_device_properties2` permits the KHR command. Unknown facts, a missing selected command or a retired device return unknown VRAM and block costly raises; the query never falls back to an unproven alias.
 
 The governor is a pure state machine with unit tests (section 10).
 
+The runtime reads the present ring every 50 ms using reserved frame and statistics buffers.
+It refreshes the display period every 5 s and checks memory availability every 2 s.
+A successful scene-hook batch is the source of the installed fact. If that hook stops advancing
+for 10 s while frames arrive, the runtime logs once and holds every current step until it recovers.
+A panic stops the governor before it publishes a partial knob batch. Every 30 s the info log
+reports recent frame p50/p95, the effective target, all three steps and active/inactive/backoff state.
+Fixed debug steps obey the same probe, grass capacity and memory gates as automatic raises.
+
 ### 6.5 NVIDIA Reflex (experimental)
+
+Startup publishes the parsed Reflex mode before Vulkan interception. The real present wrapper
+runs the Reflex sequence for an eligible live swapchain. Driver failures set the Reflex disabled
+bit silently; no logging is scheduled from the present path. Fake-driver tests cover this wiring.
+In-game behavior and latency improvement remain unverified.
 
 Fact: the exe contains none of `vkLatencySleepNV`, `vkSetLatencySleepModeNV`, `vkSetLatencyMarkerNV`, `VK_NV_low_latency`, `low_latency2`, `NvAPI` or `nvapi64` (whole-file ASCII and UTF-16 search, 2026-10-25). The menu has a Reflex option (`nvidiaReflex`), but the Vulkan path cannot call Reflex, so the option is very likely inert.
 
@@ -191,66 +206,92 @@ On the author's machine (game log, 2026-10-25):
 - line 892: `timelineSemaphore=VK_TRUE` in the feature listing;
 - line 905: the game enables `VK_KHR_present_id2`.
 
-Method (NVIDIA only, and only if the driver lists `VK_NV_low_latency2`):
-1. **Device.** `wrap_create_device` copies the game's create info and adds `VK_NV_low_latency2`. It also enables timeline semaphores:
-   - If a `VkPhysicalDeviceVulkan12Features` struct is in the chain, it sets `timelineSemaphore = VK_TRUE` there.
-   - Otherwise, if a `VkPhysicalDeviceTimelineSemaphoreFeatures` struct is there, it sets it there.
-   - Otherwise it chains a new `VkPhysicalDeviceTimelineSemaphoreFeatures`.
-   - If the instance API version is below 1.2, it also adds `VK_KHR_timeline_semaphore`.
-   - If neither `VK_KHR_present_id` nor `VK_KHR_present_id2` is in the game's list, it adds `VK_KHR_present_id` (`VUID-vkCreateDevice-ppEnabledExtensionNames-01387`). The game drops `present_id2` on AMD, on NVIDIA drivers below 0x9a438000, and when the driver lacks it. If the driver lists neither, Reflex is off.
-   - **If the modified call fails, it calls again with the game's original create info and turns Reflex off for the session** (review finding 1).
-2. **Swapchain.** `wrap_create_swapchain` chains `VkSwapchainLatencyCreateInfoNV { latencyModeEnable = TRUE }`. **If that call fails, it calls again without it** and Reflex stays off. On success it calls `vkSetLatencySleepModeNV(lowLatencyMode = TRUE, lowLatencyBoost per .ini, minimumIntervalUs = 0)`. It does this again on every swapchain re-creation.
-3. **Frame IDs.** The mod keeps its own frame counter, starting at 1. `VK_NV_low_latency2` present IDs are not the `VkPresentId2KHR` IDs (review finding 3, Vulkan refpage `VkSetLatencyMarkerInfoNV`). There is no submit wrapper. Implicit attribution ties pending submits to the frame at the next `vkQueuePresentKHR`, and the game presents from a single call site (0x140fd529a). `VkLatencySubmissionPresentIdNV` is optional and is ignored below specVersion 3 (ruling 2026-10-25, research item G10).
-4. **Per frame,** in `wrap_present`:
-   - set `PRESENT_START`, call the real present, set `PRESENT_END`, and increment the frame counter;
-   - call `vkLatencySleepNV` with the mod's timeline semaphore and the next target value;
-   - wait with `vkWaitSemaphores` and a **100 ms hang-guard timeout**. Three timeouts in a row turn Reflex off for the session; a success resets the count; a lost device turns it off at once. If the real present returned `VK_ERROR_OUT_OF_DATE_KHR` or `VK_SUBOPTIMAL_KHR`, that frame's sleep is skipped and Reflex stays on (the new swapchain is re-armed when it is created). Each turn-off is logged (review finding 2; research items G7 and G8);
-   - set `SIMULATION_START` for the new frame. There is no `RENDERSUBMIT_START`.
-   - The sleep runs on the thread that presents, before it starts the next frame's work. Whether that also delays the game's input sampling depends on the game's threading, which is not known. That is why Reflex is experimental and must be measured.
-5. **Measurement.** Every 5 s, on the present thread (inside `wrap_present`, on that frame's swapchain, which is valid there), the mod reads `vkGetLatencyTimingsNV` and logs the average latency from simulation start to GPU render end, and present to display.
+Method (NVIDIA only, and only if the driver lists `VK_NV_low_latency2` revision 2 or later):
+1. **Device.** Before creation the mod queries the driver extension list and timeline/present-ID feature bits. The saved menu is still unknown. Every configured mode except `off` may prepare Reflex. The mod adds `VK_NV_low_latency2`, timeline support, and present-ID support without duplicates. It preserves an enabled `VK_KHR_present_id2` path. Otherwise it enables `VK_KHR_present_id` and its queried feature. It copies each changed feature node and every prefix node it must relink; it never writes into the game's input chain. A Vulkan 1.2 feature structure takes precedence over a standalone timeline structure. Device groups with more than one device are refused.
+   - Unchanged `vkCreateInstance` calls provide the requested API version and enabled `VK_KHR_get_physical_device_properties2` fact after successful creation. The observed instance generation retains those facts with its resolver. Reflex first reads physical properties through the Vulkan 1.0 command. It uses core Features2 only when both requested and physical API versions are at least 1.1; otherwise it uses Features2KHR only if that instance explicitly enabled the extension. Unknown facts or a missing selected function leave the device untouched, without trying the other alias. Pointer presence alone is not permission to use a route.
+   - Wiring still conservatively requires and enables the listed `VK_KHR_timeline_semaphore` extension, including on Vulkan 1.2+, and uses its KHR wait entry point.
+   - Typed copies currently support Features2, Vulkan 1.1/1.2/1.3 features, timeline, present-ID v1/v2, device group, synchronization2 and dynamic rendering nodes. An unknown device-chain layout, a cycle, or more than 64 nodes leaves the original device untouched. This is a compatibility limit, not proof that every game/driver chain is supported.
+   - If the modified create call fails, the mod calls the driver exactly once with the game's **original create-info pointer**, original chain and extension list, then leaves Reflex disabled for the session (`driver refused`).
+2. **Swapchain.** The mod prepends an owned `VkSwapchainLatencyCreateInfoNV` with `latencyModeEnable = TRUE`, borrowing the original tail unchanged. An already-present latency node is left alone. A rejected modified call retries the exact original pointer once and disables Reflex. A successful new swapchain gets an owned timeline semaphore and a sleep-mode command from the current decision. Recreation re-arms the new swapchain. If the saved menu becomes known later and changes that decision, the mod updates the sleep mode once.
+3. **Frame IDs and attribution.** IDs start at 1 and never wrap. They are independent of the game's `VkPresentId2KHR` IDs. The mod leaves `VkPresentInfoKHR` and its chain untouched. There is **no submit hook** and no `VkLatencySubmissionPresentIdNV` chaining in v1. Markers around present and implicit driver attribution are the known limit; they do not identify individual application submissions.
+4. **Present.** The exact order is `PRESENT_START`, the real present, `PRESENT_END`, `vkLatencySleepNV`, and `vkWaitSemaphores` with a **10 ms timeout**. After a successful wait, increment the frame ID, then emit `SIMULATION_START` and `RENDERSUBMIT_START`. The first timeout, lost device or out-of-date result disables Reflex. Any other sleep/wait failure also fails closed. Later presents do not sleep or wait. The original result is cached before post-work, so even a caught post-work panic cannot present again.
+   - The normal present path has no allocation, blocking lock or log. Atomic non-waiting admission rejects concurrent or reentrant present streams, disables Reflex, and lets the real present run. The one game present call site is evidence for the expected serialized stream, not a general thread-safety guarantee. Already-entered driver work must return before it can observe another thread's disable.
+   - Pacing occurs on the thread that presents, before its next frame. The effect on input sampling is unverified because the game's threading is not known.
+5. **Lifetime and teardown.** A reader count is incremented before the active runtime pointer is loaded. Destruction detaches that pointer, then drains existing readers before freeing it. Both atomics use sequential consistency, so a reader cannot see the retired pointer while the writer sees the pre-reader zero. The device table and semaphore remain live for every present and report call. Wrapped device/swapchain destruction still retires resources when Reflex or ordinary Vulkan wrapping is disabled. Required GetProcAddress/GIPA/GDPA lookup routes also remain wrapped after disable. The game must obey Vulkan external synchronization and obtain those destroy functions through the installed chain.
+   - A timed-out latency sleep can still signal its semaphore later. Retirement must drain that pending timeline value before destroying the semaphore. This can wait on a stuck driver during teardown; it is outside the normal present path. The 10 ms present timeout does not prove completion of native signaling.
+   - `vk::with_game_device` provides the separate governor with a read-only lease on the first device and its enumerated physical-device parent. Only actual outputs from `vkEnumeratePhysicalDevices` or core/KHR physical-device group enumeration establish parentage. SUCCESS and INCOMPLETE outputs count; failed and count-only calls do not. The matching instance generation and real GIPA remain together. This applies to every GPU and Reflex mode, subject to observed parentage and compatible native lifetime entry points.
+   - Device and instance teardown reject new leases and wait for old ones. Instance retirement removes its physical-device observations, so reused handle values cannot revive an old device context. After the first device dies the API stays unavailable. Callbacks must not destroy leased handles, retain them after returning, or launch asynchronous native work with them.
+   - Unknown or ambiguous parentage fails closed. The registry retains at most 64 live instances and 256 physical-device handles per instance. Untracked handles do not enable Reflex or GPU-info queries. A conflicting first-wins lifetime function leaves the optional feature that requires it unavailable instead of replacing dispatch already issued to another instance. Destruction for an unadmitted device uses its matching original function when addresses differ. Device-query admission proves only the device destructor; swapchain retirement requires Reflex admission. The existing optional GPU-info query resolves through its proven parent; unknown parentage skips that query while preserving native creation, process priority and texture-budget policy.
+6. **Measurement.** `reflex::latency_report() -> Option<String>` calls `vkGetLatencyTimingsNV` under a reader lease and formats averages for valid simulation-start-to-GPU-end and present-call timestamps. Missing timestamps produce no fabricated sample. The API has no display timestamp, so it does not claim a present-to-display measurement. The governor queries it every 5 s when debug output is enabled and logs only available reports. Formatting an emitted report may allocate; no measurement or formatting runs on the present path.
 
 `.ini`: `Reflex = game | auto | off | on | boost`, default `auto`.
-- Every enabled mode requires an NVIDIA GPU whose driver lists `VK_NV_low_latency2`.
+- Every enabled mode requires an NVIDIA GPU whose driver lists the extension and required capabilities.
 - `auto` and `on` enable Reflex without boost; `boost` enables it with boost; `off` disables it.
-- `game` follows the player's saved in-game Reflex value: 0 is off, 1 is on and 2 is boost.
-  A missing or unknown value uses the `auto` answer. Reading the saved value belongs to future wiring.
+- `game` follows the saved value: 0 is off, 1 is on and 2 is boost. Unknown values use the `auto` answer.
+- The scene-settings post-hook reads the verified `RDX-8` u32 and `RDX-11` vsync byte only when the checked relationship `R8 == RDX + 0x54` holds. Values outside Reflex 0..2 or vsync 0..1 publish unknown. A single Relaxed atomic publishes the coherent pair, with no hook logging.
 - A bad setting warns and falls back to `auto`.
 
-W19 implements only the pure device planner and mode decision. Its extension list contains
-`VK_NV_low_latency2`, plus `VK_KHR_timeline_semaphore` below Vulkan 1.2, without duplicates.
-Tasks 16/16b own the runtime wiring. Task 16 must also check the driver capabilities, present-ID
-prerequisites and create-call retry rules above before using the plan.
+W19's pure `plan_device` and `decide_mode` contracts are unchanged. W23 adds runtime wiring.
+Validation uses fake native function tables and the real wrappers, including immutable chain copies,
+exact-pointer retries, timeout disable, swapchain recreation and the native menu post-hook.
+This is **not verified in game; the maintainer runs the boot test**. Latency improvement still needs
+an in-game A/B measurement at the same spot and frame rate.
 
-Proof: the mod log shows the extension and latency mode enabled, and the logged latency is lower with Reflex on than off, at the same spot and the same fps. If it is not lower, that result goes to the author, who decides the default.
-
-Types: `ash` 0.38.0 already has all `VK_NV_low_latency2` structs. The pure layer reuses them.
-`src/vk/types.rs` defines the missing AMD types from the pinned Khronos registry.
-
+Primary API sources: [Khronos low-latency2](https://docs.vulkan.org/refpages/latest/refpages/source/VK_NV_low_latency2.html),
+[latency sleep](https://docs.vulkan.org/refpages/latest/refpages/source/vkLatencySleepNV.html),
+[semaphore lifetime](https://docs.vulkan.org/refpages/latest/refpages/source/vkDestroySemaphore.html), and
+[latency reports](https://docs.vulkan.org/refpages/latest/refpages/source/vkGetLatencyTimingsNV.html).
+Layouts use ash 0.38.0 (Vulkan 1.3.281) and the existing present-ID2 declarations pinned to
+[Vulkan-Headers v1.4.366, commit 73814d006638aa00bd553215b054f0f02e457e22](https://github.com/KhronosGroup/Vulkan-Headers/blob/73814d006638aa00bd553215b054f0f02e457e22/include/vulkan/vulkan_core.h).
 ### 6.6 AMD Anti-Lag 2 (experimental)
 
-Anti-Lag is not verified on AMD hardware. W19 adds only pure planning, mode decisions, AMD ABI
-types and an atomic call sequencer. It makes no driver calls. Task 16b owns the runtime wiring.
+Anti-Lag runtime wiring is implemented. It is **experimental, not verified on AMD hardware**.
+`.ini`: `AntiLag = auto | off | on`, default `auto`. Both `auto` and `on` require AMD
+(vendor ID `0x1002`), a driver-listed `VK_AMD_anti_lag` extension and the `antiLag` feature.
+`off` leaves creation and presentation unchanged. A bad setting warns and uses `auto`.
+A forced `on` on a non-AMD device logs "not listed, off" and changes nothing. Reflex has
+priority: an active Reflex device never receives this mod's Anti-Lag pacing.
 
-`.ini`: `AntiLag = auto | off | on`, default `auto`.
-- `auto` enables Anti-Lag for AMD GPUs (vendor ID `0x1002`) only when the driver lists
-  `VK_AMD_anti_lag` and reports the `antiLag` feature.
-- `on` still requires the extension and feature. `off` disables it.
-- A bad setting warns and falls back to `auto`.
-- Reflex and Anti-Lag are never enabled together. The GPU vendor decides the automatic path;
-  an active Reflex mode blocks Anti-Lag even with an explicit `on` setting.
-- The device planner skips groups with more than one device. It avoids duplicate extension and
-  feature-chain entries. Future wiring must query capabilities before applying it.
+Before device creation, the wrapper queries the physical device under the observed parent's
+lifetime lease. Core Features2 requires both the requested and physical API versions to be at
+least 1.1. The KHR alias requires the explicitly enabled properties2 instance extension.
+Unknown facts or a missing selected entry point leave Anti-Lag off, without alias fallback.
 
-For one serialized present stream, the counter starts at 1. The first present has no PRESENT marker.
-After it returns, the sequencer plans INPUT(2), then PRESENT(2) before the second present, then
-INPUT(3), and so on. The INPUT stage is an approximation, called after the previous present returns.
-Future wiring must execute every returned call in order. The sequencer itself sends nothing.
+The shared typed device copier owns the changed chain and extension list. It puts the enabled
+AMD feature first, adds the extension once and preserves the game's input values and pointers.
+Groups containing more than one physical device and unknown chain layouts remain unchanged.
+If the driver refuses the modified create call, the wrapper retries the exact original pointer
+once and disables Anti-Lag for the session.
 
-A lost device disables the sequencer at once. Three consecutive driver updates taking more than
-100 ms disable it for the session; an update at or below 100 ms resets the streak. The caller
-measures these durations and logs the single disable transition. Counter exhaustion also stops
-planning rather than wrapping a frame ID. The data helper sets ON with no frame-rate cap and
-clears both extension chains. Its presentation-info pointer must remain valid through the call.
+Only the first eligible AMD device is admitted. Its native destruction endpoints must be bound
+before creation. The runtime records that device's actual created queue handles with the core
+`vkGetDeviceQueue` command. Queues with nonzero creation flags, missing commands or unsupported
+queue counts leave pacing off. A common driver function pointer does not establish queue ownership.
+Each successful swapchain creation associates a fresh sequencer with that device and swapchain.
+Only a single-swapchain present on an associated queue is paced. Retirement drains readers before
+native device or swapchain destruction; reused raw handle bits cannot revive a retired record.
+
+The runtime seeds INPUT(2) immediately before the first paced present, then sends PRESENT(2),
+calls the real present once and sends INPUT(3). Later presents continue matching PRESENT and
+INPUT pairs. The INPUT stage is an approximation after the previous present; the initial seed
+has no preceding present. It does not observe the game's actual input processing. The original
+present info, its `pNext` pointer and the game's present IDs pass through unchanged.
+
+This is the issue W25 exception to the timestamp-only present rule. Present bookkeeping uses
+only atomics and stack values, with no allocation, waiting lock or ordinary logging. A second
+concurrent present stream disables Anti-Lag without waiting for the first. Each AMD driver call
+is timed with QPC. Three consecutive calls taking strictly more than 100 ms disable it for the
+session; a faster call resets the streak. This detects a returned slow call and cannot cancel
+a driver call that never returns. `VK_ERROR_DEVICE_LOST` stops pacing at once. The next device
+or swapchain lifecycle safe point reports the stop once, even when the feature is already off.
+A failing host logger cannot interrupt mandatory native teardown. Counter exhaustion also stops
+the sequencer instead of reusing an ID.
+
+The ABI and call contract follow the pinned Khronos registry from section 6.5 and the
+[`vkAntiLagUpdateAMD` reference](https://docs.vulkan.org/refpages/latest/refpages/source/vkAntiLagUpdateAMD.html).
+The author can check `AntiLag=on` on the RTX 5080: the log must say "not listed, off", no AMD
+extension is added, and normal behavior is preserved. Native fake-driver checks establish
+sequencing and safety rules; real AMD latency and game behavior still need a tester.
 
 ## 7. Knobs
 
@@ -295,7 +336,7 @@ Each knob states:
 - **Capacity (research 2026-10-25, which replaces the doubling plan):**
   - The buffers are fixed per scene view: `ScatteredObjectData[0x14000]` and two `DetailScatteringInstanceData[0x14000]`. One GPU counter (A) fills the 0x14000 budget for both scatter passes each frame. The game reads that counter back to the CPU: last value at entry+0x14, peak at +0x1c, a warn level of 0xf000 (75 %) at +0x20, and the cap of 0x14000 at +0x24.
   - The exe has no CPU-side clamp. The only bound is the shader constant `scatteredObjectCapacity` (`0x140074d52`). The 0x14000 at `0x1400745e0` is counter METADATA, not a buffer size, so patching it would cause an overflow. **Capacity is never changed.**
-  - **Scatter counter probe (7.2a):** a pre-hook on `FUN_1400767a0` reads counter A every 30th frame. It self-checks the pointer chain (warn must be 0xf000 and cap 0x14000; otherwise the probe stays off and the knob stays at 90 m) and publishes the last value.
+  - **Scatter counter probe (7.2a):** a pre-hook on `FUN_1400767a0` publishes only the pass pointer and a call counter. A sampler thread copies the GPU counter blocks every 500 ms while calls continue. It self-checks A.warn = 0xf000 and A.cap = 0x14000 before publishing a complete sample. A layout mismatch or ten consecutive misses leaves the probe off and the knob at 90 m.
   - **Live headroom rule:** the governor raises this knob from r to r_next only while `last × (r_next / r)² < 0xf000`, and steps down at once when `last ≥ 0xf000`. The readback is at least one frame late; the 25 % gap between warn and cap is the margin.
   - **Hard ceiling:** r_max = 90 × sqrt(0xf000 / peak₉₀), where peak₉₀ is measured once at vanilla 90 m in the densest grass (the author's measurement session, `[Debug] ScatterProbe = 1`). Until it is measured, the ceiling is 90 m and the knob is inactive.
   - Not covered: the brick gate's own `maxCullElements` (`BrickCullingShaderParameters` +0xec8). The measurement session also watches for missing bricks at the raised distance.
@@ -305,23 +346,26 @@ Each knob states:
 
 ### 7.2a Scatter counter probe (the author, 2026-10-25: "Add it to v1")
 
-- **Hook:** a minhook pre-hook on `FUN_1400767a0(_, pass)`. Its signature is the 14-byte prologue `48 89 54 24 10 55 53 57 41 55 41 56 41 57`, unique in build f68140a3 (checked 2026-10-26). Like the terrain signature it is fragile across updates; a mismatch leaves the probe off.
+- **Hook:** a minhook pre-hook on `FUN_1400767a0(rcx, pass, f32 in XMM2)`. Its signature is the 14-byte prologue `48 89 54 24 10 55 53 57 41 55 41 56 41 57`, unique in build f68140a3 (checked 2026-10-26). Like the terrain signature it is fragile across updates; a mismatch leaves the probe off.
 - **Pointer chain** (research write-up; a HYPOTHESIS until the runtime self-check passes):
   - obj = [pass+0x18];
   - pool = [[pass+0x8]+0x20];
   - entry(h) = [pool+0x48] + (h & 0xffff) × 0x40, for h = [obj+0x8] (counter A), [obj+0xc] (B) and [obj+0x10] (C).
-  - Every pointer is checked readable (VirtualQuery) before it is read.
+  - The sampler copies 7 blocks with `ReadProcessMemory(GetCurrentProcess(), ...)`: `pass` +0x8..+0x20, owner +0x20..+0x28, pool +0x48..+0x50, obj +0x8..+0x14, and each entry +0x14..+0x3c. A copy is accepted only if the API succeeds and reports the exact requested byte count. Checked field reads parse only these local buffers; Rust never dereferences a game address.
+- **When it is installed:** only with `[Debug] ScatterProbe = 1` and `LogLevel = debug`, or with `EnableScatterDistance = 1` once the measured ceiling r_max allows a raise (`ceiling_step(SCATTER_STEPS, r_max) > 0`). Until r_max is measured, a default install has no probe hook or sampler thread. An off log names both failed halves of this rule.
+- **Reason for the sampler:** the in-game pulse remained with the earlier 500 ms hook sampler and its 7 `VirtualQuery` checks. Contention on the process address-space lock is a HYPOTHESIS. All sampling work now runs off the game thread. Not verified in game; the maintainer boot-tests it with the probe on.
 - **Rules:**
-  - The hook samples every 30th call, publishes atomics only, never logs, and always calls the original.
-  - The self-check requires A.warn = 0xf000 and A.cap = 0x14000. On a failure, the probe turns off for the session (once, logged by the governor thread).
-  - It runs inside `guard(Feature::ScatterDistance, ...)`.
-- **Debug output:** with `[Debug] ScatterProbe = 1` and `LogLevel = debug`, the governor thread logs A, B and C (last and peak) every 2 s, and the session peak of A at exit.
+  - The guarded hook stores the latest pass pointer with `Release`, increments a call counter with `Relaxed`, and calls the original exactly once with unchanged arguments. It does not read the clock or game memory, allocate, lock or log.
+  - Only after the wanted hook installs, start one detached thread named `scatter-probe`. It sleeps 500 ms without holding a lock. If the call counter is unchanged, it reads nothing. Otherwise it loads the pass pointer with `Acquire` and attempts one sample. Its body runs inside `guard(Feature::ScatterDistance, ...)`; a panic stops it and latches `FAILED`.
+  - A failed or short copy, zero handle or ownership mismatch skips that sample. Nine consecutive misses are tolerated; the tenth while calls continue sets `FAILED` and clears `PROBE_OK`. A good complete sample resets the miss count to zero. An unchanged call counter neither reads memory nor counts another miss.
+  - A correctly copied counter A must have warn = 0xf000 and cap = 0x14000. A mismatch fails at once. No partial sample is published. Failure stays latched for the session; the governor logs it once.
+- **Debug output:** with `[Debug] ScatterProbe = 1`, `LogLevel = debug` and the governor running (`TargetFps > 0`), each 2 s counter line logs A, B and C (last and peak), followed by `session_peak_A`. The governor observes `PEAK_A` every 50 ms and retains the largest value seen during that run across scene-view resets. A peak that resets between observations may be missed.
 - **Measurement session (the author, once per build):** grass quality High, mod distance left at vanilla 90 m, stand in the densest grass for 60 s, then send the log. The controller computes r_max and records it in the RE notes. The release uses r_max as the knob's ceiling.
 
 ### 7.3 Terrain detail distance (`TerrainDistance`): priority 3
 
 - **What it changes:** `dist0`, the base distance of the voxel-terrain LOD octree. A node refines while `dist × 0.969 ≤ cell × R`, where cell = 32/2^level and R = dist0 × min(2·scale, 1) (agent knob-terrain). With dist0 = 32, full detail reaches about 33 m and each coarser band doubles.
-- **Where it lives:** `FUN_1401e2e80(mgr, camPos, params)` copies 32 bytes from `params` into `mgr+0xc478` on every call (verified at `0x1401e2eed`–`0x1401e2efb`). The defaults are 32 / 128 / 256 (verified at `0x1400fa623`–`0x1400fa631`). A minhook pre-hook multiplies `params[0]` by the knob factor before calling the original.
+- **Where it lives:** `FUN_1401e2e80(mgr, camPos, params)` copies 40 bytes (0x28) from `params` into `mgr+0xc478` on every call (verified at `0x1401e2eed`–`0x1401e2f0c`). `camPos` points at three i64 values. The defaults are 32 / 128 / 256 (verified at `0x1400fa623`–`0x1400fa631`). A minhook pre-hook multiplies `params[0]` by the knob factor before calling the original. It reads and writes only the first 32 bytes of the params buffer; the conditional change to `params[1]` is described under Steps below.
 - **Not used:** `fullyMeshedRange` (`mgr+0xc444`). It is a per-frame measurement, rolled over at `0x1401e2ee4`.
 - **Baseline:** the incoming `params[0]`, published to an atomic.
 - **Steps:** factor 1.0 → 1.25 → 1.5 → 1.75 → 2.0. If dist1 < dist0 × factor, dist1 is raised by the same factor, so that the order holds. dist2 is unchanged.
@@ -397,6 +441,8 @@ A/B protocol for the author, after a restart for each variant:
 `[Hdr]`:
 
 - `PaperWhiteNits = game | <number>` (default `game`; finite 40..=400 nits). Invalid or out-of-range values warn and use `game`.
+- `FixPeak = on | off` (default `off` until the author's in-game A/B test).
+- `DisplayPeakNits = game | <whole number>` (default `game`; 80..=10000 nits). Used only with `FixPeak = on`. Invalid or out-of-range values warn and use `game`. Decimal commas with zero fraction are accepted.
 
 `[Governor]`: the keys in 6.4.
 
@@ -414,11 +460,11 @@ A/B protocol for the author, after a restart for each variant:
 - Any invalid or out-of-range shadow value warns once and uses `game`; no clamping.
 
 `[Debug]` (debug only, needs `LogLevel = debug`; not in the default file; at any other log level the mod ignores these keys):
-- `ScatterProbe = 0 | 1` (default 0): read and log the scatter counters (7.2a). With `EnableScatterDistance = 0`, this key is the only reason to install the probe hook.
+- `ScatterProbe = 0 | 1` (default 0): enable the publish-only hook and its 500 ms sampler thread, and log the scatter counters (7.2a). Until r_max is measured, this key with `LogLevel = debug` is the only reason to install them.
 - `ForceStepObjectDistance`, `ForceStepScatterDistance`, `ForceStepTerrainDistance = 0..=4` (default: absent, the knob is not held): hold that knob at a fixed step for testing (pre-flight ruling for Task 17). A whole number outside 0..=4 is clamped with a warning. Other text warns and counts as absent.
 
 Unknown keys and invalid values are logged. Invalid choices use their defaults.
-Out-of-range numeric values are clamped, except `PaperWhiteNits`, which falls back to `game`.
+Out-of-range numeric values are clamped, except `PaperWhiteNits` and `DisplayPeakNits`, which fall back to `game`.
 
 ### HDR paper white
 
@@ -431,12 +477,38 @@ by another tool. Each outcome produces one `hdr paper white:` line.
 
 The effective-value accessor starts at 250 and publishes the chosen number only after a
 successful checked write. Skips and failed writes do not publish the configured number.
-It does not measure another tool's replacement value.
+It does not measure another tool's replacement value. A typed read-back failure also
+marks the value unverified, because the immediate may have changed despite the numeric
+getter staying at its last verified value. Dependent peak correction stays off in that case.
 
 The default remains `game` until the in-game A/B test (Task 17). The research proposes
 trying 80 nits first. The scale mismatch and visible HDR improvement remain hypotheses
-until that test. Peak changes, shader replacement and HDR metadata are later tasks.
+until that test. Shader replacement and HDR metadata are later tasks.
 See `docs/re-notes.md`, "HDR paper white", for the verified instruction and context.
+
+### HDR tonemapper peak
+
+With `FixPeak = on`, the Task 12 post-hook corrects the u16 at scene+0x41e only when the
+colour-space byte at scene+0x408 is 1 or 2. It reads the game's fresh peak on each call,
+then uses `DisplayPeakNits` when set. It writes `round(target * 80 / paperWhite)`, clamped
+to 1..=10000, with an unaligned store. Invalid paper white skips the write. Paper white
+comes from the same effective-value accessor as W13, including its 250-nit fallback.
+Windows' full-frame luminance can be below the panel's true peak, so an explicit panel
+target can replace the game's figure.
+
+Start-up configures and logs this feature after paper white and before queued hook enable.
+A failed paper-white read-back keeps it off and produces one start-up reason. It requires
+code hooks to be allowed and at least one distance knob to be enabled. With
+all distance knobs off, the existing Task 12 gate omits the hook; peak correction stays
+off and logs why. A failed scene-hook installation is reported by `object distance:`.
+The correction runs before object publication or scaling inside Task 12's inner guard.
+Its normal hook path allocates nothing, takes no lock and logs nothing. A panic there
+leaves the original scene untouched, disables the shared scene feature and does not run
+the original again. If the game skips the scene-settings call, it retains its own peak.
+
+The default remains off until the in-game A/B test. The shader-side chain and visible
+roll-off remain hypotheses, with the limits recorded in `docs/re-notes.md`,
+"HDR tonemapper peak (2026-10-26; plan route B2)".
 
 ## 9. Failure handling
 
@@ -447,7 +519,7 @@ See `docs/re-notes.md`, "HDR paper white", for the verified instruction and cont
   - On an unknown build, only API-level features apply: the frame timer, the governor's timing, Reflex, and the texture budget, which needs a full 80-byte table match. Code patches and code hooks stay off, unless `AllowUnknownBuild = 1` (review finding 10). The log says which applied.
   - A game update therefore turns the knobs off until the mod is updated, instead of risking a crash.
 - **Driver refusals.** Changed `vkCreateDevice` and `vkCreateSwapchainKHR` calls are retried with the game's original arguments if they fail. The feature then stays off.
-- **No waits without timeouts** on game threads. The Reflex wait has a 100 ms hang-guard timeout (6.5).
+- **No waits without timeouts** on game threads. The Reflex present wait has a 10 ms timeout (6.5). Pending semaphore retirement can wait longer during teardown, as documented in 6.5.
 - **Panics.** Every extern function catches unwinds and falls back to the original.
 - **Memory access.** Hooks read only the arguments the game passes in, at that moment. The governor never reads game memory. Access violations cannot be caught by `catch_unwind`, so the design avoids the stale pointers that would cause them (review finding 11).
 - **Original bytes** are kept for every patch. They are not restored at process exit.
@@ -467,7 +539,7 @@ Unit tests (`cargo test`, no game):
   - FIFO quantised at 60/120 Hz: quantised mode, no flapping;
   - target above refresh: the refresh rate is held;
   - VRAM below `MinVramFreeMiB`: no raise.
-- `governor` runaway guard: steps stay within [0, max]. If frame time does not respond, there is at most one raise per `BlockSeconds`.
+- `governor` bounds and probation: steps stay within [0, max]. After an undo, raises during probation need `BlockSeconds` since the last raise. Steady headroom outside probation can raise after each settle and hold.
 - `config`: defaults, clamping, unknown keys, missing file, read-only folder.
 - Texture budget formula: 8, 10, 12, 16 and 24 GB, and integrated GPUs.
 
@@ -510,7 +582,7 @@ In-game checks on the author's machine:
 ## 12. Release
 
 1. The author reads all code.
-2. Public GitHub repo at `C:\Modding\Enshrouded`, MIT licence. The README covers what the mod does, install, uninstall, the `.ini` reference, the tested build, and the disclosure in the author's words.
+2. Public GitHub repo at `<repository>`, MIT licence. The README covers what the mod does, install, uninstall, the `.ini` reference, the tested build, and the disclosure in the author's words.
 3. The Nexus zip has the section 4 layout and the loader's MIT licence.
 4. The mod page states the tested game build and that a game update turns the knobs off until the mod is updated (section 9).
 
@@ -518,7 +590,7 @@ In-game checks on the author's machine:
 
 1. Async compute default: `on` for everyone.
 2. Byte signatures: published in the public repo (an exception to the private rule).
-3. Reflex default: `auto`, meaning on for NVIDIA (the author, 2026-10-25). It replaces `game`: the in-game option is not shown on Vulkan.
+3. Reflex default: `auto`, meaning on for supported NVIDIA devices. `game` is retained and follows the saved 0/1/2 value; unknown values use the auto answer. The in-game option is not shown on Vulkan.
 4. Licence: MIT.
 5. Name: `enshrouded-headroom` for now; rename before the Nexus release.
 6. Spec v2: approved.

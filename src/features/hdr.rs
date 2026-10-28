@@ -1,6 +1,6 @@
 //! HDR composite paper white, applied once at start-up.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use log::Level;
 
@@ -20,6 +20,23 @@ const ORIGINAL: [u8; 4] = [0x00, 0x00, 0x7a, 0x43];
 /// `module` must describe mapped, readable memory. Call only at start-up before game
 /// threads run this code, with no concurrent writer to the image.
 pub unsafe fn apply(module: &Module, nits: f32) -> Result<(), String> {
+    // SAFETY: this function's mapped-image and start-up contract is passed to the checked writer.
+    unsafe {
+        apply_with_writer(module, nits, |site, bytes| {
+            write_checked(site, &ORIGINAL, bytes).map(|_| ())
+        })
+    }
+}
+
+/// The checked patch with its writer supplied for a failed-read-back test on an owned image.
+///
+/// # Safety
+/// Same mapped-image and start-up contract as `apply`; `write` must obey `write_checked`'s contract.
+unsafe fn apply_with_writer(
+    module: &Module,
+    nits: f32,
+    write: impl FnOnce(usize, &[u8]) -> Result<(), PatchError>,
+) -> Result<(), String> {
     if !nits.is_finite() || !(40.0..=400.0).contains(&nits) {
         return Err("skipped: value is not finite or outside 40..=400 nits".to_owned());
     }
@@ -33,17 +50,25 @@ pub unsafe fn apply(module: &Module, nits: f32) -> Result<(), String> {
     // SAFETY: the unique match contains all four target bytes in readable module memory.
     // The caller ensures start-up only and no concurrent execution or writes. The original
     // and replacement byte arrays live separately from that target memory.
-    unsafe { write_checked(site, &ORIGINAL, &encode(nits)) }
-        .map(|_| ())
-        .map_err(|error| match error {
-            PatchError::Mismatch { .. } => {
-                "skipped: immediate changed by another tool; left unchanged".to_owned()
-            }
-            PatchError::ReadBack => {
-                "patch written, but read-back failed; effective value was not published".to_owned()
-            }
-            other => format!("skipped: cannot patch the immediate: {other}"),
-        })
+    write(site, &encode(nits)).map_err(|error| match error {
+        PatchError::Mismatch { .. } => {
+            "skipped: immediate changed by another tool; left unchanged".to_owned()
+        }
+        PatchError::ReadBack => {
+            UNCERTAIN.store(true, Ordering::Release);
+            "patch written, but read-back failed; effective value was not published".to_owned()
+        }
+        other => format!("skipped: cannot patch the immediate: {other}"),
+    })
+}
+
+/// A failed read-back means the immediate may have changed without a verified value.
+static UNCERTAIN: AtomicBool = AtomicBool::new(false);
+
+/// Whether the effective paper-white value is usable by dependent features.
+/// A failed read-back leaves the numeric getter unchanged but makes this false.
+pub fn paper_white_is_verified() -> bool {
+    !UNCERTAIN.load(Ordering::Acquire)
 }
 
 /// The last successfully checked paper-white patch, initially the stock 250 nits.
@@ -106,6 +131,41 @@ pub fn encode(nits: f32) -> [u8; 4] {
     nits.to_le_bytes()
 }
 
+/// Simulate a writer that changed the immediate but returned the structured read-back failure.
+/// Only the fresh-child uncertainty test calls this helper.
+#[cfg(test)]
+pub(crate) fn test_fail_readback_after_write() {
+    let (mem, module) = tests::image();
+    mem.put(0x1100, tests::CODE);
+    let (level, _) = start_up(PaperWhiteNits::Nits(80.0), true, &EFFECTIVE, |nits| {
+        // SAFETY: the image is owned, readable memory; the callback uses the checked writer
+        // on that image, then injects its typed failure after the bytes changed.
+        unsafe {
+            apply_with_writer(&module, nits, |site, bytes| {
+                write_checked(site, &ORIGINAL, bytes)?;
+                Err(PatchError::ReadBack)
+            })
+        }
+    });
+    assert_eq!(level, Level::Warn);
+    assert_eq!(mem.get(0x1103, 4), [0x00, 0x00, 0xa0, 0x42]);
+    assert_eq!(effective_paper_white_nits(), 250.0);
+}
+
+/// Publish 80 nits through the real checked-write start-up path, on an owned test image.
+/// Only fresh-child runtime bridge tests call this helper.
+#[cfg(test)]
+pub(crate) fn test_publish_checked_eighty() {
+    let (mem, module) = tests::image();
+    mem.put(0x1100, tests::CODE);
+    let (level, _) = start_up(PaperWhiteNits::Nits(80.0), true, &EFFECTIVE, |nits| {
+        // SAFETY: this test owns the readable image and no thread executes its bytes.
+        unsafe { apply(&module, nits) }
+    });
+    assert_eq!(level, Level::Info);
+    assert_eq!(mem.get(0x1103, 4), [0x00, 0x00, 0xa0, 0x42]);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,7 +202,7 @@ mod tests {
     }
 
     /// An image of 4 read-write pages with `.text` at `0x1000`, and the module that describes it.
-    fn image() -> (Mem, Module) {
+    pub(super) fn image() -> (Mem, Module) {
         let mem = Mem::rw(0x4000);
         mem.put(0, &text_only_header());
         let module = Module {
@@ -153,7 +213,7 @@ mod tests {
     }
 
     /// Verified instruction and following context from `docs/re-notes.md`.
-    const CODE: &[u8] = &[
+    pub(super) const CODE: &[u8] = &[
         0xc7, 0x45, 0x88, 0x00, 0x00, 0x7a, 0x43, 0x49, 0x8b, 0x16, 0xc7, 0x45, 0x8c, 0x9a, 0x99,
         0x19, 0x3f,
     ];

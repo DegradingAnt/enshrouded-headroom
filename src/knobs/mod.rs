@@ -12,17 +12,28 @@
 //! This module also holds the MinHook helpers: `create_and_queue` creates a hook and queues it,
 //! and [`enable_queued_hooks`] enables every queued hook at once. `entry::start` calls that once,
 //! as its last step, so every code hook goes live in one batch.
+//!
+//! # Loom models
+//!
+//! Run `RUSTFLAGS="--cfg loom" cargo test --release --lib knobs::loom`.
+//! Local model knobs instrument every field and execute these same methods and orderings.
+//! Existing const globals stay standard-backed in the model build; normal builds use only the
+//! exact standard atomic types. The models cover two publishes and one concurrent reader, not
+//! sequence-counter wraparound or the native hooks. Loom has its documented relaxed-order limits:
+//! <https://docs.rs/loom/0.7.2/loom/>.
 
 pub mod object_distance;
 pub mod scatter_distance;
+mod sync;
+pub mod terrain_distance;
 
-use std::ffi::c_void;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::AtomicU32;
+use sync::{AtomicU32 as SharedAtomicU32, AtomicU64 as SharedAtomicU64, Ordering};
 
+#[cfg(test)]
 use log::Level;
-use minhook::{MinHook, MH_STATUS};
-
-use crate::guard::catch;
+#[cfg(test)]
+use minhook::MH_STATUS;
 
 /// One knob's shared state.
 ///
@@ -42,24 +53,24 @@ use crate::guard::catch;
 ///   time of a publish or a seen also sees what that call (and its caller, before it) stored.
 pub struct KnobShared {
     /// The value the hook applies (a factor, or metres for the scatter knob), as `f32` bits.
-    value_bits: AtomicU32,
+    value_bits: SharedAtomicU32,
     /// The game's own value from the last publish, as `f32` bits; 0 (0.0) before the first.
-    baseline_bits: AtomicU32,
+    baseline_bits: SharedAtomicU32,
     /// How many times the baseline has changed (wraps). 0 before the first change.
-    baseline_seq: AtomicU32,
+    baseline_seq: SharedAtomicU32,
     /// `QueryPerformanceCounter` time passed to the last call of publish or seen; 0 before the
     /// first such call.
-    last_seen_qpc: AtomicU64,
+    last_seen_qpc: SharedAtomicU64,
 }
 
 impl KnobShared {
     /// A knob with value `v` and no baseline yet: `baseline()` is `(0.0, 0)`, `last_seen()` is 0.
     pub const fn new(v: f32) -> Self {
         KnobShared {
-            value_bits: AtomicU32::new(v.to_bits()),
-            baseline_bits: AtomicU32::new(0),
-            baseline_seq: AtomicU32::new(0),
-            last_seen_qpc: AtomicU64::new(0),
+            value_bits: SharedAtomicU32::new(v.to_bits()),
+            baseline_bits: SharedAtomicU32::new(0),
+            baseline_seq: SharedAtomicU32::new(0),
+            last_seen_qpc: SharedAtomicU64::new(0),
         }
     }
 
@@ -141,94 +152,17 @@ pub const TERRAIN_STEPS: [f32; 5] = [1.0, 1.25, 1.5, 1.75, 2.0];
 
 // ---- MinHook --------------------------------------------------------------------------------
 
-/// Hooks that `create_and_queue` queued and [`apply_queued`] has not applied yet.
-static QUEUED: AtomicU32 = AtomicU32::new(0);
-
-/// Create a MinHook hook from `target` to `detour` and queue it to be enabled. Returns the
-/// trampoline, the address that runs the original `target`.
-///
-/// Nothing in `target` changes until [`enable_queued_hooks`] runs, so the caller stores the
-/// trampoline where its detour reads it before that.
-///
-/// # Safety
-///
-/// - `target` is the entry of a function in executable memory. MinHook copies its first
-///   instructions (at least 5 bytes) into the trampoline, relocating RIP-relative ones, and writes
-///   a jump over them; no code may jump into those bytes.
-/// - `detour` is a function with exactly the type and calling convention of `target`.
-/// - Start-up only (`entry::start`), on one thread.
-pub(crate) unsafe fn create_and_queue(target: usize, detour: usize) -> Result<usize, String> {
-    let (target_ptr, detour_ptr) = (target as *mut c_void, detour as *mut c_void);
-    // SAFETY: the caller's contract. MinHook reads `target` (executable, checked by MinHook
-    // itself) and builds the trampoline in its own memory; it writes nothing into `target` yet.
-    let created = catch("create the hook", || unsafe {
-        MinHook::create_hook(target_ptr, detour_ptr)
-    })?;
-    let trampoline =
-        created.map_err(|status| format!("MinHook cannot hook {target:#x}: {status:?}"))?;
-    // SAFETY: `target` has a hook now (created above); queueing only marks it.
-    let queued = catch("queue the hook", || unsafe {
-        MinHook::queue_enable_hook(target_ptr)
-    })?;
-    if let Err(status) = queued {
-        // Take the unused hook out again. If that fails too, it stays created but disabled, which
-        // changes nothing in `target`.
-        // SAFETY: `target` has a hook that is not enabled.
-        let _ = catch("remove the hook", || unsafe {
-            MinHook::remove_hook(target_ptr)
-        });
-        return Err(format!(
-            "MinHook cannot queue the hook at {target:#x}: {status:?}"
-        ));
-    }
-    QUEUED.fetch_add(1, Ordering::AcqRel);
-    Ok(trampoline as usize)
-}
-
-/// Enable every queued hook at once. Returns how many were queued (0: nothing to do, and MinHook
-/// is not even started).
-///
-/// MinHook suspends the process's other threads while it writes the jumps, and moves a thread
-/// whose instruction pointer is inside a patched area. If one hook fails, MinHook stops there.
-pub fn apply_queued() -> Result<u32, String> {
-    let queued = QUEUED.swap(0, Ordering::AcqRel);
-    if queued == 0 {
-        return Ok(0);
-    }
-    // SAFETY: every queued hook was made by `create_and_queue`, whose contract makes its target
-    // safe to patch and its detour the right type; each detour's trampoline was stored before
-    // this call (the rule in `create_and_queue`).
-    match catch("enable the queued hooks", || unsafe {
-        MinHook::apply_queued()
-    })? {
-        Ok(()) => Ok(queued),
-        Err(status) => Err(not_all_enabled_text(queued, status)),
-    }
-}
-
-/// The text for a failed `MH_ApplyQueued`. It enables the hooks in the order they were created and
-/// stops at the first failure (MinHook `hook.c`), so the hooks before the failing one are live and
-/// the rest are not.
-fn not_all_enabled_text(queued: u32, status: MH_STATUS) -> String {
-    format!(
-        "MinHook could not enable all {queued} queued hook(s) ({status:?}); hooks queued before \
-         the failing one are live"
-    )
-}
-
-/// The log line for [`apply_queued`]'s result; `None` when nothing was queued.
-fn hooks_line(result: &Result<u32, String>) -> Option<(Level, String)> {
-    match result {
-        Ok(0) => None,
-        Ok(n) => Some((Level::Info, format!("hooks: {n} enabled"))),
-        Err(why) => Some((Level::Warn, format!("hooks: {why}"))),
-    }
-}
+use emberkit::hooks::hooks_line;
+#[cfg(test)]
+use emberkit::hooks::not_all_enabled_text;
+pub use emberkit::hooks::{apply_queued, create_and_queue};
 
 /// The last start-up step: enable every hook queued before it, and log one line if any was.
 /// Called once, from the end of `entry::start`.
 pub fn enable_queued_hooks() {
-    if let Some((level, line)) = hooks_line(&apply_queued()) {
+    let result = apply_queued();
+    object_distance::complete_hook_batch(&result);
+    if let Some((level, line)) = hooks_line(&result) {
         log::log!(level, "{line}");
     }
 }
@@ -343,5 +277,103 @@ mod tests {
         assert_eq!(k.last_seen(), 9);
         assert_eq!(k.baseline(), (2.0, 1), "no baseline, no change counted");
         assert_eq!(k.value(), 1.0);
+    }
+}
+
+/// Model only local knobs; runtime globals retain const standard-atomic construction.
+#[cfg(all(test, loom))]
+mod loom {
+    use super::{sync, KnobShared};
+    use ::loom::sync::Arc;
+    use ::loom::thread;
+
+    /// Every field of this local knob is instrumented; no runtime-global constructor is modeled.
+    fn model_knob(value: f32) -> KnobShared {
+        KnobShared {
+            value_bits: sync::AtomicU32::modeled(value.to_bits()),
+            baseline_bits: sync::AtomicU32::modeled(0),
+            baseline_seq: sync::AtomicU32::modeled(0),
+            last_seen_qpc: sync::AtomicU64::modeled(0),
+        }
+    }
+    /// Check every two-thread execution without permutation, duration or preemption sampling.
+    fn check(model: impl Fn() + Send + Sync + 'static) {
+        let mut builder = ::loom::model::Builder::new();
+        builder.max_threads = 2;
+        builder.max_permutations = None;
+        builder.max_duration = None;
+        builder.preemption_bound = None;
+        builder.check(model);
+    }
+
+    #[test]
+    fn counter_never_publishes_an_older_baseline() {
+        check(|| {
+            let knob = Arc::new(model_knob(1.0));
+            let writer_knob = Arc::clone(&knob);
+            let writer = thread::spawn(move || {
+                writer_knob.publish(1.0, 10);
+                writer_knob.publish(2.0, 20);
+            });
+            let (baseline, counter) = knob.baseline();
+            assert!(counter <= 2);
+            assert!(
+                baseline >= counter as f32,
+                "counter {counter} exposed older baseline {baseline}"
+            );
+            writer.join().unwrap();
+            assert_eq!(knob.baseline(), (2.0, 2));
+        });
+    }
+    #[test]
+    fn publishing_identical_bits_twice_moves_the_counter_only_once() {
+        check(|| {
+            let knob = Arc::new(model_knob(1.0));
+            let writer_knob = Arc::clone(&knob);
+            let writer = thread::spawn(move || {
+                // Negative zero differs from the initial baseline bits, then repeats exactly.
+                writer_knob.publish(-0.0, 10);
+                let first_counter = writer_knob.baseline().1;
+                writer_knob.publish(-0.0, 20);
+                assert_eq!(writer_knob.baseline().1, first_counter);
+            });
+            let (baseline, counter) = knob.baseline();
+            assert!(counter <= 1, "identical bits counted as {counter} changes");
+            if counter == 1 {
+                assert_eq!(baseline.to_bits(), (-0.0f32).to_bits());
+            }
+            writer.join().unwrap();
+            assert_eq!(knob.baseline().0.to_bits(), (-0.0f32).to_bits());
+            assert_eq!(knob.baseline().1, 1);
+            assert_eq!(knob.last_seen(), 20);
+        });
+    }
+
+    #[test]
+    fn seeing_a_publish_time_orders_its_counter_or_a_later_one() {
+        check(|| {
+            let knob = Arc::new(model_knob(1.0));
+            let writer_knob = Arc::clone(&knob);
+            let writer = thread::spawn(move || {
+                writer_knob.publish(1.0, 10);
+                writer_knob.publish(2.0, 20);
+            });
+            let seen = knob.last_seen();
+            let (_, counter) = knob.baseline();
+            let minimum = match seen {
+                0 => 0,
+                10 => 1,
+                20 => 2,
+                other => panic!("unexpected time {other}"),
+            };
+            assert!(
+                counter >= minimum,
+                "time {seen} exposed earlier counter {counter}"
+            );
+            // A newer counter with an older time is allowed: there is no reverse promise.
+            writer.join().unwrap();
+            assert_eq!(knob.last_seen(), 20);
+            assert_eq!(knob.baseline(), (2.0, 2));
+        });
     }
 }

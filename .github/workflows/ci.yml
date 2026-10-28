@@ -10,10 +10,24 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  deny:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --locked --all-features --target x86_64-pc-windows-msvc
+          # Current cargo-deny selects advisory scope in deny.toml and severity here.
+          command-arguments: --warn unmaintained
+          rust-version: 1.99.1
+
   check:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # rust-toolchain.toml pins the toolchain (with clippy and rustfmt); rustup installs it here.
       - name: Toolchain
@@ -22,31 +36,52 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Format
-        run: cargo fmt --check
+        run: cargo fmt --all --check
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Documentation
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --no-deps
+        run: cargo doc --no-deps --workspace
 
       # The tests that read the real game exe or need an interactive desktop are #[ignore]d.
       - name: Test
         run: |
           $PSNativeCommandUseErrorActionPreference = $false
-          cargo test 2>&1 | Tee-Object -Variable testOutput
+          cargo test --workspace 2>&1 | Tee-Object -Variable testOutput
           $testExitCode = $LASTEXITCODE
           $testSummary = @('```text') + @($testOutput | Where-Object { $_ -match '^test result:' }) + @('```')
           $testSummary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
           Get-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
           exit $testExitCode
 
+      # Read-only W15 oracles run only when the Steam file is available on this runner.
+      - name: Real-exe oracles when available
+        env:
+          ENSHROUDED_STEAM_EXE: ${{ vars.ENSHROUDED_STEAM_EXE }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $steamExe = 'C:\Program Files (x86)\Steam\steamapps\common\Enshrouded\enshrouded.exe'
+          if ([string]::IsNullOrEmpty($env:ENSHROUDED_STEAM_EXE) -and -not (Test-Path -LiteralPath $steamExe)) {
+            Write-Output 'Skipping read-only W15 oracles: no Steam executable is available.'
+            exit 0
+          }
+          cargo test --workspace --lib scan::tests::file_oracles::instruction_fields_match_steam_exe -- --ignored --exact --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --workspace --lib scan::tests::file_oracles::pe_section_headers_match_steam_exe -- --ignored --exact --nocapture
+          exit $LASTEXITCODE
+
+      - name: Loom knob memory orderings
+        env:
+          RUSTFLAGS: --cfg loom
+        run: cargo test --workspace --release --lib knobs::loom
+
       - name: Build the .asi
         run: cargo asi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: enshrouded-headroom-asi
           path: target/release/enshrouded-headroom.asi

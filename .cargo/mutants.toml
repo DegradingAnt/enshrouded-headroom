@@ -1,0 +1,34 @@
+# W16 pure-module audit. Run on Windows with cargo-mutants 27.1.0.
+# cargo mutants --workspace --timeout 30 --build-timeout 180 --jobs 4
+# Per-module counts: use --no-config --file <path> --cargo-arg=--lib
+# with the same timeouts/jobs; config and CLI file lists are additive.
+examine_globs = [
+    "src/config.rs",
+    "src/scan.rs",
+    "crates/emberkit/src/config.rs",
+    "crates/emberkit/src/scan.rs",
+    "src/frame_timer.rs",
+    "src/governor/**",
+    "src/knobs/**",
+]
+additional_cargo_args = ["--lib"]
+# Root tests retain the config/scanner expectations after the primitive extraction.
+test_workspace = true
+# Native wrapper exclusions were fixed before the knobs baseline: 7 generated mutants.
+# apply_queued (3) and enable_queued_hooks (1) invoke MinHook and native thread/code changes.
+# object install (1) locates the live game signature and queues a detour.
+# object/scatter init (1 each) combine entry globals/logging with native installation.
+# Synthetic callbacks, owned-page set_distance, shared state and planners stay included.
+exclude_re = [
+    'src/knobs/mod\.rs:.*\b(apply_queued|enable_queued_hooks)\b',
+    'src/knobs/object_distance\.rs:.*\b(install|init)\b',
+    'src/knobs/scatter_distance\.rs:.*\binit\b',
+]
+# cargo-mutants 27.1.0 skips unsafe functions, cfg(test) bodies, and new constructors.
+# The generated population is not exhaustive source coverage; no orderings are changed.
+# Keep the tool's default with_capacity call exclusion: capacity is not observable behavior.
+# Other modules and cfg(test) bodies are outside the generated population.
+# Emberkit paths preserve the pre-extraction config/scanner population.
+timeout_multiplier = 5.0
+minimum_test_timeout = 30.0
+build_timeout_multiplier = 15.0

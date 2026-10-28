@@ -13,7 +13,7 @@
 ## Global Constraints
 
 **Project and build**
-- Repo: `C:\Modding\Enshrouded`, a new git repo, MIT licence, public on GitHub only at release (Task 18, with the author's go-ahead).
+- Repo: `<repository>`, a new git repo, MIT licence, public on GitHub only at release (Task 18, with the author's go-ahead).
 - Toolchain: pinned in `rust-toolchain.toml` to `1.99.1`, target `x86_64-pc-windows-msvc`.
 - Output file: `enshrouded-headroom.asi`. Settings: `enshrouded-headroom.ini`. Log: `enshrouded-headroom.log`. Both sit next to the `.asi` in `<game>\plugins\`, with a fallback to `%LOCALAPPDATA%\enshrouded-headroom\`.
 - Profile:
@@ -81,7 +81,7 @@
 ## File structure
 
 ```
-C:\Modding\Enshrouded\
+<repository>\
   Cargo.toml                      crate `enshrouded-headroom`, cdylib + rlib (rlib so examples/tests link)
   rust-toolchain.toml             channel = "1.99.1"
   .cargo\config.toml              +crt-static; alias `asi`
@@ -131,14 +131,14 @@ C:\Modding\Enshrouded\
 - Produces: `cargo asi`. It is an alias for `rustc --release --lib -- -C link-arg=/OUT:target/release/enshrouded-headroom.asi`.
 
 - [ ] **Step 1:** `rustup update stable` and `rustup install 1.99.1` (the author asked for the latest versions; on 2026-10-25 only `stable` = 1.98.0 was installed). Check: `rustc +1.99.1 --version` prints `1.99.1`. Do not rely on `link.exe` from PATH: rustc finds the MSVC linker itself (VS 2022 Community, MSVC 14.44.35207).
-- [ ] **Step 2:** `git init C:\Modding\Enshrouded`. Copy the spec, the re-notes and this plan into `docs/`. Add the MIT `LICENSE` (copyright: DegradingAnt), `.gitignore` (`target/`, `dist/`), and `Cargo.toml`:
+- [ ] **Step 2:** `git init <repository>`. Copy the spec, the re-notes and this plan into `docs/`. Add the MIT `LICENSE` (copyright: DegradingAnt), `.gitignore` (`target/`, `dist/`), and `Cargo.toml`:
   - `[lib] crate-type = ["cdylib", "rlib"]`, name `enshrouded_headroom`;
   - the dependencies at the exact versions in Global Constraints;
   - the release profile from Global Constraints.
 - [ ] **Step 3: Write `examples/asi_host.rs`.** It takes an `.asi` path, `LoadLibraryW`s it, calls `InitializeASI`, sleeps 500 ms, and exits 0.
 - [ ] **Step 4: Run it.** `cargo asi`, then `cargo run --release --example asi_host -- target/release/enshrouded-headroom.asi`.
   - Expected: exit 0, and `target/release/enshrouded-headroom.log` contains `loaded`.
-- [ ] **Step 5: Verify the artefact, not the build log.** `dumpbin` is NOT on PATH on the author's machine (checked 2026-10-25), and Git's own `link.exe` comes first on PATH. So use `python -I -c "import pefile; ..."` (pefile 2024.8.26 is installed). Alternatively use the full path from `vswhere` (`C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64\dumpbin.exe`). Check that the `InitializeASI` export is present and that `VCRUNTIME140.dll` is absent from the imports.
+- [ ] **Step 5: Verify the artefact, not the build log.** Use `dumpbin` from a Visual Studio developer prompt, or locate the installed toolchain with `vswhere`; do not accidentally use Git's unrelated `link.exe`. A PE inspection tool such as `pefile` is another option. Check that the `InitializeASI` export is present and that `VCRUNTIME140.dll` is absent from the imports.
 - [ ] **Step 6:** Commit: `chore: scaffold enshrouded-headroom plugin`.
 
 ### Task 2: Settings file
@@ -506,7 +506,7 @@ const GIB: u64 = 1 << 30;
   - The extern wrappers are `wrap_gpa`, `wrap_gipa`, `wrap_gdpa`, `wrap_create_device`, `wrap_create_swapchain` and `wrap_present`. Each body runs inside `guard(Feature::VkWrap, call_original, …)`.
     - `wrap_gpa` guards: ordinal names (`name as usize <= 0xFFFF`) pass through. Names are compared only when `hModule == GetModuleHandleW("vulkan-1.dll")`.
     - `wrap_create_device` calls `texture_budget::apply` once, on the first call. It reads `vkGetPhysicalDeviceMemoryProperties` (the largest `DEVICE_LOCAL` heap) and `vkGetPhysicalDeviceProperties` (`deviceType == INTEGRATED_GPU`).
-    - `wrap_present` pushes `qpc_now()` to `FRAMES`, then calls `reflex::on_present` (Task 16; a no-op until then), then calls the real present.
+    - `wrap_present` pushes `qpc_now()` to `FRAMES`, then delegates to `reflex::on_present` (Task 16), which calls the real present exactly once.
 - Produces from `vk/types.rs`: `#[repr(C)]` structs for any `VK_NV_low_latency2` / `VK_KHR_present_id2` types that ash 0.38.0 lacks. Each one gets a test asserting `size_of` against the Vulkan header value.
 
 - [ ] **Step 1: Write the failing tests:**
@@ -825,15 +825,15 @@ Task 15 consumes this module. The governor's knob 1 is enabled only while `SCATT
     - distant High (2.5) × `distant_objects_scale`;
     - voxel High (32, 128, 160) × `terrain_ring_scale`.
     - Each goes through `write_u32_checked` with the original f32 bits as the expected value. A scale of 1.0 means no write.
-- Produces from `vram_budget`: `pub unsafe fn free_mib(gipa, instance, phys) -> Option<u64>`. It uses `vkGetPhysicalDeviceMemoryProperties2` with `VkPhysicalDeviceMemoryBudgetPropertiesEXT` and returns `budget − usage` of the largest `DEVICE_LOCAL` heap. It returns `None` when the driver does not list `VK_EXT_memory_budget`.
-- Produces from `governor_thread`: `pub fn spawn(cfg: GovernorCfg, knobs: KnobsCfg, scatter_cap_ok: bool)`. Every 50 ms it:
+- Produces from `vram_budget`: `pub unsafe fn free_mib(gipa, instance, phys, route: QueryRoute) -> Option<u64>`. The caller proves either core Vulkan 1.1 support for the observed instance and physical device, or an explicitly enabled KHR properties2 route. It queries `VkPhysicalDeviceMemoryBudgetPropertiesEXT` and returns `budget − usage` of the largest `DEVICE_LOCAL` heap. Unknown facts, missing selected commands, retirement or an unlisted `VK_EXT_memory_budget` return `None`; a non-null alias is not capability proof.
+- Produces from `governor_thread`: `pub fn spawn(cfg: Config)`. Every 50 ms it:
   1. reads new frames from `FRAMES` and converts them to intervals in ms;
   2. sets `world_active = qpc_now() - OBJECT.last_seen() < 250 ms`;
   3. reads `period_ms` from `display` (refreshed every 5 s) and `free_mib` (every 2 s);
   4. works out `baseline_changed` from each knob's `baseline_seq`;
-  5. runs `Governor::tick`;
+  5. runs the equivalent `Governor::tick_with` with preallocated scratch;
   6. maps each `Action::Set{knob, step}`: knob 0 → `OBJECT.set(OBJECT_STEPS[step])`; knob 1 → `scatter_distance::set_distance(SCATTER_STEPS[step])`; knob 2 → `TERRAIN.set(TERRAIN_STEPS[step])`. Knob 1's `KnobSpec.enabled` is true only while `SCATTER_LEVEL == 3`, `scatter_cap_ok` and `enable_scatter_distance`; when that turns false, the step is reset to 0 first;
-  7. logs each step change (this thread may log).
+  7. logs each step change (this thread may log). It reports status every 30 s, available Reflex timings every 5 s at debug level, and configured scatter counters every 2 s. The VRAM query uses W23's live capability-aware lease.
 
 - [ ] **Step 1: Write the failing tests:** `assert_eq!(scaled(1.5, 0.5), 0.75)`, and `apply` with all scales at 1.0 returns a `Vec` of `"unchanged"` notes. Plus a glue test, `actions_map_to_knob_values`: given `Action::Set{knob:2, step:4}`, the mapping function `knob_value(2, 4)` returns `2.0`.
 - [ ] **Step 2:** Run `cargo test startup_scales:: governor_thread::` and expect FAIL.
@@ -843,57 +843,64 @@ Task 15 consumes this module. The governor's knob 1 is enabled only while `SCATT
 
 ### Task 16: NVIDIA Reflex
 
-**Files:**
-- Create: `src/reflex.rs`
-- Modify: `src/vk/mod.rs` (wire `wrap_create_device`, `wrap_create_swapchain`, `wrap_submit`, and `on_present`)
+**Files:** `src/reflex.rs`, `src/vk/mod.rs`, `src/knobs/object_distance.rs`, `tests/vk_chain.rs`, docs.
+Issue #27 authorizes this wiring and the Reflex present-path exception to AGENTS rule 5.
+The maintainer also approved `guard::disable_silent` in `src/guard.rs` and the parsed-mode
+initialization step in `src/entry.rs` before Vulkan interception.
+The author approved unchanged instance-creation observation to establish API/extension facts
+for safe core/KHR capability queries.
 
-**Interfaces:**
-- Consumes: `vk::types`, `config::ReflexMode`, `vk::game_device()`.
-- Produces:
-  - `pub enum TimelineFix { SetInVulkan12, SetInTimelineStruct, ChainNewStruct }`
-  - `pub fn plan_device(exts: &[&CStr], has_v12_features: bool, has_timeline_struct: bool, api_version: u32) -> (Vec<&'static CStr> /*extra exts*/, TimelineFix)`. It is pure. The extra extensions are `VK_NV_low_latency2`, plus `VK_KHR_timeline_semaphore` when `api_version < VK_API_VERSION_1_2`. Already-present extensions are not duplicated.
-  - `pub fn decide_mode(cfg: &ReflexMode, game_menu: Option<bool>, vendor_nvidia: bool, ext_listed: bool) -> Option<bool /*boost*/>`. `None` means Reflex is off.
-  - `pub unsafe fn on_device_created(...)`, `pub unsafe fn on_swapchain_created(device, swapchain)`. The latter calls `vkSetLatencySleepModeNV` and stores the swapchain. It runs again on every new swapchain.
-  - `pub unsafe fn on_submit(...)`. It chains `VkLatencySubmissionPresentIdNV { presentID: FRAME_ID }`.
-  - `pub unsafe fn on_present(queue, info, real_present) -> VkResult`. It does `PRESENT_START`, the real present, `PRESENT_END`, `vkLatencySleepNV`, then `vkWaitSemaphores` with a 10 ms timeout. On a timeout, `VK_ERROR_DEVICE_LOST` or `VK_ERROR_OUT_OF_DATE_KHR`, it calls `disable(Feature::Reflex)` and does not wait again. Then `FRAME_ID += 1`, `SIMULATION_START`, `RENDERSUBMIT_START`.
-  - Every 5 s, `pub fn latency_report()` logs the averages from `vkGetLatencyTimingsNV`. It runs on the governor thread.
-- **Retry rule (spec 6.5):** if the changed `vkCreateDevice` returns an error, call it again with the game's original create info and `disable(Feature::Reflex, "driver refused")`. The same applies to `vkCreateSwapchainKHR`.
-- **Game menu value (`ReflexMode::Game`):** a research step first. Find the `nvidiaReflex` field offset in the machine-settings struct, from the reflection descriptors (`NvidiaReflexModeSettings` type, the same method as the render-settings descriptors at `0x1417b5780`), and the getter that returns machine settings. Record it in `docs/re-notes.md`. If it is not found, `game_menu = None`, and `decide_mode(Game, None, ..)` returns `None` (off), with a log line saying so.
+**Interfaces and maintained rulings:**
+- Preserve W19's `TimelineFix` and pure `plan_device` API.
+- `decide_mode(cfg: &ReflexMode, game_menu: Option<u32>, vendor_nvidia: bool, ext_listed: bool) -> Option<bool>` uses 0/1/2 for saved off/on/boost. `Auto` is the default. Unknown saved values use auto.
+- At device creation, query prerequisites and add the extension whenever NVIDIA support exists and the configured mode is not `Off`. The saved menu is not required yet. Copy all changed chain nodes; unknown layouts fail closed.
+- Bind successful instance creation's requested API and enabled properties2 extension to its observed generation. After the Vulkan 1.0 physical-properties query, choose core Features2 only when both APIs are at least 1.1; otherwise choose KHR only when explicitly enabled. Unknown facts or a missing selected function preserve the original device without alias fallback.
+- On a rejected modified device or swapchain create call, retry the exact original create-info pointer once and disable Reflex with `driver refused`.
+- On each successful new swapchain, set sleep mode from the current decision. Once the menu first becomes known, update the mode once if that changes the decision.
+- Read the verified menu fields in the existing scene-settings post-hook (`docs/re-notes.md`, "Reflex and vsync menu values seen from the scene-settings hook"). Check `R8 == RDX + 0x54` without overflow before reading Reflex at `RDX-8` and vsync at `RDX-11`; invalid ranges publish unknown through Relaxed atomics. Preserve the original-once hook structure.
+- Present order: `PRESENT_START`, real present, `PRESENT_END`, sleep, 10 ms timeline wait. First timeout/device-lost/out-of-date disables Reflex. After success, increment ID, then `SIMULATION_START` and `RENDERSUBMIT_START`. Cache the real result before post-work. No allocation, blocking lock or ordinary logging on present.
+- **No submit wrapper or submission-ID chaining in v1.**
+- `latency_report() -> Option<String>` reads and formats driver averages. Do not schedule it here; Task 15 owns the five-second background schedule. Native handles must remain valid for the entire report query.
+- Preserve texture, priority, timer and plain-renderer behavior. Anti-Lag wiring remains Task 16b.
 
-- [ ] **Step 1: Write the failing tests:**
+**TDD and verification:**
+- Fake-driver `rearm_on_new_swapchain` and `timeout_disables_reflex` tests.
+- Real-wrapper `tests/vk_chain.rs` cases for listed extension injection, original input-chain pointer preservation, exact-original retry and non-NVIDIA bypass.
+- Guarded menu read and native post-hook tests; retain all Task 12 hook tests.
+- Actual present-wrapper tests for parsed modes, ordered markers, first-failure disable, unchanged input/timestamps and original-once fallback through both panic guards.
+- Preserve teardown/reader lifetime tests.
+- Compile and capture relevant failing mutations, then restore each implementation.
+- Fresh target directory: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, strict `cargo doc`, `cargo test`, then `cargo asi`.
+- Report: **not verified in game; the maintainer runs the boot test**.
+### Task 16b: AMD Anti-Lag 2 runtime wiring
 
-```rust
-#[test] fn adds_low_latency2_once() {
-    let (e, f) = plan_device(&[c"VK_KHR_swapchain", c"VK_KHR_present_id2"], true, false, vk::API_VERSION_1_4);
-    assert_eq!(e, vec![c"VK_NV_low_latency2"]); assert!(matches!(f, TimelineFix::SetInVulkan12));
-}
-#[test] fn old_api_adds_timeline_ext_and_struct() {
-    let (e, f) = plan_device(&[], false, false, vk::API_VERSION_1_1);
-    assert!(e.contains(&c"VK_KHR_timeline_semaphore")); assert!(matches!(f, TimelineFix::ChainNewStruct));
-}
-#[test] fn mode_follows_game_menu() {
-    assert_eq!(decide_mode(&ReflexMode::Game, Some(true), true, true), Some(false));
-    assert_eq!(decide_mode(&ReflexMode::Game, Some(false), true, true), None);
-    assert_eq!(decide_mode(&ReflexMode::Game, None, true, true), None);
-    assert_eq!(decide_mode(&ReflexMode::Boost, Some(false), true, true), Some(true));
-    assert_eq!(decide_mode(&ReflexMode::On, None, false, true), None);   // not NVIDIA
-}
-#[test] fn rearm_on_new_swapchain() { /* calling on_swapchain_created twice with different handles stores the latest and counts 2 sleep-mode calls on a fake fn table */ }
-#[test] fn timeout_disables_reflex() { /* fake vkWaitSemaphores returning VK_TIMEOUT -> is_disabled(Feature::Reflex) and the next on_present skips sleep */ }
-```
+W25 authorizes this implementation after Task 16 merges. Design section 6.6 and issue #31
+supply the maintained rules. The author also approved the parsed startup initializer in
+`entry.rs` and sharing the existing Reflex device-copy helpers without changing Reflex behavior.
 
-  The last two use a small fake function table (`struct Fns { sleep: fn(..), wait: fn(..) , ... }`) injected for tests.
-- [ ] **Step 2:** Run `cargo test reflex::` and expect FAIL.
-- [ ] **Step 3:** Do the menu-value research step. Then implement it, along with the retry rule.
-- [ ] **Step 4:** Run `cargo test` (the full suite) and expect PASS.
-- [ ] **Step 5:** Commit: `feat: NVIDIA Reflex via VK_NV_low_latency2`.
+- Publish `AntiLag` before Vulkan startup. Default `auto` requires AMD, the listed extension
+  and reported feature; forced `on` on non-AMD logs "not listed, off".
+- Reuse the proven instance capability route, typed device-chain ownership, exact-original
+  retry and device dispatch. Chain the enabled AMD feature first, without modifying game input.
+- Admit one device only with mandatory destruction routing. Record its actual native queues;
+  associate pacing with a live swapchain and queue, using nonblocking present admission.
+- Seed INPUT, then emit PRESENT, one real present and next INPUT. Preserve original present
+  pointers and IDs. INPUT after the previous present is an approximation.
+- Time every update with QPC. Three consecutive calls over 100 ms or device loss disable pacing.
+  Report once at the next lifecycle safe point, outside presentation. Keep teardown running
+  even if the host logger panics.
+- Use native fake-driver cases for feature/extension injection, existing entries, caller-chain
+  preservation, refusal, NVIDIA/Reflex precedence, capability routes, marker order, lifetime,
+  concurrent admission, slow calls, device loss and allocation-free presents.
+- Verify in a clean target in CI order: fmt, strict Clippy, strict docs and tests, then the ASI.
+  The startup line, README and PR say **experimental, not verified on AMD hardware**.
 
 ### Task 17: In-game verification on the author's machine
 
-**Install** (needs the author's go-ahead; deploying into the game folder is the author's). The game is now the Steam install, `C:\Program Files (x86)\Steam\steamapps\common\Enshrouded\` (the old `C:\Games\Enshrouded` is being deleted):
-- copy the loader v10.0.0 `dinput8.dll` (zip sha256 `3d5f2f2a…`) to `C:\Program Files (x86)\Steam\steamapps\common\Enshrouded\`;
-- copy `enshrouded-headroom.asi` to `C:\Program Files (x86)\Steam\steamapps\common\Enshrouded\plugins\`;
-- create `C:\Program Files (x86)\Steam\steamapps\common\Enshrouded\global.ini` with `[GlobalSets] DebugLog=1`;
+**Install** (needs the author's go-ahead; deployment is the author's). Locate `<Steam game folder>` through Steam Properties → Installed Files → Browse:
+- copy the loader v10.0.0 `dinput8.dll` (zip sha256 `3d5f2f2a…`) to `<Steam game folder>\`;
+- copy `enshrouded-headroom.asi` to `<Steam game folder>\plugins\`;
+- create `<Steam game folder>\global.ini` with `[GlobalSets] DebugLog=1`;
 - do not use the old `_perf\Launch-Enshrouded.ps1` launcher at the same time (a copy of the `_perf` files is in `reference\old-build\_perf`; the Steam folder has no `_perf`);
 - the old install had a `winmm.dll` (an unknown loader). The Steam folder has none (no `winmm.dll`, `dinput8.dll`, `plugins` or `global.ini` there, checked 2026-10-26). So there is one loader only, and nothing to remove.
 

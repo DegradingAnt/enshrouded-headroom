@@ -1,37 +1,32 @@
-//! Scatter counter probe (design.md 7.2a): reads the game's own grass GPU counters, so the
-//! governor can tell how close the grass is to its fixed budget.
+//! Scatter counter probe (design.md 7.2a). The render hook only publishes the latest pass
+//! pointer and increments a call counter, then calls the original exactly once.
 //!
-//! The game keeps three GPU counters for detail scatter (grass). Its pool update reads each one
-//! back to the CPU and keeps the last and the peak value next to a warn level and a cap. Counter
-//! A counts the scattered objects of both grass passes against one budget of `0x14000`; the game
-//! sets its warn level at `0xf000` (75 %). RE facts and evidence ids: docs/re-notes.md, "Scatter
-//! counter probe".
+//! A detached `scatter-probe` thread wakes every 500 ms. When the call counter changed,
+//! it copies seven fixed-size game-memory blocks with ReadProcessMemory and parses only
+//! those local bytes. No game address is dereferenced by Rust. A failed or short copy, zero
+//! handle or ownership mismatch is a transient miss: nine are tolerated, the tenth latches
+//! FAILED. A good sample resets misses; a copied A.warn/A.cap layout mismatch fails at once.
+//! No incomplete sample is published. A panic stops the guarded worker and latches failure.
 //!
-//! [`install`] puts a MinHook pre-hook on `FUN_1400767a0(rcx, pass, f)` (found by
-//! `sigs::SCATTER_FRAME_FN`). The detour ([`scatter_frame_detour`]) runs inside
-//! `guard(Feature::ScatterDistance, ...)`. On every 30th call it follows the pointer chain from
-//! `pass` with [`read_counters`], checking every address with [`is_readable`] before it reads it,
-//! and publishes the result to the atomics below. Then it calls the original with the same
-//! arguments, exactly once. It never logs and never allocates.
-//!
-//! The self-check: counter A must show the warn level `0xf000` and the cap `0x14000`. If it does
-//! not, or any read is refused, the chain is wrong for this build. Then [`FAILED`] is set,
-//! [`PROBE_OK`] is cleared, and the probe stops reading for the rest of the session.
-//!
-//! Task 15's governor consumes this module: the grass knob may rise only while [`PROBE_OK`],
-//! [`ceiling_step`] and [`headroom_ok`] allow it.
+//! Installation remains opt-in until R_MAX_M allows a raise: Debug ScatterProbe with debug
+//! logging, or an enabled scatter knob whose measured ceiling permits at least one step.
+//! This removes sampling work from the game thread after the observed in-game pulse; its
+//! address-space-lock cause is a hypothesis. Not verified in game; the maintainer boot-tests
+//! it with the probe on. Counter offsets and ABI evidence are in docs/re-notes.md.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use log::Level;
-use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
+use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 use crate::config::{Config, LogLevel};
 use crate::entry;
 use crate::guard::{guard, Feature};
 use crate::knobs::create_and_queue;
-use crate::scan::{find_in_sections, main_module, protect_is_readable, Module, Pattern};
+use crate::knobs::SCATTER_STEPS;
+use crate::scan::{find_in_sections, main_module, Module, Pattern};
 use crate::sigs::SCATTER_FRAME_FN;
 
 /// Counter A's warn level, as the game allocates it (`0x1400745eb`): 75 % of [`CAP_A`]. The
@@ -46,8 +41,8 @@ pub const CAP_A: u32 = 0x14000;
 /// 90 m until the author's measurement session sets it (plan Task 13b, Step 6).
 pub const R_MAX_M: f32 = 90.0;
 
-/// The hook reads the counters on one call in this many (the first call included).
-const SAMPLE_EVERY: u32 = 30;
+/// The sampler sleeps this many milliseconds between opportunities, holding no lock.
+const SAMPLE_INTERVAL_MS: u64 = 500;
 
 /// `[pass+0x8]`: the object that holds the counter pool.
 const PASS_POOL_OWNER: usize = 0x8;
@@ -74,6 +69,37 @@ const ENTRY_HANDLE: usize = 0x38;
 /// A handle's low 16 bits are its entry index.
 const HANDLE_INDEX_MASK: u32 = 0xffff;
 
+/// The bytes of `pass` a sample reads, as (start offset, length): the pool owner pointer (+0x8)
+/// through the scatter object pointer (+0x18..+0x20). One local copy covers both.
+const PASS_BLOCK: (usize, usize) = (PASS_POOL_OWNER, 0x18);
+/// The bytes of the scatter object a sample reads: the three handles, +0x8..+0x14.
+const HANDLES_BLOCK: (usize, usize) = (0x8, 0xc);
+/// The bytes of a pool entry a sample reads: last (+0x14) through the owner handle (+0x38..+0x3c).
+const ENTRY_BLOCK: (usize, usize) = (ENTRY_LAST, 0x28);
+
+/// Is the field of `size` bytes at offset `off` inside `block`? For the compile-time checks below.
+const fn covers(block: (usize, usize), off: usize, size: usize) -> bool {
+    match (off.checked_add(size), block.0.checked_add(block.1)) {
+        (Some(field_end), Some(block_end)) => block.0 <= off && field_end <= block_end,
+        _ => false,
+    }
+}
+const _: () =
+    assert!(covers(PASS_BLOCK, PASS_POOL_OWNER, 8) && covers(PASS_BLOCK, PASS_SCATTER_OBJ, 8));
+const _: () = assert!(
+    covers(HANDLES_BLOCK, COUNTER_HANDLES[0], 4)
+        && covers(HANDLES_BLOCK, COUNTER_HANDLES[1], 4)
+        && covers(HANDLES_BLOCK, COUNTER_HANDLES[2], 4)
+);
+const _: () = assert!(
+    covers(ENTRY_BLOCK, ENTRY_LAST, 4)
+        && covers(ENTRY_BLOCK, ENTRY_PEAK, 4)
+        && covers(ENTRY_BLOCK, ENTRY_WARN, 4)
+        && covers(ENTRY_BLOCK, ENTRY_CAP, 4)
+        && covers(ENTRY_BLOCK, ENTRY_HANDLE, 4)
+        && covers((0, ENTRY_SIZE), ENTRY_BLOCK.0, ENTRY_BLOCK.1)
+);
+
 /// One counter's values, as the game keeps them in its pool entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CounterSample {
@@ -91,9 +117,9 @@ pub struct CounterSample {
 /// failure. Stored with `Release` after the values below, so a reader that loads it with
 /// `Acquire` and sees true also sees the values of that sample (or newer ones).
 pub static PROBE_OK: AtomicBool = AtomicBool::new(false);
-/// True once a sample failed (a refused read, a handle that does not match its entry, or a
-/// failed self-check). The probe stops reading then. Stored with `Release` after `PROBE_OK` was
-/// cleared.
+/// True after ten consecutive transient misses, an immediate copied-layout failure, or a
+/// sampler panic/start failure. The probe stops reading for the session. Stored with Release
+/// after PROBE_OK is cleared.
 pub static FAILED: AtomicBool = AtomicBool::new(false);
 /// Counter A's last value from the latest good sample. `Relaxed`; see [`PROBE_OK`].
 pub static LAST_A: AtomicU32 = AtomicU32::new(0);
@@ -108,117 +134,143 @@ pub static LAST_C: AtomicU32 = AtomicU32::new(0);
 /// Counter C's peak from the latest good sample (for the debug log). `Relaxed`.
 pub static PEAK_C: AtomicU32 = AtomicU32::new(0);
 
-/// How many times the hook has run (wraps). It picks the calls that take a sample.
-static CALLS: AtomicU32 = AtomicU32::new(0);
+/// The latest grass-pass argument, published without reading the pointed-to object.
+static LAST_PASS: AtomicUsize = AtomicUsize::new(0);
+/// Number of hook publications; the sampler skips unchanged observations.
+static CALL_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// MinHook's trampoline for the game function, or 0. Stored by [`install`] before the hook is
 /// enabled; read by the detour.
 static TRAMPOLINE: AtomicUsize = AtomicUsize::new(0);
 
-/// Test only: makes the hook's sample panic, so a test can drive the real detour's panic path.
+/// Test only: panic after publication to exercise the detour's original-once fallback.
 /// Not in a non-test build.
 #[cfg(test)]
-static PANIC_IN_SAMPLE: AtomicBool = AtomicBool::new(false);
+static PANIC_IN_PUBLISH: AtomicBool = AtomicBool::new(false);
+
+/// Test only: count actual OS-reader calls in isolated native-hook tests.
+#[cfg(test)]
+static READ_CALLS: AtomicUsize = AtomicUsize::new(0);
+/// Test only: any OS-reader call panics, proving the hook never reaches it.
+#[cfg(test)]
+static PANIC_IN_READ: AtomicBool = AtomicBool::new(false);
 
 /// The type of the game function and of its detour: RCX, RDX and an `f32` in XMM2, no stack
 /// argument, no return value (docs/re-notes.md, "Scatter counter probe").
 pub type ScatterFrameFn = unsafe extern "system" fn(rcx: *mut u8, pass: *const u8, f: f32);
 
-/// Can the `len` bytes at `addr` be read now? `VirtualQuery` must report committed memory with a
-/// readable protection that is not a guard page (the rule of `scan::protect_is_readable`), and
-/// the whole range must lie in that one region. An overflowing range gives false.
-///
-/// This is a check, not a lock: another thread can free the memory after it. The probe reads
-/// game objects that the call it hooks is using, so they stay alive during that call.
-pub fn is_readable(addr: usize, len: usize) -> bool {
-    let Some(end) = addr.checked_add(len) else {
-        return false;
-    };
-    let mut info = MEMORY_BASIC_INFORMATION::default();
-    // SAFETY: `info` is a valid buffer of exactly the size passed. VirtualQuery accepts any
-    // address, reads no memory at it, and reports failure by returning 0.
-    let written = unsafe {
-        VirtualQuery(
-            addr as *const c_void,
-            &mut info,
-            size_of::<MEMORY_BASIC_INFORMATION>(),
-        )
-    };
-    if written < size_of::<MEMORY_BASIC_INFORMATION>()
-        || info.State != MEM_COMMIT
-        || !protect_is_readable(info.Protect)
+/// Copy a complete process-memory block into an owned local buffer.
+fn read_process(addr: usize, bytes: &mut [u8]) -> bool {
+    #[cfg(test)]
     {
+        READ_CALLS.fetch_add(1, Ordering::Relaxed);
+        if PANIC_IN_READ.load(Ordering::Relaxed) {
+            panic!("reader reached on hook");
+        }
+    }
+    if addr == 0 || addr.checked_add(bytes.len()).is_none() {
         return false;
     }
-    let region = info.BaseAddress as usize;
-    region <= addr && end <= region.saturating_add(info.RegionSize)
+    let mut copied = 0;
+    // SAFETY: the destination is the live mutable slice and has the supplied size. Windows
+    // validates the source range; no Rust reference or dereference is made from that address.
+    let result = unsafe {
+        ReadProcessMemory(
+            GetCurrentProcess(),
+            addr as *const c_void,
+            bytes.as_mut_ptr().cast(),
+            bytes.len(),
+            &mut copied,
+        )
+    };
+    complete_read(result, copied, bytes.len())
 }
 
-/// Follow the counter chain from `pass` and return counters A, B and C. `None` if any read is
-/// refused, a handle is 0 or does not match its entry, or counter A fails the self-check (warn
-/// [`WARN_A`], cap [`CAP_A`]).
-///
-/// The chain (docs/re-notes.md): obj = `[pass+0x18]`; pool = `[[pass+0x8]+0x20]`; base =
-/// `[pool+0x48]`; for each handle h at `[obj+0x8]` (A), `[obj+0xc]` (B), `[obj+0x10]` (C), the
-/// entry is base + (h & 0xffff) × 0x40, and `[entry+0x38]` must equal h. Each sample is last
-/// (entry+0x14), peak (+0x1c), warn (+0x20) and cap (+0x24).
-///
-/// It calls `readable(addr, len)` before EVERY read, and reads nothing after a refusal. It reads
-/// with `read_unaligned`, so it needs no alignment.
-///
-/// # Safety
-///
-/// `readable(addr, len)` returns true only if the `len` bytes at `addr` can be read when the
-/// read that follows the call happens ([`is_readable`], for memory that no other thread frees
-/// meanwhile).
-pub unsafe fn read_counters(
+/// Accept an OS copy only when it succeeds and reports every requested byte.
+fn complete_read(result: i32, copied: usize, wanted: usize) -> bool {
+    result != 0 && copied == wanted
+}
+
+/// Why a sampler could not accept a copied counter chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadError {
+    /// An object disappeared, a copy failed, or its handle no longer owns the entry.
+    Miss,
+    /// Counter A was read correctly but its warn/cap metadata disagrees with the layout.
+    Layout,
+}
+
+/// Copy and parse the seven counter blocks without dereferencing a game address.
+pub fn read_counters(
     pass: usize,
-    readable: impl Fn(usize, usize) -> bool,
-) -> Option<[CounterSample; 3]> {
-    let read_ptr = |at: usize| -> Option<usize> {
-        if !readable(at, size_of::<u64>()) {
-            return None;
-        }
-        // SAFETY: `readable` has just accepted these 8 bytes (this function's contract).
-        let value = unsafe { std::ptr::read_unaligned(at as *const u64) };
-        usize::try_from(value).ok()
-    };
-    let read_u32 = |at: usize| -> Option<u32> {
-        if !readable(at, size_of::<u32>()) {
-            return None;
-        }
-        // SAFETY: `readable` has just accepted these 4 bytes (this function's contract).
-        Some(unsafe { std::ptr::read_unaligned(at as *const u32) })
-    };
-    let obj = read_ptr(pass.checked_add(PASS_SCATTER_OBJ)?)?;
-    let owner = read_ptr(pass.checked_add(PASS_POOL_OWNER)?)?;
-    let pool = read_ptr(owner.checked_add(OWNER_POOL)?)?;
-    let entries = read_ptr(pool.checked_add(POOL_ENTRIES)?)?;
-    let counter = |handle_at: usize| -> Option<CounterSample> {
-        let handle = read_u32(obj.checked_add(handle_at)?)?;
+    mut read: impl FnMut(usize, &mut [u8]) -> bool,
+) -> Result<[CounterSample; 3], ReadError> {
+    let pass_bytes = copy_block::<0x18>(pass, PASS_BLOCK.0, &mut read).ok_or(ReadError::Miss)?;
+    let owner = pointer_field(&pass_bytes, PASS_BLOCK.0, PASS_POOL_OWNER).ok_or(ReadError::Miss)?;
+    let obj = pointer_field(&pass_bytes, PASS_BLOCK.0, PASS_SCATTER_OBJ).ok_or(ReadError::Miss)?;
+    let owner_bytes = copy_block::<8>(owner, OWNER_POOL, &mut read).ok_or(ReadError::Miss)?;
+    let pool = pointer_field(&owner_bytes, OWNER_POOL, OWNER_POOL).ok_or(ReadError::Miss)?;
+    let pool_bytes = copy_block::<8>(pool, POOL_ENTRIES, &mut read).ok_or(ReadError::Miss)?;
+    let entries = pointer_field(&pool_bytes, POOL_ENTRIES, POOL_ENTRIES).ok_or(ReadError::Miss)?;
+    let handles = copy_block::<0xc>(obj, HANDLES_BLOCK.0, &mut read).ok_or(ReadError::Miss)?;
+    let mut counter = |offset| -> Result<CounterSample, ReadError> {
+        let handle = u32_field(&handles, HANDLES_BLOCK.0, offset).ok_or(ReadError::Miss)?;
         if handle == 0 {
-            return None;
+            return Err(ReadError::Miss);
         }
-        let index = usize::try_from(handle & HANDLE_INDEX_MASK).ok()?;
-        let entry = entries.checked_add(index.checked_mul(ENTRY_SIZE)?)?;
-        // The game's own accessor makes this check (docs/re-notes.md): the entry must belong to
-        // this handle.
-        if read_u32(entry.checked_add(ENTRY_HANDLE)?)? != handle {
-            return None;
+        let index = usize::try_from(handle & HANDLE_INDEX_MASK).map_err(|_| ReadError::Miss)?;
+        let entry = index
+            .checked_mul(ENTRY_SIZE)
+            .and_then(|offset| entries.checked_add(offset))
+            .ok_or(ReadError::Miss)?;
+        let bytes = copy_block::<0x28>(entry, ENTRY_BLOCK.0, &mut read).ok_or(ReadError::Miss)?;
+        if u32_field(&bytes, ENTRY_BLOCK.0, ENTRY_HANDLE) != Some(handle) {
+            return Err(ReadError::Miss);
         }
-        Some(CounterSample {
-            last: read_u32(entry.checked_add(ENTRY_LAST)?)?,
-            peak: read_u32(entry.checked_add(ENTRY_PEAK)?)?,
-            warn: read_u32(entry.checked_add(ENTRY_WARN)?)?,
-            cap: read_u32(entry.checked_add(ENTRY_CAP)?)?,
+        Ok(CounterSample {
+            last: u32_field(&bytes, ENTRY_BLOCK.0, ENTRY_LAST).ok_or(ReadError::Miss)?,
+            peak: u32_field(&bytes, ENTRY_BLOCK.0, ENTRY_PEAK).ok_or(ReadError::Miss)?,
+            warn: u32_field(&bytes, ENTRY_BLOCK.0, ENTRY_WARN).ok_or(ReadError::Miss)?,
+            cap: u32_field(&bytes, ENTRY_BLOCK.0, ENTRY_CAP).ok_or(ReadError::Miss)?,
         })
     };
     let [at_a, at_b, at_c] = COUNTER_HANDLES;
     let a = counter(at_a)?;
     if a.warn != WARN_A || a.cap != CAP_A {
+        return Err(ReadError::Layout);
+    }
+    Ok([a, counter(at_b)?, counter(at_c)?])
+}
+
+/// Copy one fixed-size block, rejecting null bases and all address arithmetic overflow.
+fn copy_block<const N: usize>(
+    base: usize,
+    offset: usize,
+    read: &mut impl FnMut(usize, &mut [u8]) -> bool,
+) -> Option<[u8; N]> {
+    if base == 0 {
         return None;
     }
-    Some([a, counter(at_b)?, counter(at_c)?])
+    let address = base.checked_add(offset)?;
+    address.checked_add(N)?;
+    let mut bytes = [0; N];
+    read(address, &mut bytes).then_some(bytes)
+}
+
+/// Extract a field only from the local copied block, with checked range arithmetic.
+fn field<const N: usize>(bytes: &[u8], block_start: usize, offset: usize) -> Option<[u8; N]> {
+    let start = offset.checked_sub(block_start)?;
+    bytes.get(start..start.checked_add(N)?)?.try_into().ok()
+}
+
+/// Parse one copied little-endian u32.
+fn u32_field(bytes: &[u8], block_start: usize, offset: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(field(bytes, block_start, offset)?))
+}
+
+/// Parse one copied little-endian 64-bit address.
+fn pointer_field(bytes: &[u8], block_start: usize, offset: usize) -> Option<usize> {
+    usize::try_from(u64::from_le_bytes(field(bytes, block_start, offset)?)).ok()
 }
 
 /// The live headroom rule (design.md 7.2): may the grass distance go from `r_now` to `r_next`
@@ -303,47 +355,55 @@ fn public() -> Outputs<'static> {
     }
 }
 
-/// One hook call: count it in `calls`; on every 30th call (the first included), and only while
-/// the probe has not failed, take a sample with `read` and publish it to `out`.
-fn tick(calls: &AtomicU32, out: &Outputs<'_>, read: impl FnOnce() -> Option<[CounterSample; 3]>) {
-    if out.failed.load(Ordering::Relaxed) {
-        return;
-    }
-    // `fetch_add` wraps; a wrap only shifts the rhythm once.
-    if calls
-        .fetch_add(1, Ordering::Relaxed)
-        .is_multiple_of(SAMPLE_EVERY)
-    {
-        out.publish(read());
+/// The sampler's local state, independent of threads and sleeping.
+#[derive(Default)]
+struct Sampler {
+    /// The last observed hook call count.
+    last_calls: u64,
+    /// Consecutive samples whose objects could not be copied or owned.
+    misses: u8,
+}
+
+impl Sampler {
+    /// One sampling opportunity with injected pointer and memory readers.
+    fn step(
+        &mut self,
+        calls: u64,
+        pass: impl FnOnce() -> usize,
+        out: &Outputs<'_>,
+        read: &mut impl FnMut(usize, &mut [u8]) -> bool,
+    ) {
+        if out.failed.load(Ordering::Acquire) || calls == self.last_calls {
+            return;
+        }
+        self.last_calls = calls;
+        match read_counters(pass(), read) {
+            Ok(sample) => {
+                self.misses = 0;
+                out.publish(Some(sample));
+            }
+            Err(ReadError::Layout) => out.publish(None),
+            Err(ReadError::Miss) => {
+                self.misses = self.misses.saturating_add(1);
+                if self.misses >= 10 {
+                    out.publish(None);
+                }
+            }
+        }
     }
 }
 
-/// The hook's sample: [`tick`] on the public statics, reading the chain from `pass`.
-fn sample(pass: usize) {
-    #[cfg(test)]
-    if PANIC_IN_SAMPLE.load(Ordering::Relaxed) {
-        panic!("PANIC_IN_SAMPLE is set");
-    }
-    // SAFETY: `is_readable` checks each range with VirtualQuery. The chain's objects belong to
-    // the grass pass that is running this very call, so the game does not free them meanwhile.
-    tick(&CALLS, &public(), || unsafe {
-        read_counters(pass, is_readable)
-    });
+/// Stop and latch failure if the sampler panics or its feature was already disabled.
+fn guarded_sampler(out: &Outputs<'_>, body: impl FnOnce()) {
+    guard(Feature::ScatterDistance, || out.publish(None), body);
 }
 
-/// The detour's shape: `sample` in a guard of its own, then `original` exactly once.
-///
-/// - `Feature::ScatterDistance` off: only `original` runs (the outer guard's fallback).
-/// - `sample` panics: the inner guard catches it and switches the feature off; then `original`
-///   runs. The outer guard sees no panic, so it does not run `original` a second time.
-///
-/// `original` itself never panics (it only calls the trampoline), so the outer fallback can only
-/// run when the feature is already off.
-fn run_before_original(sample: impl FnOnce(), original: impl Fn()) {
+/// Publish in an inner guard, then call the native original exactly once.
+/// A publication panic is caught by the inner guard, so it cannot reach the outer fallback
+/// and call the original twice. An already disabled feature uses only the outer fallback.
+fn run_before_original(publish: impl FnOnce(), original: impl Fn()) {
     guard(Feature::ScatterDistance, &original, || {
-        // A panic in the sample stops in this inner guard, whose fallback does nothing. So the
-        // outer guard never sees one and never runs the original a second time.
-        guard(Feature::ScatterDistance, || (), sample);
+        guard(Feature::ScatterDistance, || (), publish);
         original();
     });
 }
@@ -365,11 +425,8 @@ unsafe fn call_original(trampoline: usize, rcx: *mut u8, pass: *const u8, f: f32
     unsafe { original(rcx, pass, f) }
 }
 
-/// Stands in for the game's grass pass function: samples the counters (every 30th call), then
-/// runs the original with the same arguments. See the module docs.
-///
-/// It runs on the game's render path, so it only touches atomics and `VirtualQuery`: no lock, no
-/// allocation, no log.
+/// Publish the pass pointer (Release), bump the call counter (Relaxed), then call the original.
+/// No clock, game-memory read, allocation, lock or log is added to the render path.
 ///
 /// # Safety
 ///
@@ -380,7 +437,17 @@ pub unsafe extern "system" fn scatter_frame_detour(rcx: *mut u8, pass: *const u8
     // SAFETY: `trampoline` is 0 or the trampoline for the game function; the arguments are the
     // game's own, passed on unchanged.
     let original = move || unsafe { call_original(trampoline, rcx, pass, f) };
-    run_before_original(move || sample(pass as usize), original);
+    run_before_original(
+        move || {
+            LAST_PASS.store(pass as usize, Ordering::Release);
+            CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+            #[cfg(test)]
+            if PANIC_IN_PUBLISH.load(Ordering::Relaxed) {
+                panic!("publication panic");
+            }
+        },
+        original,
+    );
 }
 
 const _: ScatterFrameFn = scatter_frame_detour;
@@ -428,55 +495,114 @@ pub unsafe fn install(m: &Module) -> Result<(), String> {
     unsafe { hook_at(target) }
 }
 
-/// Is the probe wanted? With `EnableScatterDistance = 1` (the governor's headroom rule needs
-/// it), or with `[Debug] ScatterProbe = 1` and `LogLevel = debug` (design.md section 8: the
-/// `[Debug]` keys count only with `LogLevel = debug`).
+/// Is the probe wanted? [`wanted_with`] the ceiling [`R_MAX_M`]. While that is still the game's
+/// 90 m, only the debug key installs the probe, so a default install has no probe hook.
 fn wanted(cfg: &Config) -> bool {
-    cfg.knobs.enable_scatter_distance
-        || (cfg.debug.scatter_probe && cfg.general.log_level == LogLevel::Debug)
+    wanted_with(cfg, R_MAX_M)
 }
 
-/// The body of [`init`], with the decision, the code-patch answer and the install passed in.
-/// `install` runs only when code patches are allowed and the probe is wanted. Returns the log
-/// level and the one line to log.
+/// Is the probe wanted with the grass ceiling `r_max`? With `[Debug] ScatterProbe = 1` and
+/// `LogLevel = debug` (design.md section 8: the `[Debug]` keys count only with `LogLevel =
+/// debug`), or with `EnableScatterDistance = 1` when `r_max` allows at least one raise (the
+/// governor's headroom rule is the only other consumer, and it needs a step above 90 m).
+fn wanted_with(cfg: &Config, r_max: f32) -> bool {
+    let debug_key = cfg.debug.scatter_probe && cfg.general.log_level == LogLevel::Debug;
+    let knob_can_rise =
+        cfg.knobs.enable_scatter_distance && ceiling_step(&SCATTER_STEPS, r_max) > 0;
+    debug_key || knob_can_rise
+}
+
+/// Name both failed halves of the consumer rule, without guessing why the ceiling is low.
+fn not_wanted_reason(cfg: &Config, r_max: f32) -> String {
+    let debug = if !cfg.debug.scatter_probe {
+        "[Debug] ScatterProbe = 0"
+    } else {
+        "LogLevel is not debug"
+    };
+    let knob = if !cfg.knobs.enable_scatter_distance {
+        "EnableScatterDistance = 0".to_owned()
+    } else {
+        format!("the grass ceiling r_max = {r_max} m allows no raise")
+    };
+    format!("scatter probe: off: no consumer ({debug}; {knob})")
+}
+
+/// Start only after the wanted hook was installed; both effects are injectable.
 fn start_up(
-    wanted: bool,
+    cfg: &Config,
     code_patches: bool,
     install: impl FnOnce() -> Result<(), String>,
+    start_sampler: impl FnOnce() -> Result<(), String>,
 ) -> (Level, String) {
     if !code_patches {
         return (
             Level::Info,
-            "scatter probe: off: code patches are off on this build".to_owned(),
+            "scatter probe: off: code patches are off on this build".into(),
         );
     }
-    if !wanted {
-        return (
-            Level::Info,
-            "scatter probe: off: EnableScatterDistance = 0, and no [Debug] ScatterProbe = 1 with \
-             LogLevel = debug"
-                .to_owned(),
-        );
+    if !wanted(cfg) {
+        return (Level::Info, not_wanted_reason(cfg, R_MAX_M));
     }
-    match install() {
+    match install().and_then(|()| start_sampler()) {
         Ok(()) => (
             Level::Info,
-            "scatter probe: on (grass pass hook queued; it reads the GPU counters every 30th call)"
-                .to_owned(),
+            "scatter probe: on (grass pass hook queued; sampler thread copies GPU counters every 500 ms)".into(),
         ),
         Err(why) => (Level::Warn, format!("scatter probe: off: {why}")),
     }
 }
 
-/// The start-up step: decide, install the hook (queued) if it is right to, and log one line.
+/// Run the worker under the feature guard; it holds only local state while sleeping.
+fn sampler_main() {
+    let out = public();
+    guarded_sampler(&out, || {
+        let mut state = Sampler::default();
+        let mut reader = read_process;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(SAMPLE_INTERVAL_MS));
+            if crate::guard::is_disabled(Feature::ScatterDistance) {
+                out.publish(None);
+                return;
+            }
+            if out.failed.load(Ordering::Acquire) {
+                return;
+            }
+            state.step(
+                CALL_COUNT.load(Ordering::Relaxed),
+                || LAST_PASS.load(Ordering::Acquire),
+                &out,
+                &mut reader,
+            );
+        }
+    });
+}
+
+/// Start one named, detached sampler only after installation succeeded.
+fn start_sampler_thread() -> Result<(), String> {
+    std::thread::Builder::new()
+        .name("scatter-probe".into())
+        .spawn(sampler_main)
+        .map(|_| ())
+        .map_err(|error| {
+            public().publish(None);
+            format!("cannot start sampler thread: {error}")
+        })
+}
+
+/// Decide, install the queued hook, start its detached sampler, and log one outcome line.
 /// Called once, from `entry::start`, after `code_patches_allowed` is set and before
 /// `knobs::enable_queued_hooks`.
 pub fn init(cfg: &Config) {
-    let (level, line) = start_up(wanted(cfg), entry::code_patches_allowed(), || {
-        // SAFETY: `init` runs from `entry::start`, in `InitializeASI`, before the game's
-        // `WinMain`: one thread. `main_module()` is the running exe.
-        unsafe { install(&main_module()) }
-    });
+    let (level, line) = start_up(
+        cfg,
+        entry::code_patches_allowed(),
+        || {
+            // SAFETY: `init` runs from `entry::start`, in `InitializeASI`, before the game's
+            // `WinMain`: one thread. `main_module()` is the running exe.
+            unsafe { install(&main_module()) }
+        },
+        start_sampler_thread,
+    );
     log::log!(level, "{line}");
 }
 
@@ -623,81 +749,162 @@ mod tests {
             self.mem[at..at + 4].copy_from_slice(&v.to_le_bytes());
         }
 
-        /// Every `(address, length)` the reader must check, in order, for a good chain.
+        /// Copy only from this fixture's owned buffer, without dereferencing its fake links.
+        fn copy(&self, address: usize, bytes: &mut [u8]) -> bool {
+            let Some(start) = address.checked_sub(self.base()) else {
+                return false;
+            };
+            let Some(end) = start.checked_add(bytes.len()) else {
+                return false;
+            };
+            let Some(source) = self.mem.get(start..end) else {
+                return false;
+            };
+            bytes.copy_from_slice(source);
+            true
+        }
+
+        /// Every `(address, length)` the reader must check, in order, for a good chain: one
+        /// block per object, not one check per read (ruling 3 of the stutter fix).
         fn expected_checks(&self) -> Vec<(usize, usize)> {
             let b = self.base();
             let mut v = vec![
-                (b + PASS_AT + 0x18, 8),
-                (b + PASS_AT + 0x8, 8),
+                // pass+0x8 (owner) to pass+0x20 (obj ends): both pointers.
+                (b + PASS_AT + 0x8, 0x18),
                 (b + OWNER_AT + 0x20, 8),
                 (b + POOL_AT + 0x48, 8),
+                // The three handles, obj+0x8 to obj+0x14.
+                (b + OBJ_AT + 0x8, 0xc),
             ];
-            for (i, h) in HANDLES.into_iter().enumerate() {
-                let e = b + Chain::entry_at(h);
-                v.push((b + OBJ_AT + 0x8 + 4 * i, 4));
-                for field in [0x38, 0x14, 0x1c, 0x20, 0x24] {
-                    v.push((e + field, 4));
-                }
+            for h in HANDLES {
+                // last (+0x14) to the owner handle (+0x38..+0x3c).
+                v.push((b + Chain::entry_at(h) + 0x14, 0x28));
             }
             v
         }
     }
 
     #[test]
-    fn a_good_chain_gives_all_three_counters() {
-        let chain = Chain::new();
-        // SAFETY: `is_readable` checks every read, and the chain's buffer lives to the end.
-        let got = unsafe { read_counters(chain.pass(), is_readable) };
-        assert_eq!(got, Some([A, B, C]));
-    }
-
-    #[test]
-    fn every_read_is_checked_first_with_its_address_and_length() {
+    fn copied_chain_reads_seven_exact_blocks_and_parses_all_counters() {
         let chain = Chain::new();
         let asked = RefCell::new(Vec::new());
-        // SAFETY: the closure allows only addresses inside the chain's live buffer (asserted).
-        let got = unsafe {
-            read_counters(chain.pass(), |addr, len| {
-                assert!(addr >= chain.base() && addr + len <= chain.base() + chain.mem.len());
-                asked.borrow_mut().push((addr, len));
-                true
-            })
-        };
-        assert_eq!(got, Some([A, B, C]));
+        let result = read_counters(chain.pass(), |address, bytes| {
+            asked.borrow_mut().push((address, bytes.len()));
+            chain.copy(address, bytes)
+        });
+        assert_eq!(result, Ok([A, B, C]));
         assert_eq!(*asked.borrow(), chain.expected_checks());
     }
 
     #[test]
-    fn a_refused_check_gives_none_and_that_link_and_everything_after_it_are_never_read() {
-        let chain = Chain::new();
+    fn rpm_requires_success_and_exact_byte_count() {
+        assert!(complete_read(1, 8, 8));
+        assert!(complete_read(-1, 8, 8));
+        assert!(!complete_read(0, 8, 8));
+        assert!(!complete_read(1, 7, 8));
+        assert!(!complete_read(1, 9, 8));
+        assert!(!complete_read(0, 0, 8));
+    }
+
+    #[test]
+    fn rpm_copies_full_block_and_refuses_noaccess_boundary() {
+        let pages = Mem::new(2 * PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        pages.put(PAGE - 8, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        pages.protect(PAGE, PAGE, PAGE_NOACCESS);
+        let mut bytes = [0; 8];
+        assert!(read_process(pages.base + PAGE - 8, &mut bytes));
+        assert_eq!(bytes, [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert!(!read_process(pages.base + PAGE - 8, &mut [0; 16]));
+        assert!(!read_process(pages.base + PAGE, &mut [0; 8]));
+        assert!(!read_process(0, &mut [0; 8]));
+        assert!(!read_process(usize::MAX - 2, &mut [0; 8]));
+    }
+
+    /// A chain whose every checked block ends exactly at the end of a readable page, with a
+    /// no-access page right after it: a copy past a block must fail safely.
+    #[test]
+    fn reads_stay_inside_the_checked_blocks_at_a_page_edge() {
+        let pages: Vec<Mem> = (0..5)
+            .map(|_| Mem::new(2 * PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE))
+            .collect();
+        let edge = |m: &Mem| m.base + PAGE;
+        // Each object sits so that its block ends at the page edge.
+        let pass = edge(&pages[0]) - 0x20;
+        let owner = edge(&pages[1]) - 0x28;
+        let pool = edge(&pages[2]) - 0x50;
+        let obj = edge(&pages[3]) - 0x14;
+        // Counter C has the highest index (5); its block ends at entry+0x3c.
+        let entries = edge(&pages[4]) - (5 * 0x40 + 0x3c);
+        let put64 = |m: &Mem, at: usize, v: usize| m.put(at - m.base, &(v as u64).to_le_bytes());
+        let put32 = |m: &Mem, at: usize, v: u32| m.put(at - m.base, &v.to_le_bytes());
+        put64(&pages[0], pass + 0x8, owner);
+        put64(&pages[0], pass + 0x18, obj);
+        put64(&pages[1], owner + 0x20, pool);
+        put64(&pages[2], pool + 0x48, entries);
+        for (i, (h, s)) in HANDLES.into_iter().zip([A, B, C]).enumerate() {
+            put32(&pages[3], obj + 0x8 + 4 * i, h);
+            let e = entries + (h & 0xffff) as usize * 0x40;
+            put32(&pages[4], e + 0x14, s.last);
+            put32(&pages[4], e + 0x1c, s.peak);
+            put32(&pages[4], e + 0x20, s.warn);
+            put32(&pages[4], e + 0x24, s.cap);
+            put32(&pages[4], e + 0x38, h);
+        }
+        for m in &pages {
+            m.protect(PAGE, PAGE, PAGE_NOACCESS);
+        }
+        let got = read_counters(pass, read_process);
+        assert_eq!(got, Ok([A, B, C]));
+    }
+
+    #[test]
+    fn every_refused_copy_stops_at_that_block_and_publishes_no_partial_sample() {
+        let mut chain = Chain::new();
+        chain.set(HANDLES[0], CounterSample { last: 99, ..A });
         let all = chain.expected_checks();
-        assert_eq!(all.len(), 22);
         for (i, &refused) in all.iter().enumerate() {
             let asked = RefCell::new(Vec::new());
-            // SAFETY: as above; the one refused address is never read (that is the point).
-            let got = unsafe {
-                read_counters(chain.pass(), |addr, len| {
-                    asked.borrow_mut().push((addr, len));
-                    (addr, len) != refused
-                })
+            let own = Own::default();
+            own.outputs().publish(Some([A, B, C]));
+            let mut state = Sampler::default();
+            let mut reader = |address, bytes: &mut [u8]| {
+                asked.borrow_mut().push((address, bytes.len()));
+                // Even a refusing reader fills valid bytes: ignoring its status must fail.
+                chain.copy(address, bytes) && (address, bytes.len()) != refused
             };
-            // Every link holds a good value, so reading the refused one anyway would succeed.
-            assert_eq!(got, None, "refusing check {i} {refused:x?}");
-            assert_eq!(*asked.borrow(), all[..=i], "refusing check {i}");
+            state.step(1, || chain.pass(), &own.outputs(), &mut reader);
+            assert_eq!(*asked.borrow(), all[..=i], "refused copy {i}");
+            assert_eq!(state.misses, 1);
+            assert!(!own.failed.load(Relaxed));
+            assert!(own.ok.load(Relaxed));
+            assert_eq!(own.vals(), [A.last, A.peak, B.last, B.peak, C.last, C.peak]);
         }
     }
 
     #[test]
-    fn the_self_check_needs_counter_a_warn_and_cap() {
+    fn zero_and_mismatched_handles_are_transient_and_stop_before_later_entries() {
+        for (i, handle) in HANDLES.into_iter().enumerate() {
+            for zero in [false, true] {
+                let mut chain = Chain::new();
+                if zero {
+                    chain.put_u32(OBJ_AT + 0x8 + 4 * i, 0);
+                } else {
+                    chain.put_u32(Chain::entry_at(handle) + 0x38, handle ^ 0x2_0000);
+                }
+                let asked = Cell::new(0);
+                let result = read_counters(chain.pass(), |a, b| {
+                    asked.set(asked.get() + 1);
+                    chain.copy(a, b)
+                });
+                assert_eq!(result, Err(ReadError::Miss));
+                assert_eq!(asked.get(), 4 + i + usize::from(!zero));
+            }
+        }
+    }
+
+    #[test]
+    fn only_counter_a_warn_and_cap_are_the_layout_self_check() {
         let mut chain = Chain::new();
-        chain.set(HANDLES[0], CounterSample { warn: 0xe000, ..A });
-        // SAFETY: `is_readable` checks every read; the buffer is live.
-        assert_eq!(unsafe { read_counters(chain.pass(), is_readable) }, None);
-        chain.set(HANDLES[0], CounterSample { cap: 0x28000, ..A });
-        // SAFETY: as above.
-        assert_eq!(unsafe { read_counters(chain.pass(), is_readable) }, None);
-        // B and C are not part of the self-check.
-        chain.set(HANDLES[0], A);
         chain.set(
             HANDLES[1],
             CounterSample {
@@ -706,97 +913,72 @@ mod tests {
                 ..B
             },
         );
-        // SAFETY: as above.
-        let got = unsafe { read_counters(chain.pass(), is_readable) };
-        assert_eq!(got.map(|[a, _, _]| a), Some(A));
+        assert_eq!(
+            read_counters(chain.pass(), |a, b| chain.copy(a, b)),
+            Ok([
+                A,
+                CounterSample {
+                    warn: 1,
+                    cap: 2,
+                    ..B
+                },
+                C
+            ])
+        );
     }
 
     #[test]
-    fn a_handle_that_does_not_own_its_entry_or_is_0_gives_none() {
-        for (i, h) in HANDLES.into_iter().enumerate() {
-            let mut chain = Chain::new();
-            chain.put_u32(Chain::entry_at(h) + 0x38, h ^ 0x2_0000);
-            // SAFETY: `is_readable` checks every read; the buffer is live.
+    fn local_fields_and_addresses_use_checked_bounds_and_never_read_invalid_links() {
+        let bytes = [1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0];
+        assert_eq!(u32_field(&bytes, 0, 8), Some(3));
+        assert_eq!(u32_field(&bytes, 0, 9), None);
+        assert_eq!(u32_field(&bytes, 8, 7), None);
+        assert_eq!(u32_field(&bytes, 0, usize::MAX), None);
+        assert_eq!(pointer_field(&bytes, 0, 4), Some(0x0000_0003_0000_0002));
+        assert_eq!(pointer_field(&bytes, 0, 5), None);
+        for pass in [0, usize::MAX - 4] {
             assert_eq!(
-                unsafe { read_counters(chain.pass(), is_readable) },
-                None,
-                "{i}"
+                read_counters(pass, |_, _| panic!("invalid address reached reader")),
+                Err(ReadError::Miss)
             );
-
-            // Handle 0, with an entry 0 whose owner field is 0 too.
+        }
+        for (offset, value, expected) in [
+            (PASS_AT + 0x8, 0, 1),
+            (PASS_AT + 0x8, usize::MAX - 4, 1),
+            (PASS_AT + 0x18, usize::MAX - 4, 3),
+            (POOL_AT + 0x48, usize::MAX - 4, 4),
+        ] {
             let mut chain = Chain::new();
-            chain.put_u32(OBJ_AT + 0x8 + 4 * i, 0);
-            // SAFETY: as above.
+            chain.put_u64(offset, value as u64);
+            let calls = Cell::new(0);
             assert_eq!(
-                unsafe { read_counters(chain.pass(), is_readable) },
-                None,
-                "{i}"
+                read_counters(chain.pass(), |a, b| {
+                    calls.set(calls.get() + 1);
+                    chain.copy(a, b)
+                }),
+                Err(ReadError::Miss)
             );
+            assert_eq!(calls.get(), expected);
         }
     }
 
     #[test]
-    fn unreadable_memory_in_the_chain_gives_none_without_a_fault() {
-        let none = Mem::new(PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS);
-        // SAFETY: `is_readable` refuses the no-access page before any read.
-        assert_eq!(unsafe { read_counters(none.base, is_readable) }, None);
-        let mut chain = Chain::new();
-        chain.put_u64(PASS_AT + 0x18, none.base as u64);
-        // SAFETY: as above.
-        assert_eq!(unsafe { read_counters(chain.pass(), is_readable) }, None);
-        let mut chain = Chain::new();
-        chain.put_u64(POOL_AT + 0x48, 0);
-        // SAFETY: as above; address 0 is never committed.
-        assert_eq!(unsafe { read_counters(chain.pass(), is_readable) }, None);
-        // SAFETY: as above.
-        assert_eq!(unsafe { read_counters(0, is_readable) }, None);
-        // SAFETY: as above; the address arithmetic must not overflow.
-        assert_eq!(unsafe { read_counters(usize::MAX - 4, |_, _| true) }, None);
-    }
-
-    // ---- is_readable --------------------------------------------------------------------------
-
-    #[test]
-    fn is_readable_follows_the_page_protection() {
-        let none = Mem::new(PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS);
-        assert!(!is_readable(none.base, 4));
-        let rw = Mem::new(PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-        assert!(is_readable(rw.base, 4));
-        assert!(is_readable(rw.base, PAGE));
-        assert!(is_readable(rw.base + PAGE - 4, 4));
-        let ro = Mem::new(PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READONLY);
-        assert!(is_readable(ro.base + 8, 8));
-        let guard = Mem::new(PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE | PAGE_GUARD);
-        assert!(!is_readable(guard.base, 4));
+    fn rpm_refuses_bad_pages_and_reads_readonly_memory() {
+        let ro = Mem::new(PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        ro.put(8, &[11, 12, 13, 14]);
+        ro.protect(0, PAGE, PAGE_READONLY);
+        let mut bytes = [0; 4];
+        assert!(read_process(ro.base + 8, &mut bytes));
+        assert_eq!(bytes, [11, 12, 13, 14]);
+        for flags in [PAGE_NOACCESS, PAGE_READWRITE | PAGE_GUARD] {
+            let memory = Mem::new(PAGE, MEM_RESERVE | MEM_COMMIT, flags);
+            assert!(!read_process(memory.base, &mut bytes));
+        }
         let reserved = Mem::new(PAGE, MEM_RESERVE, PAGE_READWRITE);
-        assert!(!is_readable(reserved.base, 4));
+        assert!(!read_process(reserved.base, &mut bytes));
     }
 
-    #[test]
-    fn is_readable_needs_the_whole_range_in_one_readable_region() {
-        let two = Mem::new(2 * PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-        assert!(
-            is_readable(two.base + PAGE - 4, 8),
-            "two like pages are one region"
-        );
-        two.protect(PAGE, PAGE, PAGE_NOACCESS);
-        assert!(is_readable(two.base + PAGE - 4, 4));
-        assert!(
-            !is_readable(two.base + PAGE - 4, 8),
-            "runs into the no-access page"
-        );
-        assert!(!is_readable(two.base + PAGE, 4));
-    }
-
-    #[test]
-    fn is_readable_refuses_null_and_an_overflowing_range() {
-        assert!(!is_readable(0, 8));
-        let rw = Mem::new(PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-        assert!(!is_readable(rw.base, usize::MAX));
-        assert!(!is_readable(usize::MAX - 2, 8));
-    }
-
-    // ---- publishing and the 30-call rhythm ------------------------------------------------------
+    // ---- publishing and the pure sampler ------------------------------------------------------
 
     /// A test's own set of output atomics.
     #[derive(Default)]
@@ -823,6 +1005,144 @@ mod tests {
         fn vals(&self) -> [u32; 6] {
             self.vals.each_ref().map(|v| v.load(Relaxed))
         }
+    }
+
+    #[test]
+    fn a_good_sample_resets_misses_and_preserves_values_during_later_misses() {
+        let own = Own::default();
+        let chain = Chain::new();
+        let mut state = Sampler::default();
+        for calls in 1..=9 {
+            state.step(calls, || 0, &own.outputs(), &mut |_, _| false);
+        }
+        state.step(10, || chain.pass(), &own.outputs(), &mut |a, b| {
+            chain.copy(a, b)
+        });
+        assert_eq!(state.misses, 0);
+        assert!(own.ok.load(Relaxed));
+        let values = [A.last, A.peak, B.last, B.peak, C.last, C.peak];
+        assert_eq!(own.vals(), values);
+        for calls in 11..=19 {
+            state.step(calls, || 0, &own.outputs(), &mut |_, _| false);
+            assert!(!own.failed.load(Relaxed));
+            assert!(own.ok.load(Relaxed));
+            assert_eq!(own.vals(), values);
+        }
+        state.step(20, || 0, &own.outputs(), &mut |_, _| false);
+        assert!(own.failed.load(Relaxed));
+        assert!(!own.ok.load(Relaxed));
+        assert_eq!(own.vals(), values);
+    }
+
+    #[test]
+    fn copied_bad_warn_or_cap_fails_immediately_without_publishing() {
+        for bad in [
+            CounterSample {
+                warn: WARN_A - 1,
+                ..A
+            },
+            CounterSample {
+                cap: CAP_A + 1,
+                ..A
+            },
+        ] {
+            let mut chain = Chain::new();
+            chain.set(HANDLES[0], bad);
+            let own = Own::default();
+            let mut state = Sampler::default();
+            state.step(1, || chain.pass(), &own.outputs(), &mut |a, b| {
+                chain.copy(a, b)
+            });
+            assert!(own.failed.load(Relaxed));
+            assert!(!own.ok.load(Relaxed));
+            assert_eq!(own.vals(), [0; 6]);
+        }
+    }
+
+    #[test]
+    fn unchanged_counter_skips_pointer_and_memory_reads_and_miss_counting() {
+        let own = Own::default();
+        let mut state = Sampler::default();
+        state.step(
+            0,
+            || panic!("no pass read before any call"),
+            &own.outputs(),
+            &mut |_, _| panic!("no memory read"),
+        );
+        let chain = Chain::new();
+        state.step(5, || chain.pass(), &own.outputs(), &mut |a, b| {
+            chain.copy(a, b)
+        });
+        let values = own.vals();
+        state.step(
+            5,
+            || panic!("unchanged pass"),
+            &own.outputs(),
+            &mut |_, _| panic!("unchanged read"),
+        );
+        assert_eq!(own.vals(), values);
+        state.step(6, || 0, &own.outputs(), &mut |_, _| false);
+        assert_eq!(state.misses, 1);
+        state.step(
+            6,
+            || panic!("unchanged miss"),
+            &own.outputs(),
+            &mut |_, _| panic!("unchanged read"),
+        );
+        assert_eq!(state.misses, 1);
+        state.last_calls = u64::MAX;
+        state.step(0, || chain.pass(), &own.outputs(), &mut |a, b| {
+            chain.copy(a, b)
+        });
+        assert_eq!(state.misses, 0, "a wrapped counter still changed");
+    }
+
+    #[test]
+    fn a_latched_failure_never_reads_or_recovers() {
+        let own = Own::default();
+        own.outputs().publish(None);
+        let mut state = Sampler::default();
+        state.step(
+            1,
+            || panic!("failed pointer"),
+            &own.outputs(),
+            &mut |_, _| panic!("failed read"),
+        );
+        assert!(own.failed.load(Relaxed));
+        assert!(!own.ok.load(Relaxed));
+        assert_eq!(own.vals(), [0; 6]);
+    }
+
+    #[test]
+    fn a_sampler_panic_stops_work_and_latches_failed() {
+        in_child("a_sampler_panic_stops_work_and_latches_failed", || {
+            let own = Own::default();
+            own.outputs().publish(Some([A, B, C]));
+            let reached = Cell::new(false);
+            guarded_sampler(&own.outputs(), || {
+                panic!("sampler reader panic");
+            });
+            assert!(own.failed.load(Relaxed));
+            assert!(!own.ok.load(Relaxed));
+            assert!(is_disabled(Feature::ScatterDistance));
+            guarded_sampler(&own.outputs(), || reached.set(true));
+            assert!(!reached.get());
+        });
+    }
+
+    #[test]
+    fn sampler_retries_nine_misses_then_latches_the_tenth() {
+        let own = Own::default();
+        let mut state = Sampler::default();
+        for calls in 1..=9 {
+            state.step(calls, || 0, &own.outputs(), &mut |_, _| false);
+            assert!(!own.failed.load(Relaxed), "miss {calls} is transient");
+        }
+        assert_eq!(state.misses, 9);
+        state.step(10, || 0, &own.outputs(), &mut |_, _| false);
+        assert!(own.failed.load(Relaxed));
+        assert!(!own.ok.load(Relaxed));
+        assert_eq!(own.vals(), [0; 6]);
     }
 
     #[test]
@@ -863,59 +1183,6 @@ mod tests {
         assert_eq!(own.vals(), [0; 6]);
     }
 
-    #[test]
-    fn tick_samples_the_first_call_and_then_every_30th() {
-        let own = Own::default();
-        let calls = AtomicU32::new(0);
-        let reads = Cell::new(Vec::new());
-        for call in 0..91u32 {
-            tick(&calls, &own.outputs(), || {
-                let mut r = reads.take();
-                r.push(call);
-                reads.set(r);
-                Some([CounterSample { last: call, ..A }, B, C])
-            });
-        }
-        assert_eq!(reads.take(), [0, 30, 60, 90]);
-        assert_eq!(own.vals()[0], 90);
-        assert_eq!(calls.load(Relaxed), 91);
-    }
-
-    #[test]
-    fn tick_reads_nothing_more_after_a_failure() {
-        let own = Own::default();
-        let calls = AtomicU32::new(0);
-        let reads = Cell::new(0u32);
-        for _ in 0..100 {
-            tick(&calls, &own.outputs(), || {
-                reads.set(reads.get() + 1);
-                None
-            });
-        }
-        assert_eq!(reads.get(), 1, "only the first sample ran");
-        assert!(own.failed.load(Relaxed));
-        assert!(!own.ok.load(Relaxed));
-    }
-
-    #[test]
-    fn the_call_counter_wraps_instead_of_panicking() {
-        let own = Own::default();
-        let calls = AtomicU32::new(u32::MAX);
-        let reads = Cell::new(0u32);
-        tick(&calls, &own.outputs(), || {
-            reads.set(reads.get() + 1);
-            Some([A, B, C])
-        });
-        assert_eq!(calls.load(Relaxed), 0);
-        // u32::MAX % 30 == 15: not a sample call.
-        assert_eq!(reads.get(), 0);
-        tick(&calls, &own.outputs(), || {
-            reads.set(reads.get() + 1);
-            Some([A, B, C])
-        });
-        assert_eq!(reads.get(), 1, "0 is a sample call");
-    }
-
     // ---- the start-up decision ------------------------------------------------------------------
 
     fn cfg(scatter_knob: bool, probe_key: bool, level: LogLevel) -> Config {
@@ -927,13 +1194,18 @@ mod tests {
     }
 
     #[test]
-    fn the_probe_is_wanted_for_the_grass_knob_or_the_debug_key_with_debug_logging() {
-        assert!(
-            wanted(&Config::default()),
-            "EnableScatterDistance = 1 is the default"
-        );
-        assert!(wanted(&cfg(true, false, LogLevel::Info)));
+    fn a_default_install_has_no_probe_hook() {
+        // EnableScatterDistance = 1 is the default, but r_max is still 90 m: no consumer.
+        assert!(Config::default().knobs.enable_scatter_distance);
+        assert!(!wanted(&Config::default()));
+        assert!(!wanted(&cfg(true, false, LogLevel::Info)));
+        assert!(!wanted(&cfg(true, false, LogLevel::Debug)));
+    }
+
+    #[test]
+    fn the_debug_key_with_debug_logging_installs_the_probe() {
         assert!(wanted(&cfg(false, true, LogLevel::Debug)));
+        assert!(wanted(&cfg(true, true, LogLevel::Debug)));
         assert!(
             !wanted(&cfg(false, true, LogLevel::Info)),
             "[Debug] needs LogLevel = debug"
@@ -942,56 +1214,98 @@ mod tests {
     }
 
     #[test]
-    fn no_code_patches_means_no_hook_and_says_so() {
-        let called = Cell::new(false);
-        let (level, line) = start_up(true, false, || {
-            called.set(true);
-            Ok(())
-        });
-        assert!(!called.get(), "install must not run");
+    fn the_grass_knob_wants_the_probe_only_once_r_max_allows_a_raise() {
+        let knob = cfg(true, false, LogLevel::Info);
+        assert!(!wanted_with(&knob, 90.0));
+        assert!(!wanted_with(&knob, 99.9));
+        assert!(wanted_with(&knob, 100.0), "step 1 (100 m) is allowed");
+        assert!(wanted_with(&knob, 127.0));
+        assert!(!wanted_with(&knob, f32::NAN));
+        // Without the knob, a ceiling alone wants nothing.
+        assert!(!wanted_with(&cfg(false, false, LogLevel::Info), 127.0));
+    }
+
+    #[test]
+    fn sampler_starts_once_only_after_a_wanted_hook_installs() {
+        let effects = RefCell::new(Vec::new());
+        let wanted_cfg = cfg(false, true, LogLevel::Debug);
+        let (level, _) = start_up(
+            &wanted_cfg,
+            true,
+            || {
+                effects.borrow_mut().push("install");
+                Ok(())
+            },
+            || {
+                effects.borrow_mut().push("sampler");
+                Ok(())
+            },
+        );
+        assert_eq!(level, Level::Info);
+        assert_eq!(*effects.borrow(), ["install", "sampler"]);
+        for (config, patches, installation) in [
+            (wanted_cfg, false, Ok(())),
+            (Config::default(), true, Ok(())),
+            (wanted_cfg, true, Err("missing signature".to_owned())),
+        ] {
+            effects.borrow_mut().clear();
+            let (_, line) = start_up(
+                &config,
+                patches,
+                || {
+                    effects.borrow_mut().push("install");
+                    installation
+                },
+                || {
+                    effects.borrow_mut().push("sampler");
+                    Ok(())
+                },
+            );
+            assert!(!effects.borrow().contains(&"sampler"), "{line}");
+        }
+        let (level, line) = start_up(
+            &wanted_cfg,
+            true,
+            || Ok(()),
+            || Err("cannot start worker".into()),
+        );
+        assert_eq!(level, Level::Warn);
+        assert!(line.contains("cannot start worker"));
+    }
+
+    #[test]
+    fn startup_reasons_name_the_actual_failed_halves() {
+        let (level, line) = start_up(
+            &cfg(true, true, LogLevel::Debug),
+            false,
+            || panic!("no install"),
+            || panic!("no sampler"),
+        );
         assert_eq!(level, Level::Info);
         assert_eq!(
             line,
             "scatter probe: off: code patches are off on this build"
         );
-    }
-
-    #[test]
-    fn not_wanted_means_no_hook_and_says_so() {
-        let called = Cell::new(false);
-        let (level, line) = start_up(false, true, || {
-            called.set(true);
-            Ok(())
-        });
-        assert!(!called.get(), "install must not run");
-        assert_eq!(level, Level::Info);
-        assert_eq!(
-            line,
-            "scatter probe: off: EnableScatterDistance = 0, and no [Debug] ScatterProbe = 1 with \
-             LogLevel = debug"
+        let (_, line) = start_up(
+            &Config::default(),
+            true,
+            || panic!("no install"),
+            || panic!("no sampler"),
         );
-    }
-
-    #[test]
-    fn a_wanted_probe_installs_and_says_so() {
-        let called = Cell::new(false);
-        let (level, line) = start_up(true, true, || {
-            called.set(true);
-            Ok(())
-        });
-        assert!(called.get());
-        assert_eq!(level, Level::Info);
-        assert_eq!(
-            line,
-            "scatter probe: on (grass pass hook queued; it reads the GPU counters every 30th call)"
+        assert!(line.contains("ScatterProbe = 0"));
+        assert!(line.contains("r_max = 90 m allows no raise"));
+        let line = not_wanted_reason(&cfg(false, true, LogLevel::Info), 127.0);
+        assert!(line.contains("LogLevel is not debug"));
+        assert!(line.contains("EnableScatterDistance = 0"));
+        assert!(!line.contains("not measured"));
+        let (level, line) = start_up(
+            &cfg(false, true, LogLevel::Debug),
+            true,
+            || Err("missing signature".into()),
+            || panic!("no worker"),
         );
-    }
-
-    #[test]
-    fn an_install_failure_is_a_warning_with_the_reason() {
-        let (level, line) = start_up(true, true, || Err("the game code was not found".into()));
         assert_eq!(level, Level::Warn);
-        assert_eq!(line, "scatter probe: off: the game code was not found");
+        assert_eq!(line, "scatter probe: off: missing signature");
     }
 
     // ---- the real hook, on a stand-in for the game function -----------------------------------
@@ -1011,8 +1325,8 @@ mod tests {
     /// `install` never finds it in this test binary. MinHook moves the same 5-byte first
     /// instruction as in the game.
     ///
-    /// It records RCX, RDX, XMM2 and `PROBE_OK` (so a test can see that the sample ran before
-    /// it), then counts the call.
+    /// It records RCX, RDX, XMM2 and PROBE_OK, then counts the call. Plain and hooked
+    /// measurements use exactly the same original side effects.
     #[unsafe(naked)]
     unsafe extern "system" fn fake_scatter_frame(_rcx: *mut u8, _pass: *const u8, _f: f32) {
         core::arch::naked_asm!(
@@ -1048,8 +1362,8 @@ mod tests {
     /// Call the fake through its address, as the game's caller does.
     fn call_fake(rcx: usize, pass: usize, f: f32) {
         let fake: ScatterFrameFn = std::hint::black_box(fake_scatter_frame);
-        // SAFETY: the fake only records its arguments; the hook (if any) reads `pass` only after
-        // `is_readable` accepted each address.
+        // SAFETY: the fake only records its arguments; the detour only publishes the numeric
+        // pointer, so even an invalid pass value is never dereferenced.
         unsafe { fake(rcx as *mut u8, pass as *const u8, f) };
     }
 
@@ -1097,6 +1411,12 @@ mod tests {
             stdout.contains("1 passed"),
             "the child must have run {full}\nstdout:\n{stdout}"
         );
+        // Pass the child's measurements on, so `--nocapture` shows them.
+        for line in stdout.lines() {
+            if let Some(at) = line.find("probe cost:") {
+                println!("{}", &line[at..]);
+            }
+        }
     }
 
     /// Hook the fake through the code path `install` uses, and enable it through the one that
@@ -1118,94 +1438,43 @@ mod tests {
     }
 
     #[test]
-    fn real_hook_samples_before_the_original_and_passes_every_argument_on() {
+    fn real_hook_only_publishes_and_passes_every_argument_on() {
         in_child(
-            "real_hook_samples_before_the_original_and_passes_every_argument_on",
+            "real_hook_only_publishes_and_passes_every_argument_on",
             || {
-                assert!(!is_disabled(Feature::ScatterDistance), "a fresh process");
-                let mut chain = Chain::new();
-                // Unhooked, the fake records its arguments and nothing is published.
-                call_fake(0x1234, chain.pass(), 1.5);
-                assert_eq!(FAKE_CALLS.load(Relaxed), 1);
-                assert!(!PROBE_OK.load(Relaxed));
-
-                hook_the_fake();
-                call_fake(0x5678, chain.pass(), 2.25);
-                assert_eq!(FAKE_CALLS.load(Relaxed), 2, "the original ran exactly once");
-                assert_eq!(FAKE_RCX.load(Relaxed), 0x5678, "RCX passed on");
-                assert_eq!(FAKE_RDX.load(Relaxed), chain.pass(), "RDX passed on");
-                assert_eq!(f32::from_bits(FAKE_F.load(Relaxed)), 2.25, "XMM2 passed on");
-                assert_eq!(
-                    FAKE_SAW_OK.load(Relaxed),
-                    1,
-                    "the sample ran before the original"
-                );
-                assert!(PROBE_OK.load(Relaxed));
-                assert!(!FAILED.load(Relaxed));
-                let published =
-                    [&LAST_A, &PEAK_A, &LAST_B, &PEAK_B, &LAST_C, &PEAK_C].map(|v| v.load(Relaxed));
-                assert_eq!(published, [A.last, A.peak, B.last, B.peak, C.last, C.peak]);
-
-                // The next 29 calls do not sample; the 30th after the first does.
-                chain.set(HANDLES[0], CounterSample { last: 0x8000, ..A });
-                for _ in 0..29 {
-                    call_fake(0x5678, chain.pass(), 2.25);
-                }
-                assert_eq!(FAKE_CALLS.load(Relaxed), 31);
-                assert_eq!(LAST_A.load(Relaxed), A.last, "no sample on calls 2 to 30");
-                call_fake(0x5678, chain.pass(), 2.25);
-                assert_eq!(FAKE_CALLS.load(Relaxed), 32);
-                assert_eq!(LAST_A.load(Relaxed), 0x8000, "call 31 samples");
-
-                // Take the hook out: the fake runs alone again.
-                unhook_the_fake();
-                chain.set(HANDLES[0], CounterSample { last: 0x9000, ..A });
-                for _ in 0..30 {
-                    call_fake(0x5678, chain.pass(), 2.25);
-                }
-                assert_eq!(FAKE_CALLS.load(Relaxed), 62);
-                assert_eq!(LAST_A.load(Relaxed), 0x8000, "the detour did not run");
-            },
-        );
-    }
-
-    #[test]
-    fn a_bad_chain_turns_the_probe_off_for_good_and_the_original_still_runs_once() {
-        in_child(
-            "a_bad_chain_turns_the_probe_off_for_good_and_the_original_still_runs_once",
-            || {
-                assert!(!is_disabled(Feature::ScatterDistance), "a fresh process");
-                hook_the_fake();
-                // `pass` points at a no-access page: the probe must refuse it, not fault.
-                let none = Mem::new(PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS);
-                call_fake(1, none.base, 0.5);
-                assert_eq!(FAKE_CALLS.load(Relaxed), 1, "the original ran exactly once");
-                assert_eq!(FAKE_RDX.load(Relaxed), none.base);
-                assert!(FAILED.load(Relaxed));
-                assert!(!PROBE_OK.load(Relaxed));
-                assert!(
-                    !is_disabled(Feature::ScatterDistance),
-                    "a failure is not a panic"
-                );
-
-                // A good chain later does not turn it back on: off for the session.
                 let chain = Chain::new();
-                for _ in 0..60 {
-                    call_fake(1, chain.pass(), 0.5);
+                hook_the_fake();
+                PANIC_IN_READ.store(true, Relaxed);
+                for (i, (pass, float)) in [
+                    (chain.pass(), 2.25),
+                    (usize::MAX - 8, f32::from_bits(0x7fc12345)),
+                    (0, -0.0),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    call_fake(0x5678 + i, pass, float);
+                    assert_eq!(FAKE_CALLS.load(Relaxed), i as u32 + 1);
+                    assert_eq!(FAKE_RCX.load(Relaxed), 0x5678 + i);
+                    assert_eq!(FAKE_RDX.load(Relaxed), pass);
+                    assert_eq!(FAKE_F.load(Relaxed), float.to_bits());
+                    assert_eq!(LAST_PASS.load(Ordering::Acquire), pass);
+                    assert_eq!(CALL_COUNT.load(Relaxed), i as u64 + 1);
+                    assert!(!PROBE_OK.load(Relaxed));
+                    assert!(!FAILED.load(Relaxed));
+                    assert_eq!(LAST_A.load(Relaxed), 0);
+                    assert_eq!(READ_CALLS.load(Relaxed), 0);
+                    assert!(!is_disabled(Feature::ScatterDistance));
                 }
-                assert_eq!(FAKE_CALLS.load(Relaxed), 61);
-                assert!(FAILED.load(Relaxed));
-                assert!(!PROBE_OK.load(Relaxed));
-                assert_eq!(LAST_A.load(Relaxed), 0);
                 unhook_the_fake();
             },
         );
     }
 
     #[test]
-    fn the_original_runs_exactly_once_when_the_sample_panics() {
+    fn the_original_runs_exactly_once_when_publication_panics() {
         in_child(
-            "the_original_runs_exactly_once_when_the_sample_panics",
+            "the_original_runs_exactly_once_when_publication_panics",
             || {
                 assert!(!is_disabled(Feature::ScatterDistance), "a fresh process");
                 let order = RefCell::new(Vec::new());
@@ -1245,14 +1514,14 @@ mod tests {
     }
 
     #[test]
-    fn the_real_detour_runs_the_original_once_when_its_sample_panics() {
+    fn the_real_detour_runs_the_original_once_when_publication_panics() {
         in_child(
-            "the_real_detour_runs_the_original_once_when_its_sample_panics",
+            "the_real_detour_runs_the_original_once_when_publication_panics",
             || {
                 assert!(!is_disabled(Feature::ScatterDistance), "a fresh process");
                 let chain = Chain::new();
                 hook_the_fake();
-                PANIC_IN_SAMPLE.store(true, Relaxed);
+                PANIC_IN_PUBLISH.store(true, Relaxed);
                 call_fake(7, chain.pass(), 3.0);
                 assert_eq!(FAKE_CALLS.load(Relaxed), 1, "the original ran exactly once");
                 assert_eq!(f32::from_bits(FAKE_F.load(Relaxed)), 3.0);
@@ -1264,11 +1533,73 @@ mod tests {
                 assert!(!FAILED.load(Relaxed), "a panic is not a failed sample");
 
                 // From now on the detour only runs the original, once a call.
-                PANIC_IN_SAMPLE.store(false, Relaxed);
+                PANIC_IN_PUBLISH.store(false, Relaxed);
                 call_fake(7, chain.pass(), 3.0);
                 assert_eq!(FAKE_CALLS.load(Relaxed), 2);
                 assert!(!PROBE_OK.load(Relaxed), "still nothing published");
                 unhook_the_fake();
+            },
+        );
+    }
+
+    /// Measure fixed batches without imposing a wall-clock assertion on CI.
+    fn mean_ns(n: u32, mut call: impl FnMut()) -> f64 {
+        let start = std::time::Instant::now();
+        for _ in 0..n {
+            call();
+        }
+        start.elapsed().as_secs_f64() * 1e9 / f64::from(n)
+    }
+
+    #[test]
+    fn measure_the_hooked_call_overhead_against_the_same_plain_fake() {
+        in_child(
+            "measure_the_hooked_call_overhead_against_the_same_plain_fake",
+            || {
+                let n = if cfg!(debug_assertions) {
+                    10_000
+                } else {
+                    1_000_000
+                };
+                let batches = if cfg!(debug_assertions) { 2 } else { 7 };
+                let mut calls = 0u32;
+                for batch in 0..batches {
+                    let mut measure = |hooked| {
+                        if hooked {
+                            hook_the_fake();
+                        }
+                        for _ in 0..10_000 {
+                            call_fake(
+                                std::hint::black_box(1),
+                                std::hint::black_box(0),
+                                std::hint::black_box(1.0),
+                            );
+                        }
+                        let result = mean_ns(n, || {
+                            call_fake(
+                                std::hint::black_box(1),
+                                std::hint::black_box(0),
+                                std::hint::black_box(1.0),
+                            )
+                        });
+                        calls += n + 10_000;
+                        if hooked {
+                            unhook_the_fake();
+                        }
+                        result
+                    };
+                    let (plain, hooked) = if batch % 2 == 0 {
+                        let plain = measure(false);
+                        (plain, measure(true))
+                    } else {
+                        let hooked = measure(true);
+                        (measure(false), hooked)
+                    };
+                    println!("probe cost: batch {batch}: {plain:.3} ns plain, {hooked:.3} ns hooked, {:.3} ns overhead",hooked-plain);
+                }
+                assert_eq!(FAKE_CALLS.load(Relaxed), calls);
+                assert_eq!(READ_CALLS.load(Relaxed), 0);
+                assert!(!PROBE_OK.load(Relaxed));
             },
         );
     }

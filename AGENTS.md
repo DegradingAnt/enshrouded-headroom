@@ -21,6 +21,7 @@ The plugin runs inside the game process. A panic or a bad memory write crashes t
 | `docs/plan.md` | The task-by-task plan (Tasks 1-18). |
 | `docs/re-notes.md` | Reverse-engineering evidence: every game address, signature and struct offset, with its source. |
 | `docs/codex-worksheet.md` | Tasks for you, with acceptance criteria. |
+| `crates/emberkit/` | Reusable native guard, logging, scan, patch, IAT, build identity, INI primitives/schema, process targeting and MinHook queue. |
 | `src/entry.rs` | Start-up order (`InitializeASI` → `entry::start`). |
 | `src/config.rs` | The `.ini` parser and defaults (`DEFAULT_INI` must match `enshrouded-headroom.default.ini`). |
 | `src/guard.rs` | The panic guard. Every extern function body runs inside `guard(...)`. |
@@ -33,6 +34,8 @@ The plugin runs inside the game process. A panic or a bad memory write crashes t
 | `src/build_id.rs` | The known game builds (exe SHA-256). An unknown build turns code patches off. |
 | `tests/` | Integration tests: `startup_logging.rs`, and `vk_chain.rs` (a fake `vulkan-1.dll` driven through the real import slot). |
 | `examples/asi_host.rs` | A small host that loads the built `.asi` (used for smoke tests). |
+
+New mods are new crates under `crates/` and depend on `emberkit`.
 
 ## How to build and test
 
@@ -84,10 +87,15 @@ The crate is **Windows-only** (`x86_64-pc-windows-msvc`, toolchain pinned in `ru
 - Commit messages: `type(scope): what changed`, for example `feat(priority): …`, `fix(entry): …`, `docs: …`.
 - The maintainer reviews every PR before it is merged. A PR that breaks a rule above is sent back.
 
-## Do not touch: work in progress elsewhere
+## Reserved work and task-specific exceptions
+
+The reservations below apply unless the assigned task issue explicitly authorizes a scoped exception. Follow that issue's file list and rulings; an exception does not authorize unrelated work.
+
+- W24 [issue #30](https://github.com/DegradingAnt/enshrouded-headroom/issues/30) authorizes startup scales, the governor thread, VRAM queries and the module/startup glue. Its [scope ruling](https://github.com/DegradingAnt/enshrouded-headroom/issues/30#issuecomment-6415305076) also permits behavior-preserving governor scratch/control APIs and the minimal hook-installed bridge.
+- W25 [issue #31](https://github.com/DegradingAnt/enshrouded-headroom/issues/31) authorizes Anti-Lag wiring. Its [author additions](https://github.com/DegradingAnt/enshrouded-headroom/issues/31#issuecomment-6422323088) permit parsed startup initialization and shared Reflex device-copy helpers.
 
 - `src/governor/` and the module list in `src/lib.rs`: the governor is being built (Task 11).
 - Plan Tasks 12-16 (scene-settings hook, draw-distance knobs, start-up scales, the governor thread and Reflex). They need reverse engineering of the game exe, which is not in this repo.
 - Anything that needs the game exe or an in-game test.
 
-If a task in the worksheet seems to need one of these, stop and say so in the PR instead.
+If a task needs reserved work without an explicit scoped authorization, stop and say so in the PR.

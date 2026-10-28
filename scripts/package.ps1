@@ -47,6 +47,8 @@ try {
         throw "Loader SHA-256 mismatch: expected $loaderSha256, got $actualHash. Refusing to package. Delete $loaderZip and run again."
     }
 
+    Write-Output "Loader ZIP SHA-256 verified: $actualHash"
+
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $stage = Join-Path $distRoot "stage-$([guid]::NewGuid().ToString('N'))"
     New-Item -ItemType Directory -Path (Join-Path $stage 'plugins') | Out-Null
@@ -66,6 +68,7 @@ try {
         Copy-Item -LiteralPath (Join-Path $projectRoot 'target/release/enshrouded-headroom.asi') -Destination (Join-Path $stage 'plugins/enshrouded-headroom.asi')
         Copy-Item -LiteralPath (Join-Path $projectRoot 'enshrouded-headroom.default.ini') -Destination (Join-Path $stage 'plugins/enshrouded-headroom.ini')
         Copy-Item -LiteralPath (Join-Path $projectRoot 'LICENSE') -Destination (Join-Path $stage 'LICENSE')
+        Copy-Item -LiteralPath (Join-Path $projectRoot 'THIRD_PARTY_NOTICES.md') -Destination (Join-Path $stage 'THIRD_PARTY_NOTICES.md')
 
         # Exact text from Ultimate ASI Loader v10.0.0's lowercase source file "license".
         # https://raw.githubusercontent.com/ThirteenAG/Ultimate-ASI-Loader/v10.0.0/license
@@ -95,14 +98,14 @@ SOFTWARE.
         [System.IO.File]::WriteAllText((Join-Path $stage 'ultimate-asi-loader-LICENSE.txt'), ($loaderLicense -replace "`r`n", "`n") + "`n", [System.Text.UTF8Encoding]::new($false))
 
         $stagedZip = Join-Path $stage 'package.zip'
-        $contents = @('dinput8.dll', 'ultimate-asi-loader-LICENSE.txt', 'plugins', 'LICENSE') | ForEach-Object { Join-Path $stage $_ }
+        $contents = @('dinput8.dll', 'ultimate-asi-loader-LICENSE.txt', 'plugins', 'LICENSE', 'THIRD_PARTY_NOTICES.md') | ForEach-Object { Join-Path $stage $_ }
         Compress-Archive -LiteralPath $contents -DestinationPath $stagedZip
         $archive = [System.IO.Compression.ZipFile]::OpenRead($stagedZip)
         try {
-            $expectedEntries = @('LICENSE', 'dinput8.dll', 'plugins/enshrouded-headroom.asi', 'plugins/enshrouded-headroom.ini', 'ultimate-asi-loader-LICENSE.txt') | Sort-Object -CaseSensitive
+            $expectedEntries = @('LICENSE', 'THIRD_PARTY_NOTICES.md', 'dinput8.dll', 'plugins/enshrouded-headroom.asi', 'plugins/enshrouded-headroom.ini', 'ultimate-asi-loader-LICENSE.txt') | Sort-Object -CaseSensitive
             $actualEntries = @($archive.Entries.FullName | Sort-Object -CaseSensitive)
             if (@(Compare-Object -ReferenceObject $expectedEntries -DifferenceObject $actualEntries -CaseSensitive).Count -ne 0) {
-                throw 'Package archive entries do not match the expected five files. Refusing to package.'
+                throw 'Package archive entries do not match the expected six files. Refusing to package.'
             }
             Write-Output 'Zip contents:'
             $archive.Entries | ForEach-Object { Write-Output ("  {0} ({1} bytes)" -f $_.FullName, $_.Length) }
@@ -111,7 +114,13 @@ SOFTWARE.
             $sha256 = [System.Security.Cryptography.SHA256]::Create()
             try {
                 $asiHash = [BitConverter]::ToString($sha256.ComputeHash($stream)).Replace('-', '').ToLowerInvariant()
+                $sourceAsiHash = (Get-FileHash -LiteralPath (Join-Path $projectRoot 'target/release/enshrouded-headroom.asi') -Algorithm SHA256).Hash.ToLowerInvariant()
+                Write-Output "Source ASI SHA-256: $sourceAsiHash"
                 Write-Output "Inner ASI SHA-256: $asiHash"
+                if ($asiHash -ne $sourceAsiHash) {
+                    throw "ASI SHA-256 mismatch: source $sourceAsiHash, archived $asiHash. Refusing to publish package."
+                }
+                Write-Output 'ASI hash comparison: MATCH'
             }
             finally {
                 $sha256.Dispose()
@@ -123,6 +132,7 @@ SOFTWARE.
         }
         Move-Item -LiteralPath $stagedZip -Destination $packageZip -Force
         Write-Output "Package: $packageZip"
+        Write-Output ("Package ZIP SHA-256: " + (Get-FileHash -LiteralPath $packageZip -Algorithm SHA256).Hash.ToLowerInvariant())
     }
     finally {
         $resolvedDist = (Resolve-Path -LiteralPath $distRoot).ProviderPath.TrimEnd('\') + '\'

@@ -16,8 +16,14 @@ const BAND: f64 = 0.05;
 /// slice gives 0.0. The sort uses `f64::total_cmp`, so NaN values cannot make it panic (a positive
 /// NaN sorts last).
 pub fn p95(xs: &[f64]) -> f64 {
-    let mut sorted = xs.to_vec();
-    sorted.sort_by(f64::total_cmp);
+    p95_with(xs, &mut Vec::with_capacity(xs.len()))
+}
+
+/// The same nearest-rank statistic using caller-reserved storage.
+pub fn p95_with(xs: &[f64], sorted: &mut Vec<f64>) -> f64 {
+    sorted.clear();
+    sorted.extend_from_slice(xs);
+    sorted.sort_unstable_by(f64::total_cmp);
     // ⌈95 n / 100⌉ in integers, so that n = 20 gives rank 19 exactly. The rank is at most n.
     let rank = sorted.len().saturating_mul(95).div_ceil(100);
     sorted.get(rank.saturating_sub(1)).copied().unwrap_or(0.0)
@@ -168,5 +174,12 @@ mod tests {
         // NaN is not at or below any limit.
         assert_eq!(share_at_or_below(&[f64::NAN, 1.0], 2.0), 0.5);
         assert_eq!(share_at_or_below(&[1.0], f64::NAN), 0.0);
+    }
+
+    #[test]
+    fn the_five_percent_band_includes_its_edge_with_slack() {
+        assert!(near_a_multiple(21.0, 20.0));
+        assert!(near_a_multiple(21.0 + EPS, 20.0));
+        assert!(!near_a_multiple(21.0 + 2.0 * EPS, 20.0));
     }
 }
