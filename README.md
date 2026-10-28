@@ -20,6 +20,7 @@ A Windows x64 ASI plugin for Enshrouded's Vulkan renderer, loaded by Ultimate AS
 
 **FPS-target governor** defaults to a 75 fps target, limited by display refresh. Its background loop runs every 50 ms and spends available headroom on object, grass and terrain steps in that order. It undoes raises when frames are late and holds current steps when the world signal is absent. Live VRAM is queried every two seconds; unknown or insufficient memory blocks costly raises. The grass capacity ceiling still applies. `TargetFps=0` stops the governor thread.
 
+**Optional measured quality trials** use `[Governor] TrialFloorFps=65`, `TargetFps=75` and `TerrainFirst=1`. Restart after changing them. The governor tests one step at a time after settling and a fresh frame-time window. Stable CPU-limited 67 FPS or capped 75 FPS can retain a tested step. Sustained cost beyond the larger of 0.5 ms or 3% of the retained p95 reference rolls it back, even above 65 FPS. The shared reference prevents repeated small steps from gradually spending the band. Below-floor performance causes backoff; 65 FPS is a stop boundary, while 75 FPS remains the recovery goal. The floor uses rolling p95, not an instantaneous FPS guarantee. No GPU timing is measured. Terrain is added first and removed last during normal cuts; failed trials and safety limits can still undo it. Both new settings default off. See the [precise policy](docs/design.md#opt-in-measured-quality-trials-w37).
 **NVIDIA Reflex** defaults to `auto` and requires NVIDIA plus the driver-listed extension and required capabilities. `auto` and `on` enable without boost; `boost` requests boost; `off` disables it. `game` follows saved off/on/boost values and uses auto while unknown. Runtime pacing uses present markers, driver sleep and a 10 ms semaphore-wait timeout; failures disable pacing. It has no submit hook. Available timings are logged every five seconds with debug output and a running governor; latency improvement remains unverified in game.
 
 **AMD Anti-Lag** defaults to `auto`. Its runtime is implemented but **experimental, not verified on AMD hardware**. Both `auto` and `on` require AMD, a driver-listed `VK_AMD_anti_lag` extension and the reported feature. Active Reflex takes precedence. It paces only associated native queues and swapchains; the approximate INPUT timing and stop conditions are described below.
@@ -105,14 +106,16 @@ The table is generated from the crate's `DEFAULT_INI`, with reviewed ranges and 
 | `General` | `AllowUnknownBuild` | `0` | 0, 1 (also false, true) | Permit checked code-patch attempts on unknown builds only at your own risk. |
 | `General` | `LogLevel` | `info` | error, warn, info, debug | Set the logging threshold. |
 | `Governor` | `TargetFps` | `75` | 0 (off), 30–360 fps | Set the governor target, limited by display refresh; zero stops the governor thread. |
+| `Governor` | `TrialFloorFps` | `0` | 0 (legacy), 30–360 fps; below TargetFps | Opt into one-step quality trials above a rolling p95 FPS floor; retain stable CPU/cap-limited performance and undo meaningful cost. |
+| `Governor` | `TerrainFirst` | `0` | 0, 1 (also false, true) | Raise terrain first and retain it until the final normal cut; failed trials and safety vetoes still win. |
 | `Governor` | `WindowSeconds` | `2` | 0.5–10 seconds | Choose the rolling frame-time measurement window. |
-| `Governor` | `RaiseBelow` | `0.90` | 0.5–0.99 | Require p95 headroom below this target-time fraction outside quantised vsync mode. |
-| `Governor` | `RaiseHoldSeconds` | `1.0` | 0.1–10 seconds | Require the raise condition to hold for this long. |
+| `Governor` | `RaiseBelow` | `0.90` | 0.5–0.99 | Set legacy p95 headroom below this target-time fraction outside quantised vsync mode. |
+| `Governor` | `RaiseHoldSeconds` | `1.0` | 0.1–10 seconds | Hold a raise condition, or accept a stable measured trial, for this long. |
 | `Governor` | `SettleSeconds` | `1.0` | 0.1–10 seconds | Wait this long after a distance change before normal raise/lower decisions. |
-| `Governor` | `LowerAbove` | `0.97` | 0.8–1.0; greater than RaiseBelow | Set the p95 overload fraction for undoing the latest distance raise. |
+| `Governor` | `LowerAbove` | `0.97` | 0.8–1.0; greater than RaiseBelow | Set the legacy p95 overload fraction for undoing the latest distance raise. |
 | `Governor` | `LowerHoldSeconds` | `0.3` | 0.1–10 seconds | Require the normal overload condition to hold before undoing a raise. |
 | `Governor` | `HitchFactor` | `2.0` | 1.2–5 | Set the post-raise hitch multiplier, with a display-period margin in quantised mode. |
-| `Governor` | `BlockSeconds` | `20` | 1–300 seconds | Set the base undo block and probation duration; repeated undos can extend the block. |
+| `Governor` | `BlockSeconds` | `20` | 1–300 seconds | Set the undo block and probation duration; measured trials also pause globally after any undo. |
 | `Governor` | `MinVramFreeMiB` | `1024` | 0–8192 MiB | Block costly raises below this free VRAM; unknown VRAM also blocks them. |
 | `Knobs` | `EnableObjectDistance` | `1` | 0, 1 (also false, true) | Allow governor-controlled object-distance steps above the menu baseline. |
 | `Knobs` | `MaxObjectDistance` | `4` | 0–4 | Cap the object-distance step, with zero preserving the menu baseline. |

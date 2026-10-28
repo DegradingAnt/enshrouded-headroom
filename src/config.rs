@@ -122,6 +122,10 @@ pub struct General {
 pub struct GovernorCfg {
     /// `0` turns the governor off; otherwise 30 to 360.
     pub target_fps: u32,
+    /// Zero keeps the legacy policy; otherwise trial quality only above this p95 FPS floor.
+    pub trial_floor_fps: u32,
+    /// Prefer terrain raises and retain terrain until the final normal undo.
+    pub terrain_first: bool,
     pub window_seconds: f64,
     pub raise_below: f64,
     pub raise_hold_seconds: f64,
@@ -216,6 +220,8 @@ const BUILTIN: Config = Config {
     },
     governor: GovernorCfg {
         target_fps: 75,
+        trial_floor_fps: 0,
+        terrain_first: false,
         window_seconds: 2.0,
         raise_below: 0.90,
         raise_hold_seconds: 1.0,
@@ -336,6 +342,15 @@ pub fn parse(text: &str) -> (Config, Vec<String>) {
     let g = d.governor;
     let mut governor = GovernorCfg {
         target_fps: r.int("Governor", "TargetFps", g.target_fps, 30, 360, true),
+        trial_floor_fps: r.int(
+            "Governor",
+            "TrialFloorFps",
+            g.trial_floor_fps,
+            30,
+            360,
+            true,
+        ),
+        terrain_first: r.boolean("Governor", "TerrainFirst", g.terrain_first),
         window_seconds: r.float("Governor", "WindowSeconds", g.window_seconds, 0.5, 10.0),
         raise_below: r.float("Governor", "RaiseBelow", g.raise_below, 0.5, 0.99),
         raise_hold_seconds: r.float(
@@ -365,6 +380,13 @@ pub fn parse(text: &str) -> (Config, Vec<String>) {
             false,
         ),
     };
+    if governor.target_fps != 0 && governor.trial_floor_fps >= governor.target_fps {
+        r.warn(format!(
+            "[Governor] TrialFloorFps ({}) must be below TargetFps ({}), using the default {}",
+            governor.trial_floor_fps, governor.target_fps, g.trial_floor_fps
+        ));
+        governor.trial_floor_fps = g.trial_floor_fps;
+    }
     if governor.lower_above <= governor.raise_below {
         r.warn(format!(
             "[Governor] LowerAbove ({}) must be above RaiseBelow ({}), using the defaults {} and {}",
@@ -1102,7 +1124,7 @@ mod tests {
                 .lines()
                 .filter(|line| !line.starts_with(';') && line.contains('='))
                 .count(),
-            31
+            33
         );
     }
 
@@ -1684,6 +1706,8 @@ mod tests {
                 governor:
                     GovernorCfg {
                         target_fps,
+                        trial_floor_fps,
+                        terrain_first: _,
                         window_seconds,
                         raise_below,
                         raise_hold_seconds,
@@ -1721,6 +1745,11 @@ mod tests {
                     },
             } = *config;
             assert!(target_fps == 0 || (30..=360).contains(&target_fps));
+            assert!(
+                trial_floor_fps == 0
+                    || ((30..=360).contains(&trial_floor_fps)
+                        && (target_fps == 0 || trial_floor_fps < target_fps))
+            );
             assert!((4.0..=16.0).contains(&texture_reserve_gib));
             if let TextureBudget::Gib(value) = texture_budget {
                 assert!((2.0..=8.0).contains(&value));
@@ -1809,6 +1838,20 @@ mod tests {
                 low: 30.0,
                 high: 360.0,
                 kind: Kind::Target,
+            },
+            NumericKey {
+                section: "Governor",
+                key: "TrialFloorFps",
+                low: 30.0,
+                high: 360.0,
+                kind: Kind::Target,
+            },
+            NumericKey {
+                section: "Governor",
+                key: "TerrainFirst",
+                low: 0.0,
+                high: 1.0,
+                kind: Kind::Boolean,
             },
             NumericKey {
                 section: "Governor",
@@ -1997,6 +2040,7 @@ mod tests {
         /// Set one key without causing an unrelated threshold-order warning.
         fn fixture(key: &NumericKey, text: &str) -> String {
             let companion = match key.key {
+                "TrialFloorFps" => "TargetFps=0\n",
                 "RaiseBelow" => "LowerAbove=1.0\n",
                 "LowerAbove" => "RaiseBelow=0.5\n",
                 _ => "",
@@ -2019,6 +2063,8 @@ mod tests {
                 "ForceStepObjectDistance" => f64::from(config.debug.force_step_object?),
                 "ForceStepScatterDistance" => f64::from(config.debug.force_step_scatter?),
                 "ForceStepTerrainDistance" => f64::from(config.debug.force_step_terrain?),
+                "TrialFloorFps" => f64::from(config.governor.trial_floor_fps),
+                "TerrainFirst" => f64::from(config.governor.terrain_first),
                 "Enabled" => f64::from(config.general.enabled),
                 "AllowUnknownBuild" => f64::from(config.general.allow_unknown_build),
                 "EnableObjectDistance" => f64::from(config.knobs.enable_object_distance),
@@ -2238,6 +2284,28 @@ pub fn schema() -> &'static [emberkit::config::Setting] {
         },
         Setting {
             section: "Governor",
+            key: "TrialFloorFps",
+            kind: SettingType::Int {
+                min: 30,
+                max: 360,
+                zero: true,
+                words: &[],
+            },
+            default: Some("0"),
+            description:
+                "Opt into measured quality trials above this p95 FPS floor;0 keeps legacy policy.",
+            needs_restart: true,
+        },
+        Setting {
+            section: "Governor",
+            key: "TerrainFirst",
+            kind: SettingType::Bool,
+            default: Some("0"),
+            description: "Raise terrain first and undo it last during normal frame-time backoff.",
+            needs_restart: true,
+        },
+        Setting {
+            section: "Governor",
             key: "WindowSeconds",
             kind: SettingType::Float {
                 min: 0.5,
@@ -2257,7 +2325,7 @@ pub fn schema() -> &'static [emberkit::config::Setting] {
                 words: &[],
             },
             default: Some("0.90"),
-            description: "Set p95 headroom threshold.",
+            description: "Set legacy p95 headroom threshold.",
             needs_restart: true,
         },
         Setting {
@@ -2293,7 +2361,7 @@ pub fn schema() -> &'static [emberkit::config::Setting] {
                 words: &[],
             },
             default: Some("0.97"),
-            description: "Set overload threshold.",
+            description: "Set legacy overload threshold.",
             needs_restart: true,
         },
         Setting {
@@ -2542,14 +2610,14 @@ mod schema_tests {
             .map(|s| (s.section.to_lowercase(), s.key.to_lowercase()))
             .collect();
         assert_eq!(requested, described);
-        assert_eq!(schema.len(), 35);
+        assert_eq!(schema.len(), 37);
         let mut ini = Ini::new();
         ini.read(DEFAULT_INI.into()).unwrap();
         let actual: BTreeSet<_> = schema
             .iter()
             .map(|s| (s.section.to_lowercase(), s.key.to_lowercase()))
             .collect();
-        assert_eq!(actual.len(), 35);
+        assert_eq!(actual.len(), 37);
         let defaults: BTreeSet<_> = ini
             .get_map_ref()
             .iter()
@@ -2582,5 +2650,99 @@ mod schema_tests {
         for entry in schema.iter().filter(|s| s.key.starts_with("ForceStep")) {
             assert_eq!(entry.default, None);
         }
+    }
+}
+
+#[cfg(test)]
+mod trial_settings_tests {
+    use super::*;
+
+    /// Opt-ins stay off for existing users; the band and terrain order are independent settings.
+    #[test]
+    fn trial_settings_default_off_and_accept_the_documented_author_values() {
+        let default = Config::default();
+        assert_eq!(default.governor.trial_floor_fps, 0);
+        assert!(!default.governor.terrain_first);
+        for (text, floor, terrain) in [
+            ("TrialFloorFps=65\nTerrainFirst=1", 65, true),
+            ("TrialFloorFps=0\nTerrainFirst=true", 0, true),
+            ("TrialFloorFps=65\nTerrainFirst=false", 65, false),
+            ("TrialFloorFps=65,0\nTerrainFirst=0", 65, false),
+        ] {
+            let (cfg, warnings) = parse(&format!("[Governor]\n{text}"));
+            assert!(warnings.is_empty(), "{text}: {warnings:?}");
+            assert_eq!(cfg.governor.trial_floor_fps, floor);
+            assert_eq!(cfg.governor.terrain_first, terrain);
+        }
+    }
+
+    /// The floor must be a whole, finite FPS value; invalid relationships turn the opt-in off.
+    #[test]
+    fn trial_floor_ranges_and_target_relationship_warn_and_fall_back() {
+        for (target, given, expected, warning_count) in [
+            (75, "0", 0, 0),
+            (75, "30", 30, 0),
+            (75, "74", 74, 0),
+            (75, "75", 0, 1),
+            (75, "360", 0, 1),
+            (75, "-1", 30, 1),
+            (75, "29", 30, 1),
+            (0, "360", 360, 0),
+            (0, "361", 360, 1),
+            (0, "65", 65, 0),
+            (75, "65.5", 0, 1),
+            (75, "NaN", 0, 1),
+            (75, "inf", 0, 1),
+            (75, "-inf", 0, 1),
+            (75, "banana", 0, 1),
+            (75, "", 0, 1),
+        ] {
+            let (cfg, warnings) = parse(&format!(
+                "[Governor]\nTargetFps={target}\nTrialFloorFps={given}"
+            ));
+            assert_eq!(cfg.governor.trial_floor_fps, expected, "{target}/{given}");
+            assert_eq!(
+                warnings.len(),
+                warning_count,
+                "{target}/{given}: {warnings:?}"
+            );
+            assert!(warnings
+                .iter()
+                .all(|warning| warning.contains("TrialFloorFps")));
+        }
+        let (cfg, warnings) = parse("[Governor]\nTerrainFirst=2");
+        assert!(!cfg.governor.terrain_first);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("TerrainFirst"));
+    }
+
+    /// New policy metadata agrees with parser bounds and requires a restart.
+    #[test]
+    fn trial_policy_schema_matches_its_range_and_restart_contract() {
+        use emberkit::config::SettingType;
+        let floor = schema()
+            .iter()
+            .find(|setting| setting.key == "TrialFloorFps")
+            .unwrap();
+        assert_eq!(floor.section, "Governor");
+        assert_eq!(floor.default, Some("0"));
+        assert!(matches!(
+            floor.kind,
+            SettingType::Int {
+                min: 30,
+                max: 360,
+                zero: true,
+                words: []
+            }
+        ));
+        assert!(floor.needs_restart);
+        let terrain = schema()
+            .iter()
+            .find(|setting| setting.key == "TerrainFirst")
+            .unwrap();
+        assert_eq!(terrain.section, "Governor");
+        assert_eq!(terrain.default, Some("0"));
+        assert!(matches!(terrain.kind, SettingType::Bool));
+        assert!(terrain.needs_restart);
     }
 }
