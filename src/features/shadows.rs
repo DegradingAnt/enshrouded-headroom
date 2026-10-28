@@ -13,6 +13,15 @@ use crate::sigs::SUN_SHADOW_ULTRA;
 /// Start-up only, before game threads execute or use the image. See
 /// [`crate::patch::write_checked`] and [`find_in_sections`].
 pub unsafe fn apply_sun(module: &Module, resolution: u32) -> Result<(), String> {
+    let site = sun_site(module, resolution)?;
+    // SAFETY: caller guarantees stable startup code; locator proved the signature and bounds.
+    unsafe { write_u32_checked(site, 2048, resolution) }
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Find the checked Ultra sun immediate before attempting a write.
+fn sun_site(module: &Module, resolution: u32) -> Result<usize, String> {
     if resolution != 4096 {
         return Err("unsupported sun resolution".to_owned());
     }
@@ -22,11 +31,7 @@ pub unsafe fn apply_sun(module: &Module, resolution: u32) -> Result<(), String> 
     let site = found
         .checked_add(sig.patch_offset())
         .ok_or("sun address overflow")?;
-    // SAFETY: the caller guarantees start-up with no game threads. The unique full signature
-    // proves this four-byte immediate is inside `.text`; the write checks old bytes again.
-    unsafe { write_u32_checked(site, 2048, resolution) }
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    Ok(site)
 }
 
 /// Additional texture bytes requested above Ultra, using integer texture dimensions.
@@ -70,12 +75,19 @@ const VANILLA: [u8; 220] = [
     0x51, 0x38, 0x3d, 0x40, 0x0, 0x0, 0x0, 0x0, 0x0, 0xc8, 0x42, 0x1, 0x0, 0x0, 0x0,
 ];
 
+/// A native write either verified its bytes or wrote without confirmation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WriteState {
+    Verified,
+    Unconfirmed,
+}
+
 /// Apply requested startup overrides only when code patches are permitted.
 /// # Safety
 /// The caller owns a stable module before game threads or other writers run.
 pub unsafe fn apply(module: &Module, cfg: &ShadowsCfg, allowed: bool) -> Result<(), String> {
     // SAFETY: forwards the caller's stable startup image contract.
-    unsafe { apply_with_report(module, cfg, allowed, |_| {}) }
+    unsafe { apply_with_report(module, cfg, allowed, |_, _| {}) }
 }
 /// Apply checked writes and report each actual success, including before a later failure.
 /// # Safety
@@ -84,7 +96,28 @@ unsafe fn apply_with_report(
     module: &Module,
     cfg: &ShadowsCfg,
     allowed: bool,
-    mut applied: impl FnMut(&'static str),
+    applied: impl FnMut(&'static str, WriteState),
+) -> Result<(), String> {
+    // SAFETY: forwards the caller's startup contract to the checked native writer.
+    unsafe {
+        apply_with_writer(
+            module,
+            cfg,
+            allowed,
+            |site, old, new| write_u32_checked(site, old, new).map(|_| ()),
+            applied,
+        )
+    }
+}
+/// Inject the native writer for diagnostic regression tests.
+/// # Safety
+/// Same startup contract, including a writer that only touches its supplied checked field.
+unsafe fn apply_with_writer(
+    module: &Module,
+    cfg: &ShadowsCfg,
+    allowed: bool,
+    mut write: impl FnMut(usize, u32, u32) -> Result<(), crate::patch::PatchError>,
+    mut applied: impl FnMut(&'static str, WriteState),
 ) -> Result<(), String> {
     if !allowed {
         return Err("code patches are off on this build".into());
@@ -141,21 +174,40 @@ unsafe fn apply_with_report(
             if let Some(value) = new {
                 let site = ultra.checked_add(offset).ok_or("field address overflow")?;
                 // SAFETY: whole-table preflight and bounds proved the field; caller excludes writers.
-                unsafe { write_u32_checked(site, old, value) }.map_err(|e| e.to_string())?;
-                applied(match offset {
+                let key = match offset {
                     8 => "point-light tile",
                     32 => "point-light rays",
                     _ => "point-light static distance",
-                });
+                };
+                report_write(key, write(site, old, value), &mut applied)?;
             }
         }
     }
     if let ShadowValue::Override(value) = cfg.sun_resolution {
         // SAFETY: caller guarantees startup with no executing game threads.
-        unsafe { apply_sun(module, value) }?;
-        applied("sun resolution");
+        let site = sun_site(module, value)?;
+        report_write("sun resolution", write(site, 2048, value), &mut applied)?;
     }
     Ok(())
+}
+
+/// Preserve the post-write distinction before converting an error into player text.
+fn report_write(
+    key: &'static str,
+    result: Result<(), crate::patch::PatchError>,
+    report: &mut impl FnMut(&'static str, WriteState),
+) -> Result<(), String> {
+    match result {
+        Ok(()) => {
+            report(key, WriteState::Verified);
+            Ok(())
+        }
+        Err(crate::patch::PatchError::ReadBack) => {
+            report(key, WriteState::Unconfirmed);
+            Err("patch written; effective value unknown (read-back failed)".into())
+        }
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 /// Locate and bound the complete table before copying any table bytes.
@@ -225,6 +277,25 @@ unsafe fn table_site(module: &Module) -> Result<usize, String> {
     Ok(target)
 }
 
+/// The final startup diagnostic, shared with injected native-failure tests.
+fn outcome_line(
+    key: &str,
+    value: &str,
+    outcomes: &[(&'static str, WriteState)],
+    error: Option<&str>,
+) -> (log::Level, String) {
+    let state = outcomes
+        .iter()
+        .find(|(name, _)| *name == key)
+        .map(|(_, state)| *state);
+    match state {
+        Some(WriteState::Verified)=>(log::Level::Info,format!("shadows {key}: set {value}")),
+        Some(WriteState::Unconfirmed)=>(log::Level::Warn,format!("shadows {key}: patch written; effective value unknown (read-back failed)")),
+        None if outcomes.iter().any(|(_,state)|*state==WriteState::Unconfirmed)=>(log::Level::Warn,format!("shadows {key}: off: not attempted after an earlier write could not be verified")),
+        None=>(log::Level::Warn,format!("shadows {key}: off: {}",error.unwrap_or("not applied"))),
+    }
+}
+
 /// Startup only: every selected key gets exactly one outcome line; game defaults stay silent.
 pub fn init(cfg: &ShadowsCfg) {
     let selected = [
@@ -256,17 +327,22 @@ pub fn init(cfg: &ShadowsCfg) {
     // SAFETY: entry calls this before WinMain and before enabling hooks; all reads/writes are checked.
     let mut applied = Vec::new();
     let result = unsafe {
-        apply_with_report(&module, cfg, crate::entry::code_patches_allowed(), |key| {
-            applied.push(key)
-        })
+        apply_with_report(
+            &module,
+            cfg,
+            crate::entry::code_patches_allowed(),
+            |key, state| applied.push((key, state)),
+        )
     };
     for (key, on, value) in selected {
         if on {
-            if applied.contains(&key) {
-                log::info!("shadows {key}: set {value}");
-            } else if let Err(error) = &result {
-                log::warn!("shadows {key}: off: {error}");
-            }
+            let (level, line) = outcome_line(
+                key,
+                &value,
+                &applied,
+                result.as_ref().err().map(String::as_str),
+            );
+            log::log!(level, "{line}");
         }
     }
 }
@@ -548,12 +624,77 @@ mod tests {
                 },
                 &cfg,
                 true,
-                |key| applied.push(key),
+                |key, state| {
+                    if state == WriteState::Verified {
+                        applied.push(key)
+                    }
+                },
             )
         };
         assert!(result.is_err());
         assert_eq!(applied, ["point-light rays"]);
         assert_eq!(mem.get(0x2200 + 176 + 32, 4), 128u32.to_le_bytes());
+    }
+
+    #[test]
+    fn readback_diagnostics_distinguish_written_unknown_from_refused_keys() {
+        for failed in ["point-light rays", "sun resolution"] {
+            let (mem, _) = table_image(false);
+            let cfg = ShadowsCfg {
+                point_light_tile: ShadowValue::Override(256),
+                point_light_rays: ShadowValue::Override(128),
+                point_light_static_distance: ShadowValue::Override(200.0),
+                sun_resolution: ShadowValue::Override(4096),
+            };
+            let mut applied = Vec::new();
+            // SAFETY: fixture is private; injected writer writes only the checked supplied field.
+            let result = unsafe {
+                apply_with_writer(
+                    &Module {
+                        base: mem.base,
+                        size: 0x4000,
+                    },
+                    &cfg,
+                    true,
+                    |site, old, new| {
+                        let failing = if failed == "sun resolution" {
+                            site == mem.base + 0x110a
+                        } else {
+                            site == mem.base + 0x2200 + 176 + 32
+                        };
+                        write_u32_checked(site, old, new)?;
+                        if failing {
+                            Err(crate::patch::PatchError::ReadBack)
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    |key, state| applied.push((key, state)),
+                )
+            };
+            let error = result.unwrap_err();
+            let (_, line) = outcome_line(failed, "requested", &applied, Some(&error));
+            assert!(line.contains("written; effective value unknown"), "{line}");
+            assert!(!line.contains(": off:"), "{line}");
+            assert_eq!(
+                line,
+                format!(
+                    "shadows {failed}: patch written; effective value unknown (read-back failed)"
+                )
+            );
+            assert!(
+                outcome_line("point-light tile", "256", &applied, Some(&error))
+                    .1
+                    .contains(": set 256")
+            );
+            if failed == "point-light rays" {
+                assert!(
+                    outcome_line("point-light static distance", "200", &applied, Some(&error))
+                        .1
+                        .contains(": off:")
+                );
+            }
+        }
     }
     /// Maintainer-only file check; never part of ordinary validation.
     #[test]

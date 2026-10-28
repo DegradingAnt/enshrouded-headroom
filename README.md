@@ -88,7 +88,7 @@ Close the game and back up your INI and any diagnostic log you need. Replace the
 
 Save the .ini as UTF-8. The plugin tries the first readable `enshrouded-headroom.ini` beside its ASI (normally `plugins`), then `%LOCALAPPDATA%\enshrouded-headroom`. If neither is readable, it creates defaults only where no INI exists and never overwrites an existing file. If neither location is usable, built-in defaults apply. The `settings:` log line names the selected file.
 
-Missing or invalid keys use defaults. Numeric out-of-range values are clamped, except `PaperWhiteNits` and `DisplayPeakNits`, which use `game`. If `LowerAbove` is not greater than `RaiseBelow`, both reset to defaults. Names and choices are case-insensitive; boolean keys accept `0`, `1`, `false` and `true`. Numeric decimal commas are accepted. Unknown keys warn. Lines beginning with `;` or `#` are comments. GiB and MiB are binary units.
+Missing or invalid keys use defaults. Numeric out-of-range values are clamped, except `PaperWhiteNits`, `DisplayPeakNits` and `[Shadows]` overrides, which use `game`. If `LowerAbove` is not greater than `RaiseBelow`, both reset to defaults. Names and choices are case-insensitive; boolean keys accept `0`, `1`, `false` and `true`. Numeric decimal commas are accepted. Unknown keys warn. Lines beginning with `;` or `#` are comments. GiB and MiB are binary units.
 
 The table is generated from the crate's `DEFAULT_INI`, with reviewed ranges and descriptions. Run `cargo run --example generate_readme_settings` after changing defaults; `cargo run --example generate_readme_settings -- --check` verifies it without editing. The table contains the 35 shipped default keys; the schema also describes four omitted Debug keys.
 
@@ -192,7 +192,7 @@ TODO: the author writes this section.
 
 `crates/emberkit` holds reusable native infrastructure as an MIT-licensed Rust library. New mods are separate crates depending on it; each declares its process targets. It has no ASI entry export. The root remains the default workspace member, so `cargo asi` keeps the existing artifact name and exports. Use `--workspace` for lint, docs and tests (`cargo fmt --all --check` for formatting). `cargo deny` traverses both workspace members from the workspace root.
 
-`enshrouded_headroom::config::schema()` returns all 39 read settings without file I/O. Entries describe types, accepted ranges or words, default spellings, and restart requirements. All settings currently require a restart. The four developer settings under `Debug` are deliberately absent from the 31-key default INI. The three force-step defaults are absent values, not a literal `none` spelling. No settings UI is included.
+`enshrouded_headroom::config::schema()` returns all 39 read settings without file I/O. Entries describe types, accepted ranges or words, default spellings, and restart requirements. All settings currently require a restart. The four developer settings under `Debug` are deliberately absent from the 35-key default INI. The three force-step defaults are absent values, not a literal `none` spelling. No settings UI is included.
 
 ### Shadow quality above Ultra (experimental)
 
