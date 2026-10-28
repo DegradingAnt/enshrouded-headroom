@@ -3,6 +3,9 @@
 The release bundles Ultimate ASI Loader v10.0.0 and statically links Rust
 packages, including the MinHook C library and HDE disassembler.
 
+The workspace-owned `emberkit` library uses the same MIT licence as Headroom.
+The resolved dependency set is shared by both workspace members.
+
 ## MinHook and HDE
 
 The following block is the complete `minhook/LICENSE.txt` from the published

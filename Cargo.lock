@@ -78,11 +78,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "emberkit"
+version = "0.1.0"
+dependencies = [
+ "configparser",
+ "fern",
+ "log",
+ "minhook",
+ "proptest",
+ "windows-sys",
+]
+
+[[package]]
 name = "enshrouded-headroom"
 version = "0.1.0"
 dependencies = [
  "ash",
  "configparser",
+ "emberkit",
  "fern",
  "iced-x86",
  "log",
