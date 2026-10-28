@@ -693,11 +693,14 @@ pub mod test_support {
     /// inside the `size` bytes this value owns and panics if not (this is test code). Whether the
     /// pages are readable or writable at that moment is up to the test, which set the protection.
     pub struct Mem {
+        /// Base address of the allocation owned by this fixture.
         pub base: usize,
         size: usize,
     }
 
     impl Mem {
+        /// Allocate fixture pages with the requested Windows allocation and protection flags.
+        /// Panics if allocation fails.
         pub fn new(size: usize, kind: u32, protect: u32) -> Mem {
             // SAFETY: a null address lets VirtualAlloc choose; it returns fresh pages or null.
             let p = unsafe { VirtualAlloc(null(), size, kind, protect) };
@@ -734,6 +737,7 @@ pub mod test_support {
             );
         }
 
+        /// Copy bytes into the checked fixture range; the test must leave its pages writable.
         pub fn put(&self, off: usize, bytes: &[u8]) {
             self.check(off, bytes.len());
             // SAFETY: the range is inside the allocation this value owns (checked above), so it
@@ -748,6 +752,7 @@ pub mod test_support {
             };
         }
 
+        /// Copy bytes from the checked fixture range; the test must leave its pages readable.
         pub fn get(&self, off: usize, len: usize) -> Vec<u8> {
             self.check(off, len);
             let mut out = vec![0u8; len];
@@ -760,6 +765,7 @@ pub mod test_support {
             out
         }
 
+        /// Change protection of a checked fixture range; panics if Windows rejects it.
         pub fn protect(&self, off: usize, len: usize, protect: u32) {
             self.check(off, len);
             let mut old = 0;
@@ -779,6 +785,7 @@ pub mod test_support {
         }
     }
 
+    /// Query the region containing an address; panics if Windows cannot describe it.
     pub fn info(addr: usize) -> MEMORY_BASIC_INFORMATION {
         let mut info = MEMORY_BASIC_INFORMATION::default();
         // SAFETY: `info` is a valid buffer of exactly the size passed. VirtualQuery accepts any
@@ -794,6 +801,7 @@ pub mod test_support {
         info
     }
 
+    /// Return the protection flags reported for the region containing an address.
     pub fn protect_of(addr: usize) -> u32 {
         info(addr).Protect
     }
