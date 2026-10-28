@@ -197,3 +197,5 @@ TODO: the author writes this section.
 ### Shadow quality above Ultra (experimental)
 
 Defaults unchanged; experimental; not verified in game. The four Shadows settings raise checked Ultra constants at startup and reserve requested extra texture VRAM. Invalid overrides use game. They do not add a menu quality level. Shader assumptions above 64 rays or 192-pixel tiles remain unverified. Compare High, Ultra and Ultra with PointLightRays=128 at the Polaris Falls bridge at night after restarting; record pop distance, VRAM and frame time.
+
+Opt-in shadow texture reservation reduces the native texture-budget tier selected for the GPU. Below 10 GiB it subtracts from the selected stock tier without enabling a higher texture policy. With no shadow reservation, the original top-row-only behavior is unchanged.

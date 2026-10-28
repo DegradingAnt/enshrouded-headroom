@@ -410,7 +410,7 @@ at 224 pixels and 224 MiB at 256 pixels. The six D32 sun cascades cost 288 MiB e
 Both larger choices reserve 512 MiB. The budget consumer subtracts requested extra bytes from
 its base target with saturating subtraction, for both auto and fixed GiB. The existing 2 to 8 GiB
 clamp describes the base target, before this reserve; no post-reserve floor discards it. With a
-nonzero reservation, auto also subtracts from the stock 2 GiB pool when it previously returned
+nonzero reservation, auto also subtracts from the stock 2 GiB pool on the top tier when it previously returned
 no change: the 512 MiB combination sets 1.5 GiB even on the low-auto edge. With zero reservation,
 legacy behavior is exact, including auto's no-change edge. Off and integrated GPUs stay unchanged.
 The reservation is conservative when a requested patch refuses. It estimates texture storage,
@@ -594,3 +594,5 @@ In-game checks on the author's machine:
 4. Licence: MIT.
 5. Name: `enshrouded-headroom` for now; rename before the Nexus release.
 6. Spec v2: approved.
+
+With a nonzero shadow texture reservation, cards below the 10 GiB threshold retain their selected stock texture tier as the maximum base and subtract the requested reserve from that row. The native write targets that selected budget field, not the unused top row. At 8 GiB the stock field is `0x5f400000` bytes. The whole 80-byte vanilla table is rechecked before the selected-field write. Zero shadow reservation keeps the original top-row-only policy.

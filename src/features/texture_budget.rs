@@ -3,7 +3,8 @@
 //! The game keeps a table of five rows in `.rdata`: a VRAM threshold and the texture streaming
 //! budget for it, `u64` pairs, 80 bytes. The last row's budget is 2 GiB, which is what every card
 //! with 10 GiB or more gets, however much more it has. This feature raises that one `u64` to a
-//! size that fits the card (see [`budget_bytes`]).
+//! size that fits the card (see [`budget_bytes`]). With opt-in shadow texture reservation,
+//! lower cards reserve from their selected stock row instead, preserving their existing tier policy.
 //!
 //! # Steps
 //!
@@ -40,7 +41,7 @@ use crate::patch::{read_checked, write_checked, PatchError};
 use crate::scan::{find_in_sections, find_unique, main_module, Module, Pattern, ScanError};
 
 /// The game's table: `(VRAM threshold, texture streaming budget)`, five rows, in bytes. The
-/// budget of the last row is the one this feature changes.
+/// budget of the last row changes by default; opt-in shadow reservation changes the selected row.
 pub const TABLE: [(u64, u64); 5] = [
     (0, 0x12C00000),
     (0x11F400000, 0x25800000),
@@ -112,6 +113,8 @@ pub fn budget_bytes(
 /// Zero extra bytes preserves [`budget_bytes`] exactly. With a reservation, Auto also
 /// lowers the stock 2 GiB pool when it previously returned `None`. Off and integrated
 /// GPUs remain unchanged. A NaN Auto reserve still gives `None`.
+/// Below 10 GiB the base is capped at the selected stock tier: opting into shadows
+/// reserves from the effective existing budget instead of enabling a different texture policy.
 pub fn budget_bytes_with_shadow_reserve(
     device_local: u64,
     reserve_gib: f64,
@@ -127,6 +130,13 @@ pub fn budget_bytes_with_shadow_reserve(
         (!integrated && matches!(mode, TextureBudget::Auto) && !reserve_gib.is_nan())
             .then_some(MIN_BYTES)
     })?;
+    let (_, stock) = selected_row(device_local);
+    // Below the top threshold preserve the game's existing effective tier policy, then reserve.
+    let base = if device_local < 0x280000000 {
+        base.min(stock)
+    } else {
+        base
+    };
     Some(base.saturating_sub(shadow_reserve_bytes))
 }
 
@@ -302,6 +312,52 @@ pub unsafe fn apply(p: &Prepared, bytes: u64) -> Result<(), PatchError> {
     .map(|_| ())
 }
 
+/// Apply an opt-in shadow reservation to the tier the verified selector consumes.
+/// # Safety
+/// Same first-device timing and prepared-table contract as apply.
+pub unsafe fn apply_for_device(
+    p: &Prepared,
+    bytes: u64,
+    device_local: u64,
+    shadow_reserve: u64,
+) -> Result<(), PatchError> {
+    if shadow_reserve == 0 {
+        // SAFETY: preserve the prepared-table and first-device timing contract.
+        return unsafe { apply(p, bytes) };
+    }
+    let table = p.table_addr();
+    // SAFETY: prepare bounded the complete table; caller excludes readers/writers until first device setup.
+    let original = unsafe { read_checked(table, TABLE_LEN) }?;
+    if original != table_bytes() {
+        return Err(PatchError::Mismatch {
+            at: table,
+            found: original,
+        });
+    }
+    let (index, stock) = selected_row(device_local);
+    let offset = index
+        .checked_mul(16)
+        .and_then(|v| v.checked_add(8))
+        .ok_or(PatchError::NotMapped)?;
+    let address = table.checked_add(offset).ok_or(PatchError::NotMapped)?;
+    // SAFETY: this exact budget field lies in the prepared and revalidated table; nothing reads it yet.
+    unsafe { write_checked(address, &stock.to_le_bytes(), &bytes.to_le_bytes()) }.map(|_| ())
+}
+
+/// The verified selector chooses the last row whose threshold is no greater than device-local bytes.
+fn selected_row(device_local: u64) -> (usize, u64) {
+    TABLE
+        .iter()
+        .enumerate()
+        .fold((0, 0), |selected, (index, &(threshold, budget))| {
+            if device_local >= threshold {
+                (index, budget)
+            } else {
+                selected
+            }
+        })
+}
+
 /// `bytes` as GiB with one decimal, for the log.
 fn gib_text(bytes: u64) -> String {
     format!("{:.1} GiB", bytes as f64 / GIB as f64)
@@ -327,12 +383,39 @@ pub fn outcome(
     reserve_gib: f64,
     mode: &TextureBudget,
 ) -> (Level, String) {
+    outcome_from(result, bytes, device_local, reserve_gib, mode, ORIGINAL_TOP)
+}
+/// Outcome for the actual row consumed when an opt-in shadow reservation is active.
+pub fn outcome_for_device(
+    result: &Result<(), PatchError>,
+    bytes: u64,
+    device_local: u64,
+    reserve_gib: f64,
+    mode: &TextureBudget,
+    shadow_reserve: u64,
+) -> (Level, String) {
+    let original = if shadow_reserve == 0 {
+        ORIGINAL_TOP
+    } else {
+        selected_row(device_local).1
+    };
+    outcome_from(result, bytes, device_local, reserve_gib, mode, original)
+}
+/// Format the unchanged legacy outcome with the selected original budget.
+fn outcome_from(
+    result: &Result<(), PatchError>,
+    bytes: u64,
+    device_local: u64,
+    reserve_gib: f64,
+    mode: &TextureBudget,
+    original: u64,
+) -> (Level, String) {
     match result {
-        Ok(()) if bytes == ORIGINAL_TOP => (
+        Ok(()) if bytes == original => (
             Level::Info,
             format!(
                 "texture budget: unchanged (the budget is already {} GiB)",
-                ORIGINAL_TOP / GIB
+                original / GIB
             ),
         ),
         Ok(()) => {
@@ -345,7 +428,7 @@ pub fn outcome(
                 Level::Info,
                 format!(
                     "texture budget: {} -> {} (device-local {}{reserve})",
-                    gib_text(ORIGINAL_TOP),
+                    gib_text(original),
                     gib_text(bytes),
                     gib_text(device_local)
                 ),
@@ -363,7 +446,7 @@ pub fn outcome(
                 format!(
                     "texture budget: left as it is, the table already holds {now} instead of the \
                      original {}",
-                    gib_text(ORIGINAL_TOP)
+                    gib_text(original)
                 ),
             )
         }
@@ -821,6 +904,97 @@ mod tests {
         assert_eq!(prepare(&module(&mem)), Err(TbError::ChangedByOtherTool));
     }
 
+    #[test]
+    fn shadow_reservation_reaches_the_actual_selected_native_tier() {
+        let thresholds = [0u64, 0x11f400000, 0x180000000, 0x200000000, 0x280000000];
+        let stocks = [
+            0x12c00000u64,
+            0x25800000,
+            0x40000000,
+            0x5f400000,
+            0x80000000,
+        ];
+        for (index, threshold) in thresholds.into_iter().enumerate() {
+            for heap in [threshold, threshold.saturating_add(1)] {
+                let reserve = 128 * 1024 * 1024;
+                let mem = image();
+                let table = RDATA_RVA + 0x100;
+                mem.put(table, &table_bytes());
+                let p = prepare(&module(&mem)).unwrap();
+                let bytes = budget_bytes_with_shadow_reserve(
+                    heap,
+                    11.0,
+                    false,
+                    &TextureBudget::Auto,
+                    reserve,
+                )
+                .unwrap();
+                // SAFETY: owned mapped fixture, prepared by actual native scanner, never executed.
+                unsafe { apply_for_device(&p, bytes, heap, reserve) }.unwrap();
+                let selected = table + index * 16 + 8;
+                assert_eq!(
+                    mem.get(selected, 8),
+                    stocks[index].saturating_sub(reserve).to_le_bytes(),
+                    "heap {heap:#x}"
+                );
+                let mut expected = vec![0; IMAGE_SIZE];
+                expected[..pe_headers().len()].copy_from_slice(&pe_headers());
+                expected[table..table + 80].copy_from_slice(&table_bytes());
+                expected[selected..selected + 8]
+                    .copy_from_slice(&stocks[index].saturating_sub(reserve).to_le_bytes());
+                assert_eq!(mem.get(0, IMAGE_SIZE), expected);
+            }
+            if index > 0 {
+                let heap = threshold - 1;
+                let reserve = 128 * 1024 * 1024;
+                let mem = image();
+                let table = RDATA_RVA + 0x100;
+                mem.put(table, &table_bytes());
+                let p = prepare(&module(&mem)).unwrap();
+                let bytes = budget_bytes_with_shadow_reserve(
+                    heap,
+                    11.0,
+                    false,
+                    &TextureBudget::Auto,
+                    reserve,
+                )
+                .unwrap();
+                // SAFETY: owned native fixture remains stable and unused by other threads.
+                unsafe { apply_for_device(&p, bytes, heap, reserve) }.unwrap();
+                assert_eq!(
+                    mem.get(table + (index - 1) * 16 + 8, 8),
+                    stocks[index - 1].saturating_sub(reserve).to_le_bytes()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zero_shadow_keeps_top_only_policy_and_active_shadow_rechecks_all_vanilla_bytes() {
+        for reserve in [0, 128 * 1024 * 1024] {
+            let mem = image();
+            let table = RDATA_RVA + 0x100;
+            mem.put(table, &table_bytes());
+            let p = prepare(&module(&mem)).unwrap();
+            if reserve == 0 {
+                let original = mem.get(0, IMAGE_SIZE);
+                let mut expected = original.clone();
+                expected[table + 72..table + 80].copy_from_slice(&(4 * GIB).to_le_bytes());
+                // SAFETY: owns complete mapped fixture, no concurrent readers.
+                unsafe { apply_for_device(&p, 4 * GIB, 8 * GIB, reserve) }.unwrap();
+                assert_eq!(mem.get(0, IMAGE_SIZE), expected);
+            } else {
+                mem.put(table + 8, &[42]);
+                let original = mem.get(0, IMAGE_SIZE);
+                // SAFETY: a changed prepared fixture must be refused before any write.
+                assert!(matches!(
+                    unsafe { apply_for_device(&p, GIB, 8 * GIB, reserve) },
+                    Err(PatchError::Mismatch { .. })
+                ));
+                assert_eq!(mem.get(0, IMAGE_SIZE), original);
+            }
+        }
+    }
     #[test]
     fn apply_writes_the_top_value_and_only_that() {
         let mem = image();
