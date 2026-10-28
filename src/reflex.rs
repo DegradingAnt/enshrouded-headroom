@@ -349,9 +349,11 @@ mod device_wiring_tests {
             ));
             caps.present_id = true;
             let mut timeline = vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
-            let mut v12 = vk::PhysicalDeviceVulkan12Features::default();
-            v12.p_next =
-                (&mut timeline as *mut vk::PhysicalDeviceTimelineSemaphoreFeatures<'_>).cast();
+            let v12 = vk::PhysicalDeviceVulkan12Features {
+                p_next: (&mut timeline as *mut vk::PhysicalDeviceTimelineSemaphoreFeatures<'_>)
+                    .cast(),
+                ..Default::default()
+            };
             info.p_next = (&v12 as *const vk::PhysicalDeviceVulkan12Features<'_>).cast();
             assert!(matches!(
                 DeviceCopy::new(&info, &caps),
@@ -377,10 +379,12 @@ mod device_wiring_tests {
             s_type: vk::StructureType::APPLICATION_INFO,
             ..Default::default()
         };
-        let mut head = vk::PhysicalDeviceVulkan11Features::default();
-        head.p_next = (&unknown as *const vk::BaseInStructure<'_>)
-            .cast_mut()
-            .cast();
+        let mut head = vk::PhysicalDeviceVulkan11Features {
+            p_next: (&unknown as *const vk::BaseInStructure<'_>)
+                .cast_mut()
+                .cast(),
+            ..Default::default()
+        };
         let mut info = vk::DeviceCreateInfo {
             p_next: (&head as *const vk::PhysicalDeviceVulkan11Features<'_>).cast(),
             ..Default::default()
@@ -604,9 +608,10 @@ macro_rules! chain_nodes {
             }
             /// Copy exactly the type identified by the Vulkan sType, never opaque bytes.
             /// # Safety
-            /// `node` points to a live valid Vulkan input-chain structure of its declared sType.
+            /// The common header is readable. Recognized tags have their complete declared layout;
+            /// an unknown tag requires no readable payload.
             unsafe fn copy(node: *const vk::BaseInStructure<'_>) -> Result<Self, vk::StructureType> {
-                // SAFETY: valid Vulkan input chain, as required above.
+                // SAFETY: the caller supplies the live common header.
                 match unsafe { (*node).s_type } {
                     $(tag if tag == $tag => {
                         // SAFETY: the matching sType identifies this exact Vulkan layout.
@@ -667,7 +672,7 @@ impl DeviceCopy {
                 return Err(DeviceRefusal::ChainCycle { index });
             }
             seen.push(cursor);
-            // SAFETY: the original Vulkan chain contains live typed nodes for this call.
+            // SAFETY: the header is live; recognized tags have complete typed storage.
             nodes.push(unsafe { Node::copy(cursor) }.map_err(|tag| {
                 DeviceRefusal::UnknownStructure {
                     s_type: tag.as_raw(),
