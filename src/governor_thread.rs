@@ -691,13 +691,18 @@ fn run(cfg: crate::config::Config, mode: ThreadMode) {
         let now_qpc = crate::frame_timer::qpc_now();
         let now_s = crate::frame_timer::qpc_to_ms(now_qpc.saturating_sub(origin)) / 1000.0;
         reader.read(&crate::frame_timer::FRAMES, crate::frame_timer::qpc_to_ms);
-        frame_reports.observe(now_s, &reader.intervals_us, |timestamp| {
+        // Sample the reporting clock after copying the ring, so a concurrent new present is not
+        // discarded merely because its timestamp followed the tick's earlier control clock.
+        let stats_now_s =
+            crate::frame_timer::qpc_to_ms(crate::frame_timer::qpc_now().saturating_sub(origin))
+                / 1000.0;
+        frame_reports.observe(stats_now_s, &reader.intervals_us, |timestamp| {
             timestamp
                 .checked_sub(origin)
                 .map(|delta| crate::frame_timer::qpc_to_ms(delta) / 1000.0)
         });
         if let Some(line) = frame_reports.debug_line_due(
-            now_s,
+            stats_now_s,
             cfg.general.log_level == crate::config::LogLevel::Debug
                 && log::log_enabled!(log::Level::Debug),
         ) {
@@ -758,6 +763,7 @@ fn run(cfg: crate::config::Config, mode: ThreadMode) {
                     }
                 }
                 if now_s - status_at >= 30.0 {
+                    if log::log_enabled!(log::Level::Info) {
                     let (p50, p95) = runtime.percentiles();
                     let suffix=crate::frame_stats::info_suffix(frame_reports.stats().as_ref());
                     log::info!(
@@ -770,6 +776,7 @@ fn run(cfg: crate::config::Config, mode: ThreadMode) {
                             plan.state
                         )
                     );
+                    }
                     status_at = now_s;
                 }
                 if cfg.general.log_level == crate::config::LogLevel::Debug {
@@ -903,6 +910,25 @@ mod tests {
             }
         });
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn overflowing_the_bounded_window_retains_latest_samples_without_allocating() {
+        let mut reports = FrameReports::new();
+        let first: [(u64, u64); 4096] = std::array::from_fn(|n| (n as u64, 1_000));
+        let second: [(u64, u64); 4096] = std::array::from_fn(|n| (4096 + n as u64, 2_000));
+        let mut stats = None;
+        let allocations = allocation_count(|| {
+            reports.observe(0.5, &first, |stamp| Some(stamp as f64 / 10000.0));
+            reports.observe(1.0, &second, |stamp| Some(stamp as f64 / 10000.0));
+            stats = reports.stats();
+        });
+        assert_eq!(allocations, 0);
+        assert_eq!(
+            stats.unwrap().p50_us,
+            2_000,
+            "latest4096samples replace the older batch"
+        );
     }
     #[test]
     fn stats_intervals_use_reader_lap_and_actual_timestamp_rules() {

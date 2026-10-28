@@ -61,6 +61,7 @@ pub fn calculate_in_place(scratch: &mut [u64]) -> Option<FrameStats> {
         max_us: sorted.last().copied()?,
         average_fps: 1_000_000.0 * (count as f64) / (sum as f64),
         low_1_percent_fps: 1_000_000.0 * (low_count as f64) / (slow_sum as f64),
+        // Doubling a u64 median in u128 cannot overflow.
         hitches: sorted
             .iter()
             .filter(|&&value| value > 25_000 && u128::from(value) > u128::from(p50) * 2)
