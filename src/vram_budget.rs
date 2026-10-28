@@ -115,81 +115,164 @@ pub unsafe fn free_mib(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::guard::{guard, Feature};
     use ash::vk::Handle;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     static SUPPORTED: AtomicBool = AtomicBool::new(false);
     static QUERIES: AtomicU32 = AtomicU32::new(0);
 
+    /// Return the original fixture extension advertisement.
+    /// # Safety
+    /// The caller supplies a writable count and at least one writable extension slot.
     unsafe extern "system" fn fake_enumerate(
         _: vk::PhysicalDevice,
         _: *const std::ffi::c_char,
         count: *mut u32,
         properties: *mut vk::ExtensionProperties,
     ) -> vk::Result {
-        // SAFETY: free_mib supplies valid count and a writable extension buffer.
-        unsafe {
-            *count = u32::from(SUPPORTED.load(Ordering::Relaxed));
-            if *count == 1 {
-                let mut extension = vk::ExtensionProperties::default();
-                for (to, from) in extension
-                    .extension_name
-                    .iter_mut()
-                    .zip(c"VK_EXT_memory_budget".to_bytes_with_nul())
-                {
-                    *to = *from as std::ffi::c_char;
+        guard(
+            Feature::Governor,
+            || vk::Result::ERROR_UNKNOWN,
+            || {
+                // SAFETY: free_mib supplies valid count and a writable extension buffer.
+                unsafe {
+                    *count = u32::from(SUPPORTED.load(Ordering::Relaxed));
+                    if *count == 1 {
+                        let mut extension = vk::ExtensionProperties::default();
+                        for (to, from) in extension
+                            .extension_name
+                            .iter_mut()
+                            .zip(c"VK_EXT_memory_budget".to_bytes_with_nul())
+                        {
+                            *to = *from as std::ffi::c_char;
+                        }
+                        properties.write(extension);
+                    }
                 }
-                properties.write(extension);
-            }
-        }
-        vk::Result::SUCCESS
+                vk::Result::SUCCESS
+            },
+        )
     }
 
+    /// Fill the original fixture budget and record its query.
+    /// # Safety
+    /// The output is writable properties2 chained to a writable budget struct.
     unsafe extern "system" fn fake_memory(
         _: vk::PhysicalDevice,
         memory: *mut vk::PhysicalDeviceMemoryProperties2<'_>,
     ) {
-        QUERIES.fetch_add(1, Ordering::Relaxed);
-        // SAFETY: free_mib provides writable properties chained to a budget struct of this type.
-        unsafe {
-            (*memory).memory_properties.memory_heap_count = 1;
-            (*memory).memory_properties.memory_heaps[0] = vk::MemoryHeap {
-                size: 8 << 30,
-                flags: vk::MemoryHeapFlags::DEVICE_LOCAL,
-            };
-            let budget = &mut *((*memory)
-                .p_next
-                .cast::<vk::PhysicalDeviceMemoryBudgetPropertiesEXT<'_>>());
-            budget.heap_budget[0] = 7 << 30;
-            budget.heap_usage[0] = 5 << 30;
-        }
+        guard(
+            Feature::Governor,
+            || (),
+            || {
+                QUERIES.fetch_add(1, Ordering::Relaxed);
+                // SAFETY: free_mib provides writable properties chained to a budget struct of this type.
+                unsafe {
+                    (*memory).memory_properties.memory_heap_count = 1;
+                    (*memory).memory_properties.memory_heaps[0] = vk::MemoryHeap {
+                        size: 8 << 30,
+                        flags: vk::MemoryHeapFlags::DEVICE_LOCAL,
+                    };
+                    let budget = &mut *((*memory)
+                        .p_next
+                        .cast::<vk::PhysicalDeviceMemoryBudgetPropertiesEXT<'_>>());
+                    budget.heap_budget[0] = 7 << 30;
+                    budget.heap_usage[0] = 5 << 30;
+                }
+            },
+        )
     }
 
+    /// Resolve the original fixture native commands.
+    /// # Safety
+    /// The name points to a live NUL-terminated command string.
     unsafe extern "system" fn fake_gipa(
         _: vk::Instance,
         name: *const std::ffi::c_char,
     ) -> vk::PFN_vkVoidFunction {
-        // SAFETY: free_mib passes a static nul-terminated Vulkan entry-point name.
-        match unsafe { std::ffi::CStr::from_ptr(name) }.to_bytes() {
-            b"vkEnumerateDeviceExtensionProperties" => {
-                // SAFETY: Vulkan represents all entry points as vkVoidFunction until typed by name.
-                Some(unsafe {
-                    std::mem::transmute::<
-                        vk::PFN_vkEnumerateDeviceExtensionProperties,
-                        unsafe extern "system" fn(),
-                    >(fake_enumerate)
-                })
-            }
-            b"vkGetPhysicalDeviceMemoryProperties2" => {
-                // SAFETY: the caller casts this function back according to the exact queried name.
-                Some(unsafe {
-                    std::mem::transmute::<
-                        vk::PFN_vkGetPhysicalDeviceMemoryProperties2,
-                        unsafe extern "system" fn(),
-                    >(fake_memory)
-                })
-            }
-            _ => None,
+        guard(
+            Feature::Governor,
+            || None,
+            || {
+                // SAFETY: free_mib passes a static nul-terminated Vulkan entry-point name.
+                match unsafe { std::ffi::CStr::from_ptr(name) }.to_bytes() {
+                    b"vkEnumerateDeviceExtensionProperties" => {
+                        // SAFETY: Vulkan represents all entry points as vkVoidFunction until typed by name.
+                        Some(unsafe {
+                            std::mem::transmute::<
+                                vk::PFN_vkEnumerateDeviceExtensionProperties,
+                                unsafe extern "system" fn(),
+                            >(fake_enumerate)
+                        })
+                    }
+                    b"vkGetPhysicalDeviceMemoryProperties2" => {
+                        // SAFETY: the caller casts this function back according to the exact queried name.
+                        Some(unsafe {
+                            std::mem::transmute::<
+                                vk::PFN_vkGetPhysicalDeviceMemoryProperties2,
+                                unsafe extern "system" fn(),
+                            >(fake_memory)
+                        })
+                    }
+                    _ => None,
+                }
+            },
+        )
+    }
+
+    /// Every callback honors the disabled feature before touching caller outputs or counters.
+    #[test]
+    fn native_callbacks_return_fallbacks_when_disabled() {
+        const TEST: &str = "vram_budget::tests::native_callbacks_return_fallbacks_when_disabled";
+        if crate::patch::test_support::isolated_process(TEST, "HEADROOM_VRAM_GUARD_PARENT") {
+            return;
+        }
+        crate::guard::disable_silent(crate::guard::Feature::Governor);
+        SUPPORTED.store(true, Ordering::Relaxed);
+        let physical = vk::PhysicalDevice::from_raw(2);
+        let instance = vk::Instance::from_raw(1);
+        let mut count = 7;
+        let mut extension = vk::ExtensionProperties {
+            spec_version: 99,
+            ..Default::default()
+        };
+        // SAFETY: the isolated child owns all native output slots and static lookup names.
+        unsafe {
+            assert_eq!(
+                fake_enumerate(physical, std::ptr::null(), &mut count, &mut extension),
+                vk::Result::ERROR_UNKNOWN
+            );
+            assert_eq!(count, 7);
+            assert_eq!(extension.spec_version, 99);
+            assert_eq!(
+                route_enumerate(physical, std::ptr::null(), &mut count, &mut extension),
+                vk::Result::ERROR_UNKNOWN
+            );
+            assert_eq!(count, 7);
+            assert_eq!(extension.spec_version, 99);
+            let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+            let mut memory = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+            memory.memory_properties.memory_heap_count = 7;
+            fake_memory(physical, &mut memory);
+            unsupported_core(physical, &mut memory);
+            supported_khr(physical, &mut memory);
+            assert_eq!(memory.memory_properties.memory_heap_count, 7);
+            assert_eq!(budget.heap_budget[0], 0);
+            assert_eq!(QUERIES.load(Ordering::Relaxed), 0);
+            assert_eq!(CORE_CALLS.with(std::cell::Cell::get), 0);
+            assert_eq!(KHR_CALLS.with(std::cell::Cell::get), 0);
+            assert!(
+                fake_gipa(instance, c"vkEnumerateDeviceExtensionProperties".as_ptr()).is_none()
+            );
+            assert!(
+                route_gipa(instance, c"vkEnumerateDeviceExtensionProperties".as_ptr()).is_none()
+            );
+            assert!(
+                missing_khr_gipa(instance, c"vkEnumerateDeviceExtensionProperties".as_ptr())
+                    .is_none()
+            );
+            assert_eq!(ROUTE_LOOKUPS.with(std::cell::Cell::get), 0);
         }
     }
 
@@ -222,29 +305,39 @@ mod tests {
     }
 
     /// Advertise the budget extension independently of the original test's toggled fake.
+    /// # Safety
+    /// The caller supplies a writable count and at least one writable extension slot.
     unsafe extern "system" fn route_enumerate(
         _: vk::PhysicalDevice,
         _: *const std::ffi::c_char,
         count: *mut u32,
         properties: *mut vk::ExtensionProperties,
     ) -> vk::Result {
-        let mut extension = vk::ExtensionProperties::default();
-        for (to, from) in extension
-            .extension_name
-            .iter_mut()
-            .zip(c"VK_EXT_memory_budget".to_bytes_with_nul())
-        {
-            *to = *from as std::ffi::c_char;
-        }
-        // SAFETY: free_mib supplies a writable count and at least one extension slot.
-        unsafe {
-            *count = 1;
-            properties.write(extension);
-        }
-        vk::Result::SUCCESS
+        guard(
+            Feature::Governor,
+            || vk::Result::ERROR_UNKNOWN,
+            || {
+                let mut extension = vk::ExtensionProperties::default();
+                for (to, from) in extension
+                    .extension_name
+                    .iter_mut()
+                    .zip(c"VK_EXT_memory_budget".to_bytes_with_nul())
+                {
+                    *to = *from as std::ffi::c_char;
+                }
+                // SAFETY: free_mib supplies a writable count and at least one extension slot.
+                unsafe {
+                    *count = 1;
+                    properties.write(extension);
+                }
+                vk::Result::SUCCESS
+            },
+        )
     }
 
     /// Fill the same synthetic budget without touching another test's observation counters.
+    /// # Safety
+    /// The output is writable properties2 chained to a writable budget struct.
     unsafe fn route_memory(memory: *mut vk::PhysicalDeviceMemoryProperties2<'_>) {
         // SAFETY: the query owns the writable properties and chained budget for this call.
         unsafe {
@@ -262,76 +355,110 @@ mod tests {
     }
 
     /// Deliberately non-null even when the caller has proven only the KHR route.
+    /// # Safety
+    /// The output is writable properties2 chained to a writable budget struct.
     unsafe extern "system" fn unsupported_core(
         _: vk::PhysicalDevice,
         memory: *mut vk::PhysicalDeviceMemoryProperties2<'_>,
     ) {
-        CORE_CALLS.with(|n| n.set(n.get() + 1));
-        // SAFETY: free_mib owns these output buffers; counting makes a forbidden call observable.
-        unsafe { route_memory(memory) };
+        guard(
+            Feature::Governor,
+            || (),
+            || {
+                CORE_CALLS.with(|n| n.set(n.get() + 1));
+                // SAFETY: free_mib owns these output buffers; counting makes a forbidden call observable.
+                unsafe { route_memory(memory) };
+            },
+        )
     }
 
     /// The proven enabled-KHR implementation has a distinct observable entry point.
+    /// # Safety
+    /// The output is writable properties2 chained to a writable budget struct.
     unsafe extern "system" fn supported_khr(
         _: vk::PhysicalDevice,
         memory: *mut vk::PhysicalDeviceMemoryProperties2<'_>,
     ) {
-        KHR_CALLS.with(|n| n.set(n.get() + 1));
-        // SAFETY: free_mib owns these output buffers.
-        unsafe { route_memory(memory) };
+        guard(
+            Feature::Governor,
+            || (),
+            || {
+                KHR_CALLS.with(|n| n.set(n.get() + 1));
+                // SAFETY: free_mib owns these output buffers.
+                unsafe { route_memory(memory) };
+            },
+        )
     }
 
     /// Return both addresses, so address presence cannot stand in for capability proof.
+    /// # Safety
+    /// The name points to a live NUL-terminated command string.
     unsafe extern "system" fn route_gipa(
         _: vk::Instance,
         name: *const std::ffi::c_char,
     ) -> vk::PFN_vkVoidFunction {
-        ROUTE_LOOKUPS.with(|n| n.set(n.get() + 1));
-        // SAFETY: free_mib passes a static NUL-terminated entry-point name.
-        let name = unsafe { std::ffi::CStr::from_ptr(name) }.to_bytes();
-        match name {
-            b"vkEnumerateDeviceExtensionProperties" => {
-                // SAFETY: Vulkan erases function types until the exact name is resolved.
-                Some(unsafe {
-                    std::mem::transmute::<
-                        vk::PFN_vkEnumerateDeviceExtensionProperties,
-                        unsafe extern "system" fn(),
-                    >(route_enumerate)
-                })
-            }
-            b"vkGetPhysicalDeviceMemoryProperties2" => {
-                // SAFETY: the caller recovers this exact signature from the name.
-                Some(unsafe {
-                    std::mem::transmute::<
-                        vk::PFN_vkGetPhysicalDeviceMemoryProperties2,
-                        unsafe extern "system" fn(),
-                    >(unsupported_core)
-                })
-            }
-            b"vkGetPhysicalDeviceMemoryProperties2KHR" => {
-                // SAFETY: the KHR alias has this identical signature.
-                Some(unsafe {
-                    std::mem::transmute::<
-                        vk::PFN_vkGetPhysicalDeviceMemoryProperties2,
-                        unsafe extern "system" fn(),
-                    >(supported_khr)
-                })
-            }
-            _ => None,
-        }
+        guard(
+            Feature::Governor,
+            || None,
+            || {
+                ROUTE_LOOKUPS.with(|n| n.set(n.get() + 1));
+                // SAFETY: free_mib passes a static NUL-terminated entry-point name.
+                let name = unsafe { std::ffi::CStr::from_ptr(name) }.to_bytes();
+                match name {
+                    b"vkEnumerateDeviceExtensionProperties" => {
+                        // SAFETY: Vulkan erases function types until the exact name is resolved.
+                        Some(unsafe {
+                            std::mem::transmute::<
+                                vk::PFN_vkEnumerateDeviceExtensionProperties,
+                                unsafe extern "system" fn(),
+                            >(route_enumerate)
+                        })
+                    }
+                    b"vkGetPhysicalDeviceMemoryProperties2" => {
+                        // SAFETY: the caller recovers this exact signature from the name.
+                        Some(unsafe {
+                            std::mem::transmute::<
+                                vk::PFN_vkGetPhysicalDeviceMemoryProperties2,
+                                unsafe extern "system" fn(),
+                            >(unsupported_core)
+                        })
+                    }
+                    b"vkGetPhysicalDeviceMemoryProperties2KHR" => {
+                        // SAFETY: the KHR alias has this identical signature.
+                        Some(unsafe {
+                            std::mem::transmute::<
+                                vk::PFN_vkGetPhysicalDeviceMemoryProperties2,
+                                unsafe extern "system" fn(),
+                            >(supported_khr)
+                        })
+                    }
+                    _ => None,
+                }
+            },
+        )
     }
 
     /// Missing KHR must not fall back to an unproven non-null core address.
+    /// # Safety
+    /// The name points to a live NUL-terminated command string.
     unsafe extern "system" fn missing_khr_gipa(
         instance: vk::Instance,
         name: *const std::ffi::c_char,
     ) -> vk::PFN_vkVoidFunction {
-        // SAFETY: free_mib supplies a static NUL-terminated name.
-        if unsafe { std::ffi::CStr::from_ptr(name) } == c"vkGetPhysicalDeviceMemoryProperties2KHR" {
-            return None;
-        }
-        // SAFETY: forwards the same synthetic instance/name to the matching fake.
-        unsafe { route_gipa(instance, name) }
+        guard(
+            Feature::Governor,
+            || None,
+            || {
+                // SAFETY: free_mib supplies a static NUL-terminated name.
+                if unsafe { std::ffi::CStr::from_ptr(name) }
+                    == c"vkGetPhysicalDeviceMemoryProperties2KHR"
+                {
+                    return None;
+                }
+                // SAFETY: forwards the same synthetic instance/name to the matching fake.
+                unsafe { route_gipa(instance, name) }
+            },
+        )
     }
 
     #[test]
