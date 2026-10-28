@@ -12,6 +12,8 @@ examine_globs = [
     "src/knobs/**",
 ]
 additional_cargo_args = ["--lib"]
+# Root tests retain the config/scanner expectations after the primitive extraction.
+test_workspace = true
 # Native wrapper exclusions were fixed before the knobs baseline: 7 generated mutants.
 # apply_queued (3) and enable_queued_hooks (1) invoke MinHook and native thread/code changes.
 # object install (1) locates the live game signature and queues a detour.
