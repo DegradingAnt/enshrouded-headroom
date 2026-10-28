@@ -3269,7 +3269,7 @@ mod band_tests {
             "the boost must already be accepted"
         );
         // 67 -> 65 FPS costs less than 0.5 ms, so only the floor boundary can trigger this undo.
-        assert!(1000.0 / 65.0 < 1000.0 / 67.0 + TRIAL_NOISE_MS);
+        assert!(1000.0 / 65.0 < governor.band_reference_ms.unwrap() + TRIAL_NOISE_MS);
         assert_eq!(
             drive(&mut governor, &mut now, 8.0, |_| 1000.0 / 65.0),
             [Action::Set { knob: 0, step: 0 }]
