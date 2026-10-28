@@ -872,6 +872,29 @@ for safe core/KHR capability queries.
 - Compile and capture relevant failing mutations, then restore each implementation.
 - Fresh target directory: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, strict `cargo doc`, `cargo test`, then `cargo asi`.
 - Report: **not verified in game; the maintainer runs the boot test**.
+### Task 16b: AMD Anti-Lag 2 runtime wiring
+
+W25 authorizes this implementation after Task 16 merges. Design section 6.6 and issue #31
+supply the maintained rules. The author also approved the parsed startup initializer in
+`entry.rs` and sharing the existing Reflex device-copy helpers without changing Reflex behavior.
+
+- Publish `AntiLag` before Vulkan startup. Default `auto` requires AMD, the listed extension
+  and reported feature; forced `on` on non-AMD logs "not listed, off".
+- Reuse the proven instance capability route, typed device-chain ownership, exact-original
+  retry and device dispatch. Chain the enabled AMD feature first, without modifying game input.
+- Admit one device only with mandatory destruction routing. Record its actual native queues;
+  associate pacing with a live swapchain and queue, using nonblocking present admission.
+- Seed INPUT, then emit PRESENT, one real present and next INPUT. Preserve original present
+  pointers and IDs. INPUT after the previous present is an approximation.
+- Time every update with QPC. Three consecutive calls over 100 ms or device loss disable pacing.
+  Report once at the next lifecycle safe point, outside presentation. Keep teardown running
+  even if the host logger panics.
+- Use native fake-driver cases for feature/extension injection, existing entries, caller-chain
+  preservation, refusal, NVIDIA/Reflex precedence, capability routes, marker order, lifetime,
+  concurrent admission, slow calls, device loss and allocation-free presents.
+- Verify in a clean target in CI order: fmt, strict Clippy, strict docs and tests, then the ASI.
+  The startup line, README and PR say **experimental, not verified on AMD hardware**.
+
 ### Task 17: In-game verification on the author's machine
 
 **Install** (needs the author's go-ahead; deploying into the game folder is the author's). The game is now the Steam install, `C:\Program Files (x86)\Steam\steamapps\common\Enshrouded\` (the old `C:\Games\Enshrouded` is being deleted):

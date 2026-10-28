@@ -7,7 +7,7 @@ A Rust ASI plugin for Enshrouded on Windows x64 with the Vulkan renderer. Ultima
 - **Texture streaming budget — implemented.** Sizes the top tier of the game's texture budget table for the GPU. In `auto` mode, it uses the largest Vulkan `DEVICE_LOCAL` memory heap minus the configured reserve, clamped to 2–8 GiB. A result of 2 GiB or less leaves the original budget unchanged. Integrated GPUs keep the original budget in every mode.
 - **Async compute — implemented.** Uses the game's own async-compute override path. It leaves the game in charge when `AsyncCompute=game` or a command-line argument mentions `async-compute`.
 - **NVIDIA Reflex: pure layer implemented.** Settings, mode decisions and device planning are present. Runtime wiring is planned in Task 16, so the setting has no runtime effect yet.
-- **AMD Anti-Lag 2: experimental pure layer implemented.** Settings, ABI types, decisions and call sequencing are present. Runtime wiring is planned in Task 16b. The setting has no runtime effect yet and is not verified on AMD hardware.
+- **AMD Anti-Lag 2: runtime implemented.** Default `auto` enables it only for AMD GPUs with the listed extension and feature. Reflex takes priority. **Experimental, not verified on AMD hardware.**
 - **FPS-target governor — in progress.** The planned governor uses spare GPU time to raise object draw distance first, then grass distance, then terrain detail distance. It is intended to undo raises when frames are late and never go below the player's menu settings. The default target is 75 fps. The settings are parsed, but this version has no running governor or draw-distance changes.
 
 The plugin also attempts to set the game's process priority to Above Normal once, after the first Vulkan device is created. `Priority=normal` leaves the current priority unchanged.
@@ -65,9 +65,17 @@ The tables list all 31 keys from [the default INI](enshrouded-headroom.default.i
 | `AsyncCompute` | `on` | `on` attempts the checked code patch on an allowed build. `game` leaves the game's choice unchanged. The command-line rule below can also skip the patch. |
 | `Priority` | `above_normal` | Attempts Above Normal process priority once after the first Vulkan device is created. `normal` leaves the current priority unchanged. A failed Windows request is logged. |
 | `Reflex` | `auto` | Choices: `game`, `auto`, `off`, `on`, `boost`. Enabled modes require NVIDIA and `VK_NV_low_latency2`. `game` follows saved values 0/1/2 for off/on/boost; unknown values use auto. `auto` and `on` enable without boost. **Pure layer only: no runtime effect yet.** |
-| `AntiLag` | `auto` | Choices: `auto`, `off`, `on`. `auto` requires AMD (vendor `0x1002`), `VK_AMD_anti_lag` and its feature. `on` requires the extension and feature. Active Reflex blocks Anti-Lag. **Pure layer only: no runtime effect yet; not verified on AMD hardware.** |
+| `AntiLag` | `auto` | Choices: `auto`, `off`, `on`. `auto` requires AMD (vendor `0x1002`), `VK_AMD_anti_lag` and its feature. `on` also requires AMD and both capabilities. Active Reflex blocks Anti-Lag. **Experimental, not verified on AMD hardware.** |
 | `AllowUnknownBuild` | `0` | `0` blocks code patches on an unknown executable build. `1` permits attempts on an unknown build; signatures and original-byte checks still apply. Texture data checks and Vulkan API wrappers do not depend on this switch. |
 | `LogLevel` | `info` | Logging threshold: `error`, `warn`, `info` or `debug`. `debug` includes more diagnostic detail. |
+
+Anti-Lag approximates INPUT after the previous present, with a seed before the first present.
+It does not hook the game's actual input processing. Three consecutive driver updates over
+100 ms, device loss or a concurrent present stream disable it for the session. A returned slow
+call can be detected; a driver call that never returns cannot be cancelled. The next device or
+swapchain lifecycle operation reports a stop once. On a non-AMD GPU, including the author's
+RTX 5080, `AntiLag=on` logs "not listed, off" and adds no AMD extension. See
+[design section 6.6](docs/design.md#66-amd-anti-lag-2-experimental) for the safety limits.
 
 The texture feature requires a unique match for the game's original table. If another tool changed its top budget value, the plugin leaves it alone. Changes affect process memory only; the plugin does not rewrite game files on disk.
 

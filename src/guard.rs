@@ -26,13 +26,14 @@ pub enum Feature {
     VkWrap,
     Reflex,
     Governor,
+    AntiLag,
 }
 
 impl Feature {
     /// Every variant, in `index` order. Rust cannot list an enum's variants by itself, so this is
     /// kept by hand; the check below and the tests catch a stale entry, a wrong order and a list
     /// that outgrows the mask.
-    const ALL: [Feature; 9] = [
+    const ALL: [Feature; 10] = [
         Feature::TextureBudget,
         Feature::AsyncCompute,
         Feature::StartupScales,
@@ -42,6 +43,7 @@ impl Feature {
         Feature::VkWrap,
         Feature::Reflex,
         Feature::Governor,
+        Feature::AntiLag,
     ];
 
     /// This feature's position in the disabled mask.
@@ -59,6 +61,7 @@ impl Feature {
             Feature::VkWrap => 6,
             Feature::Reflex => 7,
             Feature::Governor => 8,
+            Feature::AntiLag => 9,
         }
     }
 
