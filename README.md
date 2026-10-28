@@ -28,7 +28,7 @@ A Windows x64 ASI plugin for Enshrouded's Vulkan renderer, loaded by Ultimate AS
 
 **Process priority** defaults to `above_normal`, requested once after the first Vulkan device is created. `normal` leaves the current priority unchanged; a failed Windows request is logged.
 
-Shadows above Ultra are not included in this base, and there is no shipped shadow setting.
+Experimental shadow overrides can raise the existing Ultra constants. All four settings default to `game`; their visual effect and shader limits still need in-game verification.
 
 ## Build under test and release gates
 
