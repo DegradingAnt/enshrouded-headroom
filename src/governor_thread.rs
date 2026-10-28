@@ -576,6 +576,16 @@ fn run(cfg: crate::config::Config) {
     let mut scatter_diagnostics = ScatterDiagnostics::default();
     let mut applied = [0; 3];
     log::info!("governor: started; inactive");
+    if cfg.governor.trial_floor_fps != 0 {
+        log::info!(
+            "governor: measured quality trials; p95 floor={} fps, target={} fps, terrain first={}; no GPU timing",
+            cfg.governor.trial_floor_fps,
+            cfg.governor.target_fps,
+            cfg.governor.terrain_first
+        );
+    } else if cfg.governor.terrain_first {
+        log::info!("governor: terrain first; legacy frame-time policy");
+    }
     loop {
         if crate::guard::is_disabled(crate::guard::Feature::Governor) {
             return;
@@ -813,6 +823,71 @@ mod tests {
         );
     }
 
+    /// Band trials keep runtime memory/device/world/capacity gates and reserved-storage planning.
+    #[test]
+    fn band_runtime_obeys_safety_vetoes_and_keeps_planning_allocation_free() {
+        let (mut cfg, warnings) =
+            crate::config::parse("[Governor]\nTrialFloorFps=65\nTerrainFirst=1\n");
+        assert!(warnings.is_empty());
+        cfg.knobs.enable_object_distance = false;
+        cfg.knobs.max_terrain_distance = 1;
+        let mut runtime = Runtime::new(cfg);
+        let sample = Sample {
+            now_s: 0.0,
+            frames: &[1000.0 / 75.0; 4],
+            world_active: true,
+            installed: true,
+            seen: 1,
+            unknown: 0,
+            baseline_seq: [0; 3],
+            period_ms: 0.0,
+            level: 3,
+            probe_ok: true,
+            probe_failed: false,
+            last_a: 0,
+            free_mib: None,
+        };
+        let mut last = [0; 3];
+        let allocations = allocation_count(|| {
+            for n in 0..500 {
+                let frozen = n >= 400;
+                let plan = runtime.plan(&Sample {
+                    now_s: f64::from(n) * 0.05,
+                    installed: !frozen,
+                    world_active: !frozen,
+                    seen: n as u64 + 1,
+                    free_mib: (n >= 100).then_some(4096),
+                    ..sample
+                });
+                if n < 100 {
+                    assert_eq!(plan.steps, [0; 3], "unknown device memory must veto raises");
+                }
+                assert_eq!(plan.steps[0], 0, "disabled object knob");
+                assert_eq!(plan.steps[1], 0, "unmeasured scatter capacity");
+                if frozen {
+                    assert_eq!(plan.state, RuntimeState::Inactive);
+                    assert_eq!(plan.steps, [0, 0, 1]);
+                }
+                last = plan.steps;
+            }
+            for n in 500..700 {
+                last = runtime
+                    .plan(&Sample {
+                        now_s: f64::from(n) * 0.05,
+                        frames: &[1000.0 / 60.0; 4],
+                        seen: n as u64 + 1,
+                        free_mib: None,
+                        ..sample
+                    })
+                    .steps;
+            }
+        });
+        assert_eq!(allocations, 0);
+        assert_eq!(
+            last, [0; 3],
+            "normal safety backoff must still release terrain"
+        );
+    }
     #[test]
     fn runtime_plan_is_allocation_free_and_unknown_vram_vetoes_all_raises() {
         let mut cfg = crate::config::Config::default();
