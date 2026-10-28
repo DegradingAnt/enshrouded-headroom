@@ -1692,3 +1692,19 @@ These are the spike's proposed steps, including its then-pending documentation p
   - Receipt: Supplied W35 spike, Open questions; unresolved at the spike.
 - [HYPOTHESIS] The FUN_140f0b880 "Failed to serialize Graph" path continues with the next graph; whether the stream is still valid after one failure was not checked.
   - Receipt: Supplied W35 spike, Open questions; unresolved at the spike.
+
+### Complete shadow table static receipt (2026-10-28)
+
+A bounded read of the known Steam client (SHA-256 `d64966e23b1a458ee6f147bcbceac0b577fa7e39a212f371287d8cc119817882`) verified the complete 220-byte table at VA `0x1413b78f0`, file offset `0x13b64f0` in `.rdata`. Its SHA-256 is `d225dc778199e1ee9b08ab80f824b0e667c0993763ec915628963ac17c6ea447`. The documented LEA bytes at VA `0x1400c879c` match and resolve to that table. This is static byte evidence; no gameplay or shader safety is established.
+
+Exact 44-byte rows, in order:
+
+```text
+10 00 00 00 08 00 00 00 60 00 00 00 9a 99 99 3e 96 43 0b 3c 33 33 d3 3f cd cc 4c 3e ec 51 38 3d 10 00 00 00 00 00 a0 41 00 00 00 00
+18 00 00 00 10 00 00 00 80 00 00 00 00 00 80 3e e0 2d 10 3a 00 00 00 40 cd cc 4c 3e ec 51 38 3d 18 00 00 00 00 00 f0 41 00 00 00 00
+20 00 00 00 10 00 00 00 a0 00 00 00 00 00 80 3e e0 2d 10 3a 00 00 00 40 cd cc 4c 3e ec 51 38 3d 20 00 00 00 00 00 20 42 01 00 00 00
+20 00 00 00 20 00 00 00 a0 00 00 00 00 00 80 3e e0 2d 10 3a 00 00 00 40 cd cc 4c 3e ec 51 38 3d 30 00 00 00 00 00 48 42 01 00 00 00
+20 00 00 00 20 00 00 00 c0 00 00 00 cd cc cc 3d 34 80 b7 39 00 00 00 40 8f c2 f5 3d ec 51 38 3d 40 00 00 00 00 00 c8 42 01 00 00 00
+```
+
+For rows 0–3 the previously omitted X/Y fields at row offsets `+0x18/+0x1c` are respectively `cd cc 4c 3e` and `ec 51 38 3d`. These bytes were read directly, not generated from rounded decimal fields.

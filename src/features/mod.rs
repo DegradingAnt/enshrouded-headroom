@@ -6,5 +6,7 @@ pub mod hdr;
 pub mod hdr_peak;
 pub mod priority;
 pub mod scatter_probe;
+pub mod shadows;
 pub mod startup_scales;
+
 pub mod texture_budget;

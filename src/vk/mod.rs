@@ -52,7 +52,9 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 
 use crate::config::{Priority, TextureBudget};
 use crate::features::priority;
-use crate::features::texture_budget::{self, budget_bytes, outcome};
+use crate::features::texture_budget::{self, budget_bytes_with_shadow_reserve};
+#[cfg(test)]
+use crate::features::texture_budget::{budget_bytes, outcome};
 use crate::frame_timer::{qpc_now, FRAMES};
 use crate::guard::{guard, Feature};
 use crate::iat;
@@ -158,6 +160,8 @@ static NULL_PRESENT: AtomicBool = AtomicBool::new(false);
 pub struct TextureSettings {
     pub mode: TextureBudget,
     pub reserve_gib: f64,
+    /// Requested extra shadow texture memory, reserved even if the shadow patch refuses.
+    pub shadow_reserve_bytes: u64,
 }
 
 // ---- classifying names -------------------------------------------------------------------------
@@ -1191,7 +1195,13 @@ unsafe fn on_first_device(phys: vk::PhysicalDevice) {
             // SAFETY: `prepared` comes from `texture_budget::prepared()`, which hands out only what
             // `prepare` checked, and this runs right after the first device is created, before the
             // game reads the table.
-            unsafe { texture_budget::apply(prepared, bytes) }
+            match (gpu.as_ref(), TEXTURE_SETTINGS.get()) {
+                // SAFETY: same prepared-table/first-device contract as above.
+                (Some(gpu), Some(settings)) => unsafe {
+                    apply_texture_for_gpu(prepared, bytes, gpu, settings)
+                },
+                _ => Err(PatchError::NotMapped),
+            }
         },
     );
     if let Some((level, line)) = step {
@@ -1438,9 +1448,29 @@ fn engaged_line(gpu: Option<&GpuInfo>) -> String {
     }
 }
 
+/// Apply the exact tier selected from the same GPU and settings used for budget calculation.
+/// # Safety
+/// Prepared table and first-device timing must satisfy texture_budget::apply_for_device.
+unsafe fn apply_texture_for_gpu(
+    prepared: &texture_budget::Prepared,
+    bytes: u64,
+    gpu: &GpuInfo,
+    settings: &TextureSettings,
+) -> Result<(), PatchError> {
+    // SAFETY: caller supplies the prepared table before the game consumes it.
+    unsafe {
+        texture_budget::apply_for_device(
+            prepared,
+            bytes,
+            gpu.device_local,
+            settings.shadow_reserve_bytes,
+        )
+    }
+}
+
 /// The texture-budget step of the first device: `None` when there is nothing to say (the table
 /// was not prepared, and `texture_budget::init` has already logged why), else the one line to log.
-/// `apply` is called at most once, and only with a budget from [`budget_bytes`].
+/// `apply` is called at most once, after the configured budget and shadow reservation are resolved.
 fn texture_step<P>(
     prepared: Option<P>,
     gpu: Option<&GpuInfo>,
@@ -1461,17 +1491,35 @@ fn texture_step<P>(
             "texture budget: not applied: the GPU's memory heaps could not be read".to_owned(),
         ));
     };
-    let TextureSettings { mode, reserve_gib } = *settings;
-    match budget_bytes(gpu.device_local, reserve_gib, gpu.integrated(), &mode) {
+    let TextureSettings {
+        mode,
+        reserve_gib,
+        shadow_reserve_bytes,
+    } = *settings;
+    match budget_bytes_with_shadow_reserve(
+        gpu.device_local,
+        reserve_gib,
+        gpu.integrated(),
+        &mode,
+        shadow_reserve_bytes,
+    ) {
         Some(bytes) => {
             let result = apply(prepared, bytes);
-            Some(outcome(
+            let (level, mut line) = texture_budget::outcome_for_device(
                 &result,
                 bytes,
                 gpu.device_local,
                 reserve_gib,
                 &mode,
-            ))
+                shadow_reserve_bytes,
+            );
+            if shadow_reserve_bytes != 0 {
+                line.push_str(&format!(
+                    "; shadow reserve {} MiB",
+                    shadow_reserve_bytes / (1024 * 1024)
+                ));
+            }
+            Some((level, line))
         }
         // No budget: say why, in this order. The setting first (it decides on any GPU), then an
         // integrated GPU, then the reserve.
@@ -2703,7 +2751,93 @@ mod tests {
     const AUTO: TextureSettings = TextureSettings {
         mode: TextureBudget::Auto,
         reserve_gib: 11.0,
+        shadow_reserve_bytes: 0,
     };
+
+    #[test]
+    fn actual_texture_consumer_reserves_the_eight_gib_native_selected_row() {
+        use crate::patch::test_support::Mem;
+        let mem = Mem::rw(0x4000);
+        mem.put(
+            0,
+            &crate::scan::test_support::synth_pe(
+                &[(".rdata", 0x1000, 0x2000, 0x1000, 0x400)],
+                0x4000,
+            ),
+        );
+        mem.put(0x2100, &texture_budget::table_bytes());
+        let prepared = texture_budget::prepare(&crate::scan::Module {
+            base: mem.base,
+            size: 0x4000,
+        })
+        .unwrap();
+        let card = GpuInfo {
+            name: "owned eight GiB fixture".into(),
+            device_type: vk::PhysicalDeviceType::DISCRETE_GPU,
+            device_local: 8 * GIB,
+        };
+        let settings = TextureSettings {
+            mode: TextureBudget::Auto,
+            reserve_gib: 11.0,
+            shadow_reserve_bytes: 512 * 1024 * 1024,
+        };
+        let original = mem.get(0, 0x4000);
+        let mut expected = original.clone();
+        expected[0x2100 + 56..0x2100 + 64]
+            .copy_from_slice(&(0x5f400000u64 - 512 * 1024 * 1024).to_le_bytes());
+        let (_, line) = texture_step(Some(&prepared), Some(&card), Some(&settings), |p, bytes| {
+            // SAFETY: test owns this native image; the exact production bridge writes its selected row.
+            unsafe { apply_texture_for_gpu(p, bytes, &card, &settings) }
+        })
+        .unwrap();
+        assert_eq!(mem.get(0, 0x4000), expected);
+        assert!(line.contains("shadow reserve 512 MiB"), "{line}");
+    }
+    #[test]
+    fn texture_consumer_subtracts_shadow_reserve_including_the_stock_floor() {
+        let (cfg, warnings) =
+            crate::config::parse("[Shadows]\nPointLightTile=256\nSunResolution=4096\n");
+        assert!(warnings.is_empty());
+        let reserve = crate::features::shadows::extra_vram_bytes(&cfg.shadows);
+        assert_eq!(reserve, 536_870_912);
+        for (heap, mode, expected) in [
+            (24 * GIB, TextureBudget::Auto, 8 * GIB - 536_870_912),
+            (16 * GIB, TextureBudget::Auto, 5 * GIB - 536_870_912),
+            (13 * GIB, TextureBudget::Auto, 2 * GIB - 536_870_912),
+            (12 * GIB, TextureBudget::Auto, 2 * GIB - 536_870_912),
+            (16 * GIB, TextureBudget::Gib(2.0), 2 * GIB - 536_870_912),
+            (16 * GIB, TextureBudget::Gib(6.0), 6 * GIB - 536_870_912),
+        ] {
+            let card = gpu(heap, vk::PhysicalDeviceType::DISCRETE_GPU);
+            let settings = TextureSettings {
+                mode,
+                shadow_reserve_bytes: reserve,
+                ..AUTO
+            };
+            let mut applied = Vec::new();
+            let (_, line) = texture_step(Some(()), Some(&card), Some(&settings), |(), bytes| {
+                applied.push(bytes);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(applied, [expected], "{mode:?}, {heap}");
+            assert!(line.contains("shadow reserve 512 MiB"), "{line}");
+        }
+        for (kind, mode) in [
+            (vk::PhysicalDeviceType::INTEGRATED_GPU, TextureBudget::Auto),
+            (vk::PhysicalDeviceType::DISCRETE_GPU, TextureBudget::Off),
+        ] {
+            let card = gpu(16 * GIB, kind);
+            let settings = TextureSettings {
+                mode,
+                shadow_reserve_bytes: reserve,
+                ..AUTO
+            };
+            texture_step(Some(()), Some(&card), Some(&settings), |(), _| {
+                panic!("must keep unchanged")
+            });
+        }
+    }
 
     #[test]
     fn the_texture_budget_is_applied_once_for_a_card_with_room() {
@@ -2727,6 +2861,7 @@ mod tests {
         let fixed = TextureSettings {
             mode: TextureBudget::Gib(6.0),
             reserve_gib: 11.0,
+            shadow_reserve_bytes: 0,
         };
         let step = texture_step(Some(()), Some(&card), Some(&fixed), |(), _| {
             Err(PatchError::ReadBack)
@@ -2782,6 +2917,7 @@ mod tests {
         let off = TextureSettings {
             mode: TextureBudget::Off,
             reserve_gib: 11.0,
+            shadow_reserve_bytes: 0,
         };
         for card in [
             gpu(16 * GIB, vk::PhysicalDeviceType::INTEGRATED_GPU),
