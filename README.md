@@ -134,7 +134,21 @@ At `LogLevel=info`, check `settings:`, `game build:`, `texture budget:`, `async 
 
 The scatter probe is a developer diagnostic, off by default. `[Debug] ScatterProbe=1` also requires `LogLevel=debug`; sampling is limited to once every 500 ms. Hidden debug keys are not part of the shipped default table. The grass ceiling remains 90 m until measured capacity allows more. Debug forced-step tests are for the author's verification, not a supported way to bypass the ceiling.
 
+Anti-Lag approximates INPUT after the previous present, with a seed before the first present.
+It does not hook the game's actual input processing. Three consecutive driver updates over
+100 ms, device loss or a concurrent present stream disable it for the session. A returned slow
+call can be detected; a driver call that never returns cannot be cancelled. The next device or
+swapchain lifecycle operation reports a stop once. On a non-AMD GPU, including the author's
+RTX 5080, `AntiLag=on` logs "not listed, off" and adds no AMD extension. See
+[design section 6.6](docs/design.md#66-amd-anti-lag-2-experimental) for the safety limits.
+
+The texture feature requires a unique match for the game's original table. If another tool changed its top budget value, the plugin leaves it alone. Changes affect process memory only; the plugin does not rewrite game files on disk.
+
 AMD Anti-Lag is unverified on AMD hardware. Runtime governor/Reflex/Anti-Lag integration, distance-direction tests, HDR comparisons and the game soak test are still release gates. Source tests and a correctly hashed zip do not establish runtime results or performance gains.
+
+## Using with Extended Graphics and Physics Tweaker
+
+Headroom leaves Tweaker's fog, GI, resource and shader settings under Tweaker's control. A startup notice detects only its two installation files, not active patches. Combined runtime and performance checks remain pending; see [Tweaker compatibility](docs/tweaker-compatibility.md) for ownership, workload limits and the test matrix.
 
 ## Uninstall
 
@@ -164,3 +178,11 @@ This mod uses the [MIT licence](LICENSE). Ultimate ASI Loader v10.0.0 by Thirtee
 ## About AI assistance
 
 TODO: the author writes this section.
+
+### Workspace and process targets
+
+`enshrouded-headroom` targets the Enshrouded **client only**. A positively identified dedicated server writes one skip line and installs no rendering features or hooks. Identification uses a case-insensitive executable filename and the shared known-build table. The server hash in that table is maintainer-supplied evidence. Unknown executable names remain `Unknown`; development hosts retain the existing build and byte-check guards.
+
+`crates/emberkit` holds reusable native infrastructure as an MIT-licensed Rust library. New mods are separate crates depending on it; each declares its process targets. It has no ASI entry export. The root remains the default workspace member, so `cargo asi` keeps the existing artifact name and exports. Use `--workspace` for lint, docs and tests (`cargo fmt --all --check` for formatting). `cargo deny` traverses both workspace members from the workspace root.
+
+`enshrouded_headroom::config::schema()` returns all 35 read settings without file I/O. Entries describe types, accepted ranges or words, default spellings, and restart requirements. All settings currently require a restart. The four developer settings under `Debug` are deliberately absent from the 31-key default INI. The three force-step defaults are absent values, not a literal `none` spelling. No settings UI is included.

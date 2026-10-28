@@ -20,7 +20,7 @@ jobs:
       - name: Mutation tests
         run: |
           $PSNativeCommandUseErrorActionPreference = $false
-          cargo mutants --timeout 30 --build-timeout 180 --jobs 4
+          cargo mutants --workspace --timeout 30 --build-timeout 180 --jobs 4
           $mutantsExitCode = $LASTEXITCODE
           # Compare missed mutants (2) and timeouts (3) with docs/mutation-audit.md.
           if ($mutantsExitCode -notin @(0, 2, 3)) {
