@@ -84,10 +84,15 @@ The crate is **Windows-only** (`x86_64-pc-windows-msvc`, toolchain pinned in `ru
 - Commit messages: `type(scope): what changed`, for example `feat(priority): …`, `fix(entry): …`, `docs: …`.
 - The maintainer reviews every PR before it is merged. A PR that breaks a rule above is sent back.
 
-## Do not touch: work in progress elsewhere
+## Reserved work and task-specific exceptions
+
+The reservations below apply unless the assigned task issue explicitly authorizes a scoped exception. Follow that issue's file list and rulings; an exception does not authorize unrelated work.
+
+- W24 [issue #30](https://github.com/DegradingAnt/enshrouded-headroom/issues/30) authorizes startup scales, the governor thread, VRAM queries and the module/startup glue. Its [scope ruling](https://github.com/DegradingAnt/enshrouded-headroom/issues/30#issuecomment-6415305076) also permits behavior-preserving governor scratch/control APIs and the minimal hook-installed bridge.
+- W25 [issue #31](https://github.com/DegradingAnt/enshrouded-headroom/issues/31) authorizes Anti-Lag wiring. Its [author additions](https://github.com/DegradingAnt/enshrouded-headroom/issues/31#issuecomment-6422323088) permit parsed startup initialization and shared Reflex device-copy helpers.
 
 - `src/governor/` and the module list in `src/lib.rs`: the governor is being built (Task 11).
 - Plan Tasks 12-16 (scene-settings hook, draw-distance knobs, start-up scales, the governor thread and Reflex). They need reverse engineering of the game exe, which is not in this repo.
 - Anything that needs the game exe or an in-game test.
 
-If a task in the worksheet seems to need one of these, stop and say so in the PR instead.
+If a task needs reserved work without an explicit scoped authorization, stop and say so in the PR.
