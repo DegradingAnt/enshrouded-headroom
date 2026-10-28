@@ -1470,7 +1470,7 @@ unsafe fn apply_texture_for_gpu(
 
 /// The texture-budget step of the first device: `None` when there is nothing to say (the table
 /// was not prepared, and `texture_budget::init` has already logged why), else the one line to log.
-/// `apply` is called at most once, and only with a budget from [`budget_bytes`].
+/// `apply` is called at most once, after the configured budget and shadow reservation are resolved.
 fn texture_step<P>(
     prepared: Option<P>,
     gpu: Option<&GpuInfo>,
