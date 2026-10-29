@@ -989,6 +989,16 @@ mod reflex_driver {
     static DIAGNOSTIC_LOGGER: DiagnosticLogger = DiagnosticLogger;
     static DIAGNOSTIC_LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
     static DIAGNOSTIC_PANIC: AtomicUsize = AtomicUsize::new(0);
+    /// The drop counter proves payload destruction never runs, beyond merely catching its panic.
+    static DIAGNOSTIC_PAYLOAD_DROPS: AtomicUsize = AtomicUsize::new(0);
+    /// Logger payload whose destructor would otherwise unwind into the native fallback.
+    struct DiagnosticPanicOnDrop;
+    impl Drop for DiagnosticPanicOnDrop {
+        fn drop(&mut self) {
+            DIAGNOSTIC_PAYLOAD_DROPS.fetch_add(1, Ordering::Relaxed);
+            panic!("diagnostic payload destructor");
+        }
+    }
     static DIAGNOSTIC_ENDPOINT: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
     static DIAGNOSTIC_DESTROYS: AtomicUsize = AtomicUsize::new(0);
@@ -1012,11 +1022,16 @@ mod reflex_driver {
             let line = record.args().to_string();
             DIAGNOSTIC_LINES.lock().unwrap().push(line.clone());
             let mode = DIAGNOSTIC_PANIC.load(Ordering::Relaxed);
-            if ((mode == 1 && line.contains("refused"))
-                || (mode == 2 && line.contains("native result"))
-                || (mode == 3 && line.contains("decision=preserve-native-endpoint")))
-                && DIAGNOSTIC_PANIC.swap(0, Ordering::Relaxed) != 0
-            {
+            let should_panic = match mode {
+                1 => line.contains("refused"),
+                2 | 4 => line.contains("native result"),
+                3 | 5 => line.contains("decision=preserve-native-endpoint"),
+                _ => false,
+            };
+            if should_panic && DIAGNOSTIC_PANIC.swap(0, Ordering::Relaxed) != 0 {
+                if mode >= 4 {
+                    std::panic::panic_any(DiagnosticPanicOnDrop);
+                }
                 panic!("diagnostic logger failure");
             }
         }
@@ -2170,7 +2185,10 @@ mod reflex_driver {
                         ),
                     "{lines:?}"
                 );
-                if case == "diagnostic-endpoint-panic" {
+                if matches!(
+                    case,
+                    "diagnostic-endpoint-panic" | "diagnostic-endpoint-panic-drop"
+                ) {
                     assert_eq!(DIAGNOSTIC_PANIC.load(Ordering::Relaxed), 0);
                 }
             } else if case == "diagnostic-two" {
@@ -2212,6 +2230,27 @@ mod reflex_driver {
                     0,
                     "intended logger boundary must be exercised"
                 );
+            }
+            if matches!(
+                case,
+                "diagnostic-panic-drop-result" | "diagnostic-endpoint-panic-drop"
+            ) {
+                assert_eq!(
+                    DIAGNOSTIC_PAYLOAD_DROPS.load(Ordering::Relaxed),
+                    0,
+                    "caught logger payload must not be dropped"
+                );
+                assert_eq!(
+                    device.as_raw(),
+                    DEVICE,
+                    "retain the actual native result/output"
+                );
+                for feature in [Feature::VkWrap, Feature::Reflex, Feature::AntiLag] {
+                    assert!(
+                        !enshrouded_headroom::guard::is_disabled(feature),
+                        "diagnostics must not disable features"
+                    );
+                }
             }
             return;
         }
@@ -2395,6 +2434,8 @@ mod reflex_driver {
                     "diagnostic-panic-refusal" => 1,
                     "diagnostic-panic-result" => 2,
                     "diagnostic-endpoint-panic" => 3,
+                    "diagnostic-panic-drop-result" => 4,
+                    "diagnostic-endpoint-panic-drop" => 5,
                     _ => 0,
                 },
                 Ordering::Relaxed,
@@ -2410,6 +2451,8 @@ mod reflex_driver {
             "diagnostic-endpoint-panic",
             "diagnostic-driver-retry",
             "diagnostic-original-error",
+            "diagnostic-panic-drop-result",
+            "diagnostic-endpoint-panic-drop",
         ] {
             let output = Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", NAME, "--nocapture"])

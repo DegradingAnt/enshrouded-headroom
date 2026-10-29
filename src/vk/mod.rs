@@ -816,7 +816,11 @@ fn first_time(flag: &AtomicBool) -> bool {
 /// Contain diagnostic formatting/logger failures without changing native decisions or feature flags.
 /// Call only after securing any mandatory native work, or where the caller retains its fallback.
 pub(crate) fn log_diagnostic(body: impl FnOnce()) {
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        // A `panic_any` payload may panic in Drop. As in the shared guard, leak the rare
+        // caught payload so diagnostic failure cannot escape into the native fallback.
+        std::mem::forget(payload);
+    }
 }
 
 /// The warning for a device-level function handed back unwrapped. Without it, a probe device
@@ -2167,6 +2171,26 @@ mod tests {
     use windows_sys::Win32::System::Memory::PAGE_NOACCESS;
 
     // ---- the brief's tests (ruling G10: no submit wrappers) -----------------------------------
+
+    /// A diagnostic panic payload must never be dropped after its unwind was contained.
+    #[test]
+    fn diagnostic_panic_payload_is_not_dropped() {
+        /// Dropping this payload would start a second unwind outside the diagnostic boundary.
+        struct PanicOnDrop(std::sync::Arc<AtomicUsize>);
+        impl Drop for PanicOnDrop {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                panic!("diagnostic payload destructor");
+            }
+        }
+        let drops = std::sync::Arc::new(AtomicUsize::new(0));
+        let payload = PanicOnDrop(drops.clone());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            log_diagnostic(|| std::panic::panic_any(payload));
+        }));
+        assert!(result.is_ok(), "the payload destructor escaped containment");
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn classify_names() {
