@@ -1736,6 +1736,21 @@ The PE's 72,746 `.pdata` entries resolved through version 1/2 unwind metadata wi
 - **VERIFIED:** The leaf at `0x1409f2ea0` writes the 64-bit `RDX` to pointer`+0xe16270`, then returns. It does not write the world state byte at offset 0. Its purpose is not established here. The boolean helper at `0x1409953e0` has three unwind ranges totaling 822 bytes and includes a kind 2-specific branch. Its boolean must not be treated as a general job-quiescence contract.
 - **HYPOTHESIS:** A future observer may need to invalidate a generation on retirement entry, before waiting for a successful return. Waiting for the final handle clear could leave old marks available during cleanup. The full trigger, thread, reentrancy and coordinate-lifetime contract still needs proof before this becomes a binding.
 
+### Position schema observations
+
+**VERIFIED:** The exact target contains one qualified-name string and one matching descriptor for `keen::ecs::CurrentTransform`. The descriptor at `0x1418f1ac0` records hash `0x027ac564`. Following its reflected field types gives this layout:
+
+| Reflected type | Descriptor VA | Size in bytes | Fields used by a position reader |
+|---|---|---|---|
+| `keen::ecs::CurrentTransform` | `0x1418f1ac0` | 56 | `transform` at `+0x00`, type `keen::WorldTransform` |
+| `keen::WorldTransform` | `0x1419184b0` | 56 | `position` at `+0x00`, type `keen::WorldPosition` |
+| `keen::WorldPosition` | `0x141915220` | 24 | `x`, `y`, `z` at `+0x00`, `+0x08`, `+0x10` |
+| `keen::sint64` | `0x141b84200` | 8 | The common reflected scalar type of all three axes |
+
+These are named static schema fields. They do not prove that an arbitrary pointer is a live component. They agree with EMF's [generated position](https://github.com/matenm/emf-enshrouded/blob/08d600155fcadc8e45cc9c6f3932a67c717345be/sdk/include/emf/generated/components.hpp#L43-L59), [world transform](https://github.com/matenm/emf-enshrouded/blob/08d600155fcadc8e45cc9c6f3932a67c717345be/sdk/include/emf/generated/components.hpp#L718-L740) and [current transform](https://github.com/matenm/emf-enshrouded/blob/08d600155fcadc8e45cc9c6f3932a67c717345be/sdk/include/emf/generated/components.hpp#L7501-L7511). The separate `keen::ecs::Transform` uses float positions and must not be substituted for `WorldTransform`.
+
+EMF's [position conversion](https://github.com/matenm/emf-enshrouded/blob/08d600155fcadc8e45cc9c6f3932a67c717345be/sdk/include/emf/aim.hpp#L82-L87) divides each signed coordinate by `4294967296.0` and names the result metres. This is a pinned source contract. Static schema agreement is not our own metre calibration, proof of a fixed origin or permission to retain component pointers after a callback.
+
 ### Coverage limits and remaining gates
 
 The owner-field census found 131 raw occurrences of displacement`0x47d4e0`; 124 lay inside decoded bounded unwind ranges and 7 lacked such a range. A common displacement alone does not prove a common owner. Computed addresses and aliases are outside this census. The cleanup-reference pass covered direct `E8`/`E9` references and 64-bit RIP-relative `LEA` instructions. A separate search found zero exact absolute 8-byte pointers to the cleanup entry in raw sections; that does not exclude RVA tables or indirect references. Neither pass establishes all callers.
