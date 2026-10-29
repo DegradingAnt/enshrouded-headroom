@@ -984,6 +984,59 @@ mod reflex_driver {
         guard::{guard, Feature},
         reflex,
     };
+    /// Isolated logger releases its record lock before deliberately panicking.
+    struct DiagnosticLogger;
+    static DIAGNOSTIC_LOGGER: DiagnosticLogger = DiagnosticLogger;
+    static DIAGNOSTIC_LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    static DIAGNOSTIC_PANIC: AtomicUsize = AtomicUsize::new(0);
+    /// The drop counter proves payload destruction never runs, beyond merely catching its panic.
+    static DIAGNOSTIC_PAYLOAD_DROPS: AtomicUsize = AtomicUsize::new(0);
+    /// Logger payload whose destructor would otherwise unwind into the native fallback.
+    struct DiagnosticPanicOnDrop;
+    impl Drop for DiagnosticPanicOnDrop {
+        fn drop(&mut self) {
+            DIAGNOSTIC_PAYLOAD_DROPS.fetch_add(1, Ordering::Relaxed);
+            panic!("diagnostic payload destructor");
+        }
+    }
+    static DIAGNOSTIC_ENDPOINT: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    static DIAGNOSTIC_DESTROYS: AtomicUsize = AtomicUsize::new(0);
+
+    /// Distinct same-device endpoint records the native teardown selected by the caller.
+    unsafe extern "system" fn diagnostic_destroy(
+        _: vk::Device,
+        _: vk::SwapchainKHR,
+        _: *const vk::AllocationCallbacks<'_>,
+    ) {
+        let body = || {
+            DIAGNOSTIC_DESTROYS.fetch_add(1, Ordering::Relaxed);
+        };
+        guard(Feature::VkWrap, body, body);
+    }
+    impl log::Log for DiagnosticLogger {
+        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record<'_>) {
+            let line = record.args().to_string();
+            DIAGNOSTIC_LINES.lock().unwrap().push(line.clone());
+            let mode = DIAGNOSTIC_PANIC.load(Ordering::Relaxed);
+            let should_panic = match mode {
+                1 => line.contains("refused"),
+                2 | 4 => line.contains("native result"),
+                3 | 5 => line.contains("decision=preserve-native-endpoint"),
+                _ => false,
+            };
+            if should_panic && DIAGNOSTIC_PANIC.swap(0, Ordering::Relaxed) != 0 {
+                if mode >= 4 {
+                    std::panic::panic_any(DiagnosticPanicOnDrop);
+                }
+                panic!("diagnostic logger failure");
+            }
+        }
+        fn flush(&self) {}
+    }
     static ORIGINAL: AtomicUsize = AtomicUsize::new(0);
     static ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
     static CHANGED_OK: AtomicUsize = AtomicUsize::new(0);
@@ -1302,7 +1355,13 @@ mod reflex_driver {
             // SAFETY: every test lookup supplies a static terminated name.
             to_void(match unsafe { CStr::from_ptr(name) }.to_bytes() {
                 b"vkDestroyDevice" => destroy_device as *const () as usize,
-                b"vkDestroySwapchainKHR" => destroy_swapchain as *const () as usize,
+                b"vkDestroySwapchainKHR" => {
+                    if DIAGNOSTIC_ENDPOINT.load(Ordering::Relaxed) {
+                        diagnostic_destroy as *const () as usize
+                    } else {
+                        destroy_swapchain as *const () as usize
+                    }
+                }
                 _ if PRESENT_CASE.load(Ordering::Relaxed) != 0 => present_entry(name),
                 _ => 0,
             })
@@ -2014,7 +2073,10 @@ mod reflex_driver {
         if case == "vendor" {
             VENDOR.store(0x1002, Ordering::Relaxed);
         }
-        if case == "refusal" {
+        if matches!(
+            case,
+            "refusal" | "diagnostic-driver-retry" | "diagnostic-original-error"
+        ) {
             REFUSE.store(1, Ordering::Relaxed);
         }
         let mut tail = vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true);
@@ -2023,7 +2085,13 @@ mod reflex_driver {
         let original_next = v12.p_next;
         let names = [c"VK_KHR_swapchain".as_ptr()];
         let mut info = vk::DeviceCreateInfo::default().enabled_extension_names(&names);
-        info.p_next = if case.starts_with("caps-") {
+        let opaque = vk::BaseInStructure {
+            s_type: vk::StructureType::APPLICATION_INFO,
+            ..Default::default()
+        };
+        info.p_next = if case.starts_with("diagnostic-") && case != "diagnostic-driver-retry" {
+            (&opaque as *const vk::BaseInStructure<'_>).cast()
+        } else if case.starts_with("caps-") {
             // The 1.0 route cases must not request newer core feature structs themselves.
             std::ptr::null()
         } else {
@@ -2041,11 +2109,151 @@ mod reflex_driver {
                 &mut device,
             )
         };
-        assert_eq!(result, vk::Result::SUCCESS);
+        assert_eq!(
+            result,
+            if case == "diagnostic-original-error" {
+                vk::Result::ERROR_EXTENSION_NOT_PRESENT
+            } else {
+                vk::Result::SUCCESS
+            }
+        );
         assert_eq!(info.p_next, original_chain);
         assert_eq!(v12.p_next, original_next);
         assert_eq!(v12.timeline_semaphore, vk::FALSE);
         assert_eq!(v12.buffer_device_address, vk::TRUE);
+        if case == "diagnostic-driver-retry" {
+            assert_eq!(ATTEMPTS.load(Ordering::Relaxed), 2);
+            assert_eq!(CHANGED_OK.load(Ordering::Relaxed), 1);
+            assert_eq!(RETRY_OK.load(Ordering::Relaxed), 1);
+            assert!(enshrouded_headroom::guard::is_disabled(Feature::Reflex));
+            let lines = DIAGNOSTIC_LINES.lock().unwrap();
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(
+                        |line| line.contains("attempt=1") && line.contains("native result=SUCCESS")
+                    )
+                    .count(),
+                1,
+                "{lines:?}"
+            );
+            return;
+        }
+        if case.starts_with("diagnostic-") {
+            assert!(opaque.p_next.is_null());
+            assert_eq!(opaque.s_type.as_raw(), 0);
+            assert_eq!(info.enabled_extension_count, 1);
+            assert_eq!(info.pp_enabled_extension_names, names.as_ptr());
+            assert_eq!(ATTEMPTS.load(Ordering::Relaxed), 1);
+            assert_eq!(RETRY_OK.load(Ordering::Relaxed), 1);
+            assert_eq!(CHANGED_OK.load(Ordering::Relaxed), 0);
+            if case == "diagnostic-original-error" {
+                assert!(device.is_null());
+                assert!(DIAGNOSTIC_LINES
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|line| line
+                        .contains("native result=ERROR_EXTENSION_NOT_PRESENT device=None")));
+            } else if case.starts_with("diagnostic-endpoint") {
+                DIAGNOSTIC_ENDPOINT.store(true, Ordering::Relaxed);
+                // SAFETY: exact fake lookup and native destructor signatures; inputs stay live.
+                unsafe {
+                    let raw = wrap_gdpa(device, c"vkDestroySwapchainKHR".as_ptr()).unwrap();
+                    assert_eq!(raw as usize, diagnostic_destroy as *const () as usize);
+                    assert_eq!(
+                        wrap_gdpa(device, c"vkDestroySwapchainKHR".as_ptr()).unwrap() as usize,
+                        raw as usize
+                    );
+                    std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkDestroySwapchainKHR>(
+                        raw,
+                    )(device, vk::SwapchainKHR::from_raw(44), std::ptr::null());
+                }
+                assert_eq!(DIAGNOSTIC_DESTROYS.load(Ordering::Relaxed), 1);
+                assert_eq!(B_DESTROYS.load(Ordering::Relaxed), 0);
+                let lines = DIAGNOSTIC_LINES.lock().unwrap();
+                let diagnostic: Vec<_> = lines
+                    .iter()
+                    .filter(|line| line.contains("decision=preserve-native-endpoint"))
+                    .collect();
+                assert_eq!(diagnostic.len(), 1, "{lines:?}");
+                assert!(
+                    diagnostic[0].contains("held=0x")
+                        && diagnostic[0].contains("found=0x")
+                        && diagnostic[0].contains(
+                            "reflex_lifetime_observed=false antilag_lifetime_observed=false"
+                        ),
+                    "{lines:?}"
+                );
+                if matches!(
+                    case,
+                    "diagnostic-endpoint-panic" | "diagnostic-endpoint-panic-drop"
+                ) {
+                    assert_eq!(DIAGNOSTIC_PANIC.load(Ordering::Relaxed), 0);
+                }
+            } else if case == "diagnostic-two" {
+                // SAFETY: second physical identity and retained original inputs/output obey the fake API.
+                let second = unsafe {
+                    wrap_create_device(
+                        vk::PhysicalDevice::from_raw(PHYS + 1),
+                        &info,
+                        std::ptr::null(),
+                        &mut device,
+                    )
+                };
+                assert_eq!(second, vk::Result::SUCCESS);
+                assert_eq!(ATTEMPTS.load(Ordering::Relaxed), 2);
+                assert_eq!(RETRY_OK.load(Ordering::Relaxed), 2);
+                let lines = DIAGNOSTIC_LINES.lock().unwrap();
+                assert!(
+                    lines.iter().any(|line| line
+                        .contains(&format!("attempt=1 physical={PHYS:#x}"))
+                        && line.contains("UnknownStructure { s_type: 0, index: 0 }")),
+                    "{lines:?}"
+                );
+                for (attempt, physical) in [(1, PHYS), (2, PHYS + 1)] {
+                    assert_eq!(
+                        lines
+                            .iter()
+                            .filter(|line| line
+                                .contains(&format!("attempt={attempt} physical={physical:#x}"))
+                                && line.contains("native result=SUCCESS")
+                                && line.contains(&format!("device=Some({DEVICE:#x})")))
+                            .count(),
+                        1,
+                        "{lines:?}"
+                    );
+                }
+            } else {
+                assert_eq!(
+                    DIAGNOSTIC_PANIC.load(Ordering::Relaxed),
+                    0,
+                    "intended logger boundary must be exercised"
+                );
+            }
+            if matches!(
+                case,
+                "diagnostic-panic-drop-result" | "diagnostic-endpoint-panic-drop"
+            ) {
+                assert_eq!(
+                    DIAGNOSTIC_PAYLOAD_DROPS.load(Ordering::Relaxed),
+                    0,
+                    "caught logger payload must not be dropped"
+                );
+                assert_eq!(
+                    device.as_raw(),
+                    DEVICE,
+                    "retain the actual native result/output"
+                );
+                for feature in [Feature::VkWrap, Feature::Reflex, Feature::AntiLag] {
+                    assert!(
+                        !enshrouded_headroom::guard::is_disabled(feature),
+                        "diagnostics must not disable features"
+                    );
+                }
+            }
+            return;
+        }
         if case.starts_with("caps-") {
             let (core, khr) = match case {
                 "caps-core" => (1, 0),
@@ -2211,6 +2419,52 @@ mod reflex_driver {
                 assert!(!enshrouded_headroom::guard::is_disabled(Feature::Reflex));
             }
             _ => unreachable!(),
+        }
+    }
+    /// Real wrappers correlate two devices and remain exactly-once when diagnostics panic.
+    #[test]
+    fn diagnostic_attempts_preserve_native_inputs_and_call_counts() {
+        const NAME: &str =
+            "reflex_driver::diagnostic_attempts_preserve_native_inputs_and_call_counts";
+        if let Ok(case) = std::env::var("W43_DIAGNOSTIC_CHILD") {
+            log::set_logger(&DIAGNOSTIC_LOGGER).unwrap();
+            log::set_max_level(log::LevelFilter::Info);
+            DIAGNOSTIC_PANIC.store(
+                match case.as_str() {
+                    "diagnostic-panic-refusal" => 1,
+                    "diagnostic-panic-result" => 2,
+                    "diagnostic-endpoint-panic" => 3,
+                    "diagnostic-panic-drop-result" => 4,
+                    "diagnostic-endpoint-panic-drop" => 5,
+                    _ => 0,
+                },
+                Ordering::Relaxed,
+            );
+            child(&case);
+            return;
+        }
+        for case in [
+            "diagnostic-two",
+            "diagnostic-panic-refusal",
+            "diagnostic-panic-result",
+            "diagnostic-endpoint",
+            "diagnostic-endpoint-panic",
+            "diagnostic-driver-retry",
+            "diagnostic-original-error",
+            "diagnostic-panic-drop-result",
+            "diagnostic-endpoint-panic-drop",
+        ] {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture"])
+                .env("W43_DIAGNOSTIC_CHILD", case)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{case}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
     }
     #[test]

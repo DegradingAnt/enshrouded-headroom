@@ -159,6 +159,8 @@ struct FrameReader {
     qpc: Vec<u64>,
     /// Converted finite positive intervals, bounded by the same length.
     ms: Vec<f64>,
+    /// Positive microsecond intervals paired with their actual frame-end QPC timestamps.
+    intervals_us: Vec<(u64, u64)>,
 }
 
 impl FrameReader {
@@ -169,6 +171,7 @@ impl FrameReader {
             previous: None,
             qpc: Vec::with_capacity(crate::frame_timer::RING_LEN),
             ms: Vec::with_capacity(crate::frame_timer::RING_LEN),
+            intervals_us: Vec::with_capacity(crate::frame_timer::RING_LEN),
         }
     }
 
@@ -176,6 +179,7 @@ impl FrameReader {
     fn read(&mut self, ring: &crate::frame_timer::Ring, to_ms: impl Fn(u64) -> f64) -> &[f64] {
         self.qpc.clear();
         self.ms.clear();
+        self.intervals_us.clear();
         let next = ring.read_since(self.sequence, &mut self.qpc);
         if next.saturating_sub(self.sequence) != self.qpc.len() as u64 {
             self.previous = None;
@@ -186,6 +190,8 @@ impl FrameReader {
                 let ms = to_ms(delta);
                 if ms.is_finite() && ms > 0.0 {
                     self.ms.push(ms);
+                    self.intervals_us
+                        .push((timestamp, (ms * 1000.0).round().max(1.0) as u64));
                 }
             }
             self.previous = Some(timestamp);
@@ -544,16 +550,103 @@ fn report_reflex_latency_when_available(
     }
 }
 
+/// Last-two-second frame samples with one bounded caller-owned sorting buffer.
+struct FrameReports {
+    samples: std::collections::VecDeque<(f64, u64)>,
+    scratch: Vec<u64>,
+    debug_at_s: f64,
+}
+impl FrameReports {
+    /// Reserve once before entering the worker loop.
+    fn new() -> Self {
+        Self {
+            samples: std::collections::VecDeque::with_capacity(crate::frame_timer::RING_LEN),
+            scratch: Vec::with_capacity(crate::frame_timer::RING_LEN),
+            debug_at_s: 0.0,
+        }
+    }
+    /// Observe actual frame-end timestamps, never assigning old samples the current tick's time.
+    fn observe(
+        &mut self,
+        now_s: f64,
+        intervals: &[(u64, u64)],
+        to_seconds: impl Fn(u64) -> Option<f64>,
+    ) {
+        if !now_s.is_finite() {
+            return;
+        }
+        for &(timestamp, micros) in intervals {
+            let Some(end) = to_seconds(timestamp).filter(|end| end.is_finite() && *end <= now_s)
+            else {
+                continue;
+            };
+            if micros == 0 || end < now_s - 2.0 {
+                continue;
+            }
+            if self.samples.len() >= crate::frame_timer::RING_LEN {
+                self.samples.pop_front();
+            }
+            self.samples.push_back((end, micros));
+        }
+        while self
+            .samples
+            .front()
+            .is_some_and(|(end, _)| *end < now_s - 2.0)
+        {
+            self.samples.pop_front();
+        }
+    }
+    /// Compute with caller-owned scratch only when a report is due.
+    fn stats(&mut self) -> Option<crate::frame_stats::FrameStats> {
+        self.scratch.clear();
+        self.scratch.extend(self.samples.iter().map(|(_, us)| *us));
+        crate::frame_stats::calculate_in_place(&mut self.scratch)
+    }
+    /// Debug logging is level-gated and runs at most once per two seconds.
+    fn debug_line_due(&mut self, now_s: f64, enabled: bool) -> Option<String> {
+        if !enabled || !now_s.is_finite() || now_s - self.debug_at_s < 2.0 {
+            return None;
+        }
+        self.debug_at_s = now_s;
+        Some(crate::frame_stats::debug_line(self.stats().as_ref()))
+    }
+}
+
+/// Native control work is never admitted by the statistics-only worker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThreadMode {
+    Governor,
+    StatsOnly,
+}
+impl ThreadMode {
+    /// Queries, planning and publication form one capability boundary.
+    fn run_control(self, body: impl FnOnce()) {
+        if self == Self::Governor {
+            body();
+        }
+    }
+}
+/// Match startup to the configured log level and governor setting.
+fn thread_mode(cfg: &crate::config::Config) -> Option<ThreadMode> {
+    if cfg.governor.target_fps != 0 {
+        Some(ThreadMode::Governor)
+    } else if cfg.debug.frame_stats && cfg.general.log_level == crate::config::LogLevel::Debug {
+        Some(ThreadMode::StatsOnly)
+    } else {
+        None
+    }
+}
+
 /// Start once from entry, after queued hooks are applied. No runtime thread is started in unit
 /// tests; tests drive Runtime::plan synchronously with injected snapshots instead.
 pub fn spawn(cfg: crate::config::Config) {
-    if cfg.governor.target_fps == 0 {
+    let Some(mode) = thread_mode(&cfg) else {
         return;
-    }
+    };
     if let Err(error) = std::thread::Builder::new()
         .name("headroom-governor".to_owned())
         .spawn(move || {
-            crate::guard::guard(crate::guard::Feature::Governor, || (), || run(cfg));
+            crate::guard::guard(crate::guard::Feature::Governor, || (), || run(cfg, mode));
         })
     {
         log::warn!("governor: could not start: {error}");
@@ -561,11 +654,12 @@ pub fn spawn(cfg: crate::config::Config) {
 }
 
 /// Execute the loop entirely under the feature guard. A panic stops it with shared values held.
-fn run(cfg: crate::config::Config) {
+fn run(cfg: crate::config::Config, mode: ThreadMode) {
     use crate::features::scatter_probe as probe;
     use std::sync::atomic::Ordering::{Acquire, Relaxed};
     let mut runtime = Runtime::new(cfg);
     let mut reader = FrameReader::new();
+    let mut frame_reports = FrameReports::new();
     let origin = crate::frame_timer::qpc_now();
     let mut period_ms = 0.0;
     let mut free_mib = None;
@@ -575,16 +669,20 @@ fn run(cfg: crate::config::Config) {
     let mut latency_at = 0.0;
     let mut scatter_diagnostics = ScatterDiagnostics::default();
     let mut applied = [0; 3];
-    log::info!("governor: started; inactive");
-    if cfg.governor.trial_floor_fps != 0 {
-        log::info!(
+    if mode == ThreadMode::Governor {
+        log::info!("governor: started; inactive");
+        if cfg.governor.trial_floor_fps != 0 {
+            log::info!(
             "governor: measured quality trials; p95 floor={} fps, target={} fps, terrain first={}; no GPU timing",
             cfg.governor.trial_floor_fps,
             cfg.governor.target_fps,
             cfg.governor.terrain_first
         );
-    } else if cfg.governor.terrain_first {
-        log::info!("governor: terrain first; legacy frame-time policy");
+        } else if cfg.governor.terrain_first {
+            log::info!("governor: terrain first; legacy frame-time policy");
+        }
+    } else {
+        log::debug!("frames: log-only sampling enabled; no governor control");
     }
     loop {
         if crate::guard::is_disabled(crate::guard::Feature::Governor) {
@@ -592,6 +690,25 @@ fn run(cfg: crate::config::Config) {
         }
         let now_qpc = crate::frame_timer::qpc_now();
         let now_s = crate::frame_timer::qpc_to_ms(now_qpc.saturating_sub(origin)) / 1000.0;
+        reader.read(&crate::frame_timer::FRAMES, crate::frame_timer::qpc_to_ms);
+        // Sample the reporting clock after copying the ring, so a concurrent new present is not
+        // discarded merely because its timestamp followed the tick's earlier control clock.
+        let stats_now_s =
+            crate::frame_timer::qpc_to_ms(crate::frame_timer::qpc_now().saturating_sub(origin))
+                / 1000.0;
+        frame_reports.observe(stats_now_s, &reader.intervals_us, |timestamp| {
+            timestamp
+                .checked_sub(origin)
+                .map(|delta| crate::frame_timer::qpc_to_ms(delta) / 1000.0)
+        });
+        if let Some(line) = frame_reports.debug_line_due(
+            stats_now_s,
+            cfg.general.log_level == crate::config::LogLevel::Debug
+                && log::log_enabled!(log::Level::Debug),
+        ) {
+            log::debug!("{line}");
+        }
+        mode.run_control(|| {
         if now_s - display_at >= 5.0 {
             period_ms = crate::display::period_ms(
                 crate::display::game_window().and_then(crate::display::refresh_hz),
@@ -606,7 +723,7 @@ fn run(cfg: crate::config::Config) {
             memory_at = now_s;
         }
         let seen = crate::knobs::OBJECT.last_seen();
-        let frames = reader.read(&crate::frame_timer::FRAMES, crate::frame_timer::qpc_to_ms);
+        let frames = &reader.ms;
         let plan = runtime.plan(&Sample {
             now_s,
             frames,
@@ -646,9 +763,11 @@ fn run(cfg: crate::config::Config) {
                     }
                 }
                 if now_s - status_at >= 30.0 {
+                    if log::log_enabled!(log::Level::Info) {
                     let (p50, p95) = runtime.percentiles();
+                    let suffix=crate::frame_stats::info_suffix(frame_reports.stats().as_ref());
                     log::info!(
-                        "{}",
+                        "{}; {suffix}",
                         status_line(
                             p50,
                             p95,
@@ -657,6 +776,7 @@ fn run(cfg: crate::config::Config) {
                             plan.state
                         )
                     );
+                    }
                     status_at = now_s;
                 }
                 if cfg.general.log_level == crate::config::LogLevel::Debug {
@@ -700,6 +820,7 @@ fn run(cfg: crate::config::Config) {
             },
         );
         applied = plan.steps;
+        });
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
@@ -774,6 +895,108 @@ mod tests {
         ALLOCATIONS.with(Cell::get)
     }
 
+    #[test]
+    fn frame_sampling_and_stats_reuse_reserved_storage_without_allocating() {
+        let mut reports = FrameReports::new();
+        let mut scratch = [0u64; 102];
+        let frames = [13_300; 102];
+        let count = allocation_count(|| {
+            for tick in 0..10_000u64 {
+                reports.observe(tick as f64 / 1000.0, &[(tick, 13_300)], |stamp| {
+                    Some(stamp as f64 / 1000.0)
+                });
+                let _ = reports.stats();
+                assert!(crate::frame_stats::calculate(&frames, &mut scratch).is_some());
+            }
+        });
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn overflowing_the_bounded_window_retains_latest_samples_without_allocating() {
+        let mut reports = FrameReports::new();
+        let first: [(u64, u64); 4096] = std::array::from_fn(|n| (n as u64, 1_000));
+        let second: [(u64, u64); 4096] = std::array::from_fn(|n| (4096 + n as u64, 2_000));
+        let mut stats = None;
+        let allocations = allocation_count(|| {
+            reports.observe(0.5, &first, |stamp| Some(stamp as f64 / 10000.0));
+            reports.observe(1.0, &second, |stamp| Some(stamp as f64 / 10000.0));
+            stats = reports.stats();
+        });
+        assert_eq!(allocations, 0);
+        assert_eq!(
+            stats.unwrap().p50_us,
+            2_000,
+            "latest4096samples replace the older batch"
+        );
+    }
+    #[test]
+    fn stats_intervals_use_reader_lap_and_actual_timestamp_rules() {
+        let ring = crate::frame_timer::Ring::new();
+        let mut reader = FrameReader::new();
+        ring.push(100);
+        ring.push(110);
+        ring.push(130);
+        reader.read(&ring, |delta| delta as f64);
+        assert_eq!(reader.intervals_us, [(110, 10_000), (130, 20_000)]);
+        for n in 0..crate::frame_timer::RING_LEN + 1 {
+            ring.push(200 + n as u64);
+        }
+        reader.read(&ring, |delta| delta as f64);
+        assert!(reader.intervals_us.iter().all(|(_, us)| *us == 1_000));
+    }
+    #[test]
+    fn frame_reports_use_actual_two_second_frame_ends_and_debug_cadence() {
+        let mut reports = FrameReports::new();
+        reports.observe(
+            2.0,
+            &[(0, 120_000), (1, 10_000), (2, 20_000)],
+            |timestamp| Some(timestamp as f64),
+        );
+        assert!(reports.debug_line_due(1.9, true).is_none());
+        assert_eq!(
+            reports.debug_line_due(2.0, true).as_deref(),
+            Some("frames: p50 20.00 ms, p99 120.00 ms, max 120.00 ms, hitches 1")
+        );
+        reports.observe(3.01, &[], |timestamp| Some(timestamp as f64));
+        assert_eq!(
+            reports.stats(),
+            None,
+            "only one frame remains in the last2s"
+        );
+        assert!(reports.debug_line_due(4.0, false).is_none());
+        assert_eq!(
+            reports.debug_line_due(4.0, true).as_deref(),
+            Some("frames: no data")
+        );
+    }
+    #[test]
+    fn stats_only_mode_requires_debug_key_and_level_and_never_runs_control_work() {
+        use crate::config::{Config, LogLevel};
+        for target in [0, 75] {
+            for frame_stats in [false, true] {
+                for level in [LogLevel::Info, LogLevel::Debug] {
+                    let mut cfg = Config::default();
+                    cfg.governor.target_fps = target;
+                    cfg.debug.frame_stats = frame_stats;
+                    cfg.general.log_level = level;
+                    let expected = if target != 0 {
+                        Some(ThreadMode::Governor)
+                    } else if frame_stats && level == LogLevel::Debug {
+                        Some(ThreadMode::StatsOnly)
+                    } else {
+                        None
+                    };
+                    assert_eq!(thread_mode(&cfg), expected);
+                }
+            }
+        }
+        ThreadMode::StatsOnly
+            .run_control(|| panic!("log-only mode must not query, plan or publish native control"));
+        let mut calls = 0;
+        ThreadMode::Governor.run_control(|| calls += 1);
+        assert_eq!(calls, 1);
+    }
     #[test]
     fn scatter_debug_reports_keep_the_observed_session_peak_across_scene_resets() {
         let mut diagnostics = ScatterDiagnostics::default();
