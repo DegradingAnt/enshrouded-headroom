@@ -13,6 +13,11 @@ unmaintained = "all"
 # Unlisted licences fail. For MIT OR LGPL, only the MIT branch is allowed.
 allow = ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "Unicode-3.0", "ISC", "Zlib"]
 
+# W45 uses the pinned watcher under its upstream CC0 dedication.
+[[licenses.exceptions]]
+crate = "notify@8.2.1"
+allow = ["CC0-1.0"]
+
 [bans]
 multiple-versions = "warn"
 
