@@ -30,6 +30,8 @@ pub enum Error {
     WorldConfirmationRequired,
     /// The origin was not confirmed for the current context activation.
     GridConfirmationRequired,
+    /// The aim observation predates or cannot be ordered after this activation.
+    AimConfirmationRequired,
     /// An observation claims a time later than the query.
     FutureSample,
     /// A sample sequence or observation time is older than the accepted stream.

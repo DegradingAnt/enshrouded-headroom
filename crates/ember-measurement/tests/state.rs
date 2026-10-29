@@ -242,15 +242,15 @@ fn world_or_epoch_change_resets_selection_and_blocks_old_context() {
             Error::WorldMismatch
         );
         assert!(session.view(102, owned(), Snap::Off).first().is_none());
-        let origin = GridOrigin::caller_validated(epoch("test:a", 1), point([0.25; 3]), 102);
+        let origin = GridOrigin::caller_validated(epoch("test:a", 1), point([0.25; 3]), 103);
         session
             .observe_aim(
-                102,
+                103,
                 owned(),
                 AimSample {
                     context: new,
                     stamp: Stamp {
-                        observed_at_ms: 102,
+                        observed_at_ms: 103,
                         sequence: 4,
                     },
                     aim: Aim::Hit(point([1.0; 3])),
@@ -259,11 +259,11 @@ fn world_or_epoch_change_resets_selection_and_blocks_old_context() {
             .unwrap();
         assert_eq!(
             session
-                .act(102, owned(), Action::Pick(Snap::SmallGrid(Some(&origin))))
+                .act(103, owned(), Action::Pick(Snap::SmallGrid(Some(&origin))))
                 .error(),
             Some(Error::WorldMismatch)
         );
-        assert!(session.view(102, owned(), Snap::Off).first().is_none());
+        assert!(session.view(103, owned(), Snap::Off).first().is_none());
     }
 }
 
@@ -911,19 +911,19 @@ fn grid_confirmation_barrier_rejects_round_trip_origins_and_accepts_new_calibrat
         session.act(103, owned(), Action::Begin);
         session
             .observe_aim(
-                103,
+                104,
                 owned(),
                 AimSample {
                     context: context.clone(),
                     stamp: Stamp {
-                        observed_at_ms: 103,
+                        observed_at_ms: 104,
                         sequence: 1,
                     },
                     aim: Aim::Hit(point([1.24; 3])),
                 },
             )
             .unwrap();
-        session.act(103, owned(), Action::Pick(Snap::Off));
+        session.act(104, owned(), Action::Pick(Snap::Off));
         session
             .observe_aim(
                 104,
@@ -1191,4 +1191,184 @@ fn world_confirmation_barrier_uses_clock_high_water_after_clock_regression() {
         session.view(103, owned(), Snap::Off).measurement(),
         Some(&before)
     );
+}
+
+#[test]
+fn aim_activation_barrier_rejects_queued_samples_after_world_round_trips() {
+    for context in [epoch("test:a", 1), epoch("test:a", 2)] {
+        for old_aim in [Aim::Hit(point([9.0; 3])), Aim::Miss, Aim::Unavailable] {
+            for observed_at_ms in [101, 103] {
+                let mut session = Session::new(FreshnessPolicy::new(10).unwrap());
+                session
+                    .observe_world(100, world(context.clone(), 100, 1))
+                    .unwrap();
+                session.act(100, owned(), Action::Begin);
+                session
+                    .observe_aim(
+                        100,
+                        owned(),
+                        AimSample {
+                            context: context.clone(),
+                            stamp: Stamp {
+                                observed_at_ms: 100,
+                                sequence: 1,
+                            },
+                            aim: Aim::Hit(point([1.0; 3])),
+                        },
+                    )
+                    .unwrap();
+                session.act(100, owned(), Action::Pick(Snap::Off));
+                session
+                    .observe_world(102, world(epoch("test:b", 1), 102, 2))
+                    .unwrap();
+                session
+                    .observe_world(103, world(context.clone(), 103, 3))
+                    .unwrap();
+                session.act(103, owned(), Action::Begin);
+                // Higher sequence and acceptable age do not prove that the sample
+                // belongs to the newly activated occurrence of this world context.
+                assert!(session
+                    .observe_aim(
+                        104,
+                        owned(),
+                        AimSample {
+                            context: context.clone(),
+                            stamp: Stamp {
+                                observed_at_ms,
+                                sequence: 2
+                            },
+                            aim: old_aim,
+                        }
+                    )
+                    .is_err());
+                let view = session.view(104, owned(), Snap::Off);
+                assert_eq!(view.status(), ViewStatus::AwaitingFirst);
+                assert!(matches!(view.aim_status(), AimStatus::Unavailable(_)));
+                assert!(view.first().is_none());
+                assert!(view.measurement().is_none());
+                assert!(!session
+                    .act(104, owned(), Action::Pick(Snap::Off))
+                    .consumed());
+                session
+                    .observe_aim(
+                        105,
+                        owned(),
+                        AimSample {
+                            context: context.clone(),
+                            stamp: Stamp {
+                                observed_at_ms: 105,
+                                sequence: 3,
+                            },
+                            aim: Aim::Hit(point([2.0; 3])),
+                        },
+                    )
+                    .unwrap();
+                assert!(session
+                    .act(105, owned(), Action::Pick(Snap::Off))
+                    .consumed());
+                session
+                    .observe_aim(
+                        106,
+                        owned(),
+                        AimSample {
+                            context: context.clone(),
+                            stamp: Stamp {
+                                observed_at_ms: 106,
+                                sequence: 4,
+                            },
+                            aim: Aim::Hit(point([4.0; 3])),
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(
+                    session.view(106, owned(), Snap::Off).status(),
+                    ViewStatus::Preview
+                );
+                session
+                    .observe_aim(
+                        107,
+                        owned(),
+                        AimSample {
+                            context: context.clone(),
+                            stamp: Stamp {
+                                observed_at_ms: 107,
+                                sequence: 5,
+                            },
+                            aim: Aim::Miss,
+                        },
+                    )
+                    .unwrap();
+                let view = session.view(107, owned(), Snap::Off);
+                assert_eq!(view.status(), ViewStatus::FirstPinned);
+                assert_eq!(view.aim_status(), AimStatus::Miss);
+                assert_eq!(view.first().unwrap().coordinates(), [2.0; 3]);
+                assert!(view.measurement().is_none());
+                assert_eq!(
+                    session.act(107, owned(), Action::Pick(Snap::Off)).error(),
+                    Some(Error::NoHit)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn aim_activation_barrier_rejects_queued_samples_after_unknown_context_recovery() {
+    for lost in [
+        Unavailable::World,
+        Unavailable::Epoch,
+        Unavailable::NativeBinding,
+    ] {
+        for old_aim in [Aim::Hit(point([9.0; 3])), Aim::Miss, Aim::Unavailable] {
+            let mut session = pair();
+            let before = session
+                .view(101, owned(), Snap::Off)
+                .measurement()
+                .unwrap()
+                .clone();
+            session
+                .observe_world(102, WorldObservation::Unavailable(lost))
+                .unwrap();
+            session
+                .observe_world(103, world(epoch("test:a", 1), 103, 2))
+                .unwrap();
+            session.act(103, owned(), Action::Begin);
+            assert!(session
+                .observe_aim(
+                    104,
+                    owned(),
+                    AimSample {
+                        context: epoch("test:a", 1),
+                        stamp: Stamp {
+                            observed_at_ms: 101,
+                            sequence: 3
+                        },
+                        aim: old_aim,
+                    }
+                )
+                .is_err());
+            let view = session.view(104, owned(), Snap::Off);
+            assert_eq!(view.status(), ViewStatus::Pinned);
+            assert_eq!(view.measurement(), Some(&before));
+            assert!(matches!(view.aim_status(), AimStatus::Unavailable(_)));
+            assert!(!session
+                .act(104, owned(), Action::Pick(Snap::Off))
+                .consumed());
+            aim(&mut session, 105, 4, Aim::Hit(point([9.0; 3])));
+            assert!(session
+                .act(105, owned(), Action::Pick(Snap::Off))
+                .consumed());
+            aim(&mut session, 106, 5, Aim::Hit(point([10.0; 3])));
+            assert_eq!(
+                session.view(106, owned(), Snap::Off).status(),
+                ViewStatus::Preview
+            );
+            aim(&mut session, 107, 6, Aim::Miss);
+            let view = session.view(107, owned(), Snap::Off);
+            assert_eq!(view.status(), ViewStatus::FirstPinned);
+            assert_eq!(view.aim_status(), AimStatus::Miss);
+            assert_eq!(view.first().unwrap().coordinates(), [9.0; 3]);
+            assert!(view.measurement().is_none());
+        }
+    }
 }

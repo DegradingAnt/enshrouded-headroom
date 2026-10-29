@@ -211,10 +211,10 @@ impl View {
     }
 }
 
-/// Required ordering of an origin confirmation relative to this context activation.
+/// Required ordering of aim observations and calibration for this context activation.
 #[derive(Clone, Copy, Debug)]
 enum ConfirmationBarrier {
-    /// First activation allows calibration confirmed in the same millisecond.
+    /// First activation allows observations confirmed in the same millisecond.
     AtOrAfter(u64),
     /// Re-activation requires a later millisecond to establish event ordering.
     After(u64),
@@ -222,10 +222,10 @@ enum ConfirmationBarrier {
 
 impl ConfirmationBarrier {
     /// Equal timestamps cannot prove that reconfirmation followed re-activation.
-    fn accepts(self, confirmed_at_ms: u64) -> bool {
+    fn accepts(self, observed_at_ms: u64) -> bool {
         match self {
-            Self::AtOrAfter(activation) => confirmed_at_ms >= activation,
-            Self::After(activation) => confirmed_at_ms > activation,
+            Self::AtOrAfter(activation) => observed_at_ms >= activation,
+            Self::After(activation) => observed_at_ms > activation,
         }
     }
 }
@@ -248,8 +248,8 @@ pub struct Session {
     world_error: Option<Error>,
     /// A world observation must have been made strictly after this knowledge loss.
     world_confirm_after_ms: Option<u64>,
-    /// An origin must be newly confirmed for the current activation, not just its ID.
-    grid_confirmation: Option<ConfirmationBarrier>,
+    /// Aim and calibration must be confirmed for this activation, not just its ID.
+    activation_confirmation: Option<ConfirmationBarrier>,
     /// High-water mark of accepted world observations across world changes.
     world_stamp: Option<Stamp>,
     /// High-water mark of accepted aim observations across world changes.
@@ -281,7 +281,7 @@ impl Session {
             known_context: None,
             world_error: Some(Error::NativeUnavailable),
             world_confirm_after_ms: None,
-            grid_confirmation: None,
+            activation_confirmation: None,
             world_stamp: None,
             aim_stamp: None,
             aim: None,
@@ -324,7 +324,7 @@ impl Session {
             self.pins = (None, None);
             self.clear_aim(Error::NoAim);
             self.mode = Mode::Inactive;
-            self.grid_confirmation = Some(ConfirmationBarrier::After(now_ms));
+            self.activation_confirmation = Some(ConfirmationBarrier::After(now_ms));
         }
         self.known_context = Some(sample.context.clone());
         self.world_stamp = Some(sample.stamp);
@@ -344,9 +344,9 @@ impl Session {
             return Err(error);
         }
         if self.world_confirm_after_ms.is_some() {
-            self.grid_confirmation = Some(ConfirmationBarrier::After(now_ms));
-        } else if self.grid_confirmation.is_none() {
-            self.grid_confirmation = Some(ConfirmationBarrier::AtOrAfter(now_ms));
+            self.activation_confirmation = Some(ConfirmationBarrier::After(now_ms));
+        } else if self.activation_confirmation.is_none() {
+            self.activation_confirmation = Some(ConfirmationBarrier::AtOrAfter(now_ms));
         }
         self.world = Some(sample);
         self.world_error = None;
@@ -355,6 +355,7 @@ impl Session {
     }
 
     /// Accept a current hit/miss only while input and measurement mode are permitted.
+    /// Hits, misses and absence must all be observed after context re-activation.
     /// A rejected observation clears the old transient candidate, never accepted pins.
     pub fn observe_aim(
         &mut self,
@@ -373,7 +374,8 @@ impl Session {
                 self.policy,
                 Error::StaleAim,
             )?;
-            ordered(self.aim_stamp, sample.stamp)
+            ordered(self.aim_stamp, sample.stamp)?;
+            self.confirm_activation(sample.stamp.observed_at_ms, Error::AimConfirmationRequired)
         });
         if let Err(error) = checked {
             self.clear_aim(error);
@@ -555,14 +557,21 @@ impl Session {
                 let origin = origin.ok_or(Error::GridUnavailable)?;
                 let (point, grid_until) =
                     snap_with_deadline(point, Some(origin), &world.context, now_ms, self.policy)?;
-                if !self
-                    .grid_confirmation
-                    .is_some_and(|barrier| barrier.accepts(origin.confirmed_at_ms()))
-                {
-                    return Err(Error::GridConfirmationRequired);
-                }
+                self.confirm_activation(origin.confirmed_at_ms(), Error::GridConfirmationRequired)?;
                 Ok((point, until.min(grid_until)))
             }
+        }
+    }
+
+    /// Share one activation boundary for queued aim samples and origin calibration.
+    fn confirm_activation(&self, observed_at_ms: u64, unavailable: Error) -> Result<(), Error> {
+        if self
+            .activation_confirmation
+            .is_some_and(|barrier| barrier.accepts(observed_at_ms))
+        {
+            Ok(())
+        } else {
+            Err(unavailable)
         }
     }
 
