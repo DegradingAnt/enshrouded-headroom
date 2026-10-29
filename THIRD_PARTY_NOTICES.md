@@ -4,7 +4,16 @@ The release bundles Ultimate ASI Loader v10.0.0 and statically links Rust
 packages, including the MinHook C library and HDE disassembler.
 
 The workspace-owned `emberkit` library uses the same MIT licence as Headroom.
-The resolved dependency set is shared by both workspace members.
+The resolved dependency set is shared by the workspace crates.
+
+## Guide file watcher
+
+The optional `ember-guide-feed` workspace library uses `notify` 8.2.1 to watch
+source directories. It does not add a watcher to the Headroom plugin.
+The package is pinned in `Cargo.lock` and declares CC0-1.0.
+Source: [notify 8.2.1](https://github.com/notify-rs/notify/tree/notify-8.2.1/notify).
+The full [upstream CC0 dedication](https://github.com/notify-rs/notify/blob/notify-8.2.1/notify/LICENSE-CC0)
+applies. `notify-types` 2.2.0 is MIT OR Apache-2.0.
 
 ## MinHook and HDE
 
