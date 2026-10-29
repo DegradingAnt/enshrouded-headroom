@@ -481,7 +481,9 @@ A/B protocol for the author, after a restart for each variant:
 - `SunResolution = game | 4096`
 - Any invalid or out-of-range shadow value warns once and uses `game`; no clamping.
 
-`[Debug]` (debug only, needs `LogLevel = debug`; not in the default file; at any other log level the mod ignores these keys):
+`[Debug]` (debug only, needs `LogLevel = debug`; only FrameStats ships in the default file; at any other log level the mod ignores these keys):
+
+- `FrameStats = 0 | 1` (default `0`). With `1` and `LogLevel=debug`, start the existing worker in statistics-only mode even when `TargetFps=0`. That mode reads the existing present ring but never enters GPU/display queries, governor planning or native knob publication. An active governor already emits debug frame reports without this key. Changes require a restart. The four older debug controls remain omitted from the shipped file.
 - `ScatterProbe = 0 | 1` (default 0): enable the publish-only hook and its 500 ms sampler thread, and log the scatter counters (7.2a). Until r_max is measured, this key with `LogLevel = debug` is the only reason to install them.
 - `ForceStepObjectDistance`, `ForceStepScatterDistance`, `ForceStepTerrainDistance = 0..=4` (default: absent, the knob is not held): hold that knob at a fixed step for testing (pre-flight ruling for Task 17). A whole number outside 0..=4 is clamped with a warning. Other text warns and counts as absent.
 
@@ -618,3 +620,9 @@ In-game checks on the author's machine:
 6. Spec v2: approved.
 
 With a nonzero shadow texture reservation, cards below the 10 GiB threshold retain their selected stock texture tier as the maximum base and subtract the requested reserve from that row. The native write targets that selected budget field, not the unused top row. At 8 GiB the stock field is `0x5f400000` bytes. The whole 80-byte vanilla table is rechecked before the selected-field write. Zero shadow reservation keeps the original top-row-only policy.
+
+### Frame-pacing log statistics (W29)
+
+The governor's 30-second info status keeps its existing fields and appends `1% low N fps, hitches N`. The additional statistics cover frame intervals whose actual end timestamps are in the last two seconds, not the entire 30-second reporting period. At debug level the worker also emits `frames: p50 X ms, p99 X ms, max X ms, hitches N` every two seconds. Fewer than two positive samples gives explicit no data. Statistics-only startup also reports that it performs no governor control; a host with no presents cannot supply statistics.
+
+The pure module accepts microsecond intervals and caller-owned bounded scratch. Percentiles use nearest rank. Average FPS is one million divided by mean microseconds. The 1% low uses the mean duration of the slowest ceil(n/100) samples before taking its reciprocal; it is not the mean of individual FPS reciprocals. A hitch is strictly longer than both twice p50 and 25,000 microseconds. Non-positive intervals are discarded by the ring reader; the pure module ignores zero. Conversion rounds positive present intervals to microseconds, with a minimum of one microsecond. Sampling and calculation allocate no memory after worker initialization; formatting allocates only when emitting a line. The existing 4096-slot ring bounds retained samples; lapped data is dropped without inventing an interval. This reports CPU-observed present intervals and makes no GPU-timing claim. No present-path or policy change is made.
