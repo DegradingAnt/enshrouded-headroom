@@ -1474,6 +1474,7 @@ mod reflex_driver {
                         let mut present = false;
                         let mut address_preserved = false;
                         let mut demote_seen = 0;
+                        let mut maintenance_seen = 0;
                         let mut tags = Vec::new();
                         let mut node = info.p_next.cast::<vk::BaseInStructure<'_>>();
                         while !node.is_null() {
@@ -1488,15 +1489,25 @@ mod reflex_driver {
                                     demote.shader_demote_to_helper_invocation,
                                     vk::Bool32::from(DEMOTE_CASE.load(Ordering::Relaxed) == 2)
                                 );
-                                assert!(!demote.p_next.is_null());
-                                let tail = &*demote.p_next
-                                    .cast::<vk::PhysicalDeviceDynamicRenderingFeatures<'_>>();
-                                assert_eq!(
-                                    tail.s_type.as_raw(),
-                                    vk::StructureType::PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES.as_raw()
-                                );
-                                assert_eq!(tail.dynamic_rendering, vk::TRUE);
                                 demote_seen += 1;
+                            }
+                            if MAINTENANCE_CASE.load(Ordering::Relaxed) != 0
+                                && (*node).s_type == vk::StructureType::PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT
+                            {
+                                let maintenance = &*node.cast::<vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT<'_>>();
+                                assert_eq!(maintenance.swapchain_maintenance1, vk::Bool32::from(MAINTENANCE_CASE.load(Ordering::Relaxed) == 2));
+                                maintenance_seen += 1;
+                            }
+                            if DEMOTE_CASE.load(Ordering::Relaxed) != 0
+                                && (*node).s_type
+                                    == vk::StructureType::PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES
+                            {
+                                assert_eq!(
+                                    (*node
+                                        .cast::<vk::PhysicalDeviceDynamicRenderingFeatures<'_>>())
+                                    .dynamic_rendering,
+                                    vk::TRUE
+                                );
                             }
                             if (*node).s_type
                                 == vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_2_FEATURES
@@ -1524,14 +1535,28 @@ mod reflex_driver {
                             node = (*node).p_next;
                         }
                         if DEMOTE_CASE.load(Ordering::Relaxed) != 0 {
-                            assert_eq!(tags, [
+                            let mut expected = vec![
                                 vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
                                 vk::StructureType::PHYSICAL_DEVICE_SHADER_DEMOTE_TO_HELPER_INVOCATION_FEATURES,
+                            ];
+                            if MAINTENANCE_CASE.load(Ordering::Relaxed) != 0 {
+                                expected.push(vk::StructureType::PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT);
+                            }
+                            expected.extend([
                                 vk::StructureType::PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES,
                                 vk::StructureType::PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR,
-                            ].map(|tag| tag.as_raw()));
+                            ]);
+                            assert_eq!(
+                                tags,
+                                expected.iter().map(|tag| tag.as_raw()).collect::<Vec<_>>()
+                            );
                             assert_eq!(demote_seen, 1);
+                            assert_eq!(
+                                maintenance_seen,
+                                usize::from(MAINTENANCE_CASE.load(Ordering::Relaxed) != 0)
+                            );
                             DEMOTE_SEEN.fetch_add(demote_seen, Ordering::Relaxed);
+                            MAINTENANCE_SEEN.fetch_add(maintenance_seen, Ordering::Relaxed);
                         }
                         if low
                             && timeline
@@ -1559,7 +1584,12 @@ mod reflex_driver {
     /// The actual fake native create saw exactly one owned demote node and its following tail.
     static DEMOTE_SEEN: AtomicUsize = AtomicUsize::new(0);
 
-    /// Enable the complete fake Reflex table for present and shader-demote child cases.
+    /// Zero leaves W44 cases unchanged; one/two require an unchanged false/true maintenance bit.
+    static MAINTENANCE_CASE: AtomicUsize = AtomicUsize::new(0);
+    /// Count the maintenance node received by the actual fake native create.
+    static MAINTENANCE_SEEN: AtomicUsize = AtomicUsize::new(0);
+
+    /// Enable the complete fake Reflex table for present and owned-feature child cases.
     static PRESENT_CASE: AtomicUsize = AtomicUsize::new(0);
     /// Inject native failures without unwinding across the ABI.
     static PRESENT_RESULT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
@@ -2009,15 +2039,27 @@ mod reflex_driver {
         reflex::init(config.general.reflex);
         DEMOTE_CASE.store(
             match case {
-                "shader-demote-false" => 1,
+                "shader-demote-false"
+                | "swapchain-maintenance-false"
+                | "swapchain-maintenance-true" => 1,
                 "shader-demote-true" => 2,
+                _ => 0,
+            },
+            Ordering::Relaxed,
+        );
+        let maintenance_case = case.starts_with("swapchain-maintenance-");
+        let owned_feature_case = case.starts_with("shader-demote-") || maintenance_case;
+        MAINTENANCE_CASE.store(
+            match case {
+                "swapchain-maintenance-false" => 1,
+                "swapchain-maintenance-true" => 2,
                 _ => 0,
             },
             Ordering::Relaxed,
         );
         CAPS_CASE.store(usize::from(case.starts_with("caps-")), Ordering::Relaxed);
         PRESENT_CASE.store(
-            usize::from(case.starts_with("present-") || case.starts_with("shader-demote-")),
+            usize::from(case.starts_with("present-") || owned_feature_case),
             Ordering::Relaxed,
         );
         REAL_GIPA.store(gipa as *const () as usize, Ordering::Release);
@@ -2134,9 +2176,16 @@ mod reflex_driver {
             vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
         let mut demote = vk::PhysicalDeviceShaderDemoteToHelperInvocationFeatures::default()
             .shader_demote_to_helper_invocation(case == "shader-demote-true");
-        demote.p_next =
+        let mut maintenance = vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT::default()
+            .swapchain_maintenance1(case == "swapchain-maintenance-true");
+        maintenance.p_next =
             (&mut demote_tail as *mut vk::PhysicalDeviceDynamicRenderingFeatures<'_>).cast();
-        v12.p_next = if case.starts_with("shader-demote-") {
+        demote.p_next = if maintenance_case {
+            (&mut maintenance as *mut vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT<'_>).cast()
+        } else {
+            (&mut demote_tail as *mut vk::PhysicalDeviceDynamicRenderingFeatures<'_>).cast()
+        };
+        v12.p_next = if owned_feature_case {
             (&mut demote as *mut vk::PhysicalDeviceShaderDemoteToHelperInvocationFeatures<'_>)
                 .cast()
         } else {
@@ -2144,6 +2193,7 @@ mod reflex_driver {
         };
         let original_next = v12.p_next;
         let original_demote_next = demote.p_next;
+        let original_maintenance_next = maintenance.p_next;
         let names = [c"VK_KHR_swapchain".as_ptr()];
         let mut info = vk::DeviceCreateInfo::default().enabled_extension_names(&names);
         let opaque = vk::BaseInStructure {
@@ -2182,12 +2232,21 @@ mod reflex_driver {
         assert_eq!(v12.p_next, original_next);
         assert_eq!(v12.timeline_semaphore, vk::FALSE);
         assert_eq!(v12.buffer_device_address, vk::TRUE);
-        if case.starts_with("shader-demote-") {
+        if owned_feature_case {
             assert_eq!(device.as_raw(), DEVICE);
             assert_eq!(ATTEMPTS.load(Ordering::Relaxed), 1);
             assert_eq!(CHANGED_OK.load(Ordering::Relaxed), 1);
             assert_eq!(RETRY_OK.load(Ordering::Relaxed), 0);
             assert_eq!(DEMOTE_SEEN.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                MAINTENANCE_SEEN.load(Ordering::Relaxed),
+                usize::from(maintenance_case)
+            );
+            assert_eq!(
+                maintenance.swapchain_maintenance1,
+                vk::Bool32::from(case == "swapchain-maintenance-true")
+            );
+            assert_eq!(maintenance.p_next, original_maintenance_next);
             assert_eq!(
                 demote.shader_demote_to_helper_invocation,
                 vk::Bool32::from(case == "shader-demote-true")
@@ -2501,19 +2560,24 @@ mod reflex_driver {
             _ => unreachable!(),
         }
     }
-    /// The real Reflex create path preserves both demote values and calls the native driver once.
+    /// Shared W44/W46 cases preserve requested feature values and call the native driver once.
     #[test]
-    fn shader_demote_feature_survives_native_reflex_device_creation() {
+    fn single_bool_features_survive_native_reflex_device_creation() {
         const NAME: &str =
-            "reflex_driver::shader_demote_feature_survives_native_reflex_device_creation";
-        if let Ok(case) = std::env::var("W44_SHADER_DEMOTE_CHILD") {
+            "reflex_driver::single_bool_features_survive_native_reflex_device_creation";
+        if let Ok(case) = std::env::var("OWNED_FEATURE_CHILD") {
             child(&case);
             return;
         }
-        for case in ["shader-demote-false", "shader-demote-true"] {
+        for case in [
+            "shader-demote-false",
+            "shader-demote-true",
+            "swapchain-maintenance-false",
+            "swapchain-maintenance-true",
+        ] {
             let output = Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", NAME, "--nocapture"])
-                .env("W44_SHADER_DEMOTE_CHILD", case)
+                .env("OWNED_FEATURE_CHILD", case)
                 .output()
                 .unwrap();
             assert!(
@@ -2522,6 +2586,7 @@ mod reflex_driver {
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
+            println!("owned feature case passed: {case}");
         }
     }
 
