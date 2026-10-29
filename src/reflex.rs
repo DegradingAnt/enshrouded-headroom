@@ -316,6 +316,137 @@ mod device_wiring_tests {
             (&unknown as *const vk::BaseInStructure<'_>).cast()
         );
     }
+    /// The core/EXT alias is copied with its requested bit, owned links and following node.
+    #[test]
+    fn shader_demote_copy_preserves_both_values_alias_and_tail() {
+        assert_eq!(
+            vk::StructureType::PHYSICAL_DEVICE_SHADER_DEMOTE_TO_HELPER_INVOCATION_FEATURES.as_raw(),
+            vk::StructureType::PHYSICAL_DEVICE_SHADER_DEMOTE_TO_HELPER_INVOCATION_FEATURES_EXT
+                .as_raw(),
+        );
+        for enabled in [false, true] {
+            let mut tail =
+                vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
+            let mut demote = vk::PhysicalDeviceShaderDemoteToHelperInvocationFeaturesEXT::default()
+                .shader_demote_to_helper_invocation(enabled);
+            demote.p_next =
+                (&mut tail as *mut vk::PhysicalDeviceDynamicRenderingFeatures<'_>).cast();
+            let mut head =
+                vk::PhysicalDeviceVulkan12Features::default().buffer_device_address(true);
+            head.p_next = (&mut demote
+                as *mut vk::PhysicalDeviceShaderDemoteToHelperInvocationFeaturesEXT<'_>)
+                .cast();
+            let names = [c"VK_KHR_swapchain".as_ptr()];
+            let info = vk::DeviceCreateInfo {
+                p_next: (&head as *const vk::PhysicalDeviceVulkan12Features<'_>).cast(),
+                ..vk::DeviceCreateInfo::default().enabled_extension_names(&names)
+            };
+            let head_next = head.p_next;
+            let demote_next = demote.p_next;
+            // SAFETY: all initialized typed nodes and the extension array stay live through the copy.
+            let mut copy =
+                unsafe { DeviceCopy::copy(&info) }.unwrap_or_else(|reason| panic!("{reason:?}"));
+            let owned = copy.info(&info);
+            assert_ne!(owned.p_next, info.p_next);
+            // SAFETY: the owned chain retains the same three known layouts for this synchronous read.
+            unsafe {
+                let first = &*owned
+                    .p_next
+                    .cast::<vk::PhysicalDeviceVulkan12Features<'_>>();
+                assert_eq!(
+                    first.s_type.as_raw(),
+                    vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_2_FEATURES.as_raw()
+                );
+                assert_eq!(first.timeline_semaphore, vk::FALSE);
+                assert_eq!(first.buffer_device_address, vk::TRUE);
+                assert_ne!(first.p_next, head_next);
+                let second = &*first
+                    .p_next
+                    .cast::<vk::PhysicalDeviceShaderDemoteToHelperInvocationFeatures<'_>>();
+                assert_eq!(
+                    second.s_type.as_raw(),
+                    vk::StructureType::PHYSICAL_DEVICE_SHADER_DEMOTE_TO_HELPER_INVOCATION_FEATURES
+                        .as_raw()
+                );
+                assert_eq!(
+                    second.shader_demote_to_helper_invocation,
+                    vk::Bool32::from(enabled)
+                );
+                assert_ne!(second.p_next, demote_next);
+                let third = &*second
+                    .p_next
+                    .cast::<vk::PhysicalDeviceDynamicRenderingFeatures<'_>>();
+                assert_eq!(
+                    third.s_type.as_raw(),
+                    vk::StructureType::PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES.as_raw()
+                );
+                assert_eq!(third.dynamic_rendering, vk::TRUE);
+                assert!(third.p_next.is_null());
+            }
+            assert_eq!(
+                info.p_next,
+                (&head as *const vk::PhysicalDeviceVulkan12Features<'_>).cast()
+            );
+            assert_eq!(info.enabled_extension_count, 1);
+            assert_eq!(info.pp_enabled_extension_names, names.as_ptr());
+            assert_eq!(head.p_next, head_next);
+            assert_eq!(head.timeline_semaphore, vk::FALSE);
+            assert_eq!(head.buffer_device_address, vk::TRUE);
+            assert_eq!(demote.p_next, demote_next);
+            assert_eq!(
+                demote.shader_demote_to_helper_invocation,
+                vk::Bool32::from(enabled)
+            );
+            assert!(tail.p_next.is_null());
+            assert_eq!(tail.dynamic_rendering, vk::TRUE);
+        }
+    }
+
+    /// Learning the demote layout never admits an unknown payload after it.
+    #[test]
+    fn shader_demote_unknown_tail_still_refuses_at_its_original_index() {
+        let unknown = vk::BaseInStructure {
+            s_type: vk::StructureType::APPLICATION_INFO,
+            ..Default::default()
+        };
+        let mut demote = vk::PhysicalDeviceShaderDemoteToHelperInvocationFeatures::default()
+            .shader_demote_to_helper_invocation(true);
+        demote.p_next = (&unknown as *const vk::BaseInStructure<'_>)
+            .cast_mut()
+            .cast();
+        let head = vk::PhysicalDeviceVulkan11Features {
+            p_next: (&mut demote
+                as *mut vk::PhysicalDeviceShaderDemoteToHelperInvocationFeatures<'_>)
+                .cast(),
+            ..Default::default()
+        };
+        let info = vk::DeviceCreateInfo {
+            p_next: (&head as *const vk::PhysicalDeviceVulkan11Features<'_>).cast(),
+            ..Default::default()
+        };
+        let head_next = head.p_next;
+        let demote_next = demote.p_next;
+        // SAFETY: recognized layouts are complete; the unknown node supplies only its readable header.
+        let reason = match unsafe { DeviceCopy::copy(&info) } {
+            Err(reason) => reason,
+            Ok(_) => panic!("unknown tail must not be copied"),
+        };
+        assert_eq!(
+            reason,
+            DeviceRefusal::UnknownStructure {
+                s_type: 0,
+                index: 2
+            }
+        );
+        assert_eq!(
+            info.p_next,
+            (&head as *const vk::PhysicalDeviceVulkan11Features<'_>).cast()
+        );
+        assert_eq!(head.p_next, head_next);
+        assert_eq!(demote.p_next, demote_next);
+        assert_eq!(demote.shader_demote_to_helper_invocation, vk::TRUE);
+        assert!(unknown.p_next.is_null());
+    }
     /// Exact first refusals distinguish capability bits and supported chain constraints.
     #[test]
     fn diagnostic_refusals_keep_the_first_reason() {
@@ -635,6 +766,7 @@ chain_nodes! {
     Sync2: vk::PhysicalDeviceSynchronization2Features<'static> => vk::StructureType::PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES,
     AntiLag: crate::vk::types::PhysicalDeviceAntiLagFeaturesAMD => crate::vk::types::PHYSICAL_DEVICE_ANTI_LAG_FEATURES_AMD,
     Dynamic: vk::PhysicalDeviceDynamicRenderingFeatures<'static> => vk::StructureType::PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES,
+    ShaderDemote: vk::PhysicalDeviceShaderDemoteToHelperInvocationFeatures<'static> => vk::StructureType::PHYSICAL_DEVICE_SHADER_DEMOTE_TO_HELPER_INVOCATION_FEATURES,
 }
 
 /// Owns extensions and typed copies. Borrowed child arrays remain owned by the original call.
