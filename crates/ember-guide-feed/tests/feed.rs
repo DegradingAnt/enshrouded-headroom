@@ -72,7 +72,15 @@ fn config(limits: Limits) -> Config {
 }
 /// Wait for a semantic publication rather than assuming native event timing.
 fn until(feed: &GuideFeed, predicate: impl Fn(&SourceSnapshot) -> bool) -> Arc<SourceSnapshot> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    until_for(feed, Duration::from_secs(5), predicate)
+}
+/// Wait against a chosen timer so a native-event assertion excludes recovery polling.
+fn until_for(
+    feed: &GuideFeed,
+    timeout: Duration,
+    predicate: impl Fn(&SourceSnapshot) -> bool,
+) -> Arc<SourceSnapshot> {
+    let deadline = Instant::now() + timeout;
     loop {
         let value = feed.snapshot();
         if predicate(&value) {
@@ -502,4 +510,51 @@ fn a_resumed_model_cannot_bypass_tightened_object_limits_on_an_unchanged_highcro
         result.is_err(),
         "an accepted seed must satisfy the configured resource policy"
     );
+}
+
+#[test]
+fn deleting_an_active_parent_recreates_its_native_watch_before_reporting_current() {
+    let fixture = Fixture::new();
+    let parent = fixture.0.join("active-parent");
+    let path = parent.join("guide.json");
+    fs::create_dir(&parent).unwrap();
+    fs::write(&path, generic()).unwrap();
+    let mut feed = GuideFeed::start(
+        Source {
+            path: path.clone(),
+            format: Format::Interchange,
+        },
+        Config {
+            rescan: Duration::from_secs(6),
+            ..config(Limits::default())
+        },
+        None,
+    )
+    .unwrap();
+    until(&feed, |value| value.current().is_some());
+
+    // This removes an already registered directory, not a missing initial path.
+    fs::remove_file(&path).unwrap();
+    fs::remove_dir(&parent).unwrap();
+    until_for(&feed, Duration::from_secs(9), |value| {
+        rejected(value, ErrorKind::Io)
+    });
+    fs::create_dir(&parent).unwrap();
+    fs::write(&path, revision(2, "Recreated parent")).unwrap();
+    until_for(&feed, Duration::from_secs(9), |value| {
+        value
+            .current()
+            .is_some_and(|model| model.model().revision().sequence == 2)
+    });
+
+    // Drain prior work. The next recovery scan is six seconds away, so a
+    // later revision arriving within two seconds requires the restored watch.
+    thread::sleep(Duration::from_millis(250));
+    fs::write(&path, revision(3, "Native events after recreation")).unwrap();
+    until_for(&feed, Duration::from_secs(2), |value| {
+        value
+            .current()
+            .is_some_and(|model| model.model().revision().sequence == 3)
+    });
+    feed.stop().unwrap();
 }

@@ -10,6 +10,13 @@ Session polling. A fixed debounce coalesces writes without extending forever.
 Recovery reads also run at a bounded cadence, so missed events and temporary
 missing files can recover. Parent-watch errors are retried on that worker.
 Access events are ignored to prevent source reads from triggering themselves.
+Before each bounded source check, an existing watcher unregisters and registers
+its parent again through notify. Windows notify 8 can silently detach a deleted
+parent without an error callback, so owning a watcher alone is insufficient.
+An already absent registration is expected; other renewal failures deny Current
+and are retried. Successful registration is required before a check can become
+Current, including after an active parent is deleted and recreated. The same
+backend is reused; no second watcher/backend or unbounded retry loop is added.
 The application supplies a trusted local regular file; filesystem I/O can block.
 
 Each publication is an immutable Arc. `SourceSnapshot::Current` is successful
@@ -97,5 +104,6 @@ cargo fmt -p ember-guide-feed --check
 Tests use private temporary files and actual upstream notify, covering initial
 loading, same-version byte edits, retained selection/fidelity, malformed and
 oversized input, delete/recreate, atomic replacement and rename, burst writes,
-identity rejection/recovery, missing-parent recovery and stop/frozen output.
+identity rejection/recovery, missing-parent recovery, active-parent deletion/
+recreation followed by a native-event-only edit, and stop/frozen output.
 The source guide, game, server, site and renderer are not modified or exercised.

@@ -474,6 +474,21 @@ fn watch_parent(
     Some(watcher)
 }
 
+/// Renew the upstream registration even when no error callback reported detachment.
+///
+/// Notify 8 on Windows can silently remove a deleted parent. Unwatch first:
+/// its watch implementation does not close an existing registration on replace.
+fn reattach_parent(watcher: &mut RecommendedWatcher, path: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    match watcher.unwatch(parent) {
+        Ok(()) => {}
+        Err(error) if matches!(error.kind, notify::ErrorKind::WatchNotFound) => {}
+        Err(_) => return false,
+    }
+    watcher.watch(parent, RecursiveMode::NonRecursive).is_ok()
+}
 /// Run bounded checks and retry failed watches on the same ordinary worker.
 fn run(
     source: Source,
@@ -490,7 +505,13 @@ fn run(
         if signals.watch_failed.swap(false, Ordering::AcqRel) {
             watcher = None;
         }
-        if watcher.is_none() {
+        if let Some(active) = watcher.as_mut() {
+            // Some only owns a backend; successful registration is required
+            // before this check can publish Current after directory recreation.
+            if !reattach_parent(active, &source.path) {
+                watcher = None;
+            }
+        } else {
             watcher = watch_parent(&source.path, &signals, &wake);
         }
         signals.dirty.store(false, Ordering::Release);
