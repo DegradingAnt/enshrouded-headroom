@@ -303,13 +303,186 @@ mod device_wiring_tests {
             ],
         };
         // SAFETY: a live unknown header; the function must read only that common header then refuse.
-        assert!(unsafe { DeviceCopy::new(&info, &caps) }.is_none());
+        assert!(matches!(
+            unsafe { DeviceCopy::new(&info, &caps) },
+            Err(DeviceRefusal::UnknownStructure {
+                s_type: 0,
+                index: 0
+            })
+        ));
         assert!(unknown.p_next.is_null());
         assert_eq!(
             info.p_next,
             (&unknown as *const vk::BaseInStructure<'_>).cast()
         );
     }
+    /// Exact first refusals distinguish capability bits and supported chain constraints.
+    #[test]
+    fn diagnostic_refusals_keep_the_first_reason() {
+        let mut caps = Capabilities {
+            vendor: 0x10de,
+            timeline: false,
+            present_id: true,
+            extensions: vec![
+                c"VK_NV_low_latency2".to_owned(),
+                c"VK_KHR_timeline_semaphore".to_owned(),
+                c"VK_KHR_present_id".to_owned(),
+            ],
+        };
+        let names = [c"VK_KHR_swapchain".as_ptr()];
+        let mut info = vk::DeviceCreateInfo::default().enabled_extension_names(&names);
+        // SAFETY: all fixtures retain their initialized native input and typed nodes.
+        unsafe {
+            assert!(matches!(
+                DeviceCopy::new(&info, &caps),
+                Err(DeviceRefusal::TimelineFeature)
+            ));
+            caps.timeline = true;
+            assert!(matches!(
+                DeviceCopy::new(&vk::DeviceCreateInfo::default(), &caps),
+                Err(DeviceRefusal::MissingSwapchain)
+            ));
+            caps.present_id = false;
+            assert!(matches!(
+                DeviceCopy::new(&info, &caps),
+                Err(DeviceRefusal::MissingPresentId)
+            ));
+            caps.present_id = true;
+            let mut timeline = vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
+            let v12 = vk::PhysicalDeviceVulkan12Features {
+                p_next: (&mut timeline as *mut vk::PhysicalDeviceTimelineSemaphoreFeatures<'_>)
+                    .cast(),
+                ..Default::default()
+            };
+            info.p_next = (&v12 as *const vk::PhysicalDeviceVulkan12Features<'_>).cast();
+            assert!(matches!(
+                DeviceCopy::new(&info, &caps),
+                Err(DeviceRefusal::DuplicateTimeline)
+            ));
+            assert_eq!(v12.timeline_semaphore, vk::FALSE);
+            let devices = [
+                vk::PhysicalDevice::from_raw(1),
+                vk::PhysicalDevice::from_raw(2),
+            ];
+            let group = vk::DeviceGroupDeviceCreateInfo::default().physical_devices(&devices);
+            info.p_next = (&group as *const vk::DeviceGroupDeviceCreateInfo<'_>).cast();
+            assert!(matches!(
+                DeviceCopy::new(&info, &caps),
+                Err(DeviceRefusal::DeviceGroup { count: 2 })
+            ));
+        }
+    }
+    /// Unknown payloads stay opaque at a nonzero index; cycle and length failures are distinct.
+    #[test]
+    fn diagnostic_chain_reasons_use_only_validated_headers() {
+        let unknown = vk::BaseInStructure {
+            s_type: vk::StructureType::APPLICATION_INFO,
+            ..Default::default()
+        };
+        let mut head = vk::PhysicalDeviceVulkan11Features {
+            p_next: (&unknown as *const vk::BaseInStructure<'_>)
+                .cast_mut()
+                .cast(),
+            ..Default::default()
+        };
+        let mut info = vk::DeviceCreateInfo {
+            p_next: (&head as *const vk::PhysicalDeviceVulkan11Features<'_>).cast(),
+            ..Default::default()
+        };
+        // SAFETY: all common headers and complete recognized nodes stay live; no native call is made.
+        assert!(matches!(
+            unsafe { DeviceCopy::copy(&info) },
+            Err(DeviceRefusal::UnknownStructure {
+                s_type: 0,
+                index: 1
+            })
+        ));
+        assert!(unknown.p_next.is_null());
+        head.p_next = (&mut head as *mut vk::PhysicalDeviceVulkan11Features<'_>).cast();
+        // SAFETY: the single recognized node is live; cycle detection stops before a second copy.
+        assert!(matches!(
+            unsafe { DeviceCopy::copy(&info) },
+            Err(DeviceRefusal::ChainCycle { index: 1 })
+        ));
+        assert_eq!(
+            head.p_next,
+            (&head as *const vk::PhysicalDeviceVulkan11Features<'_>)
+                .cast_mut()
+                .cast()
+        );
+        let mut nodes = vec![vk::PhysicalDeviceVulkan11Features::default(); 65];
+        for index in 0..64 {
+            nodes[index].p_next =
+                (&mut nodes[index + 1] as *mut vk::PhysicalDeviceVulkan11Features<'_>).cast();
+        }
+        info.p_next = nodes.as_ptr().cast();
+        // SAFETY: sixty-five complete typed nodes remain live; the original sixty-four-node bound refuses.
+        assert!(matches!(
+            unsafe { DeviceCopy::copy(&info) },
+            Err(DeviceRefusal::ChainLimit)
+        ));
+        assert!(nodes[64].p_next.is_null());
+    }
+
+    /// Listed-extension and present-ID2 refusals retain their original admission requirements.
+    #[test]
+    fn diagnostic_extension_reasons_do_not_broaden_admission() {
+        let mut caps = Capabilities {
+            vendor: 0x1002,
+            timeline: true,
+            present_id: true,
+            extensions: Vec::new(),
+        };
+        let names = [
+            c"VK_KHR_swapchain".as_ptr(),
+            crate::vk::types::KHR_PRESENT_ID_2_NAME.as_ptr(),
+        ];
+        let mut info = vk::DeviceCreateInfo::default().enabled_extension_names(&names);
+        // SAFETY: initialized create info and typed feature node remain live through each pure plan.
+        unsafe {
+            assert!(matches!(
+                DeviceCopy::new(&info, &caps),
+                Err(DeviceRefusal::Vendor)
+            ));
+            caps.vendor = 0x10de;
+            assert!(matches!(
+                DeviceCopy::new(&info, &caps),
+                Err(DeviceRefusal::MissingLowLatency)
+            ));
+            caps.extensions.push(c"VK_NV_low_latency2".to_owned());
+            assert!(matches!(
+                DeviceCopy::new(&info, &caps),
+                Err(DeviceRefusal::MissingTimelineExtension)
+            ));
+            caps.extensions
+                .push(c"VK_KHR_timeline_semaphore".to_owned());
+            let id2 = crate::vk::types::PhysicalDevicePresentId2FeaturesKHR {
+                s_type: crate::vk::types::STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_2_FEATURES_KHR,
+                p_next: std::ptr::null_mut(),
+                present_id2: vk::TRUE,
+            };
+            info.p_next =
+                (&id2 as *const crate::vk::types::PhysicalDevicePresentId2FeaturesKHR).cast();
+            assert!(matches!(
+                DeviceCopy::new(&info, &caps),
+                Err(DeviceRefusal::MissingPresentId2)
+            ));
+            assert!(id2.p_next.is_null());
+            assert_eq!(id2.present_id2, vk::TRUE);
+        }
+    }
+
+    /// The diagnostic budget never wraps, repeats an id or limits native feature admission.
+    #[test]
+    fn diagnostic_attempt_budget_is_bounded() {
+        let counter = AtomicU64::new(0);
+        for id in 1..=64 {
+            assert_eq!(next_diagnostic_attempt(&counter), Some(id));
+        }
+        assert_eq!(next_diagnostic_attempt(&counter), None);
+        assert_eq!(counter.load(Ordering::Relaxed), 64);
+    }
+
     /// Enabling timeline support changes an owned copy and leaves every original byte/link intact.
     #[test]
     fn device_copy_preserves_original_chain_and_features() {
@@ -394,6 +567,35 @@ impl Capabilities {
     }
 }
 
+/// First refusal of the unchanged plan. Unknown layouts expose only their common header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeviceRefusal {
+    /// Queried vendor is not NVIDIA.
+    Vendor,
+    /// Queried timeline feature is false.
+    TimelineFeature,
+    /// Driver does not list low latency.
+    MissingLowLatency,
+    /// Conservative KHR timeline extension is absent.
+    MissingTimelineExtension,
+    /// Unsupported tag and its zero-based chain index.
+    UnknownStructure { s_type: i32, index: usize },
+    /// A previously visited node was reached again.
+    ChainCycle { index: usize },
+    /// The existing sixty-four-node bound was reached.
+    ChainLimit,
+    /// Original device does not enable swapchain support.
+    MissingSwapchain,
+    /// Aggregate and standalone timeline forms coexist.
+    DuplicateTimeline,
+    /// Enabled present-ID2 is not listed.
+    MissingPresentId2,
+    /// No supported present-ID path can be selected.
+    MissingPresentId,
+    /// More than one physical device was requested.
+    DeviceGroup { count: u32 },
+}
+
 /// Typed ownership of every copied device-chain node. Unknown layouts are never guessed.
 macro_rules! chain_nodes {
     ($($variant:ident: $ty:ty => $tag:expr),+ $(,)?) => {
@@ -406,15 +608,16 @@ macro_rules! chain_nodes {
             }
             /// Copy exactly the type identified by the Vulkan sType, never opaque bytes.
             /// # Safety
-            /// `node` points to a live valid Vulkan input-chain structure of its declared sType.
-            unsafe fn copy(node: *const vk::BaseInStructure<'_>) -> Option<Self> {
-                // SAFETY: valid Vulkan input chain, as required above.
+            /// The common header is readable. Recognized tags have their complete declared layout;
+            /// an unknown tag requires no readable payload.
+            unsafe fn copy(node: *const vk::BaseInStructure<'_>) -> Result<Self, vk::StructureType> {
+                // SAFETY: the caller supplies the live common header.
                 match unsafe { (*node).s_type } {
                     $(tag if tag == $tag => {
                         // SAFETY: the matching sType identifies this exact Vulkan layout.
-                        Some(Self::$variant(Box::new(unsafe { node.cast::<$ty>().read() })))
+                        Ok(Self::$variant(Box::new(unsafe { node.cast::<$ty>().read() })))
                     }),+,
-                    _ => None,
+                    tag => Err(tag),
                 }
             }
         }
@@ -443,8 +646,9 @@ pub(crate) struct DeviceCopy {
 impl DeviceCopy {
     /// Copy a known, acyclic device chain and its extension list for either latency path.
     /// # Safety
-    /// All original inputs satisfy vkCreateDevice and remain live through the eventual call.
-    unsafe fn copy(original: &vk::DeviceCreateInfo<'_>) -> Option<Self> {
+    /// Original arrays, names and headers remain readable; known tags have their complete layout.
+    /// Cycles and the node bound are checked here. A later native call still requires valid Vulkan inputs.
+    unsafe fn copy(original: &vk::DeviceCreateInfo<'_>) -> Result<Self, DeviceRefusal> {
         let names = if original.enabled_extension_count == 0 {
             &[][..]
         } else {
@@ -460,16 +664,25 @@ impl DeviceCopy {
         let mut cursor = original.p_next.cast::<vk::BaseInStructure<'_>>();
         let mut seen = Vec::new();
         while !cursor.is_null() {
-            if seen.len() >= 64 || seen.contains(&cursor) {
-                return None;
+            let index = seen.len();
+            if index >= 64 {
+                return Err(DeviceRefusal::ChainLimit);
+            }
+            if seen.contains(&cursor) {
+                return Err(DeviceRefusal::ChainCycle { index });
             }
             seen.push(cursor);
-            // SAFETY: the original Vulkan chain contains live typed nodes for this call.
-            nodes.push(unsafe { Node::copy(cursor) }?);
+            // SAFETY: the header is live; recognized tags have complete typed storage.
+            nodes.push(unsafe { Node::copy(cursor) }.map_err(|tag| {
+                DeviceRefusal::UnknownStructure {
+                    s_type: tag.as_raw(),
+                    index,
+                }
+            })?);
             // SAFETY: cursor is the current live Vulkan common header.
             cursor = unsafe { (*cursor).p_next };
         }
-        Some(Self {
+        Ok(Self {
             nodes,
             extensions: names.to_vec(),
         })
@@ -480,7 +693,7 @@ impl DeviceCopy {
     /// The original Vulkan inputs remain live through the synchronous native create call.
     pub(crate) unsafe fn anti_lag(original: &vk::DeviceCreateInfo<'_>) -> Option<Self> {
         // SAFETY: the caller supplies the common immutable Vulkan inputs.
-        let mut copied = unsafe { Self::copy(original) }?;
+        let mut copied = unsafe { Self::copy(original) }.ok()?;
         if copied
             .nodes
             .iter()
@@ -532,13 +745,21 @@ impl DeviceCopy {
     /// Build an immutable-input device plan. Unsupported or cyclic chains fail closed.
     /// # Safety
     /// `original` and its extension names and chain satisfy vkCreateDevice's input contract.
-    unsafe fn new(original: &vk::DeviceCreateInfo<'_>, caps: &Capabilities) -> Option<Self> {
-        if caps.vendor != 0x10de
-            || !caps.timeline
-            || !caps.lists(ash::nv::low_latency2::NAME)
-            || !caps.lists(ash::khr::timeline_semaphore::NAME)
-        {
-            return None;
+    unsafe fn new(
+        original: &vk::DeviceCreateInfo<'_>,
+        caps: &Capabilities,
+    ) -> Result<Self, DeviceRefusal> {
+        if caps.vendor != 0x10de {
+            return Err(DeviceRefusal::Vendor);
+        }
+        if !caps.timeline {
+            return Err(DeviceRefusal::TimelineFeature);
+        }
+        if !caps.lists(ash::nv::low_latency2::NAME) {
+            return Err(DeviceRefusal::MissingLowLatency);
+        }
+        if !caps.lists(ash::khr::timeline_semaphore::NAME) {
+            return Err(DeviceRefusal::MissingTimelineExtension);
         }
         // SAFETY: the shared copier preserves the caller's valid chain and names.
         let copied = unsafe { Self::copy(original) }?;
@@ -550,27 +771,31 @@ impl DeviceCopy {
             exts.push(unsafe { CStr::from_ptr(*name) });
         }
         if !exts.contains(&ash::khr::swapchain::NAME) {
-            return None;
+            return Err(DeviceRefusal::MissingSwapchain);
         }
         let has_v12 = nodes.iter().any(|n| matches!(n, Node::V12(_)));
         let has_timeline = nodes.iter().any(|n| matches!(n, Node::Timeline(_)));
         // Vulkan forbids duplicating promoted features alongside their aggregate structure.
         if has_v12 && has_timeline {
-            return None;
+            return Err(DeviceRefusal::DuplicateTimeline);
         }
         let uses_id2 = exts.contains(&crate::vk::types::KHR_PRESENT_ID_2_NAME)
             && nodes
                 .iter()
                 .any(|n| matches!(n, Node::Present2(p) if p.present_id2 == vk::TRUE));
         if uses_id2 && !caps.lists(crate::vk::types::KHR_PRESENT_ID_2_NAME) {
-            return None;
+            return Err(DeviceRefusal::MissingPresentId2);
         }
         if !uses_id2 && (!caps.present_id || !caps.lists(ash::khr::present_id::NAME)) {
-            return None;
+            return Err(DeviceRefusal::MissingPresentId);
         }
         for node in &mut nodes {
             match node {
-                Node::Group(group) if group.physical_device_count > 1 => return None,
+                Node::Group(group) if group.physical_device_count > 1 => {
+                    return Err(DeviceRefusal::DeviceGroup {
+                        count: group.physical_device_count,
+                    })
+                }
                 Node::V12(features) => features.timeline_semaphore = vk::TRUE,
                 Node::Timeline(features) => features.timeline_semaphore = vk::TRUE,
                 Node::Present(features) if !uses_id2 => features.present_id = vk::TRUE,
@@ -597,7 +822,7 @@ impl DeviceCopy {
                 )));
             }
         }
-        Some(Self { nodes, extensions })
+        Ok(Self { nodes, extensions })
     }
 
     /// Link only owned node headers, retaining their allocations through the driver call.
@@ -685,6 +910,7 @@ unsafe fn capabilities(
     gipa: usize,
     instance: usize,
     api: Option<crate::vk::InstanceApi>,
+    attempt: Option<u64>,
 ) -> Option<Capabilities> {
     // SAFETY: these commands are available in Vulkan 1.0 and use the leased parent.
     let (properties, enumerate) = unsafe {
@@ -734,12 +960,16 @@ unsafe fn capabilities(
         return None;
     }
     let mut extensions = Vec::new();
+    let mut latency_revision = None;
     for entry in listed.get(..count as usize)? {
         // The driver promises a terminated name; checking the array bounds also handles a broken fake.
         let bytes: Vec<u8> = entry.extension_name.iter().map(|c| *c as u8).collect();
         let name = CStr::from_bytes_until_nul(&bytes).ok()?;
-        if name == ash::nv::low_latency2::NAME && entry.spec_version < 2 {
-            return None;
+        if name == ash::nv::low_latency2::NAME {
+            latency_revision = Some(entry.spec_version);
+            if entry.spec_version < 2 {
+                return None;
+            }
         }
         extensions.push(name.to_owned());
     }
@@ -762,7 +992,27 @@ unsafe fn capabilities(
     unsafe { features(phys, &mut query) };
     caps.timeline = timeline.timeline_semaphore == vk::TRUE;
     caps.present_id = present.present_id == vk::TRUE;
+    if let Some(attempt) = attempt {
+        crate::vk::log_diagnostic(|| {
+            log::info!("Reflex: attempt={attempt} physical={:#x} capabilities vendor={:#x} requested_api={:?} physical_api={:#x} query={:?} low_latency2_revision={latency_revision:?} timeline={} present_id={}",
+            phys.as_raw(), caps.vendor, api.map(|facts| facts.requested_api_version), properties_out.api_version,
+            features_name, caps.timeline, caps.present_id)
+        });
+    }
     Some(caps)
+}
+
+/// Only the first sixty-four configured native attempts produce startup diagnostics.
+static DIAGNOSTIC_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+
+/// Reserve a unique bounded diagnostic identity without changing feature admission.
+fn next_diagnostic_attempt(counter: &AtomicU64) -> Option<u64> {
+    counter
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            (current < 64).then(|| current.saturating_add(1))
+        })
+        .ok()
+        .map(|previous| previous.saturating_add(1))
 }
 
 /// Device entry points retained by value; they remain callable only while `device` is live.
@@ -831,6 +1081,10 @@ pub unsafe fn create_device(
     allocator: *const vk::AllocationCallbacks<'_>,
     out: *mut vk::Device,
 ) -> vk::Result {
+    let attempt = MODE
+        .get()
+        .filter(|mode| **mode != ReflexMode::Off)
+        .and_then(|_| next_diagnostic_attempt(&DIAGNOSTIC_ATTEMPTS));
     let completed = std::cell::Cell::new(None);
     let original = || {
         if let Some(result) = completed.get() {
@@ -841,7 +1095,7 @@ pub unsafe fn create_device(
         completed.set(Some(result));
         result
     };
-    guard(Feature::Reflex, original, || {
+    let result = guard(Feature::Reflex, original, || {
         let Some(mode) = MODE.get() else {
             return original();
         };
@@ -855,16 +1109,28 @@ pub unsafe fn create_device(
         // SAFETY: the original Vulkan arguments and live physical device.
         let Some(caps) =
             crate::vk::with_physical_device_capabilities(phys, |gipa, instance, api| unsafe {
-                capabilities(phys, gipa, instance, api)
+                capabilities(phys, gipa, instance, api, attempt)
             })
             .flatten()
         else {
+            if let Some(attempt) = attempt {
+                crate::vk::log_diagnostic(|| {
+                    log::info!("Reflex: attempt={attempt} physical={:#x} capabilities unavailable; unchanged device", phys.as_raw())
+                });
+            }
             return original();
         };
         // SAFETY: info and its chain live until this call returns.
-        let Some(mut copied) = (unsafe { DeviceCopy::new(&*info, &caps) }) else {
-            log::info!("Reflex: unsupported device prerequisites or feature-chain layout; unchanged device");
-            return original();
+        let mut copied = match unsafe { DeviceCopy::new(&*info, &caps) } {
+            Ok(copied) => copied,
+            Err(reason) => {
+                if let Some(attempt) = attempt {
+                    crate::vk::log_diagnostic(|| {
+                        log::info!("Reflex: attempt={attempt} physical={:#x} device plan refused: {reason:?}; unchanged device", phys.as_raw())
+                    });
+                }
+                return original();
+            }
         };
         // SAFETY: the original info is live and the owned nodes live through the next driver call.
         let changed = copied.info(unsafe { &*info });
@@ -890,7 +1156,23 @@ pub unsafe fn create_device(
             },
         );
         result
-    })
+    });
+    // The native result is complete before diagnostics. Logger failure cannot repeat creation.
+    crate::vk::log_diagnostic(|| {
+        if let Some(attempt) = attempt {
+            let device = if result == vk::Result::SUCCESS && !out.is_null() {
+                // SAFETY: successful native creation initialized the caller's live output.
+                Some(unsafe { out.read() }.as_raw())
+            } else {
+                None
+            };
+            match device {
+                Some(device) => log::info!("Reflex: attempt={attempt} physical={:#x} native result={result:?} device=Some({device:#x})", phys.as_raw()),
+                None => log::info!("Reflex: attempt={attempt} physical={:#x} native result={result:?} device=None", phys.as_raw()),
+            }
+        }
+    });
+    result
 }
 
 #[cfg(test)]
