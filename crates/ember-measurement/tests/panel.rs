@@ -6,6 +6,7 @@ use ember_measurement::{
     WorldEpoch, WorldObservation, WorldSample,
 };
 
+/// Assert exclusive measurement input only inside this offline fixture.
 fn owned() -> InputContext {
     InputContext {
         focused: true,
@@ -13,9 +14,11 @@ fn owned() -> InputContext {
         owner: InputOwner::Measurement,
     }
 }
+/// Provide a stable synthetic world identity and coordinate epoch.
 fn context() -> WorldEpoch {
     WorldEpoch::new("test:position-ruler", 1).unwrap()
 }
+/// Refresh a synthetic canonical world through the real session checks.
 fn world(session: &mut Session, time: u64, sequence: u64) {
     session
         .observe_world(
@@ -35,12 +38,14 @@ fn world(session: &mut Session, time: u64, sequence: u64) {
         )
         .unwrap();
 }
+/// Begin a session with an explicit current world and input grant.
 fn ready() -> Session {
     let mut session = Session::new(FreshnessPolicy::new(10).unwrap());
     world(&mut session, 100, 1);
     assert!(session.act(100, owned(), Action::Begin).consumed());
     session
 }
+/// Supply a typed player position with test-owned time and sequence.
 fn position(session: &mut Session, time: u64, sequence: u64, coordinates: [f64; 3]) {
     session
         .observe_aim(
@@ -57,6 +62,7 @@ fn position(session: &mut Session, time: u64, sequence: u64, coordinates: [f64; 
         )
         .unwrap();
 }
+/// Mark two explicit position samples through the actual action path.
 fn pair(a: [f64; 3], b: [f64; 3]) -> Session {
     let mut session = ready();
     position(&mut session, 100, 1, a);
@@ -69,10 +75,12 @@ fn pair(a: [f64; 3], b: [f64; 3]) -> Session {
         .consumed());
     session
 }
+/// Prepare a 3/4/12 metre reference with a 13 metre diagonal.
 fn standard_pair() -> Session {
     pair([0.0; 3], [3.0, 4.0, 12.0])
 }
 
+/// Keep unavailable native data from becoming visible or actionable.
 #[test]
 fn no_native_source_never_displays_positions_or_actionable_measurement() {
     let mut session = Session::default();
@@ -84,6 +92,7 @@ fn no_native_source_never_displays_positions_or_actionable_measurement() {
     assert!(panel.dimension_lines().is_empty());
     assert_eq!(panel.controls(), PanelControls::default());
 }
+/// Require current world and input assertions before offering Begin.
 #[test]
 fn begin_requires_a_fresh_world_and_current_input_even_before_capture() {
     let mut session = Session::new(FreshnessPolicy::new(10).unwrap());
@@ -104,6 +113,7 @@ fn begin_requires_a_fresh_world_and_current_input_even_before_capture() {
             .begin
     );
 }
+/// Keep fractional span units honest and the large-grid diagonal in metres.
 #[test]
 fn distance_units_are_fractional_spans_and_large_diagonal_stays_metres() {
     let mut session = standard_pair();
@@ -147,6 +157,7 @@ fn distance_units_are_fractional_spans_and_large_diagonal_stays_metres() {
     assert!(UnitDisplay::LargeGrid.hint().contains("X/Z: 4 m"));
     assert!(UnitDisplay::LargeGrid.hint().contains("Y: 2 m"));
 }
+/// Distinguish the transient second point from two accepted marks.
 #[test]
 fn preview_and_next_mark_are_distinct_from_an_accepted_pair() {
     let mut session = ready();
@@ -169,6 +180,7 @@ fn preview_and_next_mark_are_distinct_from_an_accepted_pair() {
     assert_eq!(complete.mark_label(), "New A");
     assert!(complete.controls().mark);
 }
+/// Hide expired dimensions and require explicit fresh reacquisition.
 #[test]
 fn every_frame_rechecks_world_expiry_and_hides_dormant_dimensions() {
     let mut session = standard_pair();
@@ -199,6 +211,7 @@ fn every_frame_rechecks_world_expiry_and_hides_dormant_dimensions() {
         4
     );
 }
+/// Yield controls and hide dimensions on every input conflict.
 #[test]
 fn focus_menu_and_other_owners_suspend_all_measurement_controls_and_text() {
     let conflicts = [
@@ -238,6 +251,7 @@ fn focus_menu_and_other_owners_suspend_all_measurement_controls_and_text() {
         );
     }
 }
+/// Hide all labels when the coordinate epoch becomes unknown.
 #[test]
 fn unavailable_world_never_retains_visible_dimension_labels() {
     let mut session = standard_pair();
@@ -248,6 +262,7 @@ fn unavailable_world_never_retains_visible_dimension_labels() {
     assert!(panel.dimension_lines().is_empty());
     assert_eq!(panel.controls(), PanelControls::default());
 }
+/// Preserve nonzero tiny lengths and bounded finite extreme labels.
 #[test]
 fn tiny_nonzero_distances_are_not_printed_as_zero_and_extremes_stay_finite() {
     let mut tiny = pair([0.0; 3], [0.000001, 0.0, 0.0]);
@@ -262,6 +277,7 @@ fn tiny_nonzero_distances_are_not_printed_as_zero_and_extremes_stay_finite() {
         .iter()
         .all(|line| !line.contains("inf") && !line.contains("NaN")));
 }
+/// Keep display conversion separate from snapping and cell counting.
 #[test]
 fn display_units_do_not_snap_points_or_turn_spans_into_inclusive_cells() {
     let mut session = pair([-0.01, -0.01, -0.01], [0.12, 0.12, 0.12]);
@@ -279,6 +295,7 @@ fn display_units_do_not_snap_points_or_turn_spans_into_inclusive_cells() {
     assert_eq!(measurement.a().coordinates(), [-0.01; 3]);
     assert_eq!(measurement.b().coordinates(), [0.12; 3]);
 }
+/// Block an uncalibrated new mark while preserving valid accepted pins.
 #[test]
 fn missing_snap_origin_blocks_mark_without_expiring_accepted_pins() {
     let mut session = standard_pair();
@@ -298,6 +315,7 @@ fn missing_snap_origin_blocks_mark_without_expiring_accepted_pins() {
             .mark
     );
 }
+/// Remove transient display state after Clear and Exit.
 #[test]
 fn clear_and_exit_remove_visible_numbers_without_leaving_a_mark_enabled() {
     let mut session = standard_pair();
@@ -311,6 +329,7 @@ fn clear_and_exit_remove_visible_numbers_without_leaving_a_mark_enabled() {
     assert!(exited.dimension_lines().is_empty());
     assert!(exited.controls().begin);
 }
+/// Recheck an action after its earlier panel became invalid.
 #[test]
 fn a_previous_panel_does_not_authorize_a_later_conflicting_mark() {
     let mut session = standard_pair();
@@ -332,6 +351,7 @@ fn a_previous_panel_does_not_authorize_a_later_conflicting_mark() {
         .is_empty());
 }
 
+/// Preserve the distinction between a player position and a surface hit.
 #[test]
 fn player_position_is_typed_separately_from_a_surface_hit() {
     let mut session = ready();
