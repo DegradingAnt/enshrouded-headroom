@@ -125,6 +125,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ember-measurement"
+version = "0.1.0"
+dependencies = [
+ "ember-blueprint",
+]
+
+[[package]]
 name = "emberkit"
 version = "0.1.0"
 dependencies = [

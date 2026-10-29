@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/emberkit", "crates/ember-blueprint"]
+members = [".", "crates/emberkit", "crates/ember-blueprint", "crates/ember-measurement"]
 default-members = ["."]
 resolver = "2"
 
