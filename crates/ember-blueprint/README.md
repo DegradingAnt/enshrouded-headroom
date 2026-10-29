@@ -27,6 +27,11 @@ Session::poll_highcrown or a versioned interchange file through
 Session::poll_interchange. A caller must schedule these bounded operations on a
 worker and handle the published freshness state.
 
+Highcrown phase `num` accepts a JSON u32 integer or a canonical ASCII decimal
+string: `0`, or a nonzero value without leading zeros, up to `4294967295`.
+This compatibility rule applies only to that source metadata field. Exported
+`Stage.order` and all public schema/geometry numbers remain numeric.
+
 A recorded envelope is a measurement aid. It is not a block-perfect assembly.
 Unsupported details have explicit omission notes. The native camera, engine
 coordinate binding, rendering, PlayStation input and vanilla-style UI remain
