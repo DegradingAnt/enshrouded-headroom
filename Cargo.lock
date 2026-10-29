@@ -144,6 +144,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ember-ruler-probe"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "configparser",
+ "emberkit",
+ "log",
+ "windows-sys",
+]
+
+[[package]]
 name = "emberkit"
 version = "0.1.0"
 dependencies = [
