@@ -1473,8 +1473,31 @@ mod reflex_driver {
                         let mut timeline = false;
                         let mut present = false;
                         let mut address_preserved = false;
+                        let mut demote_seen = 0;
+                        let mut tags = Vec::new();
                         let mut node = info.p_next.cast::<vk::BaseInStructure<'_>>();
                         while !node.is_null() {
+                            tags.push((*node).s_type.as_raw());
+                            if DEMOTE_CASE.load(Ordering::Relaxed) != 0
+                                && (*node).s_type
+                                    == vk::StructureType::PHYSICAL_DEVICE_SHADER_DEMOTE_TO_HELPER_INVOCATION_FEATURES
+                            {
+                                let demote = &*node
+                                    .cast::<vk::PhysicalDeviceShaderDemoteToHelperInvocationFeatures<'_>>();
+                                assert_eq!(
+                                    demote.shader_demote_to_helper_invocation,
+                                    vk::Bool32::from(DEMOTE_CASE.load(Ordering::Relaxed) == 2)
+                                );
+                                assert!(!demote.p_next.is_null());
+                                let tail = &*demote.p_next
+                                    .cast::<vk::PhysicalDeviceDynamicRenderingFeatures<'_>>();
+                                assert_eq!(
+                                    tail.s_type.as_raw(),
+                                    vk::StructureType::PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES.as_raw()
+                                );
+                                assert_eq!(tail.dynamic_rendering, vk::TRUE);
+                                demote_seen += 1;
+                            }
                             if (*node).s_type
                                 == vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_2_FEATURES
                             {
@@ -1500,6 +1523,16 @@ mod reflex_driver {
                             }
                             node = (*node).p_next;
                         }
+                        if DEMOTE_CASE.load(Ordering::Relaxed) != 0 {
+                            assert_eq!(tags, [
+                                vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+                                vk::StructureType::PHYSICAL_DEVICE_SHADER_DEMOTE_TO_HELPER_INVOCATION_FEATURES,
+                                vk::StructureType::PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES,
+                                vk::StructureType::PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR,
+                            ].map(|tag| tag.as_raw()));
+                            assert_eq!(demote_seen, 1);
+                            DEMOTE_SEEN.fetch_add(demote_seen, Ordering::Relaxed);
+                        }
                         if low
                             && timeline
                             && present
@@ -1521,7 +1554,12 @@ mod reflex_driver {
         )
     }
 
-    /// Enable the complete fake table only for the actual-present child cases.
+    /// Zero leaves existing cases alone; one/two require an unchanged false/true demote bit.
+    static DEMOTE_CASE: AtomicUsize = AtomicUsize::new(0);
+    /// The actual fake native create saw exactly one owned demote node and its following tail.
+    static DEMOTE_SEEN: AtomicUsize = AtomicUsize::new(0);
+
+    /// Enable the complete fake Reflex table for present and shader-demote child cases.
     static PRESENT_CASE: AtomicUsize = AtomicUsize::new(0);
     /// Inject native failures without unwinding across the ABI.
     static PRESENT_RESULT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
@@ -1969,8 +2007,19 @@ mod reflex_driver {
         });
         assert!(warnings.is_empty());
         reflex::init(config.general.reflex);
+        DEMOTE_CASE.store(
+            match case {
+                "shader-demote-false" => 1,
+                "shader-demote-true" => 2,
+                _ => 0,
+            },
+            Ordering::Relaxed,
+        );
         CAPS_CASE.store(usize::from(case.starts_with("caps-")), Ordering::Relaxed);
-        PRESENT_CASE.store(usize::from(case.starts_with("present-")), Ordering::Relaxed);
+        PRESENT_CASE.store(
+            usize::from(case.starts_with("present-") || case.starts_with("shader-demote-")),
+            Ordering::Relaxed,
+        );
         REAL_GIPA.store(gipa as *const () as usize, Ordering::Release);
         observe_instance(case);
         if matches!(case, "caps-low-physical" | "caps-low-physical-khr") {
@@ -2081,8 +2130,20 @@ mod reflex_driver {
         }
         let mut tail = vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true);
         let mut v12 = vk::PhysicalDeviceVulkan12Features::default().buffer_device_address(true);
-        v12.p_next = (&mut tail as *mut vk::PhysicalDeviceVulkan13Features<'_>).cast();
+        let mut demote_tail =
+            vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
+        let mut demote = vk::PhysicalDeviceShaderDemoteToHelperInvocationFeatures::default()
+            .shader_demote_to_helper_invocation(case == "shader-demote-true");
+        demote.p_next =
+            (&mut demote_tail as *mut vk::PhysicalDeviceDynamicRenderingFeatures<'_>).cast();
+        v12.p_next = if case.starts_with("shader-demote-") {
+            (&mut demote as *mut vk::PhysicalDeviceShaderDemoteToHelperInvocationFeatures<'_>)
+                .cast()
+        } else {
+            (&mut tail as *mut vk::PhysicalDeviceVulkan13Features<'_>).cast()
+        };
         let original_next = v12.p_next;
+        let original_demote_next = demote.p_next;
         let names = [c"VK_KHR_swapchain".as_ptr()];
         let mut info = vk::DeviceCreateInfo::default().enabled_extension_names(&names);
         let opaque = vk::BaseInStructure {
@@ -2121,6 +2182,25 @@ mod reflex_driver {
         assert_eq!(v12.p_next, original_next);
         assert_eq!(v12.timeline_semaphore, vk::FALSE);
         assert_eq!(v12.buffer_device_address, vk::TRUE);
+        if case.starts_with("shader-demote-") {
+            assert_eq!(device.as_raw(), DEVICE);
+            assert_eq!(ATTEMPTS.load(Ordering::Relaxed), 1);
+            assert_eq!(CHANGED_OK.load(Ordering::Relaxed), 1);
+            assert_eq!(RETRY_OK.load(Ordering::Relaxed), 0);
+            assert_eq!(DEMOTE_SEEN.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                demote.shader_demote_to_helper_invocation,
+                vk::Bool32::from(case == "shader-demote-true")
+            );
+            assert_eq!(demote.p_next, original_demote_next);
+            assert_eq!(demote_tail.dynamic_rendering, vk::TRUE);
+            assert!(demote_tail.p_next.is_null());
+            assert_eq!(info.enabled_extension_count, 1);
+            assert_eq!(info.pp_enabled_extension_names, names.as_ptr());
+            assert!(!enshrouded_headroom::guard::is_disabled(Feature::Reflex));
+            assert!(!enshrouded_headroom::guard::is_disabled(Feature::VkWrap));
+            return;
+        }
         if case == "diagnostic-driver-retry" {
             assert_eq!(ATTEMPTS.load(Ordering::Relaxed), 2);
             assert_eq!(CHANGED_OK.load(Ordering::Relaxed), 1);
@@ -2421,6 +2501,30 @@ mod reflex_driver {
             _ => unreachable!(),
         }
     }
+    /// The real Reflex create path preserves both demote values and calls the native driver once.
+    #[test]
+    fn shader_demote_feature_survives_native_reflex_device_creation() {
+        const NAME: &str =
+            "reflex_driver::shader_demote_feature_survives_native_reflex_device_creation";
+        if let Ok(case) = std::env::var("W44_SHADER_DEMOTE_CHILD") {
+            child(&case);
+            return;
+        }
+        for case in ["shader-demote-false", "shader-demote-true"] {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture"])
+                .env("W44_SHADER_DEMOTE_CHILD", case)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{case}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
     /// Real wrappers correlate two devices and remain exactly-once when diagnostics panic.
     #[test]
     fn diagnostic_attempts_preserve_native_inputs_and_call_counts() {
