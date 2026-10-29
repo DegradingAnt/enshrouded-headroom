@@ -172,3 +172,59 @@ fn declared_null_floor_regions_rejects_refresh_and_keeps_the_visible_revision() 
     );
     assert_eq!(session.snapshot().freshness(), &Freshness::Current);
 }
+
+#[test]
+fn phase_order_representation_changes_refresh_bytes_without_renaming_stages() {
+    let source = include_bytes!("fixtures/highcrown-recorded.json");
+    let file = FileFixture::new(source);
+    let mut session = Session::new(
+        convert_highcrown(source, "test:phase-byte-refresh", 10, Limits::default()).unwrap(),
+    );
+    let first_stage = session
+        .snapshot()
+        .model()
+        .document()
+        .stages
+        .first()
+        .unwrap()
+        .id
+        .clone();
+    session.select(SelectionKind::Stage, &first_stage).unwrap();
+    let before = session.snapshot();
+    let mut changed: serde_json::Value = serde_json::from_slice(source).unwrap();
+    for phase in changed["content"]["guide"]["phases"]
+        .as_array_mut()
+        .unwrap()
+    {
+        phase["num"] = serde_json::json!(phase["num"].as_u64().unwrap().to_string());
+    }
+    let changed = serde_json::to_vec(&changed).unwrap();
+    std::fs::write(&file.0, &changed).unwrap();
+    assert_eq!(
+        session.poll_highcrown(&file.0, Limits::default()).unwrap(),
+        RefreshOutcome::Replaced
+    );
+    let after = session.snapshot();
+    assert_eq!(after.model().revision().sequence, 11);
+    assert_eq!(
+        after.model().revision().content_sha256,
+        ember_blueprint::sha256(&changed)
+    );
+    assert_eq!(after.model().document().source.content_version, "3.0");
+    assert_eq!(
+        after.model().document().stages,
+        before.model().document().stages
+    );
+    assert_eq!(
+        after.model().document().objects,
+        before.model().document().objects
+    );
+    assert_eq!(
+        after.selection(SelectionKind::Stage),
+        before.selection(SelectionKind::Stage)
+    );
+    assert_eq!(
+        session.poll_highcrown(&file.0, Limits::default()).unwrap(),
+        RefreshOutcome::Unchanged
+    );
+}

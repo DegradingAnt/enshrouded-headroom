@@ -251,6 +251,44 @@ struct PlanGuide {
     phases: Vec<PlanPhase>,
 }
 
+/// Accept only the two observed representations of this Highcrown metadata field.
+fn deserialize_phase_order<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserializer.deserialize_any(PhaseOrderVisitor)
+}
+
+/// Field-local parsing keeps public stage orders and geometry strictly numeric.
+struct PhaseOrderVisitor;
+
+impl<'de> serde::de::Visitor<'de> for PhaseOrderVisitor {
+    type Value = u32;
+
+    /// Describe the accepted source representations without including source content.
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a u32 integer or canonical decimal u32 string")
+    }
+
+    /// JSON nonnegative integer tokens must fit the existing public order type.
+    fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+        u32::try_from(value).map_err(|_| E::custom("phase order exceeds u32"))
+    }
+
+    /// Bound ASCII digits before checked conversion; only zero may start with zero.
+    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        if value.is_empty()
+            || value.len() > 10
+            || !value.bytes().all(|digit| digit.is_ascii_digit())
+            || (value.len() > 1 && value.starts_with('0'))
+        {
+            return Err(E::custom("phase order requires canonical decimal u32 text"));
+        }
+        value
+            .parse::<u32>()
+            .map_err(|_| E::custom("phase order exceeds u32"))
+    }
+}
 /// Construction phase.
 #[derive(Deserialize)]
 struct PlanPhase {
@@ -258,7 +296,8 @@ struct PlanPhase {
     id: String,
     /// Public name.
     name: String,
-    /// Display order.
+    /// Display order, accepting only the observed integer/decimal-string source forms.
+    #[serde(deserialize_with = "deserialize_phase_order")]
     num: u32,
     /// Construction sessions.
     sessions: Vec<PlanSession>,
