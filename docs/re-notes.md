@@ -1,6 +1,6 @@
 # Enshrouded reverse-engineering notes
 
-Target: `enshrouded.exe`, sha256 `b28b448a8dbf48c932b717f035031f5a89712a7cccfcc2d6cac0d47e6421c12a`, build `f68140a3`, image base `0x140000000`. The Steam exe of the same build has the same code at the same addresses (last section, "The Steam exe"); every virtual address in these notes holds for both.
+Default target, unless a section names another hash: `enshrouded.exe`, sha256 `b28b448a8dbf48c932b717f035031f5a89712a7cccfcc2d6cac0d47e6421c12a`, build `f68140a3`, image base `0x140000000`. The Steam exe of that build has the same code at the same addresses (see "The Steam exe"). Addresses in a section that names another target apply only to that target.
 Tools: REA 6.3.0 + Ghidra 12.1.4, and capstone/pefile scratch probes (`xref.py`, `callers.py`, `func.py`, `stores.py` used during analysis).
 Evidence labels: **VERIFIED** = read from bytes, decompile, or game log. **HYPOTHESIS** = inferred from names or neighbours.
 
@@ -1708,3 +1708,38 @@ Exact 44-byte rows, in order:
 ```
 
 For rows 0–3 the previously omitted X/Y fields at row offsets `+0x18/+0x1c` are respectively `cd cc 4c 3e` and `ec 51 38 3d`. These bytes were read directly, not generated from rounded decimal fields.
+
+## W42: walking-ruler client lifetime candidates (29 October 2026)
+
+This section uses only the client executable with SHA-256 `d64966e23b1a458ee6f147bcbceac0b577fa7e39a212f371287d8cc119817882`, image base `0x140000000`. It does not transfer addresses from the default target above. **VERIFIED** below means static bytes or unwind metadata on this exact file. It does not mean live calibration or an admitted runtime binding. [W42](https://github.com/DegradingAnt/enshrouded-headroom/issues/75) authorizes this read-only analysis. The author selected character-position A/B marks for [W39](https://github.com/DegradingAnt/enshrouded-headroom/issues/72); holograms remain deferred.
+
+### Sources and method
+
+[EMF's signature table](https://github.com/matenm/emf-enshrouded/blob/08d600155fcadc8e45cc9c6f3932a67c717345be/src/common/signatures.cpp#L11-L40) supplies the exact target hash, pattern seeds and source names used here. Its [MIT licence](https://github.com/matenm/emf-enshrouded/blob/08d600155fcadc8e45cc9c6f3932a67c717345be/LICENSE) applies to source reuse. These names are upstream interpretations, not recovered debug symbols. The file hash and each pattern were independently checked against the owned executable. Each pattern had exactly one match in `.text` at its expected RVA. Decoding used the existing offline x64 decoder; it neither opened nor changed a running process.
+
+The PE's 72,746 `.pdata` entries resolved through version1/2 unwind metadata without an unresolved entry in this pass. Chained entries were accepted only when they matched an exact preceding table entry; cycles and chains over32 entries were rejected. [Microsoft's chained unwind format](https://learn.microsoft.com/en-us/cpp/build/exception-handling-x64?view=msvc-170#chained-unwind-info-structures) groups secondary code ranges with their primary entry. This is a metadata relation, not proof of every possible caller or control-flow edge. Private receipts retain each range's bytes hash and the decoded windows.
+
+### Setup observations
+
+- **VERIFIED:** Source `ClientWorldSetup` uniquely matches VA `0x14039fd50`, RVA `0x39fd50`, with pattern `48 89 5C 24 18 55 56 57 41 54 41 55 41 56 41 57 48 8D AC 24 50 FD FF FF`. Its one unwind range is `[0x14039fd50, 0x1403a2610)`, SHA-256 `1c42aaf375dffd65ca5b8debfb765a72bdff415672dce6d62e818cf7bb35a29e`.
+- **VERIFIED:** Source `RegisterAllPrograms` uniquely matches VA `0x1404a5db0`, RVA `0x4a5db0`, with pattern `40 53 48 83 EC 50 48 8B D9 48 8D 15 ?? ?? ?? ?? 48 8D 4C 24 40 41 B8 24`. Its seed range is `[0x1404a5db0, 0x1404aa170)`, SHA-256 `aa29ab4fe7f2d4797818d4f8ca0b9e65e72efca41c27f7e643d59c34ed087fd0`.
+- **VERIFIED:** The setup body calls registration at `0x1403a2245`, passing `r13`. It loaded `r13` from handle`+0x08` at `0x1403a07ea`. Earlier, `0x14039fdb7` and `0x14039fdc1` copied the setup input's pointer at`+0xa0` to that handle field.
+- **VERIFIED:** The setup caller belongs to three unwind ranges rooted at `0x140842e70`, totaling2,720 bytes. It stores a factory result at owner`+0x1d0` at `0x140843152`, copies that pointer to setup input`+0xa0` at `0x14084352e`/`0x140843535`, calls setup at `0x140843751`, then stores the returned handle at owner`+0x47d4e0` at `0x14084375d`.
+- **HYPOTHESIS:** This registration boundary could seed a process-local client generation after its original call returns. Upstream says its [registration hook](https://github.com/matenm/emf-enshrouded/blob/08d600155fcadc8e45cc9c6f3932a67c717345be/src/core/core.cpp#L303-L356) observes setup before the first tick and includes client kind2. The static call chain alone does not prove complete reconnect, reload, address-reuse or coordinate-origin behavior.
+
+### Retirement observations
+
+- **VERIFIED:** `0x140844b90` reads owner`+0x47d4e0` and, if non-null, calls `0x1403a3650` at `0x140844bab`. A false `AL` returns7 without clearing the field. A true `AL` clears it at `0x140844bc1`. Its unwind range is `[0x140844b90, 0x140844d46)`, SHA-256 `27ace9aae689bd3960be49d435399a35d8bdf475f9d1f8707d0084ae136639a5`.
+- **VERIFIED:** No direct `E8` call to `0x140844b90` was found. Searching `E9` branches also found a decoded tail jump at `0x14084447a`. The dispatcher rooted at `0x1408443d0` has seven unwind ranges totaling1,444 bytes. It reads a32-bit value at owner`+0x466b0c`, subtracts1 and indexes twelve RVA entries at `0x140844944`. Value6 selects `0x14084446b`, which restores the frame and takes that tail jump. This records the numeric case, not a recovered state name.
+- **VERIFIED:** `0x1403a3650` has four chained unwind ranges: `[0x1403a3650, 0x1403a36a0)`, `[0x1403a36a0, 0x1403a37e9)`, `[0x1403a37e9, 0x1403a3e00)` and `[0x1403a3e00, 0x1403a42f3)`. Together they cover3,235 bytes. Reading only the first80 bytes would omit both return paths and most cleanup.
+- **VERIFIED:** That entry reads the same handle`+0x08`, calls `0x1409f2ea0` with `EDX=0`, then calls `0x1409953e0`. False `AL` branches to `0x1403a42e6` and returns false. Other cleanup can also take this return. The successful tail calls the allocator's virtual slot`+0x10` with the handle at `0x1403a42d6`, then returns true at `0x1403a42d9`.
+- **VERIFIED:** The leaf at `0x1409f2ea0` writes the64-bit `RDX` to pointer`+0xe16270`, then returns. It does not write the world state byte at offset0. Its purpose is not established here. The boolean helper at `0x1409953e0` has three unwind ranges totaling822 bytes and includes a kind2-specific branch. Its boolean must not be treated as a general job-quiescence contract.
+- **HYPOTHESIS:** A future observer may need to invalidate a generation on retirement entry, before waiting for a successful return. Waiting for the final handle clear could leave old marks available during cleanup. The full trigger, thread, reentrancy and coordinate-lifetime contract still needs proof before this becomes a binding.
+
+### Coverage limits and remaining gates
+
+The owner-field census found131 raw occurrences of displacement`0x47d4e0`;124 lay inside decoded bounded unwind ranges and7 lacked such a range. A common displacement alone does not prove a common owner. Computed addresses and aliases are outside this census. The cleanup-reference pass covered direct `E8`/`E9` references and64-bit RIP-relative `LEA` instructions. A separate search found zero exact absolute8-byte pointers to the cleanup entry in raw sections; that does not exclude RVA tables or indirect references. Neither pass establishes all callers.
+
+The existing [local-player reader](https://github.com/matenm/emf-enshrouded/blob/08d600155fcadc8e45cc9c6f3932a67c717345be/src/core/api.cpp#L79-L110) and [typed position helper](https://github.com/matenm/emf-enshrouded/blob/08d600155fcadc8e45cc9c6f3932a67c717345be/sdk/include/emf/query.hpp#L8-L29) are reusable source evidence. They do not complete this client's lifetime proof. EMF's [server-session increment](https://github.com/matenm/emf-enshrouded/blob/08d600155fcadc8e45cc9c6f3932a67c717345be/src/core/core.cpp#L324-L334) is gated to the server world. It cannot identify a guest's client world. A pointer, timestamp or constant0 also cannot stand in for verified lifecycle events.
+
+W39 must keep native samples unavailable until the adapter has receipts for field sizes, units, callback ownership, setup and retirement coverage, coordinate continuity and input permission. Native keyboard and PlayStation checks still follow that proof. This section adds no hook, runtime reader, loader, dependency or installed configuration, and does not authorize starting the full EMF runtime. World projection and hologram rendering stay deferred.
