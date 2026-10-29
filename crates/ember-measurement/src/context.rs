@@ -118,21 +118,23 @@ pub enum WorldObservation {
     Current(WorldSample),
 }
 
-/// Hit availability differs from a legitimate aim miss.
+/// A typed current point or explicit ray miss supplied by a verified caller.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Aim {
     /// A canonical surface position supplied by a future verified producer.
     Hit(Point),
+    /// A canonical local-player position supplied by a future verified producer.
+    PlayerPosition(Point),
     /// The current aim ray legitimately found no surface.
     Miss,
     /// Hit data could not be obtained.
     Unavailable,
 }
 
-/// One aim observation, with no native ray casting or provider in this crate.
+/// One selected-point observation, with no native reader or ray caster in this crate.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AimSample {
-    /// Context in which this hit/miss was observed.
+    /// Context in which this position, hit or absence was observed.
     pub context: WorldEpoch,
     /// Freshness and ordering metadata.
     pub stamp: Stamp,

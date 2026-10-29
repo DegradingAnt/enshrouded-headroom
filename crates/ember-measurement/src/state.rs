@@ -117,6 +117,8 @@ impl ActionResult {
 pub enum AimStatus {
     /// A fresh, unconsumed hit is available under the requested snap policy.
     Hit,
+    /// A fresh player position is markable, without claiming a surface hit.
+    PlayerPosition,
     /// A fresh legitimate ray miss cleared the previous preview.
     Miss,
     /// An unavailable, consumed, invalid or expired candidate cannot be picked.
@@ -430,6 +432,14 @@ impl Session {
         };
         let candidate = self.candidate(now_ms, snap);
         let aim_status = match candidate {
+            Ok(_)
+                if self
+                    .aim
+                    .as_ref()
+                    .is_some_and(|sample| matches!(sample.aim, Aim::PlayerPosition(_))) =>
+            {
+                AimStatus::PlayerPosition
+            }
             Ok(_) => AimStatus::Hit,
             Err(Error::NoHit) => AimStatus::Miss,
             Err(error) => AimStatus::Unavailable(error),
@@ -547,7 +557,7 @@ impl Session {
             Error::StaleAim,
         )?;
         let point = match sample.aim {
-            Aim::Hit(point) => point,
+            Aim::Hit(point) | Aim::PlayerPosition(point) => point,
             Aim::Miss => return Err(Error::NoHit),
             Aim::Unavailable => return Err(Error::AimUnavailable),
         };
