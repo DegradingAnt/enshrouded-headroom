@@ -25,11 +25,15 @@ Two distinct points define world-aligned bounds. A full box yields 12 unique non
 
 `Snap::Off` is the default. Requested small-grid snapping requires a `GridOrigin` that the caller explicitly calibrated and confirmed for the matching `WorldEpoch`. There is no implicit zero origin or fallback to unsnapped geometry. A missing, future, stale or mismatched origin rejects that new preview/pick while preserving accepted pins.
 
+Session snapping also checks when the origin was confirmed. Initial calibration must be confirmed at or after the first context activation. A known world/epoch transition or recovery after unavailable context requires confirmation strictly after its activation receipt. Equal milliseconds cannot prove that reconfirmation followed that event. A still-age-valid old origin cannot survive a world round trip. The standalone `snap_to_small` calculation has no session history; its caller owns any activation barrier.
+
 The lattice is origin + round((point-origin)/0.5)*0.5. Exact halfway ties round away from zero in relative lattice coordinates, including negative positions. Snapped coordinates must still satisfy the point bound. Accepted pins keep their coordinates; changing the preview's snap request does not transform existing pins.
 
 ## Observation and ownership contracts
 
 A session starts inactive and unavailable. `WorldEpoch` separates an opaque world identity from its explicit coordinate/origin lifetime. Unknown world, unknown epoch and absent native binding have explicit unavailable variants. Numeric epoch zero is valid only when explicitly supplied as known.
+
+After any reported loss of world knowledge, a recovery observation must have been observed strictly after that loss receipt. A larger sequence attached to an older or equal timestamp cannot restore pins. Rejected current-world observations keep output unavailable and establish a new confirmation boundary without deleting dormant pins. Clock regression records this boundary at the monotonic high-water mark. Repeated unavailable view queries do not move it. Fresh confirmation still requires an explicit allowed Begin to reacquire capture.
 
 World and aim streams each maintain their own strictly increasing `Stamp::sequence` across world changes. Their observation times may stay equal but cannot decrease. Callers supply monotonic milliseconds for every operation. The age policy is explicit and bounded; the default 250 ms is a pure-core policy, not a claim about native cadence. Future observations, regressing clocks, expired samples and unrepresentable deadlines fail closed. Rejected observations never preserve an earlier transient preview.
 

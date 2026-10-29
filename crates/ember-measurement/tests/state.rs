@@ -754,12 +754,12 @@ fn freshness_boundary_is_inclusive_and_refresh_does_not_reacquire_capture() {
     );
     assert_eq!(session.mode(), Mode::Suspended);
     session
-        .observe_world(111, world(epoch("test:a", 1), 111, 2))
+        .observe_world(112, world(epoch("test:a", 1), 112, 2))
         .unwrap();
-    assert!(session.view(111, owned(), Snap::Off).first().is_none());
-    session.act(111, owned(), Action::Begin);
+    assert!(session.view(112, owned(), Snap::Off).first().is_none());
+    session.act(112, owned(), Action::Begin);
     assert_eq!(
-        session.view(111, owned(), Snap::Off).status(),
+        session.view(112, owned(), Snap::Off).status(),
         ViewStatus::Pinned
     );
 }
@@ -890,5 +890,305 @@ fn requested_snap_rechecks_its_origin_on_every_preview_and_pick() {
             .unwrap()
             .coordinates(),
         [0.24; 3]
+    );
+}
+
+#[test]
+fn grid_confirmation_barrier_rejects_round_trip_origins_and_accepts_new_calibration() {
+    for context in [epoch("test:a", 1), epoch("test:a", 2)] {
+        let mut session = Session::new(FreshnessPolicy::new(10).unwrap());
+        session
+            .observe_world(100, world(context.clone(), 100, 1))
+            .unwrap();
+        session.act(100, owned(), Action::Begin);
+        let old_origin = GridOrigin::caller_validated(context.clone(), point([0.25; 3]), 100);
+        session
+            .observe_world(102, world(epoch("test:b", 1), 102, 2))
+            .unwrap();
+        session
+            .observe_world(103, world(context.clone(), 103, 3))
+            .unwrap();
+        session.act(103, owned(), Action::Begin);
+        session
+            .observe_aim(
+                103,
+                owned(),
+                AimSample {
+                    context: context.clone(),
+                    stamp: Stamp {
+                        observed_at_ms: 103,
+                        sequence: 1,
+                    },
+                    aim: Aim::Hit(point([1.24; 3])),
+                },
+            )
+            .unwrap();
+        session.act(103, owned(), Action::Pick(Snap::Off));
+        session
+            .observe_aim(
+                104,
+                owned(),
+                AimSample {
+                    context: context.clone(),
+                    stamp: Stamp {
+                        observed_at_ms: 104,
+                        sequence: 2,
+                    },
+                    aim: Aim::Hit(point([2.24; 3])),
+                },
+            )
+            .unwrap();
+        let tied_origin = GridOrigin::caller_validated(context.clone(), point([0.25; 3]), 103);
+        for origin in [&old_origin, &tied_origin] {
+            let view = session.view(104, owned(), Snap::SmallGrid(Some(origin)));
+            assert_eq!(view.status(), ViewStatus::FirstPinned);
+            assert!(view.measurement().is_none());
+            assert!(!session
+                .act(104, owned(), Action::Pick(Snap::SmallGrid(Some(origin))))
+                .consumed());
+            assert_eq!(
+                session
+                    .view(104, owned(), Snap::Off)
+                    .first()
+                    .unwrap()
+                    .coordinates(),
+                [1.24; 3]
+            );
+        }
+        let confirmed = GridOrigin::caller_validated(context, point([0.25; 3]), 105);
+        assert_eq!(
+            session
+                .view(105, owned(), Snap::SmallGrid(Some(&confirmed)))
+                .status(),
+            ViewStatus::Preview
+        );
+        assert!(session
+            .act(
+                105,
+                owned(),
+                Action::Pick(Snap::SmallGrid(Some(&confirmed)))
+            )
+            .consumed());
+        assert_eq!(
+            session
+                .view(105, owned(), Snap::Off)
+                .second()
+                .unwrap()
+                .coordinates(),
+            [2.25; 3]
+        );
+    }
+}
+
+#[test]
+fn world_confirmation_barrier_rejects_observations_from_before_or_at_knowledge_loss() {
+    for lost in [
+        Unavailable::World,
+        Unavailable::Epoch,
+        Unavailable::NativeBinding,
+    ] {
+        for observed_at_ms in [100, 102] {
+            let mut session = pair();
+            let before = session
+                .view(101, owned(), Snap::Off)
+                .measurement()
+                .unwrap()
+                .clone();
+            session
+                .observe_world(102, WorldObservation::Unavailable(lost))
+                .unwrap();
+            assert!(session
+                .observe_world(103, world(epoch("test:a", 1), observed_at_ms, 2))
+                .is_err());
+            assert!(!session.act(103, owned(), Action::Begin).consumed());
+            let view = session.view(103, owned(), Snap::Off);
+            assert!(view.context().is_none());
+            assert!(view.first().is_none());
+            assert!(view.measurement().is_none());
+            // Rejected observations preserve dormant pins, but actual new confirmation
+            // and an explicit Begin are needed before those pins are visible again.
+            session
+                .observe_world(104, world(epoch("test:a", 1), 104, 3))
+                .unwrap();
+            assert!(session
+                .view(104, owned(), Snap::Off)
+                .measurement()
+                .is_none());
+            session.act(104, owned(), Action::Begin);
+            assert_eq!(
+                session.view(104, owned(), Snap::Off).measurement(),
+                Some(&before)
+            );
+        }
+    }
+}
+
+#[test]
+fn world_confirmation_barrier_is_not_advanced_by_unavailable_view_queries() {
+    let mut session = pair();
+    session
+        .observe_world(102, WorldObservation::Unavailable(Unavailable::World))
+        .unwrap();
+    assert!(session
+        .view(105, owned(), Snap::Off)
+        .measurement()
+        .is_none());
+    assert!(!session.act(105, owned(), Action::Begin).consumed());
+    session
+        .observe_world(106, world(epoch("test:a", 1), 103, 2))
+        .unwrap();
+    session.act(106, owned(), Action::Begin);
+    assert_eq!(
+        session.view(106, owned(), Snap::Off).status(),
+        ViewStatus::Pinned
+    );
+}
+
+#[test]
+fn grid_confirmation_barrier_requires_reconfirmation_after_temporary_unknown_context() {
+    let mut session = pair();
+    let before = session
+        .view(101, owned(), Snap::Off)
+        .measurement()
+        .unwrap()
+        .clone();
+    let origin = GridOrigin::caller_validated(epoch("test:a", 1), point([0.25; 3]), 100);
+    session
+        .observe_world(102, WorldObservation::Unavailable(Unavailable::Epoch))
+        .unwrap();
+    session
+        .observe_world(103, world(epoch("test:a", 1), 103, 2))
+        .unwrap();
+    session.act(103, owned(), Action::Begin);
+    aim(&mut session, 104, 3, Aim::Hit(point([9.24; 3])));
+    assert!(!session
+        .act(104, owned(), Action::Pick(Snap::SmallGrid(Some(&origin))))
+        .consumed());
+    assert_eq!(
+        session.view(104, owned(), Snap::Off).measurement(),
+        Some(&before)
+    );
+    let confirmed = GridOrigin::caller_validated(epoch("test:a", 1), point([0.25; 3]), 105);
+    assert!(session
+        .act(
+            105,
+            owned(),
+            Action::Pick(Snap::SmallGrid(Some(&confirmed)))
+        )
+        .consumed());
+    assert_eq!(
+        session
+            .view(105, owned(), Snap::Off)
+            .first()
+            .unwrap()
+            .coordinates(),
+        [9.25; 3]
+    );
+}
+
+#[test]
+fn world_confirmation_barrier_applies_after_invalid_current_observations() {
+    let mut session = pair();
+    let before = session
+        .view(101, owned(), Snap::Off)
+        .measurement()
+        .unwrap()
+        .clone();
+    let mut wrong = frame();
+    wrong.units = "unknown".to_owned();
+    assert_eq!(
+        session
+            .observe_world(
+                102,
+                WorldObservation::Current(WorldSample {
+                    context: epoch("test:a", 1),
+                    frame: wrong,
+                    stamp: Stamp {
+                        observed_at_ms: 102,
+                        sequence: 2
+                    },
+                })
+            )
+            .unwrap_err(),
+        Error::UnsupportedFrame
+    );
+    assert!(session
+        .observe_world(103, world(epoch("test:a", 1), 102, 3))
+        .is_err());
+    assert!(session
+        .view(103, owned(), Snap::Off)
+        .measurement()
+        .is_none());
+    session
+        .observe_world(104, world(epoch("test:a", 1), 104, 4))
+        .unwrap();
+    session.act(104, owned(), Action::Begin);
+    assert_eq!(
+        session.view(104, owned(), Snap::Off).measurement(),
+        Some(&before)
+    );
+}
+
+#[test]
+fn world_confirmation_barrier_preserves_dormant_pins_after_out_of_order_observation() {
+    let mut session = pair();
+    let before = session
+        .view(101, owned(), Snap::Off)
+        .measurement()
+        .unwrap()
+        .clone();
+    assert_eq!(
+        session
+            .observe_world(102, world(epoch("test:a", 1), 101, 1))
+            .unwrap_err(),
+        Error::OutOfOrder
+    );
+    assert!(session
+        .view(102, owned(), Snap::Off)
+        .measurement()
+        .is_none());
+    session
+        .observe_world(103, world(epoch("test:a", 1), 103, 2))
+        .unwrap();
+    assert!(!session
+        .view(103, owned(), Snap::Off)
+        .measurement()
+        .is_some());
+    session.act(103, owned(), Action::Begin);
+    assert_eq!(
+        session.view(103, owned(), Snap::Off).measurement(),
+        Some(&before)
+    );
+}
+
+#[test]
+fn world_confirmation_barrier_uses_clock_high_water_after_clock_regression() {
+    let mut session = pair();
+    let before = session
+        .view(101, owned(), Snap::Off)
+        .measurement()
+        .unwrap()
+        .clone();
+    assert_eq!(
+        session.view(100, owned(), Snap::Off).status(),
+        ViewStatus::Unavailable(Error::ClockRegression)
+    );
+    assert_eq!(
+        session
+            .observe_world(101, world(epoch("test:a", 1), 101, 2))
+            .unwrap_err(),
+        Error::WorldConfirmationRequired
+    );
+    assert!(session
+        .view(102, owned(), Snap::Off)
+        .measurement()
+        .is_none());
+    session
+        .observe_world(103, world(epoch("test:a", 1), 102, 3))
+        .unwrap();
+    session.act(103, owned(), Action::Begin);
+    assert_eq!(
+        session.view(103, owned(), Snap::Off).measurement(),
+        Some(&before)
     );
 }

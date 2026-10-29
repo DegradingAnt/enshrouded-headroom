@@ -211,6 +211,25 @@ impl View {
     }
 }
 
+/// Required ordering of an origin confirmation relative to this context activation.
+#[derive(Clone, Copy, Debug)]
+enum ConfirmationBarrier {
+    /// First activation allows calibration confirmed in the same millisecond.
+    AtOrAfter(u64),
+    /// Re-activation requires a later millisecond to establish event ordering.
+    After(u64),
+}
+
+impl ConfirmationBarrier {
+    /// Equal timestamps cannot prove that reconfirmation followed re-activation.
+    fn accepts(self, confirmed_at_ms: u64) -> bool {
+        match self {
+            Self::AtOrAfter(activation) => confirmed_at_ms >= activation,
+            Self::After(activation) => confirmed_at_ms > activation,
+        }
+    }
+}
+
 /// Pure measurement state. Every observation and view is a caller assertion.
 ///
 /// The adapter must release its native input claim whenever mode() is not Active.
@@ -227,6 +246,10 @@ pub struct Session {
     known_context: Option<WorldEpoch>,
     /// A current unavailable reason, including rejected world observations.
     world_error: Option<Error>,
+    /// A world observation must have been made strictly after this knowledge loss.
+    world_confirm_after_ms: Option<u64>,
+    /// An origin must be newly confirmed for the current activation, not just its ID.
+    grid_confirmation: Option<ConfirmationBarrier>,
     /// High-water mark of accepted world observations across world changes.
     world_stamp: Option<Stamp>,
     /// High-water mark of accepted aim observations across world changes.
@@ -257,6 +280,8 @@ impl Session {
             world: None,
             known_context: None,
             world_error: Some(Error::NativeUnavailable),
+            world_confirm_after_ms: None,
+            grid_confirmation: None,
             world_stamp: None,
             aim_stamp: None,
             aim: None,
@@ -273,6 +298,7 @@ impl Session {
     }
 
     /// Accept an explicit current world or fail closed on a missing/rejected contract.
+    /// After knowledge loss, observation time must be strictly later than that event.
     pub fn observe_world(
         &mut self,
         now_ms: u64,
@@ -281,13 +307,13 @@ impl Session {
         self.clock(now_ms)?;
         let sample = match observation {
             WorldObservation::Unavailable(reason) => {
-                self.invalidate_world(reason.error());
+                self.invalidate_world(reason.error(), now_ms);
                 return Ok(());
             }
             WorldObservation::Current(sample) => sample,
         };
         if let Err(error) = self.check_world_context(now_ms, &sample) {
-            self.invalidate_world(error);
+            self.invalidate_world(error, now_ms);
             return Err(error);
         }
         if self
@@ -298,6 +324,7 @@ impl Session {
             self.pins = (None, None);
             self.clear_aim(Error::NoAim);
             self.mode = Mode::Inactive;
+            self.grid_confirmation = Some(ConfirmationBarrier::After(now_ms));
         }
         self.known_context = Some(sample.context.clone());
         self.world_stamp = Some(sample.stamp);
@@ -313,11 +340,17 @@ impl Session {
             }
         });
         if let Err(error) = frame {
-            self.invalidate_world(error);
+            self.invalidate_world(error, now_ms);
             return Err(error);
+        }
+        if self.world_confirm_after_ms.is_some() {
+            self.grid_confirmation = Some(ConfirmationBarrier::After(now_ms));
+        } else if self.grid_confirmation.is_none() {
+            self.grid_confirmation = Some(ConfirmationBarrier::AtOrAfter(now_ms));
         }
         self.world = Some(sample);
         self.world_error = None;
+        self.world_confirm_after_ms = None;
         Ok(())
     }
 
@@ -435,6 +468,12 @@ impl Session {
             Error::StaleWorld,
         )?;
         ordered(self.world_stamp, sample.stamp)?;
+        if self
+            .world_confirm_after_ms
+            .is_some_and(|loss| sample.stamp.observed_at_ms <= loss)
+        {
+            return Err(Error::WorldConfirmationRequired);
+        }
         if self.known_context.as_ref().is_some_and(|old| {
             old.world_id() == sample.context.world_id() && sample.context.epoch() < old.epoch()
         }) {
@@ -445,9 +484,12 @@ impl Session {
 
     /// Enforce the monotonic caller clock and revoke a previous live assertion on error.
     fn clock(&mut self, now_ms: u64) -> Result<(), Error> {
-        if self.last_now_ms.is_some_and(|last| now_ms < last) {
-            self.invalidate_world(Error::ClockRegression);
-            return Err(Error::ClockRegression);
+        if let Some(last) = self.last_now_ms {
+            if now_ms < last {
+                // The loss belongs to the monotonic high-water mark, not regressed time.
+                self.invalidate_world(Error::ClockRegression, last);
+                return Err(Error::ClockRegression);
+            }
         }
         self.last_now_ms = Some(now_ms);
         Ok(())
@@ -456,25 +498,25 @@ impl Session {
     /// Check world freshness even without a new producer event, then current input.
     fn permit(&mut self, now_ms: u64, input: InputContext, active: bool) -> Result<u64, Error> {
         self.clock(now_ms)?;
-        let world = self.world_error.map_or_else(
-            || {
-                self.world
-                    .as_ref()
-                    .map_or(Err(Error::NativeUnavailable), |world| {
-                        fresh_until(
-                            world.stamp.observed_at_ms,
-                            now_ms,
-                            self.policy,
-                            Error::StaleWorld,
-                        )
-                    })
-            },
-            Err,
-        );
+        if let Some(error) = self.world_error {
+            // A read of existing unavailability is not a new knowledge-loss event.
+            return Err(error);
+        }
+        let world = self
+            .world
+            .as_ref()
+            .map_or(Err(Error::NativeUnavailable), |world| {
+                fresh_until(
+                    world.stamp.observed_at_ms,
+                    now_ms,
+                    self.policy,
+                    Error::StaleWorld,
+                )
+            });
         let until = match world {
             Ok(until) => until,
             Err(error) => {
-                self.invalidate_world(error);
+                self.invalidate_world(error, now_ms);
                 return Err(error);
             }
         };
@@ -510,14 +552,26 @@ impl Session {
         match snap {
             Snap::Off => Ok((point, until)),
             Snap::SmallGrid(origin) => {
-                snap_with_deadline(point, origin, &world.context, now_ms, self.policy)
-                    .map(|(point, grid_until)| (point, until.min(grid_until)))
+                let origin = origin.ok_or(Error::GridUnavailable)?;
+                let (point, grid_until) =
+                    snap_with_deadline(point, Some(origin), &world.context, now_ms, self.policy)?;
+                if !self
+                    .grid_confirmation
+                    .is_some_and(|barrier| barrier.accepts(origin.confirmed_at_ms()))
+                {
+                    return Err(Error::GridConfirmationRequired);
+                }
+                Ok((point, until.min(grid_until)))
             }
         }
     }
 
     /// Preserve accepted pins as nonrenderable context-tagged data.
-    fn invalidate_world(&mut self, error: Error) {
+    fn invalidate_world(&mut self, error: Error, loss_at_ms: u64) {
+        self.world_confirm_after_ms = Some(
+            self.world_confirm_after_ms
+                .map_or(loss_at_ms, |old| old.max(loss_at_ms)),
+        );
         self.world_error = Some(error);
         self.clear_aim(error);
         self.suspend();

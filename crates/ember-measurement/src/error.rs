@@ -26,6 +26,10 @@ pub enum Error {
     StaleAim,
     /// The caller-validated grid origin expired.
     StaleGrid,
+    /// A world confirmation was not observed after the latest loss of knowledge.
+    WorldConfirmationRequired,
+    /// The origin was not confirmed for the current context activation.
+    GridConfirmationRequired,
     /// An observation claims a time later than the query.
     FutureSample,
     /// A sample sequence or observation time is older than the accepted stream.

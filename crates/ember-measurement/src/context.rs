@@ -155,6 +155,11 @@ pub struct GridOrigin {
 }
 
 impl GridOrigin {
+    /// Read confirmation time for the session's separate activation barrier.
+    pub(crate) fn confirmed_at_ms(&self) -> u64 {
+        self.confirmed_at_ms
+    }
+
     /// Supply a calibrated origin and its explicit context/time.
     pub fn caller_validated(context: WorldEpoch, point: Point, confirmed_at_ms: u64) -> Self {
         Self {
@@ -166,6 +171,8 @@ impl GridOrigin {
 }
 
 /// Snap only with a current caller-validated origin; never fall back to zero.
+/// This stateless calculation has no activation history. Session snapping additionally
+/// enforces origin reconfirmation after context changes or loss of knowledge.
 pub fn snap_to_small(
     point: Point,
     origin: Option<&GridOrigin>,
