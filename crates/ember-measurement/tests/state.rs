@@ -1196,7 +1196,12 @@ fn world_confirmation_barrier_uses_clock_high_water_after_clock_regression() {
 #[test]
 fn aim_activation_barrier_rejects_queued_samples_after_world_round_trips() {
     for context in [epoch("test:a", 1), epoch("test:a", 2)] {
-        for old_aim in [Aim::Hit(point([9.0; 3])), Aim::Miss, Aim::Unavailable] {
+        for old_aim in [
+            Aim::Hit(point([9.0; 3])),
+            Aim::PlayerPosition(point([9.0; 3])),
+            Aim::Miss,
+            Aim::Unavailable,
+        ] {
             for observed_at_ms in [101, 103] {
                 let mut session = Session::new(FreshnessPolicy::new(10).unwrap());
                 session
@@ -1319,7 +1324,12 @@ fn aim_activation_barrier_rejects_queued_samples_after_unknown_context_recovery(
         Unavailable::Epoch,
         Unavailable::NativeBinding,
     ] {
-        for old_aim in [Aim::Hit(point([9.0; 3])), Aim::Miss, Aim::Unavailable] {
+        for old_aim in [
+            Aim::Hit(point([9.0; 3])),
+            Aim::PlayerPosition(point([9.0; 3])),
+            Aim::Miss,
+            Aim::Unavailable,
+        ] {
             let mut session = pair();
             let before = session
                 .view(101, owned(), Snap::Off)

@@ -64,3 +64,14 @@ cargo doc --locked --offline -p ember-measurement --no-deps --document-private-i
 ```
 
 Passing these checks proves the pure calculation and state contracts. It supplies no native calibration, rendering, keyboard/gamepad or multiplayer runtime evidence. The core never crafts items or mutates a game world, save, server or inventory.
+## Position marks and interface labels
+
+`Aim::PlayerPosition` explicitly identifies a caller-supplied local-player position. It is separate from `Aim::Hit`, which identifies a surface hit. `AimStatus::PlayerPosition` preserves that distinction for the current markable candidate. Both use the same world, activation, age, sequence, snap and input checks. Neither variant reads or validates native memory; the caller must prove the source, coordinate mapping and lifetime before publishing it.
+
+The first planned client interaction marks A and B where the character stands and shows distance text. It does not require a camera ray or world outline, but it still requires a verified client-position producer, world/origin lifetime and native input assertions. Walking-mode integration must supply player positions and must not call them ray hits. The point is the verified player transform origin, not an assumed floor contact; native calibration must establish any offset.
+
+`Session::panel` rechecks `Session::view` and prepares at most four dimension lines for the current interface frame. `UnitDisplay` selects metres, fractional 0.5 m spans, or axis-specific large spans. A large-grid diagonal stays in metres. These are distances, never inclusive cell or inventory counts. Values round to three decimal places; a positive value below 0.001 is explicitly shown as `<0.001`, not zero. Changing display units does not enable snapping or move accepted pins.
+
+The panel labels a transient B as a preview and a marked A/B pair as accepted. Unavailable world/input views expose no dimension labels. The next mark is labelled Mark A, Mark B, or New A according to the actual session state. Suggested Begin/Mark/Clear/Exit flags belong only to that frame. They acquire no native input and authorize no later intent. Every button or controller intent must still call `Session::act` with current time and input assertions. Do not infer focus, closed menus or exclusive ownership merely from a native frame reporting InGame.
+
+This addition is a pure presentation model. It installs no interface, hotkey, native reader, DLL or hook. Real native UI/controller acceptance and the client-position source remain separate integration gates.

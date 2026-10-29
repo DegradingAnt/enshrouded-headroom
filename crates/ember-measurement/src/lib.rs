@@ -20,9 +20,11 @@
 mod context;
 mod error;
 mod geometry;
+mod panel;
 mod state;
 
 pub use context::*;
 pub use error::Error;
 pub use geometry::*;
+pub use panel::*;
 pub use state::*;
