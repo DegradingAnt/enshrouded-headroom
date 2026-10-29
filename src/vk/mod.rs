@@ -813,6 +813,16 @@ fn first_time(flag: &AtomicBool) -> bool {
     !flag.swap(true, Ordering::Relaxed)
 }
 
+/// Contain diagnostic formatting/logger failures without changing native decisions or feature flags.
+/// Call only after securing any mandatory native work, or where the caller retains its fallback.
+pub(crate) fn log_diagnostic(body: impl FnOnce()) {
+    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        // A `panic_any` payload may panic in Drop. As in the shared guard, leak the rare
+        // caught payload so diagnostic failure cannot escape into the native fallback.
+        std::mem::forget(payload);
+    }
+}
+
 /// The warning for a device-level function handed back unwrapped. Without it, a probe device
 /// created first would leave the frame timer dead with no clue in the log.
 fn unwrapped_line(name: &str, device: usize, game: usize) -> String {
@@ -940,7 +950,23 @@ unsafe fn gdpa_choose(
         _ => device_function(slot, found_addr, wrapper, device, game),
     };
     if out != wrapper && first_time(logged) {
-        log::warn!("{}", unwrapped_line(what, device, observed_game));
+        if matches!(
+            classify_gdpa(name),
+            Some(Wrap::DestroyDevice | Wrap::DestroySwapchain)
+        ) {
+            // Diagnostic-time observations are not additional permission to substitute endpoints.
+            // Keep this after the unchanged dispatch decision and inside wrap_gdpa's panic guard.
+            let held = slot.load(Ordering::Acquire);
+            let reflex = crate::reflex::has_device_lifetime(device);
+            let antilag = crate::antilag::has_device_lifetime(device);
+            let query = DEVICE_QUERIES.protects(device);
+            log_diagnostic(|| {
+                log::warn!("{}; held={held:#x} found={found_addr:#x} same_device={} reflex_lifetime_observed={reflex} antilag_lifetime_observed={antilag} query_lifetime_observed={query} decision=preserve-native-endpoint",
+                unwrapped_line(what, device, observed_game), device == observed_game)
+            });
+        } else {
+            log::warn!("{}", unwrapped_line(what, device, observed_game));
+        }
     }
     to_void(out)
 }
@@ -2145,6 +2171,26 @@ mod tests {
     use windows_sys::Win32::System::Memory::PAGE_NOACCESS;
 
     // ---- the brief's tests (ruling G10: no submit wrappers) -----------------------------------
+
+    /// A diagnostic panic payload must never be dropped after its unwind was contained.
+    #[test]
+    fn diagnostic_panic_payload_is_not_dropped() {
+        /// Dropping this payload would start a second unwind outside the diagnostic boundary.
+        struct PanicOnDrop(std::sync::Arc<AtomicUsize>);
+        impl Drop for PanicOnDrop {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                panic!("diagnostic payload destructor");
+            }
+        }
+        let drops = std::sync::Arc::new(AtomicUsize::new(0));
+        let payload = PanicOnDrop(drops.clone());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            log_diagnostic(|| std::panic::panic_any(payload));
+        }));
+        assert!(result.is_ok(), "the payload destructor escaped containment");
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn classify_names() {

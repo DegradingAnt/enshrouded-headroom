@@ -249,6 +249,10 @@ Method (NVIDIA only, and only if the driver lists `VK_NV_low_latency2` revision 
 - The scene-settings post-hook reads the verified `RDX-8` u32 and `RDX-11` vsync byte only when the checked relationship `R8 == RDX + 0x54` holds. Values outside Reflex 0..2 or vsync 0..1 publish unknown. A single Relaxed atomic publishes the coherent pair, with no hook logging.
 - A bad setting warns and falls back to `auto`.
 
+**Bounded Vulkan diagnostics (W43).** The first 64 configured Reflex device-create attempts receive a unique diagnostic id, physical-device identity and final native result. The device output is reported only after native success. Existing query facts identify the requested/physical API, selected feature-query alias, extension revision and feature bits when available. The first typed plan refusal identifies timeline support, an unknown numeric structure tag and zero-based index, cycle/length limit, missing swapchain/present-ID route, duplicate timeline forms or device-group count. Unknown payload layouts remain opaque and the original inputs pass through unchanged.
+
+A differing unwrapped destruction endpoint is explained once per command with saved/returned addresses and diagnostic-time observations of Reflex, Anti-Lag and device-query lifetimes. These observations grant no extra substitution permission and do not identify a faulty layer. Diagnostic logger failures are contained independently of feature-disable state, so mandatory native calls/results and retirement order remain intact. No driver query, admission rule, feature whitelist, present-path work or per-frame logging is added.
+
 W19's pure `plan_device` and `decide_mode` contracts are unchanged. W23 adds runtime wiring.
 Validation uses fake native function tables and the real wrappers, including immutable chain copies,
 exact-pointer retries, timeout disable, swapchain recreation and the native menu post-hook.
