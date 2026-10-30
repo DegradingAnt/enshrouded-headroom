@@ -1,0 +1,573 @@
+{
+  "version": "3.0",
+  "name": "Highcrown Citadel",
+  "block_m": 0.5,
+  "altar": {
+    "x": 60,
+    "y": 60,
+    "abs": 5,
+    "measure_origin": "edge",
+    "measure_width": 2,
+    "measure_depth": 2
+  },
+  "levels": [
+    {
+      "id": "L0",
+      "name": "Cliff Quarters",
+      "elev": 0
+    },
+    {
+      "id": "L1",
+      "name": "Main Level",
+      "elev": 5
+    },
+    {
+      "id": "L2",
+      "name": "Upper Ward",
+      "elev": 10
+    },
+    {
+      "id": "U",
+      "name": "Vaults",
+      "elev": 5
+    },
+    {
+      "id": "B",
+      "name": "Cellars",
+      "elev": 1
+    },
+    {
+      "id": "W",
+      "name": "The Lake",
+      "elev": -20
+    },
+    {
+      "id": "C",
+      "name": "Under-Halls",
+      "elev": -10
+    },
+    {
+      "id": "D",
+      "name": "The Deep",
+      "elev": -20
+    },
+    {
+      "id": "E",
+      "name": "Undervault",
+      "elev": -35
+    },
+    {
+      "id": "F",
+      "name": "Sealed Well",
+      "elev": -50
+    },
+    {
+      "id": "S",
+      "name": "Ember Isle",
+      "elev": 48
+    }
+  ],
+  "buildings": [
+    {
+      "id": "b_garrison",
+      "name": "Garrison Hall",
+      "level": "L1",
+      "x": 24,
+      "y": 6,
+      "w": 15,
+      "d": 7,
+      "abs_floor": 5,
+      "abs_eaves": 13,
+      "abs_ridge": 16.5,
+      "storey_heights": [
+        4,
+        3
+      ],
+      "roofgeo": {
+        "type": "hip",
+        "pitch": "normal",
+        "axis": "x",
+        "L": 15,
+        "S": 7,
+        "R": 3.5,
+        "prof": [
+          [
+            0,
+            0,
+            "r"
+          ],
+          [
+            3.5,
+            3.5,
+            "r"
+          ],
+          [
+            7,
+            0,
+            "r"
+          ]
+        ],
+        "ends": "hip",
+        "curved": false,
+        "zmin": 0,
+        "endp": [
+          [
+            0,
+            0
+          ],
+          [
+            3.5,
+            3.5
+          ]
+        ]
+      }
+    }
+  ],
+  "walls": [
+    {
+      "id": "w_outer_w",
+      "name": "Outer curtain (west & north-west)",
+      "type": "curtain",
+      "level": "L1",
+      "polyline": [
+        [
+          20.5,
+          4.5
+        ],
+        [
+          4.5,
+          4.5
+        ],
+        [
+          4.5,
+          115.5
+        ],
+        [
+          36.5,
+          115.5
+        ]
+      ],
+      "thickness": 3,
+      "height_total": 17,
+      "height_walk": 15
+    },
+    {
+      "id": "r_upper",
+      "name": "Upper Ward terrace face",
+      "type": "revetment",
+      "level": "L1",
+      "polyline": [
+        [
+          36.5,
+          114
+        ],
+        [
+          36.5,
+          84
+        ],
+        [
+          99.5,
+          84
+        ],
+        [
+          99.5,
+          114
+        ]
+      ],
+      "thickness": 1,
+      "height_total": 5,
+      "height_walk": 5
+    },
+    {
+      "id": "p_upper_s1",
+      "name": "Upper Ward parapet",
+      "type": "parapet",
+      "level": "L2",
+      "polyline": [
+        [
+          49,
+          84.5
+        ],
+        [
+          52,
+          84.5
+        ]
+      ],
+      "thickness": 1,
+      "height_total": 1.2,
+      "height_walk": 1.2
+    }
+  ],
+  "zones": [
+    {
+      "id": "z_lane_jog",
+      "name": "",
+      "level": "L1",
+      "x": 22,
+      "y": 80,
+      "w": 14,
+      "d": 4,
+      "kind": "street"
+    }
+  ],
+  "towers": [],
+  "features": [],
+  "content": {
+    "guide": {
+      "measurements": [
+        {
+          "id": "measure_deep_sw",
+          "name": "Southwest Deep floor",
+          "level": "W",
+          "x": 40.5,
+          "y": 36.5,
+          "w": 12.5,
+          "d": 9.5,
+          "kind": "floor",
+          "abs_floor": -40
+        },
+        {
+          "id": "xp_exhibition_loft",
+          "name": "Exhibition upper gallery",
+          "level": "L1",
+          "x": 66,
+          "y": 122,
+          "w": 12,
+          "d": 8,
+          "shape": "rectangle",
+          "kind": "floor",
+          "wall": 0.5,
+          "abs_floor": 9,
+          "floor_openings": [
+            {
+              "x": 68.5,
+              "y": 122.5,
+              "w": 7,
+              "d": 5,
+              "label": "OPEN GALLERY — NO FLOOR"
+            },
+            {
+              "x": 66.5,
+              "y": 122.5,
+              "w": 2,
+              "d": 4,
+              "label": "STAIR — KEEP OPEN"
+            }
+          ]
+        },
+        {
+          "id": "keep_roof31",
+          "name": "Keep lower roof walk and K5 slab",
+          "level": "L2",
+          "x": 77,
+          "y": 92,
+          "w": 22,
+          "d": 22,
+          "shape": "rectangle",
+          "kind": "floor",
+          "abs_floor": 31,
+          "floor_openings": [
+            {
+              "x": 83,
+              "y": 98,
+              "w": 4,
+              "d": 4,
+              "label": "SW RETURN STAIR — KEEP OPEN",
+              "at_floors": [
+                31,
+                36
+              ]
+            },
+            {
+              "x": 89,
+              "y": 104,
+              "w": 4,
+              "d": 4,
+              "label": "NE RETURN STAIR — KEEP OPEN",
+              "at_floors": [
+                31,
+                36
+              ]
+            }
+          ]
+        },
+        {
+          "id": "keep_stage36",
+          "name": "K6 floor at plan +36",
+          "level": "L2",
+          "x": 80,
+          "y": 95,
+          "w": 16,
+          "d": 16,
+          "shape": "rectangle",
+          "kind": "floor",
+          "abs_floor": 36,
+          "floor_openings": [
+            {
+              "x": 83,
+              "y": 98,
+              "w": 4,
+              "d": 4,
+              "label": "SW RETURN STAIR — KEEP OPEN",
+              "at_floors": [
+                31,
+                36
+              ]
+            },
+            {
+              "x": 89,
+              "y": 104,
+              "w": 4,
+              "d": 4,
+              "label": "NE RETURN STAIR — KEEP OPEN",
+              "at_floors": [
+                31,
+                36
+              ]
+            }
+          ]
+        },
+        {
+          "id": "xp_barn",
+          "name": "Outer barn and fodder store",
+          "level": "L1",
+          "x": -10,
+          "y": 40,
+          "w": 8,
+          "d": 18,
+          "shape": "rectangle",
+          "kind": "platform",
+          "expansion_role": "building",
+          "abs_floor": 5,
+          "abs_eaves": 10.5,
+          "abs_ridge": 14.5,
+          "roofgeo": {
+            "prof": [
+              [
+                0,
+                10.5
+              ],
+              [
+                4,
+                14.5
+              ],
+              [
+                8,
+                10.5
+              ]
+            ],
+            "axis": "NS",
+            "type": "gable",
+            "curved": false
+          }
+        },
+        {
+          "id": "xp_exhibition",
+          "name": "Hall of Embervale · exhibition hall",
+          "level": "L1",
+          "x": 66,
+          "y": 122,
+          "w": 12,
+          "d": 8,
+          "shape": "rectangle",
+          "kind": "floor",
+          "expansion_role": "building",
+          "abs_floor": 5,
+          "abs_eaves": 13.5,
+          "abs_ridge": 17.5,
+          "roofgeo": {
+            "prof": [
+              [
+                0,
+                13.5
+              ],
+              [
+                4,
+                17.5
+              ],
+              [
+                8,
+                13.5
+              ]
+            ],
+            "axis": "EW",
+            "type": "hipped",
+            "curved": false
+          },
+          "roof_axis": "EW"
+        }
+      ],
+      "phases": [
+        {
+          "id": "pit",
+          "name": "Excavate and seal the pit",
+          "num": 2,
+          "sessions": [
+            {
+              "steps": [
+                {
+                  "id": "pit.deepfloor",
+                  "measure_ids": [
+                    "measure_deep_sw",
+                    "measure_deep_se",
+                    "measure_deep_nw",
+                    "measure_deep_ne"
+                  ],
+                  "block_pictures": [
+                    {
+                      "object_id": "measure_deep_sw",
+                      "view": "floor",
+                      "layer": 0.5
+                    },
+                    {
+                      "object_id": "measure_deep_se",
+                      "view": "floor",
+                      "layer": 0.5
+                    },
+                    {
+                      "object_id": "measure_deep_nw",
+                      "view": "floor",
+                      "layer": 0.5
+                    },
+                    {
+                      "object_id": "measure_deep_ne",
+                      "view": "floor",
+                      "layer": 0.5
+                    }
+                  ]
+                },
+                {
+                  "id": "pit.deepwalls",
+                  "placement_ids": [
+                    "measure_deep_sw",
+                    "measure_deep_se",
+                    "measure_deep_nw",
+                    "measure_deep_ne"
+                  ],
+                  "block_pictures": [
+                    {
+                      "object_id": "measure_deep_sw",
+                      "view": "wall",
+                      "width": 12.5,
+                      "height": 19,
+                      "title": "Four Deeps — long wall face, repeat for each basin",
+                      "layer": 1
+                    },
+                    {
+                      "object_id": "measure_deep_sw",
+                      "view": "wall",
+                      "width": 9.5,
+                      "height": 19,
+                      "title": "Four Deeps — short wall face, repeat for each basin",
+                      "layer": 1
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "walls",
+          "name": "Gate Ward and the walls",
+          "num": 14,
+          "sessions": [
+            {
+              "steps": [
+                {
+                  "id": "walls.slits",
+                  "host_ids": [
+                    "w_outer_w",
+                    "w_outer_e",
+                    "w_outer_s"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "tall",
+          "name": "Keep and Spire to full height",
+          "num": 15,
+          "sessions": [
+            {
+              "steps": [
+                {
+                  "id": "tall.roofwalk",
+                  "placement_ids": [
+                    "keep_roof31"
+                  ],
+                  "block_pictures": [
+                    {
+                      "object_id": "keep_roof31",
+                      "view": "floor"
+                    }
+                  ]
+                },
+                {
+                  "id": "tall.stage",
+                  "placement_ids": [
+                    "b_keep.stage",
+                    "keep_stage36",
+                    "keep_upper_sw",
+                    "keep_upper_ne"
+                  ],
+                  "block_pictures": [
+                    {
+                      "object_id": "keep_stage36",
+                      "view": "floor",
+                      "storeyIndex": 1
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "alive",
+          "name": "Bring it to life",
+          "num": 20,
+          "sessions": [
+            {
+              "steps": [
+                {
+                  "id": "alive.vukah",
+                  "host_ids": [
+                    "b_garrison"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "flame",
+          "name": "Complete the outer defences and exhibitions",
+          "num": 22,
+          "sessions": [
+            {
+              "steps": [
+                {
+                  "id": "lv4.exhibition.loft",
+                  "placement_ids": [
+                    "xp_exhibition_loft",
+                    "xp_exhibition_stair"
+                  ],
+                  "block_pictures": [
+                    {
+                      "object_id": "xp_exhibition_loft",
+                      "view": "floor",
+                      "storeyIndex": 1
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

@@ -13,7 +13,7 @@
 ## Global Constraints
 
 **Project and build**
-- Repo: `C:\Modding\Enshrouded`, a new git repo, MIT licence, public on GitHub only at release (Task 18, with the author's go-ahead).
+- Repo: `<repository>`, a new git repo, MIT licence, public on GitHub only at release (Task 18, with the author's go-ahead).
 - Toolchain: pinned in `rust-toolchain.toml` to `1.99.1`, target `x86_64-pc-windows-msvc`.
 - Output file: `enshrouded-headroom.asi`. Settings: `enshrouded-headroom.ini`. Log: `enshrouded-headroom.log`. Both sit next to the `.asi` in `<game>\plugins\`, with a fallback to `%LOCALAPPDATA%\enshrouded-headroom\`.
 - Profile:
@@ -22,7 +22,9 @@
   - `+crt-static` through `.cargo/config.toml`.
 
 **Game build**
-- Known build: sha256 `b28b448a8dbf48c932b717f035031f5a89712a7cccfcc2d6cac0d47e6421c12a`, label `f68140a3`.
+- Known build `f68140a3`, in two exes with the same game code. Both are known:
+  - old install: sha256 `b28b448a8dbf48c932b717f035031f5a89712a7cccfcc2d6cac0d47e6421c12a`, label `f68140a3`;
+  - Steam (buildid 26082781): sha256 `d64966e23b1a458ee6f147bcbceac0b577fa7e39a212f371287d8cc119817882`, label `f68140a3-steam`.
 - On any other build, code patches and code hooks are OFF unless `AllowUnknownBuild = 1`.
 
 **Rules for game memory and hooks**
@@ -35,11 +37,12 @@
 - Every extern function wraps its body in `guard(...)` (Task 3), which runs the original on a panic.
 
 **Defaults** (spec sections 6.4 and 8)
-- `[General]`: `TargetFps=75`, `TextureBudget=auto`, `TextureReserveGiB=11`, `AsyncCompute=on`, `Reflex=game`, `AllowUnknownBuild=0`.
+- `[General]`: `TextureBudget=auto`, `TextureReserveGiB=11`, `AsyncCompute=on`, `Reflex=game`, `AllowUnknownBuild=0`. (`TargetFps` is a `[Governor]` key, per spec 6.4 and 8; ruling 2026-10-25.)
 - `[Governor]`:
 
   | Key | Default |
   |---|---|
+  | `TargetFps` | 75 |
   | `WindowSeconds` | 2 |
   | `RaiseBelow` | 0.90 |
   | `RaiseHoldSeconds` | 1.0 |
@@ -78,7 +81,7 @@
 ## File structure
 
 ```
-C:\Modding\Enshrouded\
+<repository>\
   Cargo.toml                      crate `enshrouded-headroom`, cdylib + rlib (rlib so examples/tests link)
   rust-toolchain.toml             channel = "1.99.1"
   .cargo\config.toml              +crt-static; alias `asi`
@@ -128,14 +131,14 @@ C:\Modding\Enshrouded\
 - Produces: `cargo asi`. It is an alias for `rustc --release --lib -- -C link-arg=/OUT:target/release/enshrouded-headroom.asi`.
 
 - [ ] **Step 1:** `rustup update stable` and `rustup install 1.99.1` (the author asked for the latest versions; on 2026-10-25 only `stable` = 1.98.0 was installed). Check: `rustc +1.99.1 --version` prints `1.99.1`. Do not rely on `link.exe` from PATH: rustc finds the MSVC linker itself (VS 2022 Community, MSVC 14.44.35207).
-- [ ] **Step 2:** `git init C:\Modding\Enshrouded`. Copy the spec, the re-notes and this plan into `docs/`. Add the MIT `LICENSE` (copyright: DegradingAnt), `.gitignore` (`target/`, `dist/`), and `Cargo.toml`:
+- [ ] **Step 2:** `git init <repository>`. Copy the spec, the re-notes and this plan into `docs/`. Add the MIT `LICENSE` (copyright: DegradingAnt), `.gitignore` (`target/`, `dist/`), and `Cargo.toml`:
   - `[lib] crate-type = ["cdylib", "rlib"]`, name `enshrouded_headroom`;
   - the dependencies at the exact versions in Global Constraints;
   - the release profile from Global Constraints.
 - [ ] **Step 3: Write `examples/asi_host.rs`.** It takes an `.asi` path, `LoadLibraryW`s it, calls `InitializeASI`, sleeps 500 ms, and exits 0.
 - [ ] **Step 4: Run it.** `cargo asi`, then `cargo run --release --example asi_host -- target/release/enshrouded-headroom.asi`.
   - Expected: exit 0, and `target/release/enshrouded-headroom.log` contains `loaded`.
-- [ ] **Step 5: Verify the artefact, not the build log.** `dumpbin` is NOT on PATH on the author's machine (checked 2026-10-25), and Git's own `link.exe` comes first on PATH. So use `python -I -c "import pefile; ..."` (pefile 2024.8.26 is installed). Alternatively use the full path from `vswhere` (`C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64\dumpbin.exe`). Check that the `InitializeASI` export is present and that `VCRUNTIME140.dll` is absent from the imports.
+- [ ] **Step 5: Verify the artefact, not the build log.** Use `dumpbin` from a Visual Studio developer prompt, or locate the installed toolchain with `vswhere`; do not accidentally use Git's unrelated `link.exe`. A PE inspection tool such as `pefile` is another option. Check that the `InitializeASI` export is present and that `VCRUNTIME140.dll` is absent from the imports.
 - [ ] **Step 6:** Commit: `chore: scaffold enshrouded-headroom plugin`.
 
 ### Task 2: Settings file
@@ -150,10 +153,13 @@ C:\Modding\Enshrouded\
   - `pub enum AsyncCompute { On, Game }`
   - `pub enum ReflexMode { Game, Off, On, Boost }`
   - `pub fn parse(text: &str) -> (Config, Vec<String>)`. The `Vec` holds warnings.
-  - `pub fn load_or_create(dir: &Path) -> (Config, Vec<String>)`. It writes the default file if the file is missing.
+  - `pub fn read_ini(dir: &Path) -> io::Result<Option<(Config, Vec<String>)>>`. It reads an existing file; `Ok(None)` means it is missing.
+  - `pub fn write_default(dir: &Path) -> io::Result<()>`. It creates the default file, or returns `AlreadyExists` if the file exists.
   - `pub const DEFAULT_INI: &str = include_str!("../enshrouded-headroom.default.ini")`
   - `impl Default for Config`, which equals `parse(DEFAULT_INI).0`.
 - Field names are the snake_case of the `.ini` keys in spec section 8 (`target_fps: u32`, `raise_below: f64`, `max_object_distance: u8`, …).
+
+Start-up replaced `load_or_create` with `read_ini` and `write_default` through `entry::load_settings`. The loader tries the settings folders in order.
 
 **Clamp ranges**
 
@@ -179,7 +185,7 @@ C:\Modding\Enshrouded\
 #[test] fn defaults_match_spec() {
     let (c, w) = parse(DEFAULT_INI);
     assert!(w.is_empty());
-    assert_eq!(c.general.target_fps, 75);
+    assert_eq!(c.governor.target_fps, 75);
     assert!(matches!(c.general.async_compute, AsyncCompute::On));
     assert!(matches!(c.general.reflex, ReflexMode::Game));
     assert_eq!(c.governor.raise_below, 0.90);
@@ -191,7 +197,7 @@ C:\Modding\Enshrouded\
     let (c, w) = parse("[Governor]\nRaiseBelow=0,85\nLowerAbove=banana\nTargetFps=9999\n[Nope]\nX=1\n");
     assert_eq!(c.governor.raise_below, 0.85);      // decimal comma accepted
     assert_eq!(c.governor.lower_above, 0.97);      // garbage -> default
-    assert_eq!(c.general.target_fps, 360);         // clamped
+    assert_eq!(c.governor.target_fps, 360);        // clamped
     assert!(w.len() >= 3);                         // garbage, clamp, unknown section
 }
 #[test] fn inverted_thresholds_reset_both() {
@@ -201,7 +207,10 @@ C:\Modding\Enshrouded\
 }
 #[test] fn missing_file_writes_default() {
     let d = tempdir_in_target("cfg_missing");
-    let (_, w) = load_or_create(&d);
+    assert_eq!(read_ini(&d).unwrap(), None);
+    write_default(&d).unwrap();
+    let (c, w) = read_ini(&d).unwrap().unwrap();
+    assert_eq!(c, Config::default());
     assert!(w.is_empty());
     assert_eq!(std::fs::read_to_string(d.join("enshrouded-headroom.ini")).unwrap(), DEFAULT_INI);
 }
@@ -302,7 +311,7 @@ C:\Modding\Enshrouded\
 - [ ] **Step 2:** Run `cargo test scan::` and expect FAIL.
 - [ ] **Step 3:** Implement a naive scan, anchored on the first non-wildcard byte with `memchr`-style `position`. Read the section bounds from the in-memory PE headers.
 - [ ] **Step 4:** Run `cargo test scan::` and expect PASS.
-- [ ] **Step 5: Cross-check against the real exe.** Write a test-only helper `#[ignore] fn sigs_unique_in_game_exe()`. It reads `C:\Games\Enshrouded\enshrouded.exe` from disk, maps the sections by file offset, and asserts that every `sigs::ALL` entry is unique. Run `cargo test -- --ignored sigs_unique_in_game_exe` and expect PASS.
+- [ ] **Step 5: Cross-check against the real exe.** Write a test-only helper `#[ignore] fn sigs_unique_in_game_exe()`. It reads the game exe from disk (the path in `ENSHROUDED_EXE` if set, else `C:\Program Files (x86)\Steam\steamapps\common\Enshrouded\enshrouded.exe`; a path that is set must be a readable file, or the test panics; only a missing file at the default Steam path skips), maps the sections by file offset, and asserts that every `sigs::ALL` entry is unique. Run `cargo test --lib -- --ignored --nocapture sigs_unique_in_game_exe` and expect PASS. **Run ignored tests with `-- --ignored --nocapture`:** a skip prints a `SKIPPED ...` line and the harness still reports `ok`, and without `--nocapture` the line is hidden, so a green run alone does not show that an exe was read. Look for the real output lines. This is the run recipe for every ignored real-exe test in this plan.
 - [ ] **Step 6:** Commit: `feat(scan): exactly-once signature scanning + signature table`.
 
 ### Task 5: Patching primitives and import slots
@@ -314,7 +323,7 @@ C:\Modding\Enshrouded\
 - Produces:
   - `pub struct Patched { pub addr: usize, pub original: Vec<u8> }`
   - `pub enum PatchError { Mismatch { at: usize, found: Vec<u8> }, Protect(u32), ReadBack }`
-  - `pub unsafe fn write_checked(addr: usize, expected: &[u8], new: &[u8]) -> Result<Patched, PatchError>`. It runs `VirtualProtect(PAGE_EXECUTE_READWRITE)`, writes, restores the protection, reads back and calls `FlushInstructionCache`.
+  - `pub unsafe fn write_checked(addr: usize, expected: &[u8], new: &[u8]) -> Result<Patched, PatchError>`. It makes each region writable (`PAGE_READWRITE` for non-executable regions and `PAGE_EXECUTE_READWRITE` for executable regions), writes, restores each region's own protection, reads back and calls `FlushInstructionCache`.
   - `pub unsafe fn write_u32_checked(addr: usize, expected: u32, new: u32) -> Result<Patched, PatchError>`
   - `pub fn alloc_near(target: usize, size: usize) -> Option<usize>`. It returns a `PAGE_READWRITE` allocation whose whole range is within ±2 GiB of `target`. It walks `VirtualQuery` free regions in 64 KiB steps.
   - `pub fn rel32(next_insn: usize, dest: usize) -> Option<i32>`
@@ -435,7 +444,7 @@ const GIB: u64 = 1 << 30;
   `prepare_in(hay: &[u8]) -> Result<usize, TbError>` is the pure inner part of `prepare`.
 - [ ] **Step 2:** Run `cargo test texture_budget::` and expect FAIL.
 - [ ] **Step 3:** Implement. In `entry::start`, call `prepare` and store `Prepared` in a `OnceLock`. `apply` is called from `vk::wrap_create_device` (Task 9). This is a data patch, so the spec allows it on unknown builds when the full 80-byte table matches.
-- [ ] **Step 4:** Run the tests and expect PASS. Run the ignored test `texture_table_unique_in_game_exe`, which reads the real exe, and expect PASS.
+- [ ] **Step 4:** Run the tests and expect PASS. Run the ignored test with `cargo test --lib -- --ignored --nocapture texture_table_unique_in_game_exe` (it reads the real exe; see the run recipe in Task 4 Step 5) and expect PASS.
 - [ ] **Step 5:** Commit: `feat: VRAM-sized texture budget`.
 
 ### Task 8: Async compute
@@ -493,11 +502,11 @@ const GIB: u64 = 1 << 30;
   - `pub enum Wrap { Gipa, Gdpa, CreateDevice, CreateSwapchain, Present, Submit, Submit2 }`
   - `pub fn classify_gpa(name: &[u8]) -> Option<Wrap>`, `pub fn classify_gipa(name: &[u8]) -> Option<Wrap>`, `pub fn classify_gdpa(name: &[u8], reflex_active: bool) -> Option<Wrap>`. These are pure. `Submit` and `Submit2` are returned only when `reflex_active`.
   - `pub static WRAPPER_ENGAGED: AtomicBool`. It is set when `wrap_gipa` is handed out.
-  - `pub static GAME_DEVICE: AtomicUsize` and `pub static GAME_PHYS: AtomicUsize`. They hold the first device the game creates, and its physical device.
+  - `pub fn vk::game_device() -> Option<GameDevice>`, where `GameDevice { device: usize, phys: usize }`. It returns the first device the game creates and its physical device together, or `None` before then.
   - The extern wrappers are `wrap_gpa`, `wrap_gipa`, `wrap_gdpa`, `wrap_create_device`, `wrap_create_swapchain` and `wrap_present`. Each body runs inside `guard(Feature::VkWrap, call_original, …)`.
     - `wrap_gpa` guards: ordinal names (`name as usize <= 0xFFFF`) pass through. Names are compared only when `hModule == GetModuleHandleW("vulkan-1.dll")`.
     - `wrap_create_device` calls `texture_budget::apply` once, on the first call. It reads `vkGetPhysicalDeviceMemoryProperties` (the largest `DEVICE_LOCAL` heap) and `vkGetPhysicalDeviceProperties` (`deviceType == INTEGRATED_GPU`).
-    - `wrap_present` pushes `qpc_now()` to `FRAMES`, then calls `reflex::on_present` (Task 16; a no-op until then), then calls the real present.
+    - `wrap_present` pushes `qpc_now()` to `FRAMES`, then delegates to `reflex::on_present` (Task 16), which calls the real present exactly once.
 - Produces from `vk/types.rs`: `#[repr(C)]` structs for any `VK_NV_low_latency2` / `VK_KHR_present_id2` types that ash 0.38.0 lacks. Each one gets a test asserting `size_of` against the Vulkan header value.
 
 - [ ] **Step 1: Write the failing tests:**
@@ -724,8 +733,48 @@ fn gov() -> Governor { Governor::new(Config::default().governor, vec![KnobSpec{e
 
 - [ ] **Step 3:** Run `cargo test scatter_distance::` and expect FAIL.
 - [ ] **Step 4:** Implement. The disp32 locations are signature match +30 (instance) and +9 (brick). The instruction end is the disp location + 4. Call it from `entry::start` if `code_patches_allowed()` and `knobs.enable_scatter_distance`. It must run before the scene is built, which is guaranteed because `InitializeASI` runs before WinMain.
-- [ ] **Step 5:** Run `cargo test scatter_distance::` and expect PASS. Run the ignored test `scatter_sigs_unique_in_game_exe` and expect PASS.
+- [ ] **Step 5:** Run `cargo test scatter_distance::` and expect PASS. Run the ignored test with `cargo test --lib -- --ignored --nocapture scatter_sigs_unique_in_game_exe` (see the run recipe in Task 4 Step 5) and expect PASS.
 - [ ] **Step 6:** Commit: `feat(knobs): grass distance redirect with audited capacity`.
+
+### Task 13b: Scatter counter probe (added 2026-10-25; the author: "Add it to v1")
+
+Spec: `docs/design.md` sections 7.2 ("Capacity") and 7.2a. Evidence: `(the author's notes, not in this repo)` (the pointer chain is in its "brief changes" list, and the refuter's check confirmed the counter layout from the bytes).
+
+**Files:**
+- Create: `src/features/scatter_probe.rs`
+- Modify: `src/sigs.rs` (add `SCATTER_FRAME_FN` to `ALL`), `src/config.rs` (add the `[Debug]` section with `ScatterProbe`)
+
+**Interfaces:**
+- Consumes: `scan::{Module, Pattern, find_in_sections}` (start-up only), `sigs::SCATTER_FRAME_FN`, `minhook`, `guard::{guard, Feature::ScatterDistance}`.
+- Produces:
+  - `pub const SCATTER_FRAME_FN: Sig = Sig { name: "SCATTER_FRAME_FN", pattern: "48 89 54 24 10 55 53 57 41 55 41 56 41 57", sections: &[".text"], patch_offsets: &[0] }`. It is unique in build f68140a3 at 0x1400767a0 (controller, 2026-10-26). The existing sigs tests extend to cover it; it is a prologue, so it has no imm sites.
+  - `pub struct CounterSample { pub last: u32, pub peak: u32, pub warn: u32, pub cap: u32 }`
+  - `pub const WARN_A: u32 = 0xf000; pub const CAP_A: u32 = 0x14000;`
+  - `pub unsafe fn read_counters(pass: usize, readable: impl Fn(usize, usize) -> bool) -> Option<[CounterSample; 3]>`. It follows the chain below, calls `readable(addr, len)` before EVERY read, and returns `None` if any check fails or if counter A's `warn != WARN_A` or `cap != CAP_A` (the self-check). Chain: obj = [pass+0x18]; pool = [[pass+0x8]+0x20]; base = [pool+0x48]; entry(h) = base + (h & 0xffff) × 0x40, for h = u32 at [obj+0x8] (A), [obj+0xc] (B), [obj+0x10] (C). Each sample: last = u32 at entry+0x14, peak = u32 at +0x1c, warn = u32 at +0x20, cap = u32 at +0x24.
+  - `pub fn is_readable(addr: usize, len: usize) -> bool`: VirtualQuery says MEM_COMMIT, a readable protection, not PAGE_GUARD, and the range fits in one region. Reuse Task 4's protection logic if it is public; otherwise copy its tested rule and say so.
+  - `pub fn headroom_ok(last: u32, r_now: f32, r_next: f32) -> bool` = `last as f64 * (r_next / r_now)² < WARN_A as f64`. False for a non-finite or non-positive r_now.
+  - `pub fn ceiling_step(steps: &[f32], r_max: f32) -> usize`: the highest index whose distance is <= r_max; 0 if none is.
+  - `pub const R_MAX_M: f32 = 90.0;` (the measured ceiling; stays 90.0 until the author's measurement session sets it).
+  - Published state: `pub static PROBE_OK: AtomicBool` (false until the first self-check passes; false for good after a failure), `pub static LAST_A: AtomicU32`, `pub static PEAK_A: AtomicU32`, `pub static LAST_B: AtomicU32`, `pub static LAST_C: AtomicU32`, `pub static FAILED: AtomicBool`.
+  - `pub unsafe fn install(m: &Module) -> Result<(), String>`. It is called from `entry::start` (Task 6) when `EnableScatterDistance = 1` or `[Debug] ScatterProbe = 1`. It finds `SCATTER_FRAME_FN` and creates a minhook pre-hook, queued and enabled with the other hooks. The hook body runs inside `guard(Feature::ScatterDistance, call_original, ...)`. Every 30th call it runs `read_counters(rdx, is_readable)` and publishes the result: success stores the values and sets `PROBE_OK`; failure sets `FAILED` and clears `PROBE_OK`. It then calls the original with the same arguments. It never logs and never allocates.
+- `config.rs`: add `DebugCfg { scatter_probe: bool, force_step_object: Option<u8>, force_step_scatter: Option<u8>, force_step_terrain: Option<u8> }` under `[Debug]`. ForceStep keys take `0..=4`; absent means None; out of range clamps with a warning. All of it is honoured only when `LogLevel = debug`; the gating is the consumer's job (Task 15). This also covers the ForceStep keys from the pre-flight ruling for Task 15, so Task 15 only consumes them. `[Debug]` is NOT written into the default ini.
+
+- [ ] **Step 1: Write the failing tests:**
+  - `headroom_ok(0xf000 / 2, 90.0, 100.0)` is true (0x7800 × 1.234 < 0xf000); `headroom_ok(0xe000, 90.0, 100.0)` is false; `headroom_ok(1, 0.0, 100.0)` is false.
+  - `ceiling_step(&[90.0, 100.0, 110.0, 120.0, 127.0], 112.0) == 2`; `ceiling_step(.., 80.0) == 0`; `ceiling_step(.., 127.0) == 4`.
+  - `read_counters` on a fake chain built in a test-owned buffer of real addresses gives A = {last, peak, 0xf000, 0x14000} and the B and C values; changing A.warn to 0xe000 gives None; a `readable` that refuses one link gives None, and that link is never read (the closure records the calls).
+  - `is_readable` on a `VirtualAlloc(PAGE_NOACCESS)` page is false, and on a `PAGE_READWRITE` page is true.
+  - The sigs tests cover `SCATTER_FRAME_FN` (it is in `ALL` and has offset 0). The ignored exe test finds it at 0x1400767a0.
+  - Config: `[Debug]\nScatterProbe=1\nForceStepScatterDistance=7` gives scatter_probe true, force_step_scatter Some(4) and one warning; the default file has no `[Debug]` and gives DebugCfg::default().
+- [ ] **Step 2:** Run `cargo test --lib -- scatter_probe:: sigs:: config::` and expect FAIL.
+- [ ] **Step 3:** Implement. `read_counters` uses `core::ptr::read_unaligned` on each checked address.
+- [ ] **Step 4:** Run the tests and the ignored exe test (`-- --ignored --nocapture`, see the run recipe in Task 4 Step 5); expect PASS.
+- [ ] **Step 5:** Commit: `feat(scatter): GPU counter probe with self-check and headroom rule`.
+- [ ] **Step 6 (the author, after Task 17's install):** the measurement session from spec 7.2a. The controller computes r_max = 90 × sqrt(0xf000 / peak_A), rounds it DOWN to a whole metre, sets `R_MAX_M`, records the measurement in RE-NOTES, and commits it as `chore(scatter): measured ceiling r_max = N m`.
+
+Task 15 consumes this module. The governor's knob 1 is enabled only while `SCATTER_LEVEL == 3 && EnableScatterDistance && PROBE_OK`. A raise from step s to s+1 needs `s + 1 <= ceiling_step(SCATTER_STEPS, R_MAX_M)` and `headroom_ok(LAST_A, r_s, r_{s+1})`. If `LAST_A >= WARN_A`, step down one at once. If `FAILED` becomes true, reset to step 0 and log it once. With `[Debug] ScatterProbe = 1` and `LogLevel = debug`, the governor thread logs A, B and C every 2 s.
+
+---
 
 ### Task 14: Terrain detail distance
 
@@ -776,15 +825,15 @@ fn gov() -> Governor { Governor::new(Config::default().governor, vec![KnobSpec{e
     - distant High (2.5) × `distant_objects_scale`;
     - voxel High (32, 128, 160) × `terrain_ring_scale`.
     - Each goes through `write_u32_checked` with the original f32 bits as the expected value. A scale of 1.0 means no write.
-- Produces from `vram_budget`: `pub unsafe fn free_mib(gipa, instance, phys) -> Option<u64>`. It uses `vkGetPhysicalDeviceMemoryProperties2` with `VkPhysicalDeviceMemoryBudgetPropertiesEXT` and returns `budget − usage` of the largest `DEVICE_LOCAL` heap. It returns `None` when the driver does not list `VK_EXT_memory_budget`.
-- Produces from `governor_thread`: `pub fn spawn(cfg: GovernorCfg, knobs: KnobsCfg, scatter_cap_ok: bool)`. Every 50 ms it:
+- Produces from `vram_budget`: `pub unsafe fn free_mib(gipa, instance, phys, route: QueryRoute) -> Option<u64>`. The caller proves either core Vulkan 1.1 support for the observed instance and physical device, or an explicitly enabled KHR properties2 route. It queries `VkPhysicalDeviceMemoryBudgetPropertiesEXT` and returns `budget − usage` of the largest `DEVICE_LOCAL` heap. Unknown facts, missing selected commands, retirement or an unlisted `VK_EXT_memory_budget` return `None`; a non-null alias is not capability proof.
+- Produces from `governor_thread`: `pub fn spawn(cfg: Config)`. Every 50 ms it:
   1. reads new frames from `FRAMES` and converts them to intervals in ms;
   2. sets `world_active = qpc_now() - OBJECT.last_seen() < 250 ms`;
   3. reads `period_ms` from `display` (refreshed every 5 s) and `free_mib` (every 2 s);
   4. works out `baseline_changed` from each knob's `baseline_seq`;
-  5. runs `Governor::tick`;
+  5. runs the equivalent `Governor::tick_with` with preallocated scratch;
   6. maps each `Action::Set{knob, step}`: knob 0 → `OBJECT.set(OBJECT_STEPS[step])`; knob 1 → `scatter_distance::set_distance(SCATTER_STEPS[step])`; knob 2 → `TERRAIN.set(TERRAIN_STEPS[step])`. Knob 1's `KnobSpec.enabled` is true only while `SCATTER_LEVEL == 3`, `scatter_cap_ok` and `enable_scatter_distance`; when that turns false, the step is reset to 0 first;
-  7. logs each step change (this thread may log).
+  7. logs each step change (this thread may log). It reports status every 30 s, available Reflex timings every 5 s at debug level, and configured scatter counters every 2 s. The VRAM query uses W23's live capability-aware lease.
 
 - [ ] **Step 1: Write the failing tests:** `assert_eq!(scaled(1.5, 0.5), 0.75)`, and `apply` with all scales at 1.0 returns a `Vec` of `"unchanged"` notes. Plus a glue test, `actions_map_to_knob_values`: given `Action::Set{knob:2, step:4}`, the mapping function `knob_value(2, 4)` returns `2.0`.
 - [ ] **Step 2:** Run `cargo test startup_scales:: governor_thread::` and expect FAIL.
@@ -794,60 +843,68 @@ fn gov() -> Governor { Governor::new(Config::default().governor, vec![KnobSpec{e
 
 ### Task 16: NVIDIA Reflex
 
-**Files:**
-- Create: `src/reflex.rs`
-- Modify: `src/vk/mod.rs` (wire `wrap_create_device`, `wrap_create_swapchain`, `wrap_submit`, and `on_present`)
+**Files:** `src/reflex.rs`, `src/vk/mod.rs`, `src/knobs/object_distance.rs`, `tests/vk_chain.rs`, docs.
+Issue #27 authorizes this wiring and the Reflex present-path exception to AGENTS rule 5.
+The maintainer also approved `guard::disable_silent` in `src/guard.rs` and the parsed-mode
+initialization step in `src/entry.rs` before Vulkan interception.
+The author approved unchanged instance-creation observation to establish API/extension facts
+for safe core/KHR capability queries.
 
-**Interfaces:**
-- Consumes: `vk::types`, `config::ReflexMode`, `GAME_DEVICE`.
-- Produces:
-  - `pub enum TimelineFix { SetInVulkan12, SetInTimelineStruct, ChainNewStruct }`
-  - `pub fn plan_device(exts: &[&CStr], has_v12_features: bool, has_timeline_struct: bool, api_version: u32) -> (Vec<&'static CStr> /*extra exts*/, TimelineFix)`. It is pure. The extra extensions are `VK_NV_low_latency2`, plus `VK_KHR_timeline_semaphore` when `api_version < VK_API_VERSION_1_2`. Already-present extensions are not duplicated.
-  - `pub fn decide_mode(cfg: &ReflexMode, game_menu: Option<bool>, vendor_nvidia: bool, ext_listed: bool) -> Option<bool /*boost*/>`. `None` means Reflex is off.
-  - `pub unsafe fn on_device_created(...)`, `pub unsafe fn on_swapchain_created(device, swapchain)`. The latter calls `vkSetLatencySleepModeNV` and stores the swapchain. It runs again on every new swapchain.
-  - `pub unsafe fn on_submit(...)`. It chains `VkLatencySubmissionPresentIdNV { presentID: FRAME_ID }`.
-  - `pub unsafe fn on_present(queue, info, real_present) -> VkResult`. It does `PRESENT_START`, the real present, `PRESENT_END`, `vkLatencySleepNV`, then `vkWaitSemaphores` with a 10 ms timeout. On a timeout, `VK_ERROR_DEVICE_LOST` or `VK_ERROR_OUT_OF_DATE_KHR`, it calls `disable(Feature::Reflex)` and does not wait again. Then `FRAME_ID += 1`, `SIMULATION_START`, `RENDERSUBMIT_START`.
-  - Every 5 s, `pub fn latency_report()` logs the averages from `vkGetLatencyTimingsNV`. It runs on the governor thread.
-- **Retry rule (spec 6.5):** if the changed `vkCreateDevice` returns an error, call it again with the game's original create info and `disable(Feature::Reflex, "driver refused")`. The same applies to `vkCreateSwapchainKHR`.
-- **Game menu value (`ReflexMode::Game`):** a research step first. Find the `nvidiaReflex` field offset in the machine-settings struct, from the reflection descriptors (`NvidiaReflexModeSettings` type, the same method as the render-settings descriptors at `0x1417b5780`), and the getter that returns machine settings. Record it in `docs/re-notes.md`. If it is not found, `game_menu = None`, and `decide_mode(Game, None, ..)` returns `None` (off), with a log line saying so.
+**Interfaces and maintained rulings:**
+- Preserve W19's `TimelineFix` and pure `plan_device` API.
+- `decide_mode(cfg: &ReflexMode, game_menu: Option<u32>, vendor_nvidia: bool, ext_listed: bool) -> Option<bool>` uses 0/1/2 for saved off/on/boost. `Auto` is the default. Unknown saved values use auto.
+- At device creation, query prerequisites and add the extension whenever NVIDIA support exists and the configured mode is not `Off`. The saved menu is not required yet. Copy all changed chain nodes; unknown layouts fail closed.
+- Bind successful instance creation's requested API and enabled properties2 extension to its observed generation. After the Vulkan 1.0 physical-properties query, choose core Features2 only when both APIs are at least 1.1; otherwise choose KHR only when explicitly enabled. Unknown facts or a missing selected function preserve the original device without alias fallback.
+- On a rejected modified device or swapchain create call, retry the exact original create-info pointer once and disable Reflex with `driver refused`.
+- On each successful new swapchain, set sleep mode from the current decision. Once the menu first becomes known, update the mode once if that changes the decision.
+- Read the verified menu fields in the existing scene-settings post-hook (`docs/re-notes.md`, "Reflex and vsync menu values seen from the scene-settings hook"). Check `R8 == RDX + 0x54` without overflow before reading Reflex at `RDX-8` and vsync at `RDX-11`; invalid ranges publish unknown through Relaxed atomics. Preserve the original-once hook structure.
+- Present order: `PRESENT_START`, real present, `PRESENT_END`, sleep, 10 ms timeline wait. First timeout/device-lost/out-of-date disables Reflex. After success, increment ID, then `SIMULATION_START` and `RENDERSUBMIT_START`. Cache the real result before post-work. No allocation, blocking lock or ordinary logging on present.
+- **No submit wrapper or submission-ID chaining in v1.**
+- `latency_report() -> Option<String>` reads and formats driver averages. Do not schedule it here; Task 15 owns the five-second background schedule. Native handles must remain valid for the entire report query.
+- Preserve texture, priority, timer and plain-renderer behavior. Anti-Lag wiring remains Task 16b.
 
-- [ ] **Step 1: Write the failing tests:**
+**TDD and verification:**
+- Fake-driver `rearm_on_new_swapchain` and `timeout_disables_reflex` tests.
+- Real-wrapper `tests/vk_chain.rs` cases for listed extension injection, original input-chain pointer preservation, exact-original retry and non-NVIDIA bypass.
+- Guarded menu read and native post-hook tests; retain all Task 12 hook tests.
+- Actual present-wrapper tests for parsed modes, ordered markers, first-failure disable, unchanged input/timestamps and original-once fallback through both panic guards.
+- Preserve teardown/reader lifetime tests.
+- Compile and capture relevant failing mutations, then restore each implementation.
+- Fresh target directory: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, strict `cargo doc`, `cargo test`, then `cargo asi`.
+- Report: **not verified in game; the maintainer runs the boot test**.
+### Task 16b: AMD Anti-Lag 2 runtime wiring
 
-```rust
-#[test] fn adds_low_latency2_once() {
-    let (e, f) = plan_device(&[c"VK_KHR_swapchain", c"VK_KHR_present_id2"], true, false, vk::API_VERSION_1_4);
-    assert_eq!(e, vec![c"VK_NV_low_latency2"]); assert!(matches!(f, TimelineFix::SetInVulkan12));
-}
-#[test] fn old_api_adds_timeline_ext_and_struct() {
-    let (e, f) = plan_device(&[], false, false, vk::API_VERSION_1_1);
-    assert!(e.contains(&c"VK_KHR_timeline_semaphore")); assert!(matches!(f, TimelineFix::ChainNewStruct));
-}
-#[test] fn mode_follows_game_menu() {
-    assert_eq!(decide_mode(&ReflexMode::Game, Some(true), true, true), Some(false));
-    assert_eq!(decide_mode(&ReflexMode::Game, Some(false), true, true), None);
-    assert_eq!(decide_mode(&ReflexMode::Game, None, true, true), None);
-    assert_eq!(decide_mode(&ReflexMode::Boost, Some(false), true, true), Some(true));
-    assert_eq!(decide_mode(&ReflexMode::On, None, false, true), None);   // not NVIDIA
-}
-#[test] fn rearm_on_new_swapchain() { /* calling on_swapchain_created twice with different handles stores the latest and counts 2 sleep-mode calls on a fake fn table */ }
-#[test] fn timeout_disables_reflex() { /* fake vkWaitSemaphores returning VK_TIMEOUT -> is_disabled(Feature::Reflex) and the next on_present skips sleep */ }
-```
+W25 authorizes this implementation after Task 16 merges. Design section 6.6 and issue #31
+supply the maintained rules. The author also approved the parsed startup initializer in
+`entry.rs` and sharing the existing Reflex device-copy helpers without changing Reflex behavior.
 
-  The last two use a small fake function table (`struct Fns { sleep: fn(..), wait: fn(..) , ... }`) injected for tests.
-- [ ] **Step 2:** Run `cargo test reflex::` and expect FAIL.
-- [ ] **Step 3:** Do the menu-value research step. Then implement it, along with the retry rule.
-- [ ] **Step 4:** Run `cargo test` (the full suite) and expect PASS.
-- [ ] **Step 5:** Commit: `feat: NVIDIA Reflex via VK_NV_low_latency2`.
+- Publish `AntiLag` before Vulkan startup. Default `auto` requires AMD, the listed extension
+  and reported feature; forced `on` on non-AMD logs "not listed, off".
+- Reuse the proven instance capability route, typed device-chain ownership, exact-original
+  retry and device dispatch. Chain the enabled AMD feature first, without modifying game input.
+- Admit one device only with mandatory destruction routing. Record its actual native queues;
+  associate pacing with a live swapchain and queue, using nonblocking present admission.
+- Seed INPUT, then emit PRESENT, one real present and next INPUT. Preserve original present
+  pointers and IDs. INPUT after the previous present is an approximation.
+- Time every update with QPC. Three consecutive calls over 100 ms or device loss disable pacing.
+  Report once at the next lifecycle safe point, outside presentation. Keep teardown running
+  even if the host logger panics.
+- Use native fake-driver cases for feature/extension injection, existing entries, caller-chain
+  preservation, refusal, NVIDIA/Reflex precedence, capability routes, marker order, lifetime,
+  concurrent admission, slow calls, device loss and allocation-free presents.
+- Verify in a clean target in CI order: fmt, strict Clippy, strict docs and tests, then the ASI.
+  The startup line, README and PR say **experimental, not verified on AMD hardware**.
 
 ### Task 17: In-game verification on the author's machine
 
-**Install** (needs the author's go-ahead; deploying into the game folder is the author's):
-- copy the loader v10.0.0 `dinput8.dll` (zip sha256 `3d5f2f2a…`) to `C:\Games\Enshrouded\`;
-- copy `enshrouded-headroom.asi` to `C:\Games\Enshrouded\plugins\`;
-- create `C:\Games\Enshrouded\global.ini` with `[GlobalSets] DebugLog=1`;
-- do not use `_perf\Launch-Enshrouded.ps1` at the same time.
+**Install** (needs the author's go-ahead; deployment is the author's). Locate `<Steam game folder>` through Steam Properties → Installed Files → Browse:
+- copy the loader v10.0.0 `dinput8.dll` (zip sha256 `3d5f2f2a…`) to `<Steam game folder>\`;
+- copy `enshrouded-headroom.asi` to `<Steam game folder>\plugins\`;
+- create `<Steam game folder>\global.ini` with `[GlobalSets] DebugLog=1`;
+- do not use the old `_perf\Launch-Enshrouded.ps1` launcher at the same time (a copy of the `_perf` files is in `reference\old-build\_perf`; the Steam folder has no `_perf`);
+- the old install had a `winmm.dll` (an unknown loader). The Steam folder has none (no `winmm.dll`, `dinput8.dll`, `plugins` or `global.ini` there, checked 2026-10-26). So there is one loader only, and nothing to remove.
 
-- [ ] **Step 1: Load check.** `dinput8.log` shows the trigger API and `enshrouded-headroom.asi` loaded. The mod log shows `game build: f68140a3; code patches on`.
+- [ ] **Step 1: Load check.** `dinput8.log` shows the trigger API and `enshrouded-headroom.asi` loaded. The mod log shows `game build: f68140a3-steam; code patches on`. This is a Steam exe: its entry point is in Steam's DRM stub (`.bind`), which runs before the game's own entry. Note when `InitializeASI` runs relative to the stub, and that the game still starts and stays up with the code patches on (`AsyncCompute=on` patches `.text`). See RE-NOTES, "The Steam exe".
 - [ ] **Step 2: Start-up features.** The game log shows `Setting texture streaming budget to 4,941,938,688 Bytes.` and `[render] async compute is enabled`.
 - [ ] **Step 3: Vulkan.** The mod log shows `wrapper chain engaged`, and Reflex enabled or the reason it is off.
 - [ ] **Step 4: Direction test.** Set `[Knobs]` so that each knob is forced to its maximum (add a debug key `ForceStep<Name>=4`, only honoured when `LogLevel=debug`). At a fixed spot, take screenshots at step 0 and step 4 for each knob.
