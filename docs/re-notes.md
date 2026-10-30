@@ -1770,3 +1770,33 @@ This entry applies only to client SHA-256 `d64966e23b1a458ee6f147bcbceac0b577fa7
 - **VERIFIED (source layout):** The pinned [offset table](https://github.com/matenm/emf-enshrouded/blob/08d600155fcadc8e45cc9c6f3932a67c717345be/src/common/offsets.h) places storage at world`+0xe15dc0`, kind at `+0xe15dc8`, state at `+0`, singleton entries/count/map at `+0x7462d0/+0x7462d8/+0x7462f8`, entry stride `0xe8`, entry name hash/object at `+0xa0/+0xa8`, and local entity at LocalPlayerData`+4`. The map uses occupied bits/capacity/keys/values/count at `+8/+0x10/+0x28/+0x40/+0x54`. Its keys are 32-bit name hashes and its values are 16-bit singleton indices. FNV-1a of the exact name `LocalPlayerData` is `0x9117771d`.
 
 The probe bounds all map arithmetic and reads, rejects non-running/non-client worlds, and never persists a component pointer. File identity and fresh mapped entry-prefix checks precede activation; the getter prefix is checked on every lookup. These measures make the diagnostic fail closed. Native callback/lifecycle completeness, calibration and coexistence still require controlled runtime evidence. They do not turn an opaque address or timestamp into WorldEpoch.
+
+## W50 adaptive graphics: GI cache boundary (static only)
+
+This receipt applies only to client SHA-256 `d64966e23b1a458ee6f147bcbceac0b577fa7e39a212f371287d8cc119817882`, image base `0x140000000`. Runtime GI adaptation is **unavailable**. No hook, process-memory access, resource patch, settings refresh or native call was performed for this analysis.
+
+The existing governor can supply quality decisions, but an apply contract is still missing. The installed Tweaker documents manually selected GI presets and resource/shader patches for effects. Its GI command updates a table and instructs the player to change GI quality away from Ultra and back. The current command selects a process by name and has no PID argument. A repeated CLI invocation is not a complete adaptive interface. Headroom must retain one controller and explicit ownership; a future adapter must detect manual changes rather than compete with them. Tweaker's [current permissions](https://www.nexusmods.com/enshrouded/mods/243) require consent to modify its files. No implementation was copied, modified or executed here.
+
+### Independent client-file evidence
+
+The owned PE/unwind reader and offline iced-x86 decoder found these facts from the client's original bytes:
+
+| Location | Static observation |
+|---|---|
+| `0x1400878a0` | Candidate GI quality-update entry. Its AMD64 unwind group contains eight contiguous metadata fragments, ending at exclusive `0x140089ebc`, totalling 9,756 bytes. |
+| `0x1400878d1`–`0x1400878fb` | After preliminary checks, the routine compares an opaque 64-bit result with an input token, then compares cached `u32` at object`+0xec` with input`+0x28`. Matching values branch to the epilogue at `0x140089e99`. The token's meaning and lifetime are not established. |
+| `0x140087901`–`0x140087919` | The routine stores that selector at object`+0xec`, loads table base `0x1413b68d0` and multiplies the input selector by `0x8c` (140). |
+| `0x140087930`–`0x1400879a1` | It copies the selected 140 bytes to object offsets `[0x60, 0xec)`. The final copies are eight bytes at `+0xe0` and four at `+0xe8`. |
+| `0x140104362` | One decoded direct `E8` call to the candidate entry, inside unwind range `[0x140103d40, 0x140104685)`. This census does not exclude indirect calls or other transfers. |
+
+The 700-byte table slice at `0x1413b68d0` has SHA-256 `991a6c42dc24fd5db4a07501cce6ccaf07628a36ca23e9196bea900428179a98`. The first five 32-bit words of its five inspected records are `(0,0,128,128,64000)`, `(1,0,128,128,100000)`, `(1,1,128,128,256000)`, `(2,1,128,128,512000)` and `(3,2,128,128,2480000)`. These records are a bounded slice, not proof of the complete table, enum names, legal selector range or every field's units.
+
+The same decoded metadata group contains references to GI cache/probe texture-creation log strings. That makes allocation and retirement relevant to the apply contract; it does not establish a complete resource-creation call graph or its thread. Unwind grouping identifies metadata fragments, not every reachable instruction or caller.
+
+### Consequence for an adaptive control
+
+When this path's token and selector checks match, it skips the table copy. Changing table bytes alone does not invalidate those observed cache keys. The static evidence therefore explains why the existing manual preset command is insufficient as an automatic apply operation. Other table consumers were not exhaustively inventoried.
+
+Before enabling runtime writes, establish the quality-refresh boundary, its exact ABI and owner thread, the cache object's lifetime, synchronization and GPU resource retirement. Distinguish a cheap per-frame workload limit from a change that resizes resources. Do not force repeated quality toggles or resource/shader rebuilds to simulate adaptation. Prove applied-state readback and manual-control arbitration, then use the existing governor with explicit quality bounds and rollback. Unknown builds, layouts or ownership must leave the adapter unavailable.
+
+Particle lifetime, debris, extra shadow lights and fog need separate live-consumer and lifetime receipts. This GI analysis does not authorize adapting those controls or show that either mod caused the reported stalls.
