@@ -840,6 +840,143 @@ These are the spike's proposed steps, including its then-pending documentation p
 - [HYPOTHESIS] The climbing spike left kfc-parser's licence UNVERIFIED and its submodule empty. The separate glass spike records a read-only clone and GPL-3.0-or-later evidence. These are different spike observations; the earlier unknown is retained.
   - Receipt: Climbing P4/open question and glass kfc-parser HEAD db1580a receipt.
 
+## Free climbing (ember-climb)
+
+Every game fact `crates/ember-climb` relies on is here. Addresses are the client's. All of them come from the reference exe sha256 `b28b448a…`, whose `.text` is identical to the Steam exe sha256 `d64966e2…`. `crates/ember-climb/tests/real_exe.rs` re-checks the signatures on the Steam exe file.
+
+**Nothing below has run in the game.** VERIFIED means read from the exe. It does not mean the mod works. Every statement about feel is a HYPOTHESIS until a play test says otherwise.
+
+**The server is unproven.** The server exe was not on disk when this crate was written, so no fact here was read from it. The build table and the signature list are the only link to it. If a signature does not match exactly once in that exe, the mod logs which one and installs nothing.
+
+### Corrections to the climbing spike
+
+- [VERIFIED] The live ray goes through Jolt, not through `FUN_1409ff1e0`. That function is the fallback for a null `world+0x1a0`, and `FUN_14099d670` returns no collision in that case, so the live game must have it set. The path is `FUN_1409fff60` to `FUN_140a00070` to `FUN_140967c70` to `FUN_14003a520` (a Jolt cast with filters) to the shape `VoxelWorldShape`.
+  - Receipt: Decompiles of those functions. Strings 'VoxelWorldShape::CollidePoint not implemented' 0x1413b58a0 and 'JPH_DOUBLE_PRECISION' 0x14151fc10. Vtable 0x1413b5770.
+- [VERIFIED] `FUN_140967e80` is the water plane, not a voxel layer. The mask table of the pin stays valid. Its voxel path does not.
+  - Receipt: `FUN_140967c70` calls it after the Jolt cast. It serves mask bit 4, Fluid.
+- [VERIFIED] The 20 m/s gate reads `param_1[4]`, which is `MovementVector.velocity.y`, not the Velocity component.
+  - Receipt: Program read-list order [2] CurrentTransform [3] MovementCollider [4] MovementVector. `ecs.MovementVector` desc 0x141820250: velocity +0, movement +0xc.
+- [VERIFIED] CanClimb is read a third time: `FUN_140213260` case 0x13 at 0x1402133c5, when the request to start climbing is consumed.
+  - Receipt: Decompile of `FUN_140213260`. The layer 0x13 case calls `FUN_140218200(actor, 0x10)`. Layers 0x10, 0x15, 0x17 and 0x1a always pass.
+- [VERIFIED] The call of `FUN_14024a360` in the stamina program is at 0x1402eb788. The spike's 0x1402eb789 is its rel32.
+  - Receipt: Bytes at 0x1402eb786: `33 c9 e8 d3 eb f5 ff`. rel32 0xfff5ebd3 from 0x1402eb78d gives 0x14024a360.
+
+### Why the old approach failed
+
+The first experiment widened the wall-probe mask and the plane tolerance. Its test log was not saved, so which step failed is a HYPOTHESIS. The code gives these causes.
+
+- [VERIFIED] Terrain is three static Jolt bodies with one mesh and one collider flag each: flag 1 World (positions and normals displaced), flag 4 WorldNormalsNotDisplaced (positions displaced, normals not), flag 2 WorldNotDisplaced (neither). Fluid is a fourth body with flag 0x10. A mask does not widen a voxel hit. It picks which surface answers. With bits 0, 1 and 2 set, each ray returns the nearest of two different surfaces. So mask 0x12f gives a different surface per ray.
+  - Receipt: `FUN_140a10a20`: `FUN_14003c610(…,1,1)` with flag 1, stored at +0x518; `(…,1,0)` with flag 4, +0x51c; `(…,0,0)` with flag 2, +0x520. Ctor `FUN_1400438f0`: param_6 to shape+0x38, param_7 to shape+0x39. Body filter `FUN_1400379b0`: accept when `mask & record+0` is not 0.
+- [VERIFIED] A voxel hit normal is the flat normal of one triangle. It is not smoothed.
+  - Receipt: `FUN_141097b70`: cross product of three packed vertices, no interpolation. With normalsDisplaced 0 it first moves each vertex back by `d * vn`, with `d = i8 * 0.0078125` m.
+- [VERIFIED] The four corner rays of `FUN_14024abc0` cannot pass on rock. They sit 1.0 m apart sideways and 0.75 m apart up and down, so they land on different triangles, and each normal must match the forward normal within 0.001. Status 0x15.
+  - Receipt: `FUN_14024abc0` decompile lines 119-145 and 166-173.
+- [VERIFIED] The wall probe has a depth margin of 0.10 m. Every ray is 0.65 m long during a climb and the player stands 0.55 m off. A corner on a surface that recedes more misses, status 0x1f.
+  - Receipt: `FUN_14024abc0`: `param_5 + 0.65000004`, `* 0.55`. `FUN_14024b390` passes length 0.
+- [VERIFIED] Climb motion is world up plus sideways, not along the wall: `up * input.z - right * input.x`, with `right = (nz, 0, -nx)`. On a wall with normal up part `ny`, each metre up moves the player `ny` metres off the surface. With the 0.10 m margin the climb stalls after `0.10 / ny` metres.
+  - Receipt: `FUN_140418c50`, `FUN_14023c080`, `FUN_14024a600`.
+- [VERIFIED] The exit query has no walkable test. For a plane, ray A (2.1 m up, 1.05 m along `-n`) misses when `ny > 0.238`, and ray B (1.35 m down) hits when `ny < 0.667`. So faces 48 to 76 degrees steep pass, and the first up input plays the mantle on the rock itself.
+  - Receipt: `FUN_14024a6f0` lines 56-78, masks 0x129 and 0x21. The band is arithmetic from those constants. `crates/ember-climb/src/testworld.rs`, `the_games_own_exit_misfires_on_a_steep_face`.
+- [VERIFIED] Nothing ends a climb where a wall turns walkable. With a fixed normal the head ray stops hitting within 0.65 m, so the move check blocks up, while ray A with its 1.05 m reach still hits the slope. The player stops with no fall and no exit.
+  - Receipt: `FUN_14024a6f0`, `FUN_140417d90`, `FUN_14024c9f0`.
+- [HYPOTHESIS] That is the old mod's "bugs out when a wall becomes walkable". By the clean-room rule the third-party DLL was not examined.
+  - Receipt: Author's report only.
+- [VERIFIED] The game's 45 degree test uses the raw stick and the full normal. A half-pressed stick aimed straight at a wall fails it: `dot(-n, input) = 0.5`. So does a stick more than 23 degrees off on a 50 degree face.
+  - Receipt: `FUN_14024c0d0` lines 62-70: `acos(-n.x * input.x - n.y * input.y - n.z * input.z) <= 0.7853982` on `ActorInput+0x198`.
+- [HYPOTHESIS] That raw test is part of the author's "starting a climb is inconsistent".
+  - Receipt: The code above. The mod was not inspected.
+- [VERIFIED] A drop feeds a retry loop. Wall lost stops the climb and blocks a re-grab for 375 ms, and a held stick then latches again.
+  - Receipt: `FUN_14024a090`: `param_2 + 375000000` into Climb+0x10. `FUN_14024c0d0` line 26.
+
+### Game layouts the crate reads and writes
+
+- [VERIFIED] The climb context, built in `FUN_140419570` and `FUN_140418c50`: +0 Actor, +8 Climb, +0x10 CurrentTransform, +0x18 MovementColliderConfig, +0x20 MovementCollider, +0x28 PlayerState (may be null), +0x30 entity id (u32), +0x38 ColliderSystem.
+  - Receipt: `local_f8 = param_1[8]; local_f0 = param_1[0x14]; local_e8 = param_1[2]; local_e0 = param_1[1]; local_d8 = param_1[3]; local_d0 = param_1[5]; local_c8 = entity; local_c0 = param_1[0x27]`.
+- [VERIFIED] `CurrentTransform` starts with three i64 in 32.32 fixed point.
+  - Receipt: `(float)plVar2[0] * 2.3283064e-10`, `FUN_14024b390`.
+- [VERIFIED] Raycast `FUN_1409fff60(out, world, ray, ignore, 0, mask, flags, 0)`. Stack arguments at the caller: arg5 `[rsp+0x20]`, mask `[rsp+0x28]`, flags byte `[rsp+0x30]`, arg8 `[rsp+0x38]`. `ray` is two float4, origin then end. `out` is 0x70 bytes, copied with `movups`.
+  - Receipt: `FUN_1409fff60` assembly: `SUB RSP, 0xb0` after `PUSH RBX`, then reads at `[RSP+0xe0]`, `+0xe8`, `+0xf0`, `+0xf8`. Call site 0x14024acc8.
+- [VERIFIED] Raycast result: +0 status (0 is a hit), +0xc id, +0x14 point, +0x20 normal, +0x64 squared distance.
+  - Receipt: `FUN_140a00070` lines 197-218.
+- [VERIFIED] Ray flags: 0x20 skips hits whose normal does not face the ray. 0x40 skips ids 1 to 0x3ff. Bits 4 and 7 change the filter. Bits 5 and 6 do nothing else, so 0x60 is safe to pass.
+  - Receipt: `FUN_140a00070` lines 157-162. `FUN_1409a48b0(filter, flags, mask)` reads only `flags & 0x10` and the sign bit.
+- [VERIFIED] Mask 0x124 goes to the all-layers path of the filter, because bit 8 is outside the list {0,1,2,3,5,6,9,19}.
+  - Receipt: `FUN_1409a48b0`: `(mask & ~0x8026f) != 0` sets `filter+0x40 = 0x3f`.
+- [HYPOTHESIS] Ids 1 to 0x3ff are players.
+  - Receipt: The range only. `FUN_14023c0e0` tests the same range when it splits non-player results.
+- [VERIFIED] Probe result, 0x24 bytes: +0 code, +8 position, +0x14 normal, +0x20 entity. The exit query uses the same layout.
+  - Receipt: `FUN_14024abc0` lines 201-205, `FUN_14024a6f0` lines 82-86, `FUN_140419570` lines 106-108.
+- [VERIFIED] The probe's position is `hit - corner offset + n * 0.55`. Its first corner sits 2.0 m up, so the game's stand-off is measured near the head.
+  - Receipt: `FUN_14024abc0` lines 174-178.
+- [VERIFIED] `FUN_140417d90(velocity, ctx, pos, dt)` receives the Velocity pointer from the accessor, in `rcx`, and `dt` in `xmm3`. It has one caller, 0x1404192a4. The exit prediction is computed before it runs, from the velocity before the check.
+  - Receipt: `FUN_140418c50`: `uVar15 = FUN_14031e8f0(puVar10)`, then `FUN_140417d90(uVar15,&local_168,&local_188,fVar20)`, then `local_188 = fVar18 * fVar20 + …` from values read earlier.
+- [VERIFIED] The exit check `FUN_14024c9f0` needs `ActorInput+0x194 > 0`. The mantle's first two points are `hit + n * 1.05`, and the third is the hit.
+  - Receipt: `FUN_14024c9f0`, `FUN_14024bc90`.
+- [VERIFIED] The climb normal has no reader in the probes other than `-n` as the ray direction. `actor_rotation` reads it every frame and builds a full 3D rotation with `view = -n` and `up = (0,1,0)`.
+  - Receipt: `FUN_14026a1e0`, branch "%s (%u): Climbing": `FUN_14021c730(&local_1288,local_1728,local_1738,…)`, stored at +0xec4.
+- [VERIFIED] So the body lies along a leaning surface. The stand-off therefore belongs at the feet, and the ray patch belongs on a plane parallel to the surface. With the game's world-up offsets a 1 m reach loses every face less steep than about 66 degrees.
+  - Receipt: The rotation above. The figure is arithmetic: `0.55 + 2.0 * ny` must stay under the reach.
+- [VERIFIED] Writes to ECS components go through `FUN_140417d50`, `FUN_14031e8f0` and `FUN_140417d10` to `FUN_1409c75e0`, which marks the change. A direct write skips the mark.
+  - Receipt: Decompiles of those accessors.
+- [HYPOTHESIS] Skipping the mark is harmless for the climb normal, because no client reader of it was found.
+  - Receipt: Camera and animation programs read Climb+1 only. Generic reflection replication was not read.
+- [VERIFIED] `MovementColliderConfig`: width +0 (the diameter), height +4. `MovementCollider`: results +0x10, `m_isSet` +0x50, `hasSpheroidCollision` +0x4b.
+  - Receipt: `python -I rtype.py <exe> ecs.MovementColliderConfig ecs.MovementCollider ecs.OptionalMovementCollisionResults ecs.MovementCollisionResults`. `FUN_14023c0e0`: sphere centre `height - width * 0.5`, radius `(width - 0.005) * 0.5`.
+- [VERIFIED] Actor state: `FUN_14021aaa0` reads +0xbf8, and while +0x1b1 bit 0 is set it applies `(state | +0xbd0) & ~+0xbd8`. `StateFlag`: 0 Grounded, 1 Jumping, 32 Falling, 34 Climbing, 35 ClimbingTransition, 37 HangGliding. There is no sprint flag.
+  - Receipt: Decompile of `FUN_14021aaa0`. Enum desc 0x1417fe9b0, 63 members at 0x1417f4960.
+- [VERIFIED] Sprint is `ActorInput+0x1c4 == 4`: `locomotionSpeed`, `ecs.LocomotionSpeedSelector`, member 4 Sprint.
+  - Receipt: `rtype.py` on `ecs.ActorInput` and `ecs.LocomotionSpeedSelector`. `FUN_140431270` compares the same byte with 4.
+- [VERIFIED] `FUN_140218200(actor, 16)` reads +0xc00 when no sequence runs and +0xbc8 when one does. The climb iterator holds the Actor at `param_1[8]`.
+  - Receipt: Decompile of `FUN_140218200`. `FUN_140419570` line 60. Signature `48 8b 4f 40 b2 10 e8`.
+- [VERIFIED] `FUN_14024a360` has two twins with the same body and another key, so no pattern on the function matches once. Its only caller is the stamina program.
+  - Receipt: A 113-byte pattern with the two rel32s as wildcards still matches 3 times in the Steam exe. `procedure_callers 0x14024a360` gives 0x1402eb420.
+
+### What the crate changes
+
+| Site | Client address | Change | Signature |
+|---|---|---|---|
+| Wall probe | 0x14024abc0 | post-hook: patch fit when the game's probe fails | `PROBE_FN` |
+| Wall-lost check | 0x14024b390 | hook: mode and grace | `WALL_LOST_FN` |
+| Wall-lost return | 0x14024b4a5 | 12 bytes: id 0 returns 0xffffffff | `WALL_LOST_RET` +26 |
+| Attachment store | 0x140418db8 | 19 bytes: reordered, see below | `ATTACH_STORE` |
+| Move check | 0x140417d90 | pre-hook: steering | `MOVE_CHECK_FN` |
+| Exit query | 0x14024a6f0 | post-hook: walkable test | `EXIT_QUERY_FN` |
+| Bottom entry | 0x14024c0d0 | hook: trigger and cone test | `LOW_ENTRY_FN` |
+| Start check | 0x140419570 | hook: glider, diagnostics | `START_FN` |
+| Enter layer | 0x140419947 | 1 byte 0x13 to 0x10, only with `Glide = 1` | `ENTER_LAYER` +18 |
+| Stamina cost | 0x14024a360 | hook behind its call, only when the multiplier is not 1 | `STAMINA_CALL` |
+| Top entry, stop, exit-top, bottom exit | 0x14024c320, 0x14024a090, 0x14024c9f0, 0x14024c8f0 | post-hooks, counters only | see `sigs.rs` |
+| Raycast | 0x1409fff60 | called, not changed | `RAYCAST_FN` |
+
+- [VERIFIED] The attachment id is only compared and written. No code resolves it.
+  - Receipt: Uses at 0x140418dbf and 0x140418dd0, and zeroing in `FUN_14023bae0` and at 0x1404189eb. Search scope: the 19 programs that name Climb. Not covered: generic reflection replication and `debug_draw_player_jump`.
+- [VERIFIED] The stand-in value 0xffffffff must not enter the game's data, in case something replicates it. The game's bytes are `mov rax,[rdi+0xa0]; cmp [rax+0x18],ebx; je skip; lea rcx,[rdi+0xa0]`, then `call` and the store. The replacement is `lea rcx,[rdi+0xa0]; mov rax,[rcx]; cmp [rax+0x18],ebx; je skip; test ebx,ebx; js skip`. It is the same length, so the `call` does not move. A real id takes exactly the game's path, and the stand-in has its top bit set, so it skips the store.
+  - Receipt: Bytes at 0x140418db8. The code at `skip` starts `48 8b 0f`, `mov rcx,[rdi]`, so the changed `rcx` is harmless there. Both are checked on the file by `tests/real_exe.rs`, and the encoding is decoded in `plan.rs`.
+- [HYPOTHESIS] No real id has its top bit set.
+  - Receipt: `maximumEntities` is 1048576 in the ShroudForge profile.
+- [VERIFIED] Ultimate ASI Loader loads plugins in name order, so a plugin can start before a mod that loads later.
+  - Receipt: A saved `DINPUT8.log` of the first boot test lists `climb-anywhere.asi`, `enshrouded-headroom.asi` and `greeneye-loader.asi`, in that order. This is why start-up checks for ClimbAnywhere twice.
+- [HYPOTHESIS] ClimbAnywhere has shipped under three names: `climb-anywhere.asi` in `plugins\`, a chained `dinput8Hooked.dll`, and a `dinput8.dll` in `plugins\`.
+  - Receipt: The boot log above, and file names and sizes in one install. No file was opened. By the clean-room rule the third-party DLL was not examined.
+
+### Numbers that are starting values
+
+All of these are HYPOTHESIS until a play test. Most are settings.
+
+- [HYPOTHESIS] `WalkableAngle` 50. The game's limit is data (`SlopeDefinition`), which was not read.
+- [HYPOTHESIS] `PlaneTolerance` 0.45 m, measured along the fitted normal.
+- [HYPOTHESIS] `HoldReach` 1.0 m, `EntryReach` 0.95 m, `GraceSeconds` 0.15, `OverhangAngle` 110.
+- [HYPOTHESIS] Ray side offset 0.35 m, normal time 0.12 s, stand-off gain 6 per second, speed 1.2 m/s, deadband 0.03 m.
+- [HYPOTHESIS] Mask bit 2 covers terrain and player walls, and bit 5 covers rock props. Prop flags are data.
+- [HYPOTHESIS] Actors do not carry `Walkable`.
+
+### Open at the first play test
+
+- [HYPOTHESIS] Glider start: three points are unproven. A sequence may not preempt the glider on layer 0x10, HangGliding may not end when Enter replaces it, and world move input may be zero while gliding.
+- [HYPOTHESIS] The capsule width is data and was not read. The 0.55 m stand-off may leave little gap. The diagnostics line prints the real width and height.
+- [HYPOTHESIS] Whether the server exe matches any of this. Run `cargo test -p ember-climb --test real_exe -- --ignored` with `ENSHROUDED_SERVER_EXE` set, and open that exe in REA to confirm `world+0x1a0`.
+- [HYPOTHESIS] Whether a client without the mod shows a modded server's climber correctly.
+
 
 ## Glass and window materials (2026-10-26 spike)
 

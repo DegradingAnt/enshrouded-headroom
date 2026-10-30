@@ -200,6 +200,8 @@ TODO: the author writes this section.
 
 `crates/emberkit` holds reusable native infrastructure as an MIT-licensed Rust library. New mods are separate crates depending on it; each declares its process targets. It has no ASI entry export. The root remains the default workspace member, so `cargo asi` keeps the existing artifact name and exports. Use `--workspace` for lint, docs and tests (`cargo fmt --all --check` for formatting). `cargo deny` traverses both workspace members from the workspace root.
 
+`crates/ember-climb` is a separate ASI for free climbing on any steep rock, cliff or wall, with the game's own moves, stamina and collision. It targets the client and the dedicated server, on the exact builds `f68140a3-steam` and `d7baa768-server`. It is a first test build. It has not run in the game, and it has not been checked against the server exe. See [its README](crates/ember-climb/README.md) for install steps, settings and how to read its log. It must not run next to ClimbAnywhere.
+
 `enshrouded_headroom::config::schema()` returns all 42 read settings without file I/O. Entries describe types, accepted ranges or words, default spellings, and restart requirements. All settings currently require a restart. The four developer settings under `Debug` are deliberately absent from the 38-key default INI. The three force-step defaults are absent values, not a literal `none` spelling. No settings UI is included.
 
 ### Shadow quality above Ultra (experimental)
