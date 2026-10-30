@@ -42,36 +42,37 @@ fn select_free_mib(
     )
 }
 
-/// Query the driver's advertised memory budget without allocating.
-///
-/// The largest DEVICE_LOCAL heap supplies budget minus usage, saturated at zero, in MiB.
-/// An unproven route, unsupported extension, missing selected entry point or refused/incomplete
-/// enumeration is unknown. Only the caller-proven core or KHR command is resolved; a non-null
-/// address never establishes support and no fallback to another route is attempted.
-/// Sources: Khronos vkEnumerateDeviceExtensionProperties, vkGetPhysicalDeviceMemoryProperties2
-/// and VkPhysicalDeviceMemoryBudgetPropertiesEXT reference pages.
-///
+/// A typed command prepared for one protected instance/physical-device lifetime.
+/// No native handle or budget value is retained here.
+pub(crate) struct BudgetQuery {
+    /// The exact core or enabled-KHR function selected by proven capabilities.
+    query: vk::PFN_vkGetPhysicalDeviceMemoryProperties2,
+}
+
+impl BudgetQuery {
+    /// Read a new dynamic budget under the same lifetime used for preparation.
+    /// # Safety
+    /// The original instance and matching physical device remain live under their synchronous
+    /// lease. This command is never reused for another generation or queried after retirement.
+    pub(crate) unsafe fn sample(&self, phys: vk::PhysicalDevice) -> Option<u64> {
+        let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+        let mut memory = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+        // SAFETY: the caller's live matching lease protects the command, device and stack outputs.
+        unsafe { (self.query)(phys, &mut memory) };
+        select_free_mib(&memory.memory_properties, &budget)
+    }
+}
+
+/// Resolve immutable budget capability once, without retaining handles or reading a budget.
 /// # Safety
-///
-/// `gipa` is the real Vulkan loader entry point. `instance` and `phys` are a matching live
-/// instance/physical-device pair and stay alive throughout this call; their destruction must
-/// not race this query. The driver honors the Vulkan ABI and output-buffer contracts.
-///
-/// `route` must reflect capabilities observed for these exact handles:
-/// - `Core11`: the API version used to create this instance AND this physical device's reported
-///   API version are both at least Vulkan1.1, permitting the core physical-device query.
-/// - `EnabledKhr`: VK_KHR_get_physical_device_properties2 was enabled in this instance's
-///   creation info, permitting the KHR query, even when the core route is not available.
-/// - `Unknown`: no query route has been proven; no Vulkan call is made.
-///
-/// A loader version, a live device lease, an advertised memory-budget extension, or a non-null
-/// function pointer alone proves neither route. Do not retain handles beyond their valid lease.
-pub unsafe fn free_mib(
+/// The same loader, matching-live-pair, proven-route and synchronization requirements as
+/// free_mib apply. Every later sample must hold that exact original lifetime's lease.
+pub(crate) unsafe fn prepare(
     gipa: vk::PFN_vkGetInstanceProcAddr,
     instance: vk::Instance,
     phys: vk::PhysicalDevice,
     route: QueryRoute,
-) -> Option<u64> {
+) -> Option<BudgetQuery> {
     let query_name = match route {
         QueryRoute::Unknown => return None,
         QueryRoute::Core11 => c"vkGetPhysicalDeviceMemoryProperties2",
@@ -105,11 +106,43 @@ pub unsafe fn free_mib(
     let query = unsafe { gipa(instance, query_name.as_ptr()) }?;
     // SAFETY: the exact entry-point name specifies this type, including the KHR alias.
     let query: vk::PFN_vkGetPhysicalDeviceMemoryProperties2 = unsafe { std::mem::transmute(query) };
-    let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
-    let mut memory = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
-    // SAFETY: both stack structs have the required sType and pNext chain and remain live.
-    unsafe { query(phys, &mut memory) };
-    select_free_mib(&memory.memory_properties, &budget)
+    Some(BudgetQuery { query })
+}
+
+/// Query the driver's advertised memory budget without allocating.
+///
+/// The largest DEVICE_LOCAL heap supplies budget minus usage, saturated at zero, in MiB.
+/// An unproven route, unsupported extension, missing selected entry point or refused/incomplete
+/// enumeration is unknown. Only the caller-proven core or KHR command is resolved; a non-null
+/// address never establishes support and no fallback to another route is attempted.
+/// Sources: Khronos vkEnumerateDeviceExtensionProperties, vkGetPhysicalDeviceMemoryProperties2
+/// and VkPhysicalDeviceMemoryBudgetPropertiesEXT reference pages.
+///
+/// # Safety
+///
+/// `gipa` is the real Vulkan loader entry point. `instance` and `phys` are a matching live
+/// instance/physical-device pair and stay alive throughout this call; their destruction must
+/// not race this query. The driver honors the Vulkan ABI and output-buffer contracts.
+///
+/// `route` must reflect capabilities observed for these exact handles:
+/// - `Core11`: the API version used to create this instance AND this physical device's reported
+///   API version are both at least Vulkan1.1, permitting the core physical-device query.
+/// - `EnabledKhr`: VK_KHR_get_physical_device_properties2 was enabled in this instance's
+///   creation info, permitting the KHR query, even when the core route is not available.
+/// - `Unknown`: no query route has been proven; no Vulkan call is made.
+///
+/// A loader version, a live device lease, an advertised memory-budget extension, or a non-null
+/// function pointer alone proves neither route. Do not retain handles beyond their valid lease.
+pub unsafe fn free_mib(
+    gipa: vk::PFN_vkGetInstanceProcAddr,
+    instance: vk::Instance,
+    phys: vk::PhysicalDevice,
+    route: QueryRoute,
+) -> Option<u64> {
+    // SAFETY: this function's contract supplies the matching live pair and proven route.
+    let query = unsafe { prepare(gipa, instance, phys, route) }?;
+    // SAFETY: the same synchronous lease remains held through this fresh dynamic sample.
+    unsafe { query.sample(phys) }
 }
 
 #[cfg(test)]

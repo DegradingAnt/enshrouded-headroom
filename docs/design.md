@@ -79,6 +79,15 @@ The `_perf\Launch-Enshrouded.ps1` launcher from 2026-10-23 is replaced by this m
 
 **Threads and shared state.** Start-up runs on the loader's call. The hooks run on game threads. They read and write only mod-owned atomics: knob factors in, and observations out (menu baselines, frame stamps). They never block, log or allocate. The governor runs on its own thread every 50 ms. It reads only those atomics and the frame-time ring, and it never touches game memory. That avoids stale or freed game pointers (review findings 7 and 11).
 
+The governor discovers memory-query capabilities once, inside the first admitted device and
+parent-instance lease. Later polls reacquire that same lease and call only the prepared dynamic
+budget query. They do not repeat extension enumeration, physical properties or command lookups.
+A refused discovery stays unknown; a missing initial lease does not consume the attempt.
+Retirement still blocks every query, including when raw handle bits are reused. No native handle
+or budget value is cached. Periodic native polling completes before the frame batch and scene
+observation; the control clock follows that observation so fresh scene data cannot appear to be
+in the future.
+
 ## 6. Features
 
 ### 6.1 Texture budget

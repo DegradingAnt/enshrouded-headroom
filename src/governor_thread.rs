@@ -500,22 +500,66 @@ impl Runtime {
     }
 }
 
-/// Query only during the first device's live lease, using facts from its exact instance generation.
-/// Unknown capabilities and missing selected commands leave every costly raise blocked.
-fn query_vram_free_mib() -> Option<u64> {
-    use ash::vk::{self, Handle};
-    crate::vk::with_game_device_capabilities(|game, gipa, instance, api| {
+/// Immutable discovery is scoped to the one first-device lease, never a reusable raw handle.
+#[derive(Default)]
+struct VramPoller {
+    /// Outer None means no admitted attempt; inner None means discovery refused permanently.
+    prepared: Option<Option<crate::vram_budget::BudgetQuery>>,
+}
+
+impl VramPoller {
+    /// Obtain the existing device/parent lease for every native poll, including cached polls.
+    fn poll(&mut self) -> Option<u64> {
+        crate::vk::with_game_device_capabilities(|game, gipa, instance, api| {
+            // SAFETY: the lease supplies this exact first-device parent and keeps it live.
+            unsafe { self.sample_native(gipa, instance, game.phys, api) }
+        })
+        .flatten()
+    }
+
+    /// Query the same first-device pair while its current lease is held.
+    /// # Safety
+    /// The arguments belong to the one immutable DeviceQueries context and its live parent.
+    /// Every call holds that context's synchronous lease; native references never escape it.
+    unsafe fn sample_native(
+        &mut self,
+        gipa: usize,
+        instance: usize,
+        physical: usize,
+        api: Option<crate::vk::InstanceApi>,
+    ) -> Option<u64> {
+        use ash::vk::{self, Handle};
+        if self.prepared.is_none() {
+            // SAFETY: this attempt occurs only inside this first device's current live lease.
+            self.prepared = Some(unsafe { Self::prepare(gipa, instance, physical, api) });
+        }
+        let query = self.prepared.as_ref()?.as_ref()?;
+        // SAFETY: poll reacquires the same immutable first-device/parent lease on every call.
+        // A retired or reused handle never enters this callback; no native handle was cached.
+        unsafe { query.sample(vk::PhysicalDevice::from_raw(physical as u64)) }
+    }
+
+    /// Inspect only immutable capabilities from the first admitted live pair.
+    /// # Safety
+    /// All sample_native lifetime, matching-handle and proven-instance contracts apply.
+    unsafe fn prepare(
+        gipa: usize,
+        instance: usize,
+        physical: usize,
+        api: Option<crate::vk::InstanceApi>,
+    ) -> Option<crate::vram_budget::BudgetQuery> {
+        use ash::vk::{self, Handle};
         let api = api?;
         if gipa == 0 {
             return None;
         }
-        // SAFETY: the lease supplies this exact parent's real loader and matching live handles.
+        // SAFETY: the caller's lease supplies the exact real loader and live matching handles.
         let gipa: vk::PFN_vkGetInstanceProcAddr = unsafe { std::mem::transmute(gipa) };
         let instance = vk::Instance::from_raw(instance as u64);
-        let physical = vk::PhysicalDevice::from_raw(game.phys as u64);
-        // SAFETY: this command is legal in Vulkan1.0; the lease protects its parent and output.
+        let physical = vk::PhysicalDevice::from_raw(physical as u64);
+        // SAFETY: this Vulkan1.0 command is legal for the leased pair and owned output.
         let properties = unsafe { gipa(instance, c"vkGetPhysicalDeviceProperties".as_ptr()) }?;
-        // SAFETY: the exact command name specifies this native signature.
+        // SAFETY: the exact command name determines this native signature.
         let properties: vk::PFN_vkGetPhysicalDeviceProperties =
             unsafe { std::mem::transmute(properties) };
         let mut output = vk::PhysicalDeviceProperties::default();
@@ -530,11 +574,26 @@ fn query_vram_free_mib() -> Option<u64> {
         } else {
             crate::vram_budget::QueryRoute::Unknown
         };
-        // SAFETY: the observed instance facts and Vulkan1.0 physical properties prove only this
-        // route. The synchronous query ends before the lease; no alias fallback is permitted.
-        unsafe { crate::vram_budget::free_mib(gipa, instance, physical, route) }
-    })
-    .flatten()
+        // SAFETY: observed creation facts and physical properties prove this exact route only.
+        unsafe { crate::vram_budget::prepare(gipa, instance, physical, route) }
+    }
+}
+
+/// One frame-control clock observed after reading the scene signal.
+struct ControlClock {
+    /// The sampled scene timestamp, never inferred from an address.
+    seen: u64,
+    /// A clock captured after the scene observation, so it cannot predate that observation.
+    now: u64,
+}
+
+impl ControlClock {
+    /// Preserve the native observation order, even when another thread updates the scene.
+    fn capture(read_scene: impl FnOnce() -> u64, clock: impl FnOnce() -> u64) -> Self {
+        let seen = read_scene();
+        let now = clock();
+        Self { seen, now }
+    }
 }
 
 /// Read a background report only while debug output is enabled; emit only available samples.
@@ -659,6 +718,7 @@ fn run(cfg: crate::config::Config, mode: ThreadMode) {
     use std::sync::atomic::Ordering::{Acquire, Relaxed};
     let mut runtime = Runtime::new(cfg);
     let mut reader = FrameReader::new();
+    let mut vram_poller = VramPoller::default();
     let mut frame_reports = FrameReports::new();
     let origin = crate::frame_timer::qpc_now();
     let mut period_ms = 0.0;
@@ -688,14 +748,39 @@ fn run(cfg: crate::config::Config, mode: ThreadMode) {
         if crate::guard::is_disabled(crate::guard::Feature::Governor) {
             return;
         }
-        let now_qpc = crate::frame_timer::qpc_now();
-        let now_s = crate::frame_timer::qpc_to_ms(now_qpc.saturating_sub(origin)) / 1000.0;
-        reader.read(&crate::frame_timer::FRAMES, crate::frame_timer::qpc_to_ms);
-        // Sample the reporting clock after copying the ring, so a concurrent new present is not
-        // discarded merely because its timestamp followed the tick's earlier control clock.
-        let stats_now_s =
+        let polling_s =
             crate::frame_timer::qpc_to_ms(crate::frame_timer::qpc_now().saturating_sub(origin))
                 / 1000.0;
+        mode.run_control(|| {
+            if polling_s - display_at >= 5.0 {
+                period_ms = crate::display::period_ms(
+                    crate::display::game_window().and_then(crate::display::refresh_hz),
+                );
+                display_at = crate::frame_timer::qpc_to_ms(
+                    crate::frame_timer::qpc_now().saturating_sub(origin),
+                ) / 1000.0;
+            }
+            if !crate::guard::is_disabled(crate::guard::Feature::Governor)
+                && polling_s - memory_at >= 2.0
+            {
+                free_mib = vram_poller.poll();
+                memory_at = crate::frame_timer::qpc_to_ms(
+                    crate::frame_timer::qpc_now().saturating_sub(origin),
+                ) / 1000.0;
+            }
+        });
+        reader.read(&crate::frame_timer::FRAMES, crate::frame_timer::qpc_to_ms);
+        // Scene and control time must follow native polling and the ring copy. A freshly
+        // published scene must not look like a future timestamp after a slow driver call.
+        let control_clock = ControlClock::capture(
+            || crate::knobs::OBJECT.last_seen(),
+            crate::frame_timer::qpc_now,
+        );
+        let now_qpc = control_clock.now;
+        let now_s = crate::frame_timer::qpc_to_ms(now_qpc.saturating_sub(origin)) / 1000.0;
+        // Sample the reporting clock after copying the ring, so a concurrent new present is not
+        // discarded merely because its timestamp followed the tick's earlier control clock.
+        let stats_now_s = now_s;
         frame_reports.observe(stats_now_s, &reader.intervals_us, |timestamp| {
             timestamp
                 .checked_sub(origin)
@@ -709,20 +794,10 @@ fn run(cfg: crate::config::Config, mode: ThreadMode) {
             log::debug!("{line}");
         }
         mode.run_control(|| {
-        if now_s - display_at >= 5.0 {
-            period_ms = crate::display::period_ms(
-                crate::display::game_window().and_then(crate::display::refresh_hz),
-            );
-            display_at = now_s;
-        }
         if crate::guard::is_disabled(crate::guard::Feature::Governor) {
             return;
         }
-        if now_s - memory_at >= 2.0 {
-            free_mib = query_vram_free_mib();
-            memory_at = now_s;
-        }
-        let seen = crate::knobs::OBJECT.last_seen();
+        let seen = control_clock.seen;
         let frames = &reader.ms;
         let plan = runtime.plan(&Sample {
             now_s,
@@ -1640,7 +1715,7 @@ mod tests {
     }
     /// Real wrapper publication and teardown, isolated because the Vulkan state is first-wins.
     mod live_queries {
-        use super::super::query_vram_free_mib;
+        use super::super::VramPoller;
         use crate::guard::{guard, Feature};
         use ash::vk::{self, Handle};
         use std::cell::Cell;
@@ -2048,12 +2123,13 @@ mod tests {
                     );
                 }
                 CALLS.with(|calls| calls.set([0; 6]));
+                let mut poller = VramPoller::default();
                 let expected = match index {
                     0 | 10 | 11 => Some(2048),
                     1 | 3 => Some(2048),
                     _ => None,
                 };
-                assert_eq!(query_vram_free_mib(), expected);
+                assert_eq!(poller.poll(), expected);
                 let counts = match index {
                     0 | 10 | 11 => [1, 1, 1, 0, 1, 0],
                     1 | 3 => [1, 1, 0, 1, 0, 1],
@@ -2068,11 +2144,40 @@ mod tests {
                 assert_eq!(
                     super::allocation_count(|| {
                         for _ in 0..100 {
-                            std::hint::black_box(query_vram_free_mib());
+                            std::hint::black_box(poller.poll());
                         }
                     }),
                     0
                 );
+                let mut warm_counts = counts;
+                if expected.is_some() {
+                    let budget_index = if matches!(index, 1 | 3) { 5 } else { 4 };
+                    warm_counts[budget_index] += 100;
+                }
+                assert_eq!(
+                    CALLS.with(Cell::get),
+                    warm_counts,
+                    "warm polls must not repeat static discovery"
+                );
+                if index == 9 {
+                    // No initial lease is not a discovery failure: publication may arrive later.
+                    let create: vk::PFN_vkCreateDevice = std::mem::transmute(
+                        crate::vk::wrap_gipa(instance, c"vkCreateDevice".as_ptr()).unwrap(),
+                    );
+                    let mut device = vk::Device::null();
+                    assert_eq!(
+                        create(
+                            physical,
+                            &vk::DeviceCreateInfo::default(),
+                            std::ptr::null(),
+                            &mut device
+                        ),
+                        vk::Result::SUCCESS
+                    );
+                    CALLS.with(|calls| calls.set([0; 6]));
+                    assert_eq!(poller.poll(), Some(2048));
+                    assert_eq!(CALLS.with(Cell::get), [1, 1, 1, 0, 1, 0]);
+                }
                 if matches!(index, 10 | 11) {
                     crate::vk::wrap_destroy_device(vk::Device::from_raw(DEVICE), std::ptr::null());
                     assert_eq!(DESTROYS.with(Cell::get), 1);
@@ -2090,10 +2195,257 @@ mod tests {
                         assert_eq!(device.as_raw(), DEVICE);
                     }
                     CALLS.with(|calls| calls.set([0; 6]));
-                    assert_eq!(query_vram_free_mib(), None);
+                    assert_eq!(poller.poll(), None);
                     assert_eq!(CALLS.with(Cell::get), [0; 6]);
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod poll_cost_tests {
+    use super::{ControlClock, VramPoller};
+    use ash::vk;
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Resolver, physical properties, extension enumeration and dynamic-budget calls.
+        static CALLS: Cell<[u32; 4]> = const { Cell::new([0; 4]) };
+        /// The fixture may advertise the immutable capability or refuse it.
+        static SUPPORTED: Cell<bool> = const { Cell::new(true) };
+        /// The selected memory query must match the proven instance route.
+        static ROUTE: Cell<u8> = const { Cell::new(0) };
+    }
+
+    /// Record only this test thread's synthetic native calls.
+    fn count(index: usize) -> u32 {
+        CALLS.with(|calls| {
+            let mut values = calls.get();
+            values[index] += 1;
+            calls.set(values);
+            values[index]
+        })
+    }
+
+    /// Fill the owned physical-properties output with Vulkan1.1 support.
+    /// # Safety
+    /// The caller supplies a writable output and synthetic handles never leave the fixture.
+    unsafe extern "system" fn properties(
+        _: vk::PhysicalDevice,
+        out: *mut vk::PhysicalDeviceProperties,
+    ) {
+        crate::guard::guard(
+            crate::guard::Feature::Governor,
+            || (),
+            || {
+                count(1);
+                // SAFETY: sample_native supplies its owned initialized output.
+                unsafe { (*out).api_version = vk::API_VERSION_1_1 };
+            },
+        );
+    }
+
+    /// Advertise exactly one budget extension, or an empty list when unsupported.
+    /// # Safety
+    /// The caller supplies a writable count and capacity for at least one extension.
+    unsafe extern "system" fn extensions(
+        _: vk::PhysicalDevice,
+        _: *const std::ffi::c_char,
+        count_out: *mut u32,
+        out: *mut vk::ExtensionProperties,
+    ) -> vk::Result {
+        crate::guard::guard(
+            crate::guard::Feature::Governor,
+            || vk::Result::ERROR_UNKNOWN,
+            || {
+                count(2);
+                let supported = SUPPORTED.with(Cell::get);
+                // SAFETY: prepare supplies owned writable count/output slots of the stated capacity.
+                unsafe {
+                    *count_out = u32::from(supported);
+                    if supported {
+                        let mut extension = vk::ExtensionProperties::default();
+                        for (to, from) in extension
+                            .extension_name
+                            .iter_mut()
+                            .zip(c"VK_EXT_memory_budget".to_bytes_with_nul())
+                        {
+                            *to = *from as std::ffi::c_char;
+                        }
+                        out.write(extension);
+                    }
+                }
+                vk::Result::SUCCESS
+            },
+        )
+    }
+
+    /// Change usage on each call, proving that the dynamic budget itself is never cached.
+    /// # Safety
+    /// Output is owned properties2 chained to a writable owned budget struct.
+    unsafe extern "system" fn budget(
+        _: vk::PhysicalDevice,
+        out: *mut vk::PhysicalDeviceMemoryProperties2<'_>,
+    ) {
+        crate::guard::guard(
+            crate::guard::Feature::Governor,
+            || (),
+            || {
+                let poll = count(3);
+                // SAFETY: the caller constructs both typed output nodes and retains them here.
+                unsafe {
+                    (*out).memory_properties.memory_heap_count = 1;
+                    (*out).memory_properties.memory_heaps[0] = vk::MemoryHeap {
+                        size: 8 << 30,
+                        flags: vk::MemoryHeapFlags::DEVICE_LOCAL,
+                    };
+                    let budget = &mut *(*out)
+                        .p_next
+                        .cast::<vk::PhysicalDeviceMemoryBudgetPropertiesEXT<'_>>();
+                    budget.heap_budget[0] = 7 << 30;
+                    budget.heap_usage[0] = (4 + u64::from(poll)) << 30;
+                }
+            },
+        );
+    }
+
+    /// Resolve exact fixture command names and record all resolver traffic.
+    /// # Safety
+    /// Name is a static NUL-terminated name supplied by the sampler and prepare routine.
+    unsafe extern "system" fn loader(
+        _: vk::Instance,
+        name: *const std::ffi::c_char,
+    ) -> vk::PFN_vkVoidFunction {
+        crate::guard::guard(
+            crate::guard::Feature::Governor,
+            || None,
+            || {
+                count(0);
+                // SAFETY: the sampler passes static NUL-terminated Vulkan command names.
+                let name = unsafe { std::ffi::CStr::from_ptr(name) }.to_bytes();
+                // SAFETY: Vulkan erases each matching native signature until resolved by this name.
+                unsafe {
+                    match name {
+                        b"vkGetPhysicalDeviceProperties" => {
+                            Some(std::mem::transmute::<
+                                vk::PFN_vkGetPhysicalDeviceProperties,
+                                unsafe extern "system" fn(),
+                            >(properties))
+                        }
+                        b"vkEnumerateDeviceExtensionProperties" => {
+                            Some(std::mem::transmute::<
+                                vk::PFN_vkEnumerateDeviceExtensionProperties,
+                                unsafe extern "system" fn(),
+                            >(extensions))
+                        }
+                        b"vkGetPhysicalDeviceMemoryProperties2"
+                        | b"vkGetPhysicalDeviceMemoryProperties2KHR" => {
+                            ROUTE.with(|route| {
+                                route.set(if name.ends_with(b"KHR") { 2 } else { 1 })
+                            });
+                            Some(std::mem::transmute::<
+                                vk::PFN_vkGetPhysicalDeviceMemoryProperties2,
+                                unsafe extern "system" fn(),
+                            >(budget))
+                        }
+                        _ => None,
+                    }
+                }
+            },
+        )
+    }
+
+    /// Reset the thread-owned driver fixture without touching process-global native state.
+    fn reset(supported: bool) {
+        CALLS.with(|calls| calls.set([0; 4]));
+        SUPPORTED.with(|value| value.set(supported));
+        ROUTE.with(|route| route.set(0));
+    }
+
+    /// Sample only the known fixture functions, not an actual Vulkan device or game process.
+    fn sample(poller: &mut VramPoller, api: Option<crate::vk::InstanceApi>) -> Option<u64> {
+        // SAFETY: these synthetic handles reach only our matching synchronous fake driver.
+        unsafe { poller.sample_native(loader as *const () as usize, 1, 2, api) }
+    }
+
+    /// Creation facts for the fixture's core1.1 route.
+    fn core_api() -> Option<crate::vk::InstanceApi> {
+        Some(crate::vk::InstanceApi {
+            requested_api_version: vk::API_VERSION_1_1,
+            properties2_enabled: false,
+        })
+    }
+
+    /// Repeated polls retain capability discovery, but each returns its fresh changed budget.
+    #[test]
+    fn w49_native_poll_discovers_once_and_reads_every_budget() {
+        reset(true);
+        let mut poller = VramPoller::default();
+        assert_eq!(sample(&mut poller, core_api()), Some(2048));
+        assert_eq!(sample(&mut poller, core_api()), Some(1024));
+        assert_eq!(sample(&mut poller, core_api()), Some(0));
+        assert_eq!(CALLS.with(Cell::get), [3, 1, 1, 3]);
+        assert_eq!(ROUTE.with(Cell::get), 1);
+    }
+
+    /// Unsupported immutable capabilities never cause repeated enumerations or dynamic queries.
+    #[test]
+    fn w49_unsupported_budget_is_remembered_as_unknown() {
+        reset(false);
+        let mut poller = VramPoller::default();
+        assert_eq!(sample(&mut poller, core_api()), None);
+        assert_eq!(sample(&mut poller, core_api()), None);
+        assert_eq!(CALLS.with(Cell::get), [2, 1, 1, 0]);
+    }
+
+    /// A legal KHR route is preserved by the prepared query, never replaced by a core fallback.
+    #[test]
+    fn w49_khr_route_stays_khr_across_polls() {
+        reset(true);
+        let mut poller = VramPoller::default();
+        let api = Some(crate::vk::InstanceApi {
+            requested_api_version: vk::API_VERSION_1_0,
+            properties2_enabled: true,
+        });
+        assert_eq!(sample(&mut poller, api), Some(2048));
+        assert_eq!(sample(&mut poller, api), Some(1024));
+        assert_eq!(CALLS.with(Cell::get), [3, 1, 1, 2]);
+        assert_eq!(ROUTE.with(Cell::get), 2);
+    }
+
+    /// Unknown creation facts and a known but illegal route cannot dispatch a budget query.
+    #[test]
+    fn w49_unknown_capabilities_never_dispatch_a_budget_query() {
+        reset(true);
+        let mut poller = VramPoller::default();
+        assert_eq!(sample(&mut poller, None), None);
+        assert_eq!(sample(&mut poller, None), None);
+        assert_eq!(CALLS.with(Cell::get), [0; 4]);
+        let mut poller = VramPoller::default();
+        let api = Some(crate::vk::InstanceApi {
+            requested_api_version: vk::API_VERSION_1_0,
+            properties2_enabled: false,
+        });
+        assert_eq!(sample(&mut poller, api), None);
+        assert_eq!(sample(&mut poller, api), None);
+        assert_eq!(CALLS.with(Cell::get), [1, 1, 0, 0]);
+    }
+
+    /// A scene update that arrives during sampling cannot be timestamped after the control clock.
+    #[test]
+    fn w49_scene_clock_cannot_appear_in_the_future() {
+        let clock = Cell::new(1000u64);
+        let snapshot = ControlClock::capture(
+            || {
+                clock.set(1016);
+                1016
+            },
+            || clock.get(),
+        );
+        assert!(
+            snapshot.now >= snapshot.seen,
+            "fresh scene was made inactive by an older clock"
+        );
     }
 }
