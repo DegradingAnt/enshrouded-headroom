@@ -4,85 +4,34 @@
 //! "latch, drop, latch" the old mod is known for. So on a natural surface a failed hold is
 //! forgiven for a fraction of a second. A lattice keeps the game's exact behaviour.
 //!
-//! Climb programs can run on more than one thread and one server has many players, so the state
-//! lives in a table of atomics, one slot per entity.
+//! The client rolls back and replays up to 20 ticks, and only component bytes come back. So the
+//! state here is one byte in the game's own Climb component (`game::Ctx::grace_at`), and it counts
+//! ticks. Nothing here reads a clock or keeps state of its own, so a replayed tick decides what its
+//! first run decided, and what the server decided.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
-/// Slots in the table. Player ids are below 0x400 (`FUN_140a00070`, flag 0x40).
-const SLOTS: usize = 0x400;
+/// The ticks in one second. The tick is 0xfe502b ns in both exes.
+pub const TICKS_PER_SECOND: f32 = 60.0;
 /// The state for "this player is on a lattice, or has no climb".
-const NOT_NATURAL: u64 = 0;
-/// The state for "this player holds a natural surface".
-const HOLDING: u64 = 1;
-/// A larger state is the time of the first failure, moved up by this much so it cannot look like
-/// either state above.
-const TIME_BASE: u64 = 2;
+pub const NOT_NATURAL: u8 = 0;
+/// The state for "this player holds a natural surface". Each tick forgiven adds one to it.
+pub const HOLDING: u8 = 1;
 
-/// One step of the state of a slot: the next state, and whether to keep holding.
-pub fn fail_step(state: u64, now_ms: u64, limit_ms: u64) -> (u64, bool) {
-    match state {
-        NOT_NATURAL => (NOT_NATURAL, false),
-        HOLDING if limit_ms == 0 => (NOT_NATURAL, false),
-        HOLDING => (now_ms.saturating_add(TIME_BASE), true),
-        since => {
-            let waited = now_ms.saturating_sub(since.saturating_sub(TIME_BASE));
-            if waited <= limit_ms {
-                (since, true)
-            } else {
-                (NOT_NATURAL, false)
-            }
-        }
+/// The state after a hold that passed.
+pub fn held(natural: bool) -> u8 {
+    if natural {
+        HOLDING
+    } else {
+        NOT_NATURAL
     }
 }
 
-/// The grace state of every player.
-pub struct Grace {
-    /// One state per entity id.
-    slots: [AtomicU64; SLOTS],
-}
-
-impl Grace {
-    /// Nobody holds anything.
-    pub const fn new() -> Grace {
-        Grace {
-            slots: [const { AtomicU64::new(NOT_NATURAL) }; SLOTS],
-        }
-    }
-
-    /// The slot of `entity`.
-    fn slot(&self, entity: u32) -> Option<&AtomicU64> {
-        self.slots.get(entity as usize % SLOTS)
-    }
-
-    /// `entity` holds a natural surface right now.
-    pub fn held(&self, entity: u32) {
-        if let Some(slot) = self.slot(entity) {
-            slot.store(HOLDING, Ordering::Relaxed);
-        }
-    }
-
-    /// `entity` holds a lattice right now, so a failure there is the game's to judge.
-    pub fn lattice(&self, entity: u32) {
-        if let Some(slot) = self.slot(entity) {
-            slot.store(NOT_NATURAL, Ordering::Relaxed);
-        }
-    }
-
-    /// `entity` failed its hold at `now_ms`. Should it keep holding?
-    pub fn failed(&self, entity: u32, now_ms: u64, limit_ms: u64) -> bool {
-        let Some(slot) = self.slot(entity) else {
-            return false;
-        };
-        let (next, hold) = fail_step(slot.load(Ordering::Relaxed), now_ms, limit_ms);
-        slot.store(next, Ordering::Relaxed);
-        hold
-    }
-}
-
-impl Default for Grace {
-    fn default() -> Grace {
-        Grace::new()
+/// The state after a hold that failed, and whether to keep holding. `limit` is how many ticks in a
+/// row may be forgiven, so the tick after that many drops the player.
+pub fn failed(state: u8, limit: u8) -> (u8, bool) {
+    if state == NOT_NATURAL || state.saturating_sub(HOLDING) >= limit {
+        (NOT_NATURAL, false)
+    } else {
+        (state.saturating_add(1), true)
     }
 }
 
@@ -90,85 +39,80 @@ impl Default for Grace {
 mod tests {
     use super::*;
 
+    /// Run failed holds from `state` until the drop, and give the ticks forgiven.
+    fn forgiven(mut state: u8, limit: u8) -> u32 {
+        let mut ticks = 0;
+        loop {
+            let (next, keep) = failed(state, limit);
+            state = next;
+            if !keep {
+                assert_eq!(state, NOT_NATURAL, "a drop clears the state");
+                return ticks;
+            }
+            ticks += 1;
+        }
+    }
+
     /// A failure on a lattice is a drop at once, exactly as the game has it.
     #[test]
     fn a_lattice_gets_no_grace() {
-        assert_eq!(fail_step(NOT_NATURAL, 1000, 150), (NOT_NATURAL, false));
-        let grace = Grace::new();
-        grace.lattice(9);
-        assert!(!grace.failed(9, 1000, 150));
+        assert_eq!(held(false), NOT_NATURAL);
+        assert_eq!(failed(held(false), 9), (NOT_NATURAL, false));
     }
 
-    /// The first failure starts the clock and holds.
+    /// The first failure of a natural hold is forgiven.
     #[test]
     fn the_first_failure_holds() {
-        let (state, hold) = fail_step(HOLDING, 1000, 150);
-        assert!(hold);
-        assert_eq!(state, 1000 + TIME_BASE);
+        assert_eq!(failed(held(true), 9), (HOLDING + 1, true));
     }
 
-    /// The hold lasts exactly as long as the limit, then the player drops.
+    /// The hold lasts exactly the limit, then the player drops.
     #[test]
     fn the_hold_ends_at_the_limit() {
-        let grace = Grace::new();
-        grace.held(5);
-        assert!(grace.failed(5, 1000, 150));
-        assert!(grace.failed(5, 1100, 150));
-        assert!(grace.failed(5, 1150, 150));
-        assert!(!grace.failed(5, 1151, 150));
+        for limit in [1, 2, 9, 60] {
+            assert_eq!(forgiven(HOLDING, limit), u32::from(limit), "{limit}");
+        }
     }
 
-    /// After a drop the slot is clear, so the next failure is not forgiven by old state.
+    /// After a drop the state is clear, so the next failure is not forgiven by old state.
     #[test]
     fn a_drop_clears_the_state() {
-        let grace = Grace::new();
-        grace.held(5);
-        assert!(grace.failed(5, 1000, 150));
-        assert!(!grace.failed(5, 2000, 150));
-        assert!(!grace.failed(5, 2001, 150));
+        assert_eq!(forgiven(HOLDING, 3), 3);
+        assert_eq!(forgiven(NOT_NATURAL, 3), 0);
     }
 
-    /// A good frame in between starts the clock again, so a long climb of short gaps holds.
+    /// A good tick in between starts the count again, so a long climb of short gaps holds.
     #[test]
-    fn a_good_frame_starts_the_clock_again() {
-        let grace = Grace::new();
-        grace.held(5);
-        assert!(grace.failed(5, 1000, 150));
-        grace.held(5);
-        assert!(grace.failed(5, 1140, 150));
-        assert!(grace.failed(5, 1290, 150));
+    fn a_good_tick_starts_the_count_again() {
+        let (state, keep) = failed(held(true), 2);
+        assert!(keep);
+        let (state, keep) = failed(state, 2);
+        assert!(keep);
+        assert_eq!(failed(state, 2), (NOT_NATURAL, false));
+        assert_eq!(forgiven(held(true), 2), 2);
     }
 
     /// A limit of 0 turns the grace off.
     #[test]
     fn a_zero_limit_means_no_grace() {
-        let grace = Grace::new();
-        grace.held(5);
-        assert!(!grace.failed(5, 1000, 0));
+        assert_eq!(failed(HOLDING, 0), (NOT_NATURAL, false));
     }
 
-    /// Players do not share state.
+    /// The decision depends on the byte and the limit alone: the same byte gives the same answer
+    /// however often it is asked, which is what a replay asks of it.
     #[test]
-    fn players_do_not_share_state() {
-        let grace = Grace::new();
-        grace.held(5);
-        assert!(!grace.failed(6, 1000, 150));
-        assert!(grace.failed(5, 1000, 150));
+    fn the_same_byte_gives_the_same_answer() {
+        for state in 0..=u8::MAX {
+            assert_eq!(failed(state, 9), failed(state, 9));
+        }
     }
 
-    /// Any id is safe, including ids past the table.
+    /// Any byte is safe, including one no build of this mod wrote. At the largest limit the
+    /// settings allow, it can only shorten the grace.
     #[test]
-    fn any_id_is_safe() {
-        let grace = Grace::new();
-        grace.held(u32::MAX);
-        assert!(grace.failed(u32::MAX, 1000, 150));
-    }
-
-    /// A clock that jumps back cannot underflow.
-    #[test]
-    fn a_clock_going_backward_is_safe() {
-        let (state, hold) = fail_step(5000 + TIME_BASE, 1000, 150);
-        assert!(hold);
-        assert_eq!(state, 5000 + TIME_BASE);
+    fn any_byte_is_safe() {
+        for state in 0..=u8::MAX {
+            assert!(forgiven(state, 60) <= 60, "{state}");
+        }
     }
 }

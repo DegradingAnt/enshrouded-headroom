@@ -7,18 +7,19 @@
 //! 3. the exit query is corrected, using that fit and that answer.
 //!
 //! All of that happens in one call on one thread, so both live in thread-locals. State that
-//! must last between frames is the climb normal, in the game's own component, and the grace
-//! table. Nothing here allocates, takes a lock or logs.
+//! must last between ticks lives in the game's own Climb component: the climb normal and the grace
+//! count. The client replays old ticks, and only component bytes come back, so nothing here may
+//! carry a decision from one tick to the next any other way. Nothing here allocates, takes a lock
+//! or logs.
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 use emberkit::guard::{guard, FeatureId};
-use windows_sys::Win32::System::SystemInformation::GetTickCount64;
 
 use crate::config::Settings;
-use crate::diag::DIAG;
+use crate::diag::{BodySample, DIAG};
 use crate::exit::{self, Exit};
 use crate::game::{
     self, encode_result, failed_result, read_vec3, result_code, result_entity, result_hit,
@@ -26,7 +27,7 @@ use crate::game::{
     RESULT_SIZE,
 };
 use crate::geom::Vec3;
-use crate::grace::Grace;
+use crate::grace;
 use crate::plan::{self, HELD};
 use crate::sigs::{self, Sig};
 use crate::surface::{cone_ok, scan, steer, Fit, Hit, Mode, Scan, SteerInput, Tuning};
@@ -41,8 +42,10 @@ const GAME_STAMINA_COST: f32 = 8.0;
 pub struct Runtime {
     /// The surface limits.
     pub tuning: Tuning,
-    /// The grace time, in milliseconds.
-    pub grace_ms: u64,
+    /// The grace time, in game ticks.
+    pub grace_ticks: u8,
+    /// Does the log get the per-second lines?
+    pub diagnostics: bool,
     /// Does walking start a climb?
     pub walk: bool,
     /// Does jumping or falling?
@@ -66,7 +69,8 @@ impl Runtime {
     pub unsafe fn new(settings: &Settings, raycast: usize) -> Runtime {
         Runtime {
             tuning: settings.tuning(),
-            grace_ms: settings.grace_ms(),
+            grace_ticks: settings.grace_ticks(),
+            diagnostics: settings.diagnostics,
             walk: settings.walk,
             jump: settings.jump,
             sprint: settings.sprint,
@@ -93,8 +97,6 @@ static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 /// Do the detours do anything? Set only after every hook and write went in, so a start-up that
 /// fails half way leaves detours that only forward.
 static ACTIVE: AtomicBool = AtomicBool::new(false);
-/// Who holds what, for the grace time.
-static GRACE: Grace = Grace::new();
 
 /// Store the settings for the detours. A second call is ignored: start-up runs once.
 pub fn prepare(runtime: Runtime) {
@@ -414,41 +416,34 @@ unsafe fn wall_lost_original(ctx: *mut u8) -> (u32, Option<u8>) {
     (id, get(&NESTED, None))
 }
 
-/// The time now, in milliseconds.
-fn now_ms() -> u64 {
-    // SAFETY: the call has no arguments and cannot fail.
-    unsafe { GetTickCount64() }
-}
-
-/// What the wall-lost check's answer means for a natural climb.
-fn after_wall_lost(id: u32, probed: bool, entity: u32) -> u32 {
-    let hold = get(&HOLD, None);
+/// What the wall-lost check's answer means for a natural climb. `state` is the grace count of this
+/// tick and `limit` the ticks that may be forgiven. The answer and the next count come back.
+fn after_wall_lost(id: u32, probed: bool, state: u8, limit: u8, entity: u32) -> (u32, u8) {
     if id != 0 {
-        match hold {
-            Some(hold) if hold.natural => GRACE.held(entity),
-            _ => GRACE.lattice(entity),
-        }
+        let natural = get(&HOLD, None).is_some_and(|hold| hold.natural);
         DIAG.held(id == HELD);
-        return id;
+        return (id, grace::held(natural));
     }
-    let limit = runtime().map_or(0, |runtime| runtime.grace_ms);
-    if probed && GRACE.failed(entity, now_ms(), limit) {
-        DIAG.graced();
-        let hold = Hold {
-            entity,
-            natural: true,
-            fit: None,
-            steady: false,
-        };
-        set(&HOLD, Some(hold));
-        return HELD;
+    if probed {
+        let (next, keep) = grace::failed(state, limit);
+        if keep {
+            DIAG.graced();
+            let hold = Hold {
+                entity,
+                natural: true,
+                fit: None,
+                steady: false,
+            };
+            set(&HOLD, Some(hold));
+            return (HELD, next);
+        }
     }
     DIAG.dropped(probed);
-    0
+    (0, grace::NOT_NATURAL)
 }
 
 /// Hook on the wall-lost check. The patched return already turns a voxel hit into [`HELD`]. This
-/// adds the grace time.
+/// adds the grace time, counted in the Climb component.
 ///
 /// # Safety
 ///
@@ -457,9 +452,24 @@ unsafe extern "system" fn wall_lost_detour(ctx: *mut u8) -> u32 {
     // SAFETY: the game's own argument.
     let original = || unsafe { wall_lost_original(ctx) };
     post_hook(Feature::Surface, original, |(id, nested)| {
-        // SAFETY: the game's own context, alive for this call.
-        let entity = unsafe { Ctx(ctx).entity() };
-        (after_wall_lost(id, nested.is_some(), entity), nested)
+        let Some(runtime) = runtime() else {
+            return (id, nested);
+        };
+        let ctx = Ctx(ctx);
+        // SAFETY: the game's own context, alive for this call. The check just read this Climb.
+        let (entity, at, state) = unsafe {
+            let at = ctx.grace_at();
+            (ctx.entity(), at, at.read())
+        };
+        let limit = runtime.grace_ticks;
+        let (id, next) = after_wall_lost(id, nested.is_some(), state, limit, entity);
+        if next != state {
+            // SAFETY: a padding byte of this entity's Climb. The check's one caller is the climb
+            // update, which runs only inside program 244. That program has Climb in its write
+            // list, and it marked this entity before the update (`FUN_1404188c0`).
+            unsafe { at.write(next) };
+        }
+        (id, nested)
     })
     .0
 }
@@ -528,17 +538,21 @@ unsafe extern "system" fn low_entry_detour(
         Feature::Entry,
         || ran.get().unwrap_or_else(&original).0,
         || {
-            set(&FOUND, None);
             // SAFETY: the game's own arguments.
             set(&TRIGGER, unsafe { entry_trigger(Ctx(ctx), input) });
             let (result, nested) = original();
             ran.set(Some((result, nested)));
+            // Both go before anything that could panic, so they end with this call on every path
+            // out, and a later entry that the guard runs alone finds them empty.
+            let found = get(&FOUND, None);
+            set(&FOUND, None);
+            set(&TRIGGER, None);
             if result.is_null() {
                 return result;
             }
             // SAFETY: the entry writes a whole result on every path and returns its buffer.
             let mut code = unsafe { result_code(result) };
-            if let (NOT_NOW, Some(found)) = (code, get(&FOUND, None)) {
+            if let (NOT_NOW, Some(found)) = (code, found) {
                 // SAFETY: the game's own input.
                 let wanted = unsafe { game::world_move_input(input) };
                 if cone_ok(found.normal, wanted) {
@@ -552,6 +566,33 @@ unsafe extern "system" fn low_entry_detour(
             result
         },
     )
+}
+
+/// Show the log thread how this climber's body lies. It only reads, for the log.
+///
+/// # Safety
+///
+/// `ctx` is the game's context to the move check.
+unsafe fn note_body(ctx: Ctx) {
+    if !runtime().is_some_and(|runtime| runtime.diagnostics) {
+        return;
+    }
+    // SAFETY: the function's contract.
+    let Some(actor) = (unsafe { ctx.actor() }) else {
+        return;
+    };
+    // SAFETY: the function's contract: the game's own components, alive for this call.
+    let sample = unsafe {
+        let (speed, mode) = actor.rotation();
+        BodySample {
+            entity: ctx.entity(),
+            speed,
+            mode,
+            normal: read_vec3(ctx.normal_at()),
+            orientation: ctx.orientation(),
+        }
+    };
+    DIAG.body(&sample);
 }
 
 /// One frame of steering, for a natural surface only.
@@ -634,6 +675,8 @@ unsafe extern "system" fn move_check_detour(
     // SAFETY: the game's own arguments.
     let original = || unsafe { move_check_original(velocity, ctx, pos, dt) };
     guard(Feature::Steer, original, || {
+        // SAFETY: the game's own context. The log must not be able to stop the steering.
+        guard(Feature::Diag, || (), || unsafe { note_body(Ctx(ctx)) });
         // SAFETY: the game's own arguments.
         unsafe { steer_frame(velocity, Ctx(ctx), pos, dt) };
         original()
@@ -1163,42 +1206,75 @@ mod tests {
         assert!(!defaults.allows(Trigger::Glide));
     }
 
-    /// A lattice hold leaves grace off, and a natural hold turns it on.
+    /// A hold on this thread, for the wall-lost tests.
+    fn holding(natural: bool) -> Option<Hold> {
+        Some(Hold {
+            entity: 301,
+            natural,
+            fit: None,
+            steady: false,
+        })
+    }
+
+    /// A lattice hold clears the count, and a natural hold starts it.
     #[test]
     fn a_natural_hold_earns_grace_and_a_lattice_does_not() {
-        let entity = 301;
-        set(
-            &HOLD,
-            Some(Hold {
-                entity,
-                natural: true,
-                fit: None,
-                steady: false,
-            }),
+        set(&HOLD, holding(true));
+        assert_eq!(
+            after_wall_lost(HELD, true, grace::NOT_NATURAL, 9, 301),
+            (HELD, grace::HOLDING)
         );
-        assert_eq!(after_wall_lost(HELD, true, entity), HELD);
-        assert!(GRACE.failed(entity, now_ms(), 1000));
-        set(
-            &HOLD,
-            Some(Hold {
-                entity,
-                natural: false,
-                fit: None,
-                steady: false,
-            }),
+        set(&HOLD, holding(false));
+        assert_eq!(
+            after_wall_lost(55, true, grace::HOLDING, 9, 301),
+            (55, grace::NOT_NATURAL)
         );
-        assert_eq!(after_wall_lost(55, true, entity), 55);
-        assert!(!GRACE.failed(entity, now_ms(), 1000));
+    }
+
+    /// A hold that came back ends the count, however far it had run.
+    #[test]
+    fn a_hold_after_a_seam_starts_the_count_again() {
+        set(&HOLD, holding(true));
+        assert_eq!(
+            after_wall_lost(HELD, true, grace::HOLDING + 4, 9, 301),
+            (HELD, grace::HOLDING)
+        );
+    }
+
+    /// A forgiven tick answers as a hold, moves the count, and leaves a hold with no fit, which
+    /// tells the steering and the exit that this is a natural climb.
+    #[test]
+    fn a_forgiven_tick_counts_and_holds() {
+        set(&HOLD, None);
+        assert_eq!(
+            after_wall_lost(0, true, grace::HOLDING, 9, 301),
+            (HELD, grace::HOLDING + 1)
+        );
+        let hold = get(&HOLD, None).unwrap();
+        assert!(hold.natural && hold.fit.is_none() && !hold.steady);
+        assert_eq!(hold.entity, 301);
+    }
+
+    /// Past the limit the player drops, and the count is clear for the next climb.
+    #[test]
+    fn past_the_limit_the_player_drops() {
+        set(&HOLD, None);
+        assert_eq!(
+            after_wall_lost(0, true, grace::HOLDING + 9, 9, 301),
+            (0, grace::NOT_NATURAL)
+        );
+        assert_eq!(get(&HOLD, None), None);
     }
 
     /// Without a nested probe nothing is forgiven: the climb normal was 0, which is the game's
-    /// own failure.
+    /// own failure. The count ends with the climb.
     #[test]
     fn no_probe_means_no_grace() {
-        let entity = 302;
-        GRACE.held(entity);
         set(&HOLD, None);
-        assert_eq!(after_wall_lost(0, false, entity), 0);
+        assert_eq!(
+            after_wall_lost(0, false, grace::HOLDING, 9, 302),
+            (0, grace::NOT_NATURAL)
+        );
     }
 
     /// The hit that stands for a fit carries its centre and normal.

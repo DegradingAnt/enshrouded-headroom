@@ -155,9 +155,10 @@ impl<C: Caster> Search<'_, C> {
             .filter(|patch| patch.normal.y >= query.walkable_ny)
     }
 
-    /// The ground under the patch, if the patch has turned walkable. On a long curve the body lies
-    /// along the rock and the chest reaches flat ground well before anything ahead of the feet
-    /// does. Waiting for the feet would stop the climb at the hold limit with no exit.
+    /// The ground under the patch, if the patch has turned walkable. On a long curve the ray patch
+    /// lies along the rock, as the body is thought to (HYPOTHESIS, see `surface::Frame`), and it
+    /// reaches flat ground well before anything ahead of the feet does. Waiting for the feet would
+    /// stop the climb at the hold limit with no exit.
     fn over_the_patch(&self) -> Option<Hit> {
         let above = self.walkable_patch()?.point + UP * PATCH_RISE;
         let below = above - UP * (PATCH_RISE * 2.0);

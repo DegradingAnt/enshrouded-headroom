@@ -59,6 +59,11 @@ const CTX_ENTITY: usize = 0x30;
 const CTX_WORLD: usize = 0x38;
 /// `Climb.climbNormal`.
 const CLIMB_NORMAL: usize = 0x04;
+/// Padding in Climb, between `climbState` and `climbNormal`. This mod keeps its grace count here.
+/// +3 stays free.
+const CLIMB_GRACE: usize = 0x02;
+/// `CurrentTransform.transform.orientation`: x, y, z, w.
+const TRANSFORM_ORIENTATION: usize = 0x18;
 /// `MovementCollider.results.m_isSet`.
 const COLLIDER_RESULTS_SET: usize = 0x50;
 /// `MovementCollider.results.m_value.hasSpheroidCollision`.
@@ -75,6 +80,10 @@ const ACTOR_STATE_ADD: usize = 0xbd0;
 const ACTOR_STATE_REMOVE: usize = 0xbd8;
 /// Actor: the state bits.
 const ACTOR_STATE: usize = 0xbf8;
+/// Actor: the rotation speed that `actor_rotation` stored for this tick's branch.
+const ACTOR_ROTATION_SPEED: usize = 0xee0;
+/// Actor: the `actor.InterpolationMode` stored with that speed.
+const ACTOR_ROTATION_MODE: usize = 0xee4;
 /// `AbilityFlag` 16, CanClimb, in the ability mask.
 const CAN_CLIMB: u32 = 1 << 16;
 /// `StateFlag` 0, Grounded.
@@ -326,6 +335,37 @@ impl Ctx {
         unsafe { pointer_at(self.0, CTX_CLIMB).add(CLIMB_NORMAL).cast() }
     }
 
+    /// Where the grace count is stored: a padding byte of the Climb component, which the game
+    /// copies and sends with the rest of the component and never reads (docs/re-notes.md, "Replay
+    /// and the grace byte").
+    ///
+    /// # Safety
+    ///
+    /// `self` is the game's climb context, alive for this call. The game's own code reads this
+    /// pointer without a null check.
+    pub unsafe fn grace_at(self) -> *mut u8 {
+        // SAFETY: the caller's contract: the context is 0x40 bytes, and the Climb component is
+        // 0x98 bytes.
+        unsafe { pointer_at(self.0, CTX_CLIMB).add(CLIMB_GRACE) }
+    }
+
+    /// The body's orientation: x, y, z, w.
+    ///
+    /// # Safety
+    ///
+    /// `self` is the game's climb context, alive for this call. The game's own code reads this
+    /// pointer without a null check.
+    pub unsafe fn orientation(self) -> [f32; 4] {
+        // SAFETY: the caller's contract: the CurrentTransform component is 0x38 bytes, and any
+        // bits are a valid f32.
+        unsafe {
+            pointer_at(self.0, CTX_TRANSFORM)
+                .add(TRANSFORM_ORIENTATION)
+                .cast::<[f32; 4]>()
+                .read_unaligned()
+        }
+    }
+
     /// Where the player's feet are.
     ///
     /// # Safety
@@ -450,6 +490,21 @@ impl Actor {
     pub unsafe fn gliding(self) -> bool {
         // SAFETY: the caller's contract.
         unsafe { self.state(STATE_GLIDING) }
+    }
+
+    /// The rotation speed and `actor.InterpolationMode` that `actor_rotation` stored.
+    ///
+    /// # Safety
+    ///
+    /// `self` is the game's Actor, alive for this call.
+    pub unsafe fn rotation(self) -> (f32, u8) {
+        // SAFETY: the caller's contract. Both fields are inside the 0xef8-byte component.
+        unsafe {
+            (
+                f32::from_le_bytes(bytes_at::<4>(self.0, ACTOR_ROTATION_SPEED)),
+                self.0.add(ACTOR_ROTATION_MODE).read(),
+            )
+        }
     }
 
     /// Set CanClimb in the sequence's ability mask. Returns true if this call set it, which means
@@ -786,9 +841,49 @@ mod tests {
         }
     }
 
-    /// An Actor as a plain buffer, big enough for the fields this mod reads.
+    /// The grace byte is the one after `climbState`. A write there must miss the fields around it,
+    /// and +3, which stays free.
+    #[test]
+    fn the_grace_byte_sits_in_the_padding() {
+        let mut climb = [0xaau8; 0x98];
+        let fields: [usize; 2] = [0, climb.as_mut_ptr() as usize];
+        let ctx = Ctx(fields.as_ptr() as *mut u8);
+        // SAFETY: `fields` and `climb` live to the end of this test, and the byte is inside `climb`.
+        unsafe { ctx.grace_at().write(7) };
+        let mut expected = [0xaau8; 0x98];
+        expected[2] = 7;
+        assert_eq!(climb, expected);
+    }
+
+    /// The orientation comes after the three i64 of the position, x first.
+    #[test]
+    fn the_orientation_is_read_from_its_offset() {
+        let mut transform = [0u8; 0x38];
+        for (index, value) in [1.0f32, 2.0, 3.0, 4.0].into_iter().enumerate() {
+            let at = TRANSFORM_ORIENTATION + index * 4;
+            transform[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        let fields: [usize; 3] = [0, 0, transform.as_ptr() as usize];
+        let ctx = Ctx(fields.as_ptr() as *mut u8);
+        // SAFETY: `fields` and `transform` live to the end of this test.
+        assert_eq!(unsafe { ctx.orientation() }, [1.0, 2.0, 3.0, 4.0]);
+    }
+
+    /// An Actor as a plain buffer, the size of the component.
     fn actor_bytes() -> Vec<u8> {
-        vec![0u8; 0xc10]
+        vec![0u8; 0xef8]
+    }
+
+    /// The speed and the mode sit where `actor_rotation` stores them.
+    #[test]
+    fn the_rotation_is_read_from_its_offsets() {
+        let mut bytes = actor_bytes();
+        bytes[ACTOR_ROTATION_SPEED..ACTOR_ROTATION_SPEED + 4]
+            .copy_from_slice(&7.5f32.to_le_bytes());
+        bytes[ACTOR_ROTATION_MODE] = 3;
+        let actor = Actor(bytes.as_mut_ptr());
+        // SAFETY: `bytes` is big enough and lives to the end of this test.
+        assert_eq!(unsafe { actor.rotation() }, (7.5, 3));
     }
 
     /// The state readers apply the game's rule at the game's offsets.

@@ -8,6 +8,7 @@ use std::path::Path;
 use configparser::ini::Ini;
 use emberkit::config::{Reader, Setting, SettingType};
 
+use crate::grace::TICKS_PER_SECOND;
 use crate::surface::Tuning;
 
 /// The settings file's name.
@@ -90,10 +91,11 @@ impl Settings {
         )
     }
 
-    /// The grace time in whole milliseconds.
-    pub fn grace_ms(&self) -> u64 {
-        // The reader keeps the value in 0..=1, and a float-to-integer `as` cast cannot panic.
-        (self.grace_seconds * 1000.0).round() as u64
+    /// The grace time in whole game ticks.
+    pub fn grace_ticks(&self) -> u8 {
+        // The reader keeps the value in 0..=1, which fits, and a float-to-integer `as` cast cannot
+        // panic.
+        (self.grace_seconds * TICKS_PER_SECOND).round() as u8
     }
 }
 
@@ -529,10 +531,20 @@ mod tests {
         assert!(t.entry_ray > 1.9, "{t:?}");
     }
 
-    /// The grace time rounds to whole milliseconds.
+    /// The grace time stays in seconds in the file and becomes ticks at 60 a second.
     #[test]
-    fn the_grace_time_is_in_milliseconds() {
-        assert_eq!(Settings::default().grace_ms(), 150);
+    fn the_grace_time_becomes_ticks() {
+        assert_eq!(Settings::default().grace_ticks(), 9);
+        let ticks = |grace_seconds| {
+            let settings = Settings {
+                grace_seconds,
+                ..Settings::default()
+            };
+            settings.grace_ticks()
+        };
+        assert_eq!(ticks(0.0), 0);
+        assert_eq!(ticks(0.05), 3);
+        assert_eq!(ticks(1.0), 60);
     }
 
     /// A missing file is not an error, and the default is written once, never over a player's

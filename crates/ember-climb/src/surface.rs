@@ -262,8 +262,9 @@ impl Scan {
     }
 }
 
-/// The axes of one ray patch. For a climb they lie along the surface, because the game turns
-/// the whole body to face it (`FUN_14021c730`, "Climbing").
+/// The axes of one ray patch. For a climb they lie along the surface, because the game's target
+/// rotation faces it (`FUN_14021c730`, "Climbing"). HYPOTHESIS: the body reaches that target. It
+/// can only do so if the rotation mode allows it, which the `climb body:` log line will show.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Frame {
     /// Where the rays point, length 1.
@@ -370,8 +371,9 @@ pub fn near_distance(pos: Vec3, fit: &Fit, capsule: Capsule) -> f32 {
 
 /// How far the feet stay from a surface whose normal has `ny` up in it.
 ///
-/// The game keeps 0.55 m, and the body lies along the surface at the same distance. The capsule
-/// stays upright, so an overhang tips its top toward the rock; there the feet stay farther out.
+/// The game keeps 0.55 m. HYPOTHESIS until the `climb body:` log line proves it: the body lies
+/// along the surface at the same distance. The capsule stays upright, so an overhang tips its top
+/// toward the rock; there the feet stay farther out.
 pub fn standoff_target(ny: f32, capsule: Capsule) -> f32 {
     GAME_STANDOFF.max(capsule.radius + CAPSULE_GAP - capsule.top() * ny)
 }
@@ -644,7 +646,7 @@ mod tests {
     }
 
     /// Every ray starts the same distance from the surface, so the reach need not grow with the
-    /// slope. This is why the patch lies along the body.
+    /// slope. This is why the patch lies along the surface.
     #[test]
     fn origins_stay_a_constant_distance_from_a_leaning_surface() {
         let normal = face(60.0);

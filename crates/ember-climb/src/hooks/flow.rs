@@ -224,12 +224,12 @@ unsafe extern "system" fn game_stamina(_data: *mut u8) -> f32 {
 
 /// One player's components, in memory that lasts as long as the test process.
 struct Player {
-    /// The Actor, large enough for the fields read.
+    /// The Actor, the size of the component.
     actor: &'static mut [u8],
     /// The Climb component.
     climb: &'static mut [u8],
-    /// The position, in 32.32 fixed point.
-    transform: &'static mut [i64; 3],
+    /// The CurrentTransform component: the position in 32.32 fixed point, then the orientation.
+    transform: &'static mut [i64; 7],
     /// The ActorInput component.
     input: &'static mut [u8],
     /// The context, as `FUN_140419570` builds it.
@@ -239,10 +239,10 @@ struct Player {
 impl Player {
     /// A player on the ground in front of the wall, with the normal on the wall.
     fn new() -> Player {
-        let actor = vec![0u8; 0xc10].leak();
+        let actor = vec![0u8; 0xef8].leak();
         actor[0xbf8] = 1;
         let climb = vec![0u8; 0x98].leak();
-        let transform = Box::leak(Box::new([0i64; 3]));
+        let transform = Box::leak(Box::new([0i64; 7]));
         let config = Box::leak(Box::new([0.8f32, 2.0]));
         let collider = vec![0u8; 0x54].leak();
         let input = vec![0u8; 0x1c8].leak();
@@ -348,6 +348,11 @@ impl Player {
     }
 }
 
+/// Two floats as the bytes of one word of the transform.
+fn sample_words(low: f32, high: f32) -> [u8; 8] {
+    (u64::from(high.to_bits()) << 32 | u64::from(low.to_bits())).to_le_bytes()
+}
+
 /// Point every slot at its fake, and turn the mod on.
 fn install() {
     let probe: ProbeFn = game_probe;
@@ -399,6 +404,12 @@ fn a_climb_runs_through_the_detours() {
     assert!(stand.y.abs() < 1e-4, "{stand:?}");
     assert!((normal.x + 1.0).abs() < 1e-4, "{normal:?}");
 
+    // Nothing of an entry outlives its call, so a later call that the guard runs alone cannot see
+    // an old trigger or an old surface.
+    assert_eq!(get(&TRIGGER, None), None);
+    assert_eq!(get(&FOUND, None), None);
+    assert_eq!(get(&MODE, None), None);
+
     // Each start can be off. A glider is off by default, so the answer stays the game's.
     player.set_state(false, true, false);
     assert_eq!(player.low_entry()[0], MISS);
@@ -434,7 +445,7 @@ fn a_climb_runs_through_the_detours() {
     assert!(steered.y > 1.9, "{steered:?}");
 
     // The stored climb normal eases toward the surface, in the game's own component. This is what
-    // turns the body with the rock, and what points the next frame's rays.
+    // points the next frame's rays, and the body's target rotation.
     let leaning = Vec3::new(-0.98, 0.2, 0.0).normalized().unwrap();
     player.set_normal(leaning);
     assert_eq!(player.wall_lost(), HELD);
@@ -451,12 +462,69 @@ fn a_climb_runs_through_the_detours() {
     let (_, passed) = player.move_check(UP * 1.95);
     assert_eq!(passed, 0);
 
-    // The surface goes for a moment: the grace time holds, then the player drops.
-    assert_eq!(player.wall_lost(), HELD, "the first miss is forgiven");
-    assert_eq!(player.wall_lost(), HELD, "and the next, inside the limit");
-    std::thread::sleep(std::time::Duration::from_millis(120));
-    assert_eq!(player.wall_lost(), 0, "past the limit the player drops");
+    // The surface goes for a moment: the grace time holds for its 3 ticks, then the player drops.
+    // The count is in the Climb bytes, and only there: put back the bytes and the same ticks give
+    // the same answers, as they do in a replay. No other byte of the component moves.
+    player.climb[3] = 0x5a;
+    let saved = player.climb.to_vec();
+    assert_eq!(saved[2], grace::HOLDING);
+    for run in 0..2 {
+        assert_eq!(
+            player.wall_lost(),
+            HELD,
+            "run {run}: the first miss is forgiven"
+        );
+        assert_eq!(player.climb[2], grace::HOLDING + 1, "run {run}");
+        assert_eq!(player.wall_lost(), HELD, "run {run}: and the next");
+        assert_eq!(player.wall_lost(), HELD, "run {run}: and the last");
+        assert_eq!(player.climb[2], grace::HOLDING + 3, "run {run}");
+        assert_eq!(
+            player.wall_lost(),
+            0,
+            "run {run}: past the limit the player drops"
+        );
+        assert_eq!(
+            player.climb[2],
+            grace::NOT_NATURAL,
+            "run {run}: a drop clears it"
+        );
+        let mut expected = saved.clone();
+        expected[2] = grace::NOT_NATURAL;
+        assert_eq!(
+            player.climb,
+            &expected[..],
+            "run {run}: the other bytes stand"
+        );
+        player.climb.copy_from_slice(&saved);
+    }
+    player.climb[3] = 0;
     WALL_THERE.store(true, Ordering::Relaxed);
+
+    // A replay can start inside the seam: from a count of 2, one tick is left.
+    assert_eq!(player.wall_lost(), HELD);
+    assert_eq!(player.climb[2], grace::HOLDING);
+    WALL_THERE.store(false, Ordering::Relaxed);
+    player.climb[2] = grace::HOLDING + 2;
+    assert_eq!(player.wall_lost(), HELD);
+    assert_eq!(player.wall_lost(), 0);
+    WALL_THERE.store(true, Ordering::Relaxed);
+
+    // The move check shows the log thread how the body lies, and changes nothing to do it.
+    player.climb[2] = grace::HOLDING;
+    player.actor[0xee0..0xee4].copy_from_slice(&8.0f32.to_le_bytes());
+    player.actor[0xee4] = 3;
+    let up = crate::geom::UP;
+    player.transform[3] = i64::from_le_bytes(sample_words(0.0, 0.0));
+    player.transform[4] = i64::from_le_bytes(sample_words(0.0, 1.0));
+    assert_eq!(player.wall_lost(), HELD);
+    let body = DIAG.snapshot().body_samples;
+    player.move_check(up * 1.95);
+    assert_eq!(DIAG.snapshot().body_samples, body + 1);
+    let sample = DIAG.body_sample();
+    assert_eq!((sample.speed, sample.mode), (8.0, 3));
+    assert_eq!(sample.entity, PLAYER as u32);
+    assert_eq!(sample.normal, player.normal());
+    assert_eq!(sample.orientation, [0.0, 0.0, 0.0, 1.0]);
 
     // Steep rock is no exit for a climber, and a real floor stays the game's exit. The hook hands
     // over where the game's floor lies: with no ground around that spot it is one stray triangle.
@@ -514,11 +582,14 @@ fn a_climb_runs_through_the_detours() {
     // SAFETY: the fake reads nothing.
     assert_eq!(unsafe { stamina_detour(std::ptr::null_mut()) }, 16.0);
 
-    // With the mod off the detours only forward: rock is the game's "no" again.
+    // With the mod off the detours only forward: rock is the game's "no" again, and no byte of the
+    // game's component moves.
     deactivate();
     player.set_stick(1.0);
     assert_eq!(player.low_entry()[0], MISS);
+    player.climb[2] = grace::HOLDING + 1;
     assert_eq!(player.wall_lost(), 0);
+    assert_eq!(player.climb[2], grace::HOLDING + 1);
     // SAFETY: the fake reads nothing.
     assert_eq!(unsafe { stamina_detour(std::ptr::null_mut()) }, 8.0);
 }

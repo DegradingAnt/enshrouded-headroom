@@ -5,6 +5,7 @@
 //! game: the collision capsule and the animation are not in here.
 
 use std::cell::Cell;
+use std::ops::Range;
 
 use crate::exit::{self, Exit};
 use crate::geom::{Vec3, UP};
@@ -425,6 +426,66 @@ impl Caster for Faceted {
     }
 }
 
+/// A surface that is gone on some ticks, the same ticks for everyone who runs them.
+///
+/// A seam in fixed rock cannot lose the hold here. The move check refuses a spot with too few hits,
+/// and the next hold looks from exactly that spot, so it has the rays the check had. In the game
+/// the position comes from the movement program, and it can land where the check did not look.
+/// Going by the tick gives that lost hold, and a replay of a tick still sees that tick's world.
+pub struct Flicker<C> {
+    /// The surface.
+    inner: C,
+    /// The ticks it is gone.
+    gaps: Vec<Range<usize>>,
+    /// The tick being run.
+    tick: Cell<usize>,
+}
+
+impl<C> Flicker<C> {
+    /// `inner`, gone on `gaps`.
+    pub fn new(inner: C, gaps: Vec<Range<usize>>) -> Flicker<C> {
+        Flicker {
+            inner,
+            gaps,
+            tick: Cell::new(0),
+        }
+    }
+
+    /// Run `tick` next.
+    pub fn at(&self, tick: usize) {
+        self.tick.set(tick);
+    }
+}
+
+impl<C: Caster> Caster for Flicker<C> {
+    fn cast(&self, from: Vec3, to: Vec3, mask: u32) -> Option<Hit> {
+        let tick = self.tick.get();
+        if self.gaps.iter().any(|gap| gap.contains(&tick)) {
+            return None;
+        }
+        self.inner.cast(from, to, mask)
+    }
+}
+
+/// What the hook does with a hold, so that a test can hold in different ways.
+pub trait Keeper {
+    /// The hold passed.
+    fn held(&mut self, climber: &mut Climber);
+    /// The hold failed. Does the player keep holding?
+    fn failed(&mut self, climber: &mut Climber) -> bool;
+}
+
+/// No grace: a hold that fails is a drop.
+pub struct NoGrace;
+
+impl Keeper for NoGrace {
+    fn held(&mut self, _climber: &mut Climber) {}
+
+    fn failed(&mut self, _climber: &mut Climber) -> bool {
+        false
+    }
+}
+
 /// What one climbing frame did.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Frame {
@@ -439,7 +500,7 @@ pub enum Frame {
 }
 
 /// A player on a wall, running the game's climb update. All speeds are the game's.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Climber {
     /// Feet.
     pub pos: Vec3,
@@ -449,6 +510,8 @@ pub struct Climber {
     pub normal: Vec3,
     /// The capsule.
     pub capsule: Capsule,
+    /// The byte the mod keeps in the Climb component.
+    pub grace: u8,
 }
 
 /// The game's top climbing speed (`0x14150af74`).
@@ -468,6 +531,7 @@ impl Climber {
             velocity: Vec3::default(),
             normal: hit.normal,
             capsule: Capsule::FALLBACK,
+            grace: 0,
         }
     }
 
@@ -527,10 +591,24 @@ impl Climber {
         false
     }
 
-    /// One frame of the climb update, in the game's order.
+    /// One frame of the climb update, in the game's order, with no grace.
     pub fn step<C: Caster>(&mut self, world: &C, stick: (f32, f32), dt: f32, t: &Tuning) -> Frame {
+        self.step_kept(world, stick, dt, t, &mut NoGrace)
+    }
+
+    /// One frame of the climb update, in the game's order, with `keeper` judging the hold.
+    pub fn step_kept<C: Caster, K: Keeper>(
+        &mut self,
+        world: &C,
+        stick: (f32, f32),
+        dt: f32,
+        t: &Tuning,
+        keeper: &mut K,
+    ) -> Frame {
         let hold = scan(world, self.pos, -self.normal, Mode::Stay, t, self.capsule);
-        if hold.verdict.is_err() {
+        if hold.verdict.is_ok() {
+            keeper.held(self);
+        } else if !keeper.failed(self) {
             return Frame::Dropped;
         }
         let wanted = self.wanted(stick.0, stick.1);
@@ -658,6 +736,7 @@ mod climbs {
                 velocity: Vec3::default(),
                 normal: entry.fit.unwrap().normal,
                 capsule: Capsule::FALLBACK,
+                grace: 0,
             };
             for frame in 0..120 {
                 let step = climber.step(&rock, (0.0, 1.0), dt, &t);
@@ -985,6 +1064,7 @@ mod climbs {
             velocity: Vec3::default(),
             normal: face(30.0),
             capsule: Capsule::FALLBACK,
+            grace: 0,
         };
         for frame in 0..300 {
             let step = climber.step(&rock, (0.0, 1.0), 1.0 / 60.0, &t);
@@ -1015,5 +1095,275 @@ mod climbs {
             climbed += SPEED / 60.0;
         }
         assert!(climbed < 2.0, "{climbed}");
+    }
+}
+
+/// Is a replay the same climb? The client rolls back and replays up to 20 ticks, and only component
+/// bytes come back (`FUN_1409f4400`, `FUN_140979c60`, `FUN_140987a30`).
+#[cfg(test)]
+mod replay {
+    use super::*;
+    use crate::grace;
+
+    /// One tick, in seconds.
+    const DT: f32 = 1.0 / 60.0;
+    /// The deepest replay (`FUN_1409f4400`: `0x14 < tick - start`).
+    const DEEPEST: usize = 20;
+    /// How long the climb runs.
+    const TICKS: usize = 200;
+    /// The surface goes for six ticks, and the grace must carry the player across.
+    const SEAM: Range<usize> = 60..66;
+    /// The surface goes for good, and the grace runs out.
+    const LOST: Range<usize> = 120..TICKS;
+
+    /// The bytes that come back in a rollback.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    struct Bytes {
+        /// The components.
+        climber: Climber,
+        /// What the tick did. After a drop the climb is over.
+        frame: Frame,
+    }
+
+    /// A keeper that may look at a clock.
+    trait Clocked: Keeper {
+        /// The wall clock reads `ms`.
+        fn now(&mut self, _ms: u64) {}
+    }
+
+    impl Clocked for NoGrace {}
+
+    /// The default `GraceSeconds`, in ticks.
+    const LIMIT: u8 = 9;
+
+    /// The grace as the hook keeps it: a count in the component's bytes.
+    struct Count;
+
+    impl Keeper for Count {
+        fn held(&mut self, climber: &mut Climber) {
+            climber.grace = grace::held(true);
+        }
+
+        fn failed(&mut self, climber: &mut Climber) -> bool {
+            let (next, keep) = grace::failed(climber.grace, LIMIT);
+            climber.grace = next;
+            keep
+        }
+    }
+
+    impl Clocked for Count {}
+
+    /// The grace as the first build kept it, in one slot outside the bytes, on the wall clock.
+    /// It stays here to prove that these tests can see that fault.
+    struct WallClock {
+        /// 0 is no natural hold, 1 is holding, and more is the time of the first failure plus 2.
+        state: u64,
+        /// The wall clock.
+        now_ms: u64,
+    }
+
+    impl WallClock {
+        /// The limit, in milliseconds.
+        const LIMIT_MS: u64 = 150;
+
+        /// Nobody holds anything.
+        fn new() -> WallClock {
+            WallClock {
+                state: 0,
+                now_ms: 0,
+            }
+        }
+    }
+
+    impl Keeper for WallClock {
+        fn held(&mut self, _climber: &mut Climber) {
+            self.state = 1;
+        }
+
+        fn failed(&mut self, _climber: &mut Climber) -> bool {
+            let (next, keep) = match self.state {
+                0 => (0, false),
+                1 => (self.now_ms + 2, true),
+                since if self.now_ms.saturating_sub(since - 2) <= WallClock::LIMIT_MS => {
+                    (since, true)
+                }
+                _ => (0, false),
+            };
+            self.state = next;
+            keep
+        }
+    }
+
+    impl Clocked for WallClock {
+        fn now(&mut self, ms: u64) {
+            self.now_ms = ms;
+        }
+    }
+
+    /// A sheer wall with a seam, and later no wall at all.
+    fn rock() -> Flicker<Plane> {
+        Flicker::new(Plane::wall(0.0), vec![SEAM, LOST])
+    }
+
+    /// `tick` on the wall clock, in milliseconds.
+    fn ms(tick: usize) -> u64 {
+        tick as u64 * 1000 / 60
+    }
+
+    /// The bytes before the first tick.
+    fn start(world: &Flicker<Plane>) -> Bytes {
+        world.at(0);
+        Bytes {
+            climber: Climber::on(world, Vec3::new(-1.0, 0.0, 0.0), face(90.0)),
+            frame: Frame::Moved,
+        }
+    }
+
+    /// Run `tick` from `bytes`, with the stick up.
+    fn run<K: Keeper>(world: &Flicker<Plane>, bytes: Bytes, tick: usize, keeper: &mut K) -> Bytes {
+        if bytes.frame == Frame::Dropped {
+            return bytes;
+        }
+        world.at(tick);
+        let mut climber = bytes.climber;
+        let frame = climber.step_kept(world, (0.0, 1.0), DT, &tuning(), keeper);
+        Bytes { climber, frame }
+    }
+
+    /// The server: each tick once, on a clock that moves with the ticks.
+    fn server<K: Clocked>(world: &Flicker<Plane>, keeper: &mut K) -> Vec<Bytes> {
+        let mut bytes = start(world);
+        (0..TICKS)
+            .map(|tick| {
+                keeper.now(ms(tick));
+                bytes = run(world, bytes, tick, keeper);
+                bytes
+            })
+            .collect()
+    }
+
+    /// The client: on each tick the server's bytes for `delay` ticks ago come in, and everything
+    /// after them runs again. All of that happens at one moment of `clock`. The result is the
+    /// client's view at the end of each tick.
+    fn client<K: Clocked>(
+        world: &Flicker<Plane>,
+        theirs: &[Bytes],
+        delay: usize,
+        clock: impl Fn(usize) -> u64,
+        keeper: &mut K,
+    ) -> Vec<Bytes> {
+        let mut bytes = start(world);
+        let mut views = Vec::new();
+        for tick in 0..theirs.len() {
+            keeper.now(clock(tick));
+            let from = match tick.checked_sub(delay) {
+                Some(acked) => {
+                    bytes = theirs[acked];
+                    acked + 1
+                }
+                None => tick,
+            };
+            for replayed in from..=tick {
+                bytes = run(world, bytes, replayed, keeper);
+            }
+            views.push(bytes);
+        }
+        views
+    }
+
+    /// The first tick where the client's view is not the server's.
+    fn first_difference(theirs: &[Bytes], ours: &[Bytes]) -> Option<usize> {
+        theirs.iter().zip(ours).position(|(a, b)| a != b)
+    }
+
+    /// A climb across a seam that needs the grace, and on into a loss the grace cannot carry. At
+    /// every replay depth the client must be in the server's state at the end of every tick.
+    #[test]
+    fn a_replay_gives_the_servers_climb() {
+        let world = rock();
+        let theirs = server(&world, &mut Count);
+        for delay in [1, 2, 3, 4, 9, DEEPEST] {
+            let ours = client(&world, &theirs, delay, ms, &mut Count);
+            if let Some(tick) = first_difference(&theirs, &ours) {
+                panic!(
+                    "delay {delay}, tick {tick}: the server has {:?}, the client {:?}",
+                    theirs[tick], ours[tick]
+                );
+            }
+        }
+    }
+
+    /// The climb above is the one its comment says: the grace carries the seam and the count sits
+    /// in the bytes, and the loss drops the player on the tick after the limit.
+    #[test]
+    fn the_climb_crosses_the_seam_and_ends_in_the_loss() {
+        let theirs = server(&rock(), &mut Count);
+        let count = |tick: usize| theirs[tick].climber.grace;
+        assert_eq!(count(SEAM.start - 1), grace::HOLDING);
+        assert_eq!(count(SEAM.start), grace::HOLDING + 1);
+        assert_eq!(count(SEAM.end - 1), grace::HOLDING + 6);
+        assert_eq!(count(SEAM.end), grace::HOLDING, "a good tick starts again");
+        assert_eq!(theirs[SEAM.start].frame, Frame::Blocked);
+        assert_eq!(theirs[SEAM.end + 10].frame, Frame::Moved);
+        let last_held = LOST.start + usize::from(LIMIT) - 1;
+        assert_eq!(theirs[last_held].frame, Frame::Blocked);
+        assert_eq!(theirs[last_held + 1].frame, Frame::Dropped);
+        assert_eq!(count(last_held + 1), grace::NOT_NATURAL);
+        assert_eq!(
+            theirs[TICKS - 1],
+            theirs[last_held + 1],
+            "the climb is over"
+        );
+    }
+
+    /// A count that stayed behind when the bytes came back would show here: the client rewinds to
+    /// a tick inside the seam, on every tick of the seam.
+    #[test]
+    fn a_rollback_into_the_seam_restores_the_count() {
+        let world = rock();
+        let theirs = server(&world, &mut Count);
+        let ours = client(&world, &theirs, 2, ms, &mut Count);
+        assert_eq!(ours[SEAM.start + 3], theirs[SEAM.start + 3]);
+        assert_eq!(ours[SEAM.start + 3].climber.grace, grace::HOLDING + 4);
+    }
+
+    /// Without the grace the seam ends the climb, so the tests above test something.
+    #[test]
+    fn the_seam_needs_the_grace() {
+        let theirs = server(&rock(), &mut NoGrace);
+        assert_eq!(theirs[SEAM.start - 1].frame, Frame::Moved);
+        assert_eq!(theirs[SEAM.start].frame, Frame::Dropped);
+    }
+
+    /// The first build's fault, both ways round. A replay that starts before the loss resets the
+    /// wall clock, so the client holds on after the server dropped. A stall in the client's clock
+    /// inside the seam runs the time out, so the client drops while the server holds. This is what
+    /// `a_replay_gives_the_servers_climb` must see if the state ever leaves the bytes.
+    #[test]
+    fn a_grace_on_the_wall_clock_leaves_the_server() {
+        let world = rock();
+        let theirs = server(&world, &mut WallClock::new());
+        let ours = client(&world, &theirs, 4, ms, &mut WallClock::new());
+        let tick = first_difference(&theirs, &ours).expect("the client holds too long");
+        assert!(LOST.contains(&tick), "{tick}");
+        assert_eq!(theirs[tick].frame, Frame::Dropped);
+        assert_eq!(ours[tick].frame, Frame::Blocked);
+
+        let stall = |tick: usize| ms(tick) + if tick > SEAM.start { 200 } else { 0 };
+        let ours = client(&world, &theirs, 1, stall, &mut WallClock::new());
+        let tick = first_difference(&theirs, &ours).expect("the client drops too soon");
+        assert!(SEAM.contains(&tick), "{tick}");
+        assert_eq!(theirs[tick].frame, Frame::Blocked);
+        assert_eq!(ours[tick].frame, Frame::Dropped);
+    }
+
+    /// The count has no clock to stall: the same stall changes nothing.
+    #[test]
+    fn a_stall_on_the_client_does_not_touch_the_count() {
+        let world = rock();
+        let theirs = server(&world, &mut Count);
+        let stall = |tick: usize| ms(tick) + if tick > SEAM.start { 200 } else { 0 };
+        let ours = client(&world, &theirs, 1, stall, &mut Count);
+        assert_eq!(first_difference(&theirs, &ours), None);
     }
 }

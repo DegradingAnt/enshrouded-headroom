@@ -861,8 +861,10 @@ The file is `enshrouded_server.exe`, build 26083076, sha256 `d7baa768eb00aa895d9
 - [VERIFIED] The server imports `DINPUT8.dll`, so Ultimate ASI Loader can load there under that name.
   - Receipt: The PE import directory lists 17 DLLs, `DINPUT8.dll` among them.
 - [HYPOTHESIS] `world+0x1a0` is set on the server. The code that reads it is the same, and nobody has seen its value at run time.
-- [HYPOTHESIS] Client and server both need the mod, with the same `ember-climb.ini`. A client without it, or with other limits, would disagree with the server about where a climber may be.
-  - Receipt: No test yet. The climb programs read authoritative ECS. ClimbAnywhere's public server README asks the same of that mod.
+- [VERIFIED] The server needs the mod, and so does every player who climbs, with the same `ember-climb.ini`. A player who only watches does not. The server decides from its own probe, and a client sends only stick and buttons. A player entity is predicted only by its owner, because every player is created with `createFlags` 2 and the mask `1 << playerIndex`. A viewer gets the id and the transform from the server.
+  - Receipt: `FUN_140981b30` (server `0x1406223b0`, same bytes): `mov eax,1; shl ax,cl`, `mov byte [rsp+0x4c],2`, `mov word [rsp+0x4a],ax`. `FUN_14097cad0` lines 807-819. `FUN_140a17830`: flag 2 with the player's bit clear culls that player from prediction. `ecs.ClientPlayerInputData` holds camera and cursor transforms, no character position and no wall data.
+- [HYPOTHESIS] A client with the mod on a vanilla server gets a stuck start and a snap back at natural walls. Lattices stay vanilla.
+  - Receipt: No test. Replay restores the server's Climb, whose state stays 0 there.
 - [HYPOTHESIS] `dinput8.dll` next to `enshrouded_server.exe` is Ultimate ASI Loader. `coexist.rs` cannot tell it from ClimbAnywhere's server build, which has the same name in the same place. That build normally keeps the loader out, so this mod does not start at all. The overlap needs a second proxy.
   - Receipt: Public README text only. No third-party DLL was opened.
 
@@ -950,12 +952,12 @@ The first experiment widened the wall-probe mask and the plane tolerance. Its te
   - Receipt: `FUN_14024c9f0`, `FUN_14024bc90`.
 - [VERIFIED] The climb normal has no reader in the probes other than `-n` as the ray direction. `actor_rotation` reads it every frame and builds a full 3D rotation with `view = -n` and `up = (0,1,0)`.
   - Receipt: `FUN_14026a1e0`, branch "%s (%u): Climbing": `FUN_14021c730(&local_1288,local_1728,local_1738,…)`, stored at +0xec4.
-- [VERIFIED] So the body lies along a leaning surface. The stand-off therefore belongs at the feet, and the ray patch belongs on a plane parallel to the surface. With the game's world-up offsets a 1 m reach loses every face less steep than about 66 degrees.
+- [HYPOTHESIS] So the body lies along a leaning surface. Correction: the rotation above is only a target, and a body can only tilt if the interpolation mode allows it. See "Body tilt". The tilt log settles this. Until then the stand-off at the feet and the ray patch on a plane parallel to the surface rest on this hypothesis. With the game's world-up offsets a 1 m reach loses every face less steep than about 66 degrees.
   - Receipt: The rotation above. The figure is arithmetic: `0.55 + 2.0 * ny` must stay under the reach.
 - [VERIFIED] Writes to ECS components go through `FUN_140417d50`, `FUN_14031e8f0` and `FUN_140417d10` to `FUN_1409c75e0`, which marks the change. A direct write skips the mark.
   - Receipt: Decompiles of those accessors.
-- [HYPOTHESIS] Skipping the mark is harmless for the climb normal, because no client reader of it was found.
-  - Receipt: Camera and animation programs read Climb+1 only. Generic reflection replication was not read.
+- [VERIFIED] Skipping the mark is harmless for a raw write inside program 244. The body `FUN_1404188c0` calls `FUN_1409c75e0` for Climb at the top of each entity's turn, before it reads Climb, and `FUN_140418c50` calls it again on entry. The mark is per entity, and the prediction stream does not use it.
+  - Receipt: `FUN_1404188c0` lines 27-29, `FUN_140418c50` lines 61-65. Accessor cell `chunk + [chunk+0x1c] + index*4` at 0x1409b3f57 is the cell `FUN_140983c20` reads.
 - [VERIFIED] `MovementColliderConfig`: width +0 (the diameter), height +4. `MovementCollider`: results +0x10, `m_isSet` +0x50, `hasSpheroidCollision` +0x4b.
   - Receipt: `python -I rtype.py <exe> ecs.MovementColliderConfig ecs.MovementCollider ecs.OptionalMovementCollisionResults ecs.MovementCollisionResults`. `FUN_14023c0e0`: sphere centre `height - width * 0.5`, radius `(width - 0.005) * 0.5`.
 - [VERIFIED] Actor state: `FUN_14021aaa0` reads +0xbf8, and while +0x1b1 bit 0 is set it applies `(state | +0xbd0) & ~+0xbd8`. `StateFlag`: 0 Grounded, 1 Jumping, 32 Falling, 34 Climbing, 35 ClimbingTransition, 37 HangGliding. There is no sprint flag.
@@ -995,10 +997,10 @@ What the crate does, in order, when the player rises:
 | Site | Client address | Change | Signature |
 |---|---|---|---|
 | Wall probe | 0x14024abc0 | post-hook: patch fit when the game's probe fails | `PROBE_FN` |
-| Wall-lost check | 0x14024b390 | hook: mode and grace | `WALL_LOST_FN` |
+| Wall-lost check | 0x14024b390 | hook: mode, and the grace count in Climb +2 | `WALL_LOST_FN` |
 | Wall-lost return | 0x14024b4a5 | 12 bytes: id 0 returns 0xffffffff | `WALL_LOST_RET` +26 |
 | Attachment store | 0x140418db8 | 19 bytes: reordered, see below | `ATTACH_STORE` |
-| Move check | 0x140417d90 | pre-hook: steering | `MOVE_CHECK_FN` |
+| Move check | 0x140417d90 | pre-hook: steering, and a read of the body for the log | `MOVE_CHECK_FN` |
 | Exit query | 0x14024a6f0 | post-hook: see "The exit" | `EXIT_QUERY_FN` |
 | Bottom entry | 0x14024c0d0 | hook: trigger and cone test | `LOW_ENTRY_FN` |
 | Start check | 0x140419570 | hook: glider, diagnostics | `START_FN` |
@@ -1018,6 +1020,59 @@ What the crate does, in order, when the player rises:
 - [HYPOTHESIS] ClimbAnywhere has shipped under three names: `climb-anywhere.asi` in `plugins\`, a chained `dinput8Hooked.dll`, and a `dinput8.dll` in `plugins\`.
   - Receipt: The boot log above, and file names and sizes in one install. No file was opened. By the clean-room rule the third-party DLL was not examined.
 
+### Replay and the grace byte
+
+The client simulates its own player ahead of the server, and it replays old ticks on most ticks. Only component bytes come back. So anything a climb decision needs from an earlier tick must live in a component, and time must be ticks.
+
+- [VERIFIED] The client rolls back and replays at most 20 ticks. The start is the lowest `dataTick + 1` over dirty entities, clamped to `tick - 20`. `FUN_14096cec0` restores it, then `FUN_140a1bc10` runs each tick.
+  - Receipt: `FUN_1409f4400`: `0x14 < param_2 - iVar12`, `FUN_14096cec0(param_1)`, `for (...; uVar9 <= param_2; ...) FUN_140a1bc10(param_1,uVar9)`. 32 history slots.
+- [VERIFIED] The tick is 1/60 s on both exes.
+  - Receipt: `mov [rdi+0x4c0],0xfe502b` at client 0x1409866bf and server 0x140626f3f. 0xfe502b ns is 16.67 ms, so 150 ms is 9 ticks.
+- [VERIFIED] `ecs.Climb`: +0 climbType, +1 climbState, +4 climbNormal, +0x10 climbBlockingTimeEnd, +0x18 attachmentEntityId, +0x1c climbCollisionQueries, +0x8c laddersQueryId, +0x90 ladderStepPhase, size 0x98. So +2 and +3 are padding. The two exes agree.
+  - Receipt: `python -I rtype.py <exe> ecs.Climb`.
+- [VERIFIED] The padding crosses every copy, because each copy is of the whole component:
+  - History save: `FUN_140979c60` copies each sized component with `memcpy` (`FUN_1413ad610`), by the archetype's stride at `+0xa84`.
+  - History restore: `FUN_140987a30` with `param_3 = 0` is a plain `memcpy`.
+  - Server state: `FUN_140987a30` with `param_3 = 1` goes through `FUN_14096b920`, which is a `memcpy`. After that it fixes only the listed handle fields, and padding is no field.
+  - Send: `FUN_14097bb80` lists `{pointer, stride}` for each component and `memcpy`s them. `FUN_14087f0a0` then writes a byte delta against the base.
+  - Receive: `FUN_1408ae3d0` applies that byte delta to all `size` bytes.
+  - Client ECS: `FUN_14096c640` copies Climb from the history slot, by the stride.
+  - Climb has no custom coder, so both streams use the byte delta.
+- [VERIFIED] No store to +2 or +3 was found in the reach of the Climb writers. Stores near the start of Climb:
+  - `FUN_14023bae0` (the reset behind `FUN_14024a090` stop, `FUN_140246c40`, and hook shot `FUN_140423200`): `mov word ptr [rdx],0` at 0x14023baea, +0 and +1 only, and `mov dword ptr [rdx+0x18],0`.
+  - `FUN_14024a150` (start): `mov byte ptr [rax],1`, `mov byte ptr [rax+1],1`.
+  - `FUN_14024a180` and `FUN_140246d50` (exit state): `+1` byte, and `+0x10`.
+  - `FUN_1404188c0`, `FUN_140425c60` (state changes): `+0` and `+1` bytes, `+0x18` dword.
+  - `FUN_140419570` (entry): `+4` qword, `+0xc` dword.
+  - Receipt: a capstone scan walks calls to depth 3 from the 7 smaller writer programs and from `FUN_14041f620`, `FUN_14041f710`, `FUN_140246c40`: 162 functions. A hit is a store through a base register other than rsp and rbp, with no index, whose bytes overlap +2 or +3 of that base. No hit has a displacement of 1, 2 or 3. Each hit at displacement 0 was judged by its base: Velocity, ActorInput, HookShot, LerpTransform, StaminaDepletion, out buffers, events, and library helpers that are not given Climb. In `actor_jump` and `player_control_action_sequence` the Climb slot goes only to the functions named here.
+  - Scope limit: a store through a computed index is not seen, and a judged hit is a reading, not a proof. Program lists leave only 9 programs and the ECS copies above able to write Climb: `Climb` has bits 0x19, so client programs do not write it.
+- [VERIFIED] Every path to the byte write runs inside program 244. The write is in the detour on `FUN_14024b390`. That has one call site, 0x140418d7f, in `FUN_140418c50`. That has two: 0x140418a84 in `FUN_1404188c0`, the body of `player_locomotion_climb_wall`, and a `jmp` at 0x140418122 in `FUN_1404180c0`. `FUN_1404180c0` has no reference at all, direct or by pointer, beyond its own `.pdata` entry. `FUN_1404188c0` has one absolute pointer, at 0x141deff60 in that program's descriptor. The server is the same: 0x14005fb60, 0x1401b9ba0, 0x1401b9810, descriptor 0x14135c920, and the unreferenced twin 0x1401b9010.
+  - Receipt: A byte scan of each exe. Scope: `E8`, `E9` and `lea` over all of `.text`, absolute qwords and RVAs over every section. A computed address is not caught.
+- [VERIFIED] The readers of the thread-locals `HOLD` and `STUCK` run only after the wall-lost check of the same update. `FUN_140417d90` has one call site, 0x1404192a4, and `FUN_14024a6f0` has one, 0x140419302. Both sit in `FUN_140418c50` behind the wall-lost call at 0x140418d7f, and the detour clears both before it runs the check.
+  - Receipt: The same byte scan, and the `FUN_140418c50` decompile.
+- [HYPOTHESIS] The byte is 0 when a Climb is created. The default was not read. Any value is safe: a hold sets it, and a stray value can only shorten the grace.
+- [HYPOTHESIS] All of this at run time. Nothing has run in the game. The first test should watch a seam on a client with some latency.
+
+What the crate keeps in the byte: 0 for no natural hold, 1 for a natural hold, and 1 plus the ticks forgiven so far. +3 stays free. A hold that passes sets 0 or 1. The hook writes it only inside program 244, after the game's check. A drop clears it. A climb that ends another way leaves it, and the first hold of the next climb sets it. If that first hold fails, the old value can give that one tick some grace. The first build had the same gap.
+
+### Body tilt
+
+Whether a climber's body tilts is not settled, and `crates/ember-climb` must not assume it does.
+
+- [VERIFIED] `ecs.ActorRotation` +0x48 is `climbingRotationSpeed`, a `RotationSpeedEntry` of `rotationSpeed` +0 (float) and `interpolationMode` +4. The real value is template data, not in the exe. The C++ default is 0.0 and mode 0.
+  - Receipt: `rtype.py ecs.ActorRotation ecs.RotationSpeedEntry`. Default constructor 0x141291990 to 0x1412684e0.
+- [VERIFIED] The climb branch of `actor_rotation` stores that entry in the Actor: speed at +0xee0, mode at +0xee4, target orientation at +0xec4, axis at +0xed4. The axis is minus world up. These are `actor.RotationInterpolation` at Actor+0xeb4: targetOrientation +0x10, linearRotationAxis +0x20, speed +0x2c, interpolationMode +0x30.
+  - Receipt: `FUN_14026a1e0` lines 2491-2504: `uVar26 = local_16a0[9]`, `*(char *)(lVar33 + 0xee4) = (char)(uVar26 >> 0x20)`, `*(undefined4 *)(lVar33 + 0xee0) = ...`, `FUN_140f54fc0(lVar33 + 0xec4, ...)`. `local_16a0[0xb]` is read as `minLinearAxisRotationAngle`, which shows that `local_16a0` is ActorRotation.
+- [VERIFIED] Correction: a body can only tilt if the mode allows it. Mode 0, `LinearAxisRotation`, turns the orientation about that axis only, so it can only yaw. Modes 1 and 3, and a speed of `FLT_MAX`, reach the whole target.
+  - Receipt: `FUN_14026a1e0` lines 2814-2823 and 2884-2994, `FUN_140245810`. `actor.InterpolationMode`: 0 LinearAxisRotation, 1 ExponentialLerp, 2 SpringDamper, 3 LerpWithConstantSpeed, 4 LerpSmooth, 5 LerpSmoother, 6 to 11 Rotate variants.
+- [VERIFIED] `CurrentTransform` is a `WorldTransform`: position +0, orientation +0x18 as x, y, z, w, scale +0x28, size 0x38. The game turns a vector with `v + 2 * cross(q, cross(q, v) + w * v)`.
+  - Receipt: `rtype.py WorldTransform Quaternion`. `FUN_14021ad10`, called with `local_1708 + 3`.
+- [VERIFIED] `ecs.Actor` is 0xef8 bytes, so +0xee4 is inside it.
+  - Receipt: `rtype.py ecs.Actor`.
+- [HYPOTHESIS] Modes 2, 4 and up. Their code was not read. The tilt line reads the body's real up vector, so it catches them too.
+
+The move check gives the log thread the speed, the mode, the climb normal and the orientation. The log thread writes one `climb body:` line per climb, about a second in. To read it, climb a face near 70 degrees. If `body leans` follows `surface leans`, the body tilts. If it stays near 0, the mod must set the rotation itself, and the stand-off and the ray patch need a rethink.
+
 ### Numbers that are starting values
 
 All of these are HYPOTHESIS until a play test. Most are settings.
@@ -1036,7 +1091,7 @@ All of these are HYPOTHESIS until a play test. Most are settings.
 
 - [HYPOTHESIS] Glider start: three points are unproven. A sequence may not preempt the glider on layer 0x10, HangGliding may not end when Enter replaces it, and world move input may be zero while gliding.
 - [HYPOTHESIS] The capsule width is data and was not read. The 0.55 m stand-off may leave little gap. The diagnostics line prints the real width and height.
-- [HYPOTHESIS] Whether a client without the mod shows a modded server's climber correctly.
+- [HYPOTHESIS] A client without the mod that only watches sees a climber correctly. The stream and prediction rules say it does (see "Server exe checks"). Nobody has watched one.
 - Open for the author: a surface that tops out under 2 m above the feet starts no climb, because a start needs 3 of 4 rays and the upper row is at 2 m. It also covers a jump at a ledge just above the player. One option is a start on the lower row alone when a floor sits above it, so the climb goes straight to the mantle. The build keeps the limit until the author decides.
 
 

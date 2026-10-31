@@ -25,7 +25,7 @@ The server decides where players are, so the mod must run there for its players 
 1. **Remove ClimbAnywhere first.** Its server build is itself a `dinput8.dll` next to `enshrouded_server.exe`, with `climb-anywhere.ini` and `climb-anywhere.log`. Delete all three. While that file stays there, Ultimate ASI Loader cannot take its place, so this mod does not load.
 2. Put Ultimate ASI Loader as `dinput8.dll` next to `enshrouded_server.exe`.
 3. Put `ember-climb.asi` and `ember-climb.ini` in `plugins\` in the server folder.
-4. **Every player needs the mod too**, with the same values in `ember-climb.ini`. Other values on the two sides would pull a climber back and forth. This is the expected behaviour, and it has not been tested.
+4. **Every player who climbs needs the mod too**, with the same values in `ember-climb.ini`. Other values on the two sides would pull a climber back and forth. This is the expected behaviour, and it has not been tested. A player who only watches does not need the mod. See "Who needs the mod" below.
 
 Under Wine or Proton, the server also needs `WINEDLLOVERRIDES="dinput8=n,b"`, or Wine loads its own `dinput8`.
 
@@ -57,12 +57,20 @@ If the mod stays off, the log says why in one line:
 While a climb starts, runs or ends, the log gets one line a second, like this (shortened):
 
 ```text
-climb diag: probe ok 0, 0x15 0, 0x1e 0, 0x1f 412 ... | natural entry 3/90, move 180/190, stay 200/200 (refused dir 0, hits 12, bumpy 8, walkable 0, overhang 0, far 67, blocked 0; last hits 4 spread 0.12 ny 0.21 gap +0.02) | ... | lost 0/200 (voxel 200, grace 0, no probe 0) | steer 180 | ...
+climb diag: probe ok 0, 0x15 0, 0x1e 0, 0x1f 412 ... | natural entry 3/90, move 180/190, stay 200/200 (refused dir 0, hits 12, bumpy 8, walkable 0, overhang 0, far 67, blocked 0; last hits 4 spread 0.12 ny 0.21 gap +0.02) | ... | lost 0/200 (voxel 200, grace 0, no probe 0) | steer 180 | ... | updates 240/s
 ```
 
 If a surface was near and no climb started, the log gets one line at most every 30 seconds. A start that failed still leaves a trace, and a walk along a cliff does not fill the log.
 
-The counts add up over the session. `natural entry 3/90` means 90 tries to start a climb on natural rock and 3 that could start.
+The counts add up over the session. `natural entry 3/90` means 90 tries to start a climb on natural rock and 3 that could start. Only `updates` is per second.
+
+About a second into each climb that moves, the log gets one more line, once per climb:
+
+```text
+climb body: entity 1, rotation speed 8.00 mode 1 (ExponentialLerp), normal -0.940 0.342 0.000, body up -0.342 0.940 0.000, surface leans 20.0 degrees, body leans 20.0 degrees
+```
+
+This line settles whether the body really tilts. Climb a face near 70 degrees and compare the last two numbers. If `body leans` follows `surface leans`, the body tilts. If it stays near 0, the body stays upright. Until a test shows that, the idea that the body lies along the surface is a hypothesis.
 
 | Part | What it tells you |
 |---|---|
@@ -75,6 +83,7 @@ The counts add up over the session. `natural entry 3/90` means 90 tries to start
 | `lost` | Hold checks that dropped the player, out of all checks. `voxel` held on terrain, `grace` forgiven for a moment. |
 | `exit` | How climbs ended. `refused` stopped a mantle onto steep rock, and `taken` found a way out the game did not. |
 | `capsule` | The player's real collision size. |
+| `updates` | Runs of the climb update in the last second, for all climbers. One climber at 60 ticks a second gives 60. A client replays old ticks, so more than that shows how long its replays are: 240 means each tick ran four times. |
 
 Keep the log after a test, even a bad one. Without it nobody can tell which step failed.
 
@@ -96,7 +105,7 @@ All settings are in `ember-climb.ini`, and all need a restart. A value that is n
 | Tuning | OverhangAngle | 110 | 90 to 135 | The farthest a face may hang over to start a climb, in degrees. 90 is a sheer wall. A running climb gets 15 degrees more, so that one rough patch does not stop it. |
 | Tuning | EntryReach | 0.95 | 0.6 to 1.4 | How close you must be to start a climb, in metres. |
 | Tuning | HoldReach | 1 | 0.8 to 1.6 | How far the mod looks for the surface during a climb, in metres. Under an overhang you hang farther out, and it looks that much farther. |
-| Tuning | GraceSeconds | 0.15 | 0 to 1 | How long a lost surface is forgiven before you fall. |
+| Tuning | GraceSeconds | 0.15 | 0 to 1 | How long a lost surface is forgiven before you fall. The game counts it in ticks, 60 a second, so 0.15 is 9 ticks. |
 | Debug | Diagnostics | 1 | 0 or 1 | The one-line-a-second log. It also adds five small hooks. |
 
 `SurfaceMask` is a sum of these bits, in hex or decimal: `0x4` terrain and player walls, `0x20` rock props, `0x100` iron lattices, `0x8` other solid props such as trees. Other bits are refused. Bits 0 and 1 are other copies of the terrain, and asking for them gives a different surface per ray.
@@ -114,7 +123,7 @@ The game already climbs, but only on flat iron lattices. Its wall probe wants fo
 - The game moves a climber along world up, which walks straight off any face that leans. The mod turns the movement into the surface, keeps the speed, and holds the game's 0.55 m distance.
 - The game has no exit where a wall turns into a slope, and it mantles onto steep rock. The mod refuses the second and finds the first. One triangle of rough rock can look like a floor, so the mod judges a floor as an area, and it looks whether the face goes on ahead of your head.
 - A half-pressed stick fails the game's start test however straight you run at a wall. The mod tests only the heading.
-- A surface lost for a moment is forgiven, so a seam in the rock does not drop you.
+- A surface lost for a moment is forgiven, so a seam in the rock does not drop you. The count is in ticks, in one spare byte of the game's own climb data. A client replays old ticks, and this way a replay decides what the server decided.
 
 Evidence for every game fact is in [docs/re-notes.md](../../docs/re-notes.md), "Free climbing".
 
@@ -130,6 +139,14 @@ The mod is built for the dedicated server build `d7baa768-server`. All 15 signat
 set ENSHROUDED_SERVER_EXE=<path to enshrouded_server.exe>
 cargo test -p ember-climb --test real_exe -- --ignored
 ```
+
+### Who needs the mod
+
+The server decides from its own probe. The client sends only its stick and buttons. So:
+
+- **The server needs the mod**, and so does **every player who climbs**. The client predicts its own player, and it needs the same probe to agree with the server.
+- **A player who only watches does not need the mod.** A player is predicted only on that player's own client. A watcher gets the position and the animation from the server.
+- **A client with the mod on a vanilla server** gets a stuck start and a snap back at natural walls. This is a hypothesis until it is tested. Lattices stay vanilla.
 
 ## Build and test
 

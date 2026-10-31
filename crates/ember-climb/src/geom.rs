@@ -94,9 +94,53 @@ impl Neg for Vec3 {
     }
 }
 
+/// Where world up points after the rotation `[x, y, z, w]`, as the game turns a vector
+/// (`FUN_14021ad10`).
+pub fn up_of([x, y, z, w]: [f32; 4]) -> Vec3 {
+    Vec3::new(
+        2.0 * (x * y - w * z),
+        1.0 - 2.0 * (x * x + z * z),
+        2.0 * (y * z + w * x),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The game's `FUN_14021ad10`, step for step: `v + 2 * cross(q, cross(q, v) + w * v)`.
+    fn game_rotate([x, y, z, w]: [f32; 4], v: Vec3) -> Vec3 {
+        let axis = Vec3::new(x, y, z);
+        v + axis.cross(axis.cross(v) + v * w) * 2.0
+    }
+
+    /// No rotation leaves up alone.
+    #[test]
+    fn no_rotation_keeps_up() {
+        assert_eq!(up_of([0.0, 0.0, 0.0, 1.0]), UP);
+    }
+
+    /// A turn around the up axis leaves up alone, whatever the angle.
+    #[test]
+    fn a_turn_around_up_keeps_up() {
+        let half = 0.6f32;
+        let up = up_of([0.0, half.sin(), 0.0, half.cos()]);
+        assert!((up - UP).length() < 1e-6, "{up:?}");
+    }
+
+    /// Up follows the game's own rotation, whatever the rotation.
+    #[test]
+    fn up_follows_the_games_rotation() {
+        for q in [
+            [0.1, 0.2, 0.3, 0.927_362],
+            [-0.5, 0.5, -0.5, 0.5],
+            [0.7, 0.0, 0.1, 0.706_930_6],
+            [0.0, -0.3, 0.8, 0.519_615_2],
+        ] {
+            let difference = up_of(q) - game_rotate(q, UP);
+            assert!(difference.length() < 1e-6, "{q:?}");
+        }
+    }
 
     /// The cross product of two axes is the third, with the game's right-handed sign.
     #[test]
