@@ -137,6 +137,45 @@ impl Caster for Cylinder {
     }
 }
 
+/// A ball of rock, for a surface that curves both ways.
+pub struct Ball {
+    /// Its centre.
+    centre: Vec3,
+    /// Its radius.
+    radius: f32,
+}
+
+impl Ball {
+    /// The rock at `centre` with `radius`.
+    pub fn new(centre: Vec3, radius: f32) -> Ball {
+        Ball { centre, radius }
+    }
+}
+
+impl Caster for Ball {
+    fn cast(&self, from: Vec3, to: Vec3, _mask: u32) -> Option<Hit> {
+        let delta = to - from;
+        let start = from - self.centre;
+        let a = delta.dot(delta);
+        let b = 2.0 * start.dot(delta);
+        let c = start.dot(start) - self.radius * self.radius;
+        let root = b * b - 4.0 * a * c;
+        if a <= 0.0 || root < 0.0 || c < 0.0 {
+            return None;
+        }
+        let t = (-b - root.sqrt()) / (2.0 * a);
+        if !(0.0..=1.0).contains(&t) {
+            return None;
+        }
+        let point = from + delta * t;
+        Some(Hit {
+            point,
+            normal: (point - self.centre).normalized()?,
+            entity: 0,
+        })
+    }
+}
+
 /// A rock face drawn as a line in the x-y plane and stretched along z. The line runs from the foot
 /// up to the top, with the rock on its right, like a voxel mesh of flat triangles. The player is on
 /// the left. Only front faces answer.
@@ -940,6 +979,155 @@ mod climbs {
             );
         }
         assert!(climber.pos.y < 9.0, "{climber:?}");
+    }
+
+    /// How a climb with the stick held up ended.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum End {
+        /// The mantle fired.
+        Mantle,
+        /// The player stopped for 1.5 s and hung on.
+        Stall,
+        /// The player fell.
+        Drop,
+        /// 30 s passed and the player was still climbing.
+        Climbing,
+    }
+
+    /// Hold the stick up for up to 30 s, and say how it ended.
+    fn hold_up<C: Caster>(world: &C, climber: &mut Climber) -> End {
+        let t = tuning();
+        let mut still = 0;
+        for _ in 0..1800 {
+            let before = climber.pos;
+            match climber.step(world, (0.0, 1.0), 1.0 / 60.0, &t) {
+                Frame::Moved | Frame::Blocked => {}
+                Frame::Mantle(_) => return End::Mantle,
+                Frame::Dropped => return End::Drop,
+            }
+            if (climber.pos - before).length() < 1e-4 {
+                still += 1;
+                if still > 90 {
+                    return End::Stall;
+                }
+            } else {
+                still = 0;
+            }
+        }
+        End::Climbing
+    }
+
+    /// Going down and going sideways both work from here: the ways out the README names.
+    fn assert_a_way_out<C: Caster>(world: &C, climber: Climber, label: &str) {
+        let t = tuning();
+        for (stick, name) in [((0.0, -1.0), "down"), ((1.0, 0.0), "sideways")] {
+            let mut moving = climber;
+            for frame in 0..60 {
+                let step = moving.step(world, stick, 1.0 / 60.0, &t);
+                assert_eq!(step, Frame::Moved, "{label}, {name}, frame {frame}");
+            }
+            let moved = (moving.pos - climber.pos).length();
+            assert!(moved > 0.9, "{label}, {name}: {moved}");
+        }
+    }
+
+    /// A face at `lower` degrees up to height 5, a shelf `width` metres wide that rises at `tilt`
+    /// degrees, 3 m of sheer wall behind it, and flat ground on top.
+    fn shelf(lower: f32, tilt: f32, width: f32) -> Profile {
+        let lean = lower.to_radians();
+        let knee = (5.0 / lean.tan(), 5.0);
+        let turn = tilt.to_radians();
+        let inner = (knee.0 + turn.cos() * width, knee.1 + turn.sin() * width);
+        Profile::new(vec![
+            (-lean.cos() * 60.0, -lean.sin() * 60.0),
+            knee,
+            inner,
+            (inner.0, inner.1 + 3.0),
+            (inner.0 + 60.0, inner.1 + 3.0),
+        ])
+    }
+
+    /// A known limit, pinned so that a later change shows up. A flat shelf of 0.3, 0.5 or 0.7 m in
+    /// a 60 degree face, or of 0.6 m in a sheer wall, stops the climber for good while the stick is
+    /// up. The move check refuses the walkable shelf, and the wall behind it reads as the face
+    /// going on. The climber hangs on, and can go down or sideways. On the 60 degree face a shelf
+    /// of 1 m or more ends in a mantle. These widths stall with or without the game's head sphere,
+    /// which this model leaves out.
+    #[test]
+    fn a_short_shelf_stops_the_climber() {
+        for (lower, width) in [(60.0, 0.3), (60.0, 0.5), (60.0, 0.7), (90.0, 0.6)] {
+            let rock = shelf(lower, 0.0, width);
+            let mut climber = Climber::on(&rock, Vec3::new(-1.0, 0.0, 0.0), face(lower));
+            let label = format!("{lower} degrees, {width} m");
+            assert_eq!(hold_up(&rock, &mut climber), End::Stall, "{label}");
+            assert!(climber.pos.y < 5.0, "{label}: under the shelf: {climber:?}");
+            assert_a_way_out(&rock, climber, &label);
+        }
+        for width in [1.0, 1.5, 2.0, 3.0] {
+            let rock = shelf(60.0, 0.0, width);
+            let mut climber = Climber::on(&rock, Vec3::new(-1.0, 0.0, 0.0), face(60.0));
+            assert_eq!(hold_up(&rock, &mut climber), End::Mantle, "{width} m");
+        }
+    }
+
+    /// The hard end of the same limit, pinned the same way. A bench of 10 or 20 degrees and 0.3 m
+    /// in a sheer wall tips the climb normal so far that the upper ray row starts behind the wall
+    /// above the bench. The move check then finds no surface in any direction, and the hold still
+    /// passes on the lower row. So the climber does not fall, and does not go down or sideways
+    /// either. Only the game's own jump ends this, and this model has no jump.
+    #[test]
+    fn a_narrow_bench_in_a_sheer_wall_holds_the_climber_in_place() {
+        let t = tuning();
+        for tilt in [10.0, 20.0] {
+            let rock = shelf(90.0, tilt, 0.3);
+            let mut climber = Climber::on(&rock, Vec3::new(-1.0, 0.0, 0.0), face(90.0));
+            assert_eq!(hold_up(&rock, &mut climber), End::Stall, "{tilt}");
+            for stick in [(0.0, -1.0), (1.0, 0.0), (-1.0, 0.0)] {
+                let mut moving = climber;
+                for frame in 0..120 {
+                    let step = moving.step(&rock, stick, 1.0 / 60.0, &t);
+                    assert_eq!(step, Frame::Blocked, "{tilt}, {stick:?}, frame {frame}");
+                }
+                assert_eq!(moving.pos, climber.pos, "{tilt}, {stick:?}");
+            }
+        }
+    }
+
+    /// A wall at 90 degrees that bends along an arc of 2 m radius into a long slope at `to`.
+    fn curve_into(to: f32) -> Profile {
+        let mut points = vec![(0.0, -60.0), (0.0, 0.0)];
+        let (mut x, mut y) = (0.0f32, 0.0f32);
+        let steps = 24;
+        let arc = (90.0 - to).to_radians() * 2.0 / steps as f32;
+        for step in 1..=steps {
+            let angle = (90.0 + (to - 90.0) * step as f32 / steps as f32).to_radians();
+            x += angle.cos() * arc;
+            y += angle.sin() * arc;
+            points.push((x, y));
+        }
+        let end = to.to_radians();
+        points.push((x + end.cos() * 80.0, y + end.sin() * 80.0));
+        Profile::new(points)
+    }
+
+    /// The other known limit, pinned the same way. The level ray of the exit reaches planes 3
+    /// degrees flatter than the walkable limit (`FACE_REACH_MARGIN_DEGREES`), so with the default
+    /// limit of 50 a long slope from 47 to 50 degrees reads as the face going on. The setting calls
+    /// it walkable, and the climb does not end there. The climber can go down or sideways. A slope
+    /// of 45 degrees, under that band, ends in a mantle.
+    #[test]
+    fn a_long_slope_near_the_walkable_limit_does_not_end_the_climb() {
+        for to in [47.5, 48.0, 49.5] {
+            let rock = curve_into(to);
+            let mut climber = Climber::on(&rock, Vec3::new(-3.0, -3.0, 0.0), face(90.0));
+            let label = format!("{to} degrees");
+            assert_eq!(hold_up(&rock, &mut climber), End::Climbing, "{label}");
+            assert!(climber.pos.y > 30.0, "{label}: {climber:?}");
+            assert_a_way_out(&rock, climber, &label);
+        }
+        let rock = curve_into(45.0);
+        let mut climber = Climber::on(&rock, Vec3::new(-3.0, -3.0, 0.0), face(90.0));
+        assert_eq!(hold_up(&rock, &mut climber), End::Mantle);
     }
 
     /// Climb `height` metres up rough rock. Panics on a mantle, a drop or a long stall.

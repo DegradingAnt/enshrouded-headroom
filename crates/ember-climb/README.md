@@ -67,10 +67,10 @@ The counts add up over the session. `natural entry 3/90` means 90 tries to start
 About a second into each climb that moves, the log gets one more line, once per climb:
 
 ```text
-climb body: entity 1, rotation speed 8.00 mode 1 (ExponentialLerp), normal -0.940 0.342 0.000, body up -0.342 0.940 0.000, surface leans 20.0 degrees, body leans 20.0 degrees
+climb body: entity 1, rotation speed 8.00 mode 1 (ExponentialLerp), normal -0.940 0.342 0.000, body up 0.342 0.940 0.000, surface leans 20.0 degrees, body leans 20.0 degrees
 ```
 
-This line settles whether the body really tilts. Climb a face near 70 degrees and compare the last two numbers. If `body leans` follows `surface leans`, the body tilts. If it stays near 0, the body stays upright. Until a test shows that, the idea that the body lies along the surface is a hypothesis.
+This line settles whether the body really tilts. Climb a face near 70 degrees and compare the last two numbers. If `body leans` follows `surface leans`, the body tilts. If it stays near 0, the body stays upright. Until a test shows that, the idea that the body lies along the surface is a hypothesis. Under an overhang `surface leans` goes negative and `body leans` stays positive, so compare their sizes there.
 
 | Part | What it tells you |
 |---|---|
@@ -123,13 +123,16 @@ The game already climbs, but only on flat iron lattices. Its wall probe wants fo
 - The game moves a climber along world up, which walks straight off any face that leans. The mod turns the movement into the surface, keeps the speed, and holds the game's 0.55 m distance.
 - The game has no exit where a wall turns into a slope, and it mantles onto steep rock. The mod refuses the second and finds the first. One triangle of rough rock can look like a floor, so the mod judges a floor as an area, and it looks whether the face goes on ahead of your head.
 - A half-pressed stick fails the game's start test however straight you run at a wall. The mod tests only the heading.
-- A surface lost for a moment is forgiven, so a seam in the rock does not drop you. The count is in ticks, in one spare byte of the game's own climb data. A client replays old ticks, and this way a replay decides what the server decided.
+- A surface lost for a moment is forgiven, so a seam in the rock does not drop you. The count is in ticks, in one spare byte of the game's own climb data. A client replays old ticks, and this way a replay decides what the server decided, as long as the rays on both sides see the same rock.
 
 Evidence for every game fact is in [docs/re-notes.md](../../docs/re-notes.md), "Free climbing".
 
 ## Limits
 
 - A surface must reach 2 m above your feet to start a climb. A lower wall starts nothing, and neither does a ledge you jump at when it is less than 2 m above your feet at that moment. Use the game's jump there. This may change after the first play test.
+- A short walkable shelf in a face stops you while the stick is up. In the simulation a flat shelf of 0.3 to 0.7 m in a 60 degree face does this. On that face a shelf of 1 m or more ends in a mantle. You do not fall. Go sideways or go down, or jump off.
+- A narrow bench in a sheer wall can hold you in place. In the simulation a bench of 10 or 20 degrees and 0.3 m does this. You do not fall, but going down and going sideways do not move you either. Jump off.
+- A long slope close to `WalkableAngle` does not end the climb. With the default of 50 that is a slope of 47 to 50 degrees. You can walk on it, but the mod reads it as the face going on, so no mantle comes. Go sideways, go down or jump off.
 
 ## Server
 

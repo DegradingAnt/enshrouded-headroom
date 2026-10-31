@@ -40,9 +40,16 @@ const HOLD_MARGIN_DEGREES: f32 = 15.0;
 const OVERHANG_MARGIN_DEGREES: f32 = 15.0;
 /// The collider flag Solid (bit 3). The default surface mask does not ask for it.
 const MASK_SOLID: u32 = 0x08;
-/// How far short of a hit the clearance rays stop, in metres. A rock prop can be Solid and Walkable
-/// at once, and must not block itself.
+/// How far short of its own hit a corner clearance ray stops, in metres. A rock prop can be Solid
+/// and Walkable at once, and must not block itself.
 const CLEARANCE_GAP: f32 = 0.02;
+/// How far in front of the fit plane the chest clearance ray stops, in metres, along the normal.
+/// No surface ray ran on that line, so the plane is all that is known there, and rock between the
+/// hits stands proud of it: 0.14 m on a ball of radius 1 m, and up to 0.184 m on rock displaced by
+/// 0.15 m either way. A Solid rock prop must not block itself on that. `plane_tolerance` is too
+/// large for this: at its default 0.45 m a ray from 0.8 m off the rock ends 0.35 m out, inside a
+/// capsule of radius 0.4 m. Rock in the existing tests also needs this under 0.3 m.
+const CHEST_MARGIN: f32 = 0.2;
 /// The widest angle between the stick and the wall that starts a climb, as a cosine. The game's
 /// limit is 0.7853982 radians (45 degrees); only the way it is measured differs here.
 const ENTRY_CONE_COS: f32 = 0.707_106_77;
@@ -406,8 +413,16 @@ fn judge(fit: &Fit, mode: Mode, t: &Tuning, pos: Vec3, capsule: Capsule) -> Resu
 
 /// Does something solid stand between the rays' `starts` and their `hits`? The surface rays do not
 /// ask for Solid, so they pass through a tree, a fence or an enemy. These rays stop just short of
-/// each hit. A ray from the chest covers the gap between the side rays, where a thin trunk fits.
-fn blocked<C: Caster>(caster: &C, frame: &Frame, pos: Vec3, starts: &[Vec3], hits: &[Hit]) -> bool {
+/// each hit. A ray from the chest covers the gap between the side rays, where a thin trunk fits. It
+/// has no hit of its own, so it stops [`CHEST_MARGIN`] short of `fit`'s plane.
+fn blocked<C: Caster>(
+    caster: &C,
+    frame: &Frame,
+    pos: Vec3,
+    fit: &Fit,
+    starts: &[Vec3],
+    hits: &[Hit],
+) -> bool {
     let [top, low] = RAY_ROWS;
     let chest = pos + frame.up * ((top + low) * 0.5);
     let rays = || {
@@ -416,12 +431,17 @@ fn blocked<C: Caster>(caster: &C, frame: &Frame, pos: Vec3, starts: &[Vec3], hit
             .zip(hits)
             .map(|(start, hit)| (*start, (hit.point - *start).dot(frame.along)))
     };
-    let nearest = rays().map(|(_, length)| length).fold(f32::MAX, f32::min);
     let in_way = |start: Vec3, length: f32| {
-        let end = start + frame.along * (length - CLEARANCE_GAP);
-        length > CLEARANCE_GAP && caster.cast(start, end, MASK_SOLID).is_some()
+        let end = start + frame.along * length;
+        length > 0.0 && caster.cast(start, end, MASK_SOLID).is_some()
     };
-    in_way(chest, nearest) || rays().any(|(start, length)| in_way(start, length))
+    // Each metre of ray closes on the plane by this much. A fit that lies along the ray divides by
+    // next to nothing, so the rays that found the surface cap the length. `min` also drops a NaN.
+    let closing = -frame.along.dot(fit.normal);
+    let to_margin = (fit.distance(chest, fit.normal) - CHEST_MARGIN) / closing;
+    let farthest = rays().map(|(_, length)| length).fold(0.0, f32::max);
+    in_way(chest, to_margin.min(farthest))
+        || rays().any(|(start, length)| in_way(start, length - CLEARANCE_GAP))
 }
 
 /// Probe for a surface from `pos` along `dir`, and answer `mode`.
@@ -484,7 +504,7 @@ pub fn scan<C: Caster>(
     let mut verdict = judge(&fit, mode, t, pos, capsule).map(|()| stand);
     if mode == Mode::Entry && verdict.is_ok() {
         let starts = starts.get(..hits).unwrap_or_default();
-        if blocked(caster, &frame, pos, starts, &found) {
+        if blocked(caster, &frame, pos, &fit, starts, &found) {
             verdict = Err(Reject::Blocked);
         }
     }
@@ -608,7 +628,7 @@ pub fn steer(input: &SteerInput, t: &Tuning, capsule: Capsule) -> Option<Steered
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testworld::{face, tuning, Cylinder, Empty, Plane, Scripted};
+    use crate::testworld::{face, tuning, Ball, Cylinder, Empty, Faceted, Plane, Scripted};
 
     /// A player standing with the wall 0.8 m ahead along +x.
     const AHEAD: Vec3 = Vec3::new(1.0, 0.0, 0.0);
@@ -1242,7 +1262,8 @@ mod tests {
     }
 
     /// A rock prop can be Solid and Walkable at once, and rough rock can stand a little proud of
-    /// a hit. The ray stops short of each hit, so rock does not block itself.
+    /// a hit. The corner rays stop short of each hit, and the chest ray short of the fit plane, so
+    /// rock does not block itself.
     #[test]
     fn a_solid_collider_at_the_surface_changes_nothing() {
         let t = tuning();
@@ -1252,6 +1273,179 @@ mod tests {
         };
         let scan = scan(&world, Vec3::default(), AHEAD, Mode::Entry, &t, CAPSULE);
         assert!(scan.verdict.is_ok(), "{scan:?}");
+    }
+
+    /// Height of the chest ray above the feet: halfway between the ray rows.
+    const CHEST: f32 = 1.625;
+
+    /// Round rock stands proud of the plane through the four hits at the chest, 0.06 m on an
+    /// upright rock of radius 1 and 0.14 m on a ball of radius 1. These worlds answer every mask,
+    /// like a rock prop that is Solid and Walkable at once, and that rock must not block itself.
+    #[test]
+    fn round_solid_rock_does_not_block_itself() {
+        let t = tuning();
+        for radius in [1.0, 2.0, 3.0] {
+            let rock = Cylinder::new(Vec3::new(radius + 0.6, 0.0, 0.0), radius);
+            let scan = scan(&rock, Vec3::default(), AHEAD, Mode::Entry, &t, CAPSULE);
+            assert!(scan.verdict.is_ok(), "radius {radius}: {scan:?}");
+        }
+        for radius in [1.0, 1.5, 2.0, 3.0, 4.0, 6.0] {
+            let rock = Ball::new(Vec3::new(radius + 0.6, CHEST, 0.0), radius);
+            let scan = scan(&rock, Vec3::default(), AHEAD, Mode::Entry, &t, CAPSULE);
+            assert!(scan.verdict.is_ok(), "ball {radius}: {scan:?}");
+        }
+    }
+
+    /// The same rock with no Solid in it, as voxel terrain has none.
+    struct NoSolid<'a>(&'a Faceted);
+
+    impl Caster for NoSolid<'_> {
+        fn cast(&self, from: Vec3, to: Vec3, mask: u32) -> Option<Hit> {
+            (mask != 0x08)
+                .then(|| self.0.cast(from, to, mask))
+                .flatten()
+        }
+    }
+
+    /// Rough rock that answers mask 0x08 too. A start that passes with no Solid in the rock must
+    /// pass with it, at every steepness and over the whole reach.
+    #[test]
+    fn rough_solid_rock_does_not_block_itself() {
+        let t = tuning();
+        let mut starts = 0;
+        for angle in [90.0f32, 75.0, 60.0, 52.0, 100.0] {
+            let run = 1.0 / angle.to_radians().tan();
+            for depth in [0.05, 0.1, 0.15] {
+                for seed in 1..=20 {
+                    let rock = Faceted::face(angle, depth, seed);
+                    for step in 0..40 {
+                        let z = -1.5 + step as f32 * 0.075;
+                        let y = 1.0 + step as f32 * 0.05;
+                        for far in [0.5, 0.7, 0.9] {
+                            let pos = Vec3::new(run * (y + CHEST) - far, y, z);
+                            let plain = scan(&NoSolid(&rock), pos, AHEAD, Mode::Entry, &t, CAPSULE);
+                            if plain.verdict.is_ok() {
+                                starts += 1;
+                                let solid = scan(&rock, pos, AHEAD, Mode::Entry, &t, CAPSULE);
+                                assert_eq!(
+                                    solid.verdict, plain.verdict,
+                                    "{angle} degrees, +-{depth} m, seed {seed}, {pos:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            starts > 34_000,
+            "the grid must really start climbs: {starts}"
+        );
+    }
+
+    /// A thin Solid trunk between the side rays, with its front `out` metres in front of a rock
+    /// through `at`. Only the chest ray can meet it.
+    struct Trunk {
+        /// The rock.
+        rock: Plane,
+        /// The front of the trunk.
+        front: Plane,
+    }
+
+    impl Trunk {
+        /// The trunk in front of the plane through `at` with `normal`.
+        fn out_of(at: Vec3, normal: Vec3, out: f32) -> Trunk {
+            Trunk {
+                rock: Plane::through(at, normal),
+                front: Plane::through(at + normal * out, normal),
+            }
+        }
+    }
+
+    impl Caster for Trunk {
+        fn cast(&self, from: Vec3, to: Vec3, mask: u32) -> Option<Hit> {
+            if mask == 0x08 {
+                let middle = from.z.abs() < 0.1;
+                self.front.cast(from, to, mask).filter(|_| middle)
+            } else {
+                self.rock.cast(from, to, mask)
+            }
+        }
+    }
+
+    /// The chest ray stops 0.2 m off the fit plane, measured along the normal. Rough rock in the
+    /// tests stands up to 0.184 m proud of its plane, so less than that blocks the rock itself. A
+    /// trunk just past the margin still blocks, and the same trunk just inside it does not. This
+    /// holds at normal reach on a face that leans either way, so the margin is pinned both ways.
+    #[test]
+    fn the_chest_ray_stops_two_tenths_off_the_fit_plane() {
+        let t = tuning();
+        for angle in [90.0, 75.0, 60.0, 52.0, 105.0] {
+            let normal = face(angle);
+            let rock = Vec3::new(0.0, CHEST, 0.0) - normal * 0.8;
+            let verdict = |out: f32| {
+                let world = Trunk::out_of(rock, normal, out);
+                scan(&world, Vec3::default(), AHEAD, Mode::Entry, &t, CAPSULE).verdict
+            };
+            assert_eq!(verdict(0.21), Err(Reject::Blocked), "{angle}");
+            assert!(verdict(0.19).is_ok(), "{angle}");
+        }
+    }
+
+    /// A Solid post in the path of one side ray, `out` metres in front of the rock at 0.8 m.
+    struct SidePost(f32);
+
+    impl Caster for SidePost {
+        fn cast(&self, from: Vec3, to: Vec3, mask: u32) -> Option<Hit> {
+            let solid = mask == 0x08;
+            let wall = if solid { 0.8 - self.0 } else { 0.8 };
+            let hit = Plane::wall(wall).cast(from, to, mask);
+            hit.filter(|_| !solid || from.z > 0.2)
+        }
+    }
+
+    /// A side ray has a hit of its own, so it looks almost all the way to it. The wide margin is
+    /// only for the chest ray. A post right in front of the rock blocks on that ray, and the gap
+    /// of 0.02 m is pinned from both sides.
+    #[test]
+    fn a_side_ray_looks_almost_to_its_hit() {
+        let t = tuning();
+        let verdict = |out: f32| {
+            let world = SidePost(out);
+            scan(&world, Vec3::default(), AHEAD, Mode::Entry, &t, CAPSULE).verdict
+        };
+        assert_eq!(verdict(0.1), Err(Reject::Blocked));
+        assert_eq!(verdict(0.03), Err(Reject::Blocked));
+        assert!(verdict(0.01).is_ok());
+    }
+
+    /// Hits that say the surface lies almost along the ray put the fit plane far down that ray.
+    /// The chest ray must stop at the farthest hit, or a bad normal sends a ray of 300 km into the
+    /// game.
+    #[test]
+    fn a_fit_along_the_ray_gives_no_endless_chest_ray() {
+        /// Answers every surface ray with one hit, and keeps the longest Solid ray.
+        struct AlongTheRay(std::cell::Cell<f32>);
+
+        impl Caster for AlongTheRay {
+            fn cast(&self, from: Vec3, to: Vec3, mask: u32) -> Option<Hit> {
+                if mask == 0x08 {
+                    self.0.set(self.0.get().max((to - from).length()));
+                    return None;
+                }
+                Some(Hit {
+                    point: Vec3::new(0.8, CHEST, -0.5),
+                    normal: Vec3::new(-1e-6, 0.0, 1.0),
+                    entity: 0,
+                })
+            }
+        }
+
+        let t = tuning();
+        let world = AlongTheRay(std::cell::Cell::new(0.0));
+        let scan = scan(&world, Vec3::default(), AHEAD, Mode::Entry, &t, CAPSULE);
+        assert!(scan.verdict.is_ok(), "{scan:?}");
+        assert!((world.0.get() - 0.8).abs() < 1e-3, "{}", world.0.get());
     }
 
     /// Only a start asks. During a climb the capsule itself meets what stands in the way.

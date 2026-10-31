@@ -2,18 +2,22 @@
 //!
 //! Rock has seams. A ray can slip through one for a frame, and dropping the player for that is the
 //! "latch, drop, latch" the old mod is known for. So on a natural surface a failed hold is
-//! forgiven for a fraction of a second. A lattice keeps the game's exact behaviour.
+//! forgiven for a fraction of a second.
 //!
 //! The client rolls back and replays up to 20 ticks, and only component bytes come back. So the
 //! state here is one byte in the game's own Climb component (`game::Ctx::grace_at`), and it counts
-//! ticks. Nothing here reads a clock or keeps state of its own, so a replayed tick decides what its
-//! first run decided, and what the server decided.
+//! ticks. Nothing here reads a clock or keeps state of its own, so a replayed tick with the same
+//! rays decides what its first run decided. Client and server agree only if their rays do.
+//!
+//! A hold on a lattice clears the byte, and a failed hold after that is the game's own drop. One
+//! gap remains: a climb that ends without a drop leaves the byte set. If the first hold of the next
+//! climb fails, it can get that grace, even on a lattice.
 
 /// The ticks in one second. The tick is 0xfe502b ns in both exes.
 pub const TICKS_PER_SECOND: f32 = 60.0;
-/// The state for "this player is on a lattice, or has no climb".
+/// The state after a lattice hold or a drop. A climb that ends another way leaves the old state.
 pub const NOT_NATURAL: u8 = 0;
-/// The state for "this player holds a natural surface". Each tick forgiven adds one to it.
+/// The state after a natural hold that passed. Each tick forgiven adds one to it.
 pub const HOLDING: u8 = 1;
 
 /// The state after a hold that passed.
@@ -53,7 +57,7 @@ mod tests {
         }
     }
 
-    /// A failure on a lattice is a drop at once, exactly as the game has it.
+    /// A failure after a lattice hold is a drop at once, exactly as the game has it.
     #[test]
     fn a_lattice_gets_no_grace() {
         assert_eq!(held(false), NOT_NATURAL);

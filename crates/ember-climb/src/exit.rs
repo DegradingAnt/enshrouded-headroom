@@ -93,7 +93,9 @@ pub struct Query {
     pub pos: Vec3,
     /// The current climb normal.
     pub normal: Vec3,
-    /// Is the player rising? Only then can a climb end at the top.
+    /// Does the game's velocity point up? Only then can a climb end at the top. This is the
+    /// velocity before the move check, which may zero it, so a player the check stopped still
+    /// reads true. The `stuck` path depends on that.
     pub moving_up: bool,
     /// The floor the game found, or `None` when it found no exit.
     pub floor: Option<Hit>,
@@ -139,7 +141,9 @@ impl<C: Caster> Search<'_, C> {
     }
 
     /// `hit`, if it can be stood on: its own triangle first, because that costs no ray. A player
-    /// who cannot move on gets no second look at this spot, so there the area alone decides.
+    /// who cannot move on gets no second look at this spot, so there the area alone decides. This
+    /// is for hits of rays that look straight down. The head ray in [`decide`] runs sideways, and
+    /// it keeps the test of its own normal.
     fn floor(&self, hit: Option<Hit>) -> Option<Hit> {
         let query = self.query;
         hit.filter(|hit| {
@@ -234,9 +238,12 @@ pub fn decide<C: Caster>(caster: &C, query: &Query) -> Exit {
         return Exit::Take(ground);
     }
     if query.floor.is_none() {
-        // Something at head height: a slope to stand on, or the wall going on.
+        // Something at head height: a slope to stand on, or the wall going on. This ray runs
+        // sideways, so it can land on a vertical face with flat ground just above it. A stopped
+        // player gets no pass here: the hit's own normal must be walkable.
         if let Some(hit) = caster.cast(head, reach, MASK_HEAD) {
-            return search.floor(Some(hit)).map_or(Exit::Keep, Exit::Take);
+            let slope = hit.normal.y >= query.walkable_ny && search.walkable_around(hit.point);
+            return if slope { Exit::Take(hit) } else { Exit::Keep };
         }
     }
     search
@@ -620,6 +627,83 @@ mod tests {
         chest.stuck = false;
         let answers = [Some(hit_at(1.6, 2.6)), Some(hit_at(1.05, 1.2))];
         assert_eq!(decide(&Scripted::new(&answers), &chest), Exit::Keep);
+    }
+
+    /// A block `depth` out from a sheer wall, between two heights, with the wall going on above.
+    fn block(depth: f32, low: f32, high: f32) -> Profile {
+        Profile::new(vec![
+            (0.0, -50.0),
+            (0.0, low),
+            (-depth, low),
+            (-depth, high),
+            (0.0, high),
+            (0.0, 60.0),
+        ])
+    }
+
+    /// The head ray runs sideways. Under the top of a block it lands on the block's vertical face,
+    /// and the ring around that hit reads the flat top. Being stopped does not excuse that face:
+    /// the mantle would start from inside the rock. A stopped player gets what a moving one gets.
+    #[test]
+    fn a_stuck_player_takes_no_vertical_face_at_head_height() {
+        let t = tuning();
+        let rock = block(0.45, 2.0, 3.0);
+        for feet in [0.2, 0.4, 0.6] {
+            for stuck in [false, true] {
+                let chest = Query {
+                    pos: Vec3::new(-0.55, feet, 0.0),
+                    normal: face(90.0),
+                    moving_up: true,
+                    floor: None,
+                    patch: Some(Hit {
+                        point: Vec3::new(0.0, feet + 1.6, 0.0),
+                        normal: face(90.0),
+                        entity: 0,
+                    }),
+                    walkable_ny: t.walkable_ny,
+                    face: t.face,
+                    stuck,
+                };
+                assert_eq!(decide(&rock, &chest), Exit::Keep, "{feet}, {stuck}");
+            }
+        }
+    }
+
+    /// A slope at head height is still an exit for a stopped player: the stuck rule only stopped
+    /// counting for the ray that runs sideways, and a walkable hit passes without it.
+    #[test]
+    fn a_stuck_player_takes_a_slope_at_head_height() {
+        let slope = floor(0.8);
+        let world = Scripted::new(&[
+            None,
+            Some(slope),
+            Some(slope),
+            Some(slope),
+            Some(slope),
+            Some(slope),
+        ]);
+        let mut stuck = query(None);
+        stuck.stuck = true;
+        assert_eq!(decide(&world, &stuck), Exit::Take(slope));
+    }
+
+    /// The ground must be walkable as an area at head height too: one walkable triangle in a
+    /// steep ring is no exit, stopped or not.
+    #[test]
+    fn a_walkable_hit_at_head_height_needs_the_ring() {
+        for stopped in [false, true] {
+            let world = Scripted::new(&[
+                None,
+                Some(floor(0.8)),
+                Some(floor(0.1)),
+                Some(floor(0.1)),
+                Some(floor(0.1)),
+                Some(floor(0.1)),
+            ]);
+            let mut chest = query(None);
+            chest.stuck = stopped;
+            assert_eq!(decide(&world, &chest), Exit::Keep, "{stopped}");
+        }
     }
 
     /// Stopped under steep rock is no exit: the face test still stands.

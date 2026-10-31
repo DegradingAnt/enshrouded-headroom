@@ -722,6 +722,8 @@ unsafe fn correct_exit(result: *mut u8, ctx: Ctx, pos: *const f32) {
     let query = exit::Query {
         pos,
         normal,
+        // The game made `pos` from its velocity before the move check, so this is true for a
+        // player the check stopped. The stuck path in `exit::decide` depends on that.
         moving_up: pos.y > current.y + MOVING_UP,
         // SAFETY: the function's contract: the query writes a whole result on every path.
         floor: (code == OK)

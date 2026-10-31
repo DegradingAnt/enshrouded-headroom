@@ -990,7 +990,18 @@ What the crate does, in order, when the player rises:
 1. A level ray from 0.5 m above ray A's end looks ahead. With the ground under its start it gives the slope of the rock over a metre or more, from positions alone. A steep rise on the plane of the climb means the face goes on, and there is no exit.
 2. A floor must be walkable as an area: at least 3 of 4 rays, 0.35 m around it, and their averaged normal.
 3. The candidates are the game's floor, the ground under a walkable patch, a slope at head height, and four columns from 0 to 1.2 m past ray A's end.
-4. A player the move check stopped gets no second look at the same spot, so one triangle does not decide there, and a walkable patch overrides step 1.
+4. A player the move check stopped gets no second look at the same spot, so one triangle does not decide there, and a walkable patch overrides step 1. This holds for the game's floor and for the rays that look straight down. The head ray runs sideways, so a hit at head height must have a walkable normal of its own, stopped or not.
+
+Limits of the exit. These come from the closed-loop model, so all of them are HYPOTHESIS for the game until a play test. The model has no jump and no animation.
+
+- [HYPOTHESIS] A short walkable shelf in a face stops the climber while the stick is up. The move check refuses the shelf as walkable. The level ray reads the wall behind it as steep and on the plane of the climb, so the answer is no exit. A flat shelf of 0.3, 0.5 or 0.7 m in a 60 degree face stalls, and so does one of 0.6 m in a sheer wall. On the 60 degree face a shelf of 1 m or more ends in a mantle. The climber does not fall, and can go sideways, go down or jump off.
+  - Receipt: `crates/ember-climb/src/testworld.rs`, `a_short_shelf_stops_the_climber`. With the game's head sphere added to the model, more shelves stall: on a fine map of 12600 climbs about 210 stalled, and none dropped. The exact count moves by a few: two builds of the same code differed on shelves about 0.45 to 0.5 m wide, where ray A's end reaches the wall behind the shelf.
+- [HYPOTHESIS] A bench of 10 or 20 degrees and 0.3 m in a sheer wall is the hard end of that limit. The climb normal tips to about 0.46 up, and the upper ray row then starts behind the wall above the bench: at feet (-0.61, 4.04) it starts at x 0.313, and the wall is at x 0.295. A ray from inside the rock meets no front face, so the move check gets too few hits in every direction, and the hold still passes on the lower row. The climber does not fall, and going down or sideways does not move them. Only the game's jump ends this.
+  - Receipt: `a_narrow_bench_in_a_sheer_wall_holds_the_climber_in_place`. The jump is `actor_jump_abort_climbing`, see "Jumping off and interrupts" above. How often: of the 32 stalls on 4000 random rock lines, 28 could go both ways and 4 could not move. With no head sphere in the model it was 1. On the fine map of shelves, which is made of such cases, 70 of about 210 stalls could not move. On rough rock that turns walkable, none of 480 climbs stalled at +-0.15 m, and 34 of 480 did at +-0.25 m, most of them with normals as rough as the positions. Whether real rock has such benches was not measured.
+- [HYPOTHESIS] A long slope within `FACE_REACH_MARGIN_DEGREES` of the walkable limit does not end the climb. The level ray reaches planes 3 degrees flatter than the limit, so with `WalkableAngle` 50 a slope from 47 to 50 degrees reads as the face going on, though the setting calls it walkable. The band is deliberate: rock just past the limit reads walkable as often as not. Slopes of 47.5, 48 and 49.5 degrees gave no exit in 30 s and more than 30 m of climbing. A slope of 45 degrees ends in a mantle. The climber can go sideways, go down or jump off.
+  - Receipt: `a_long_slope_near_the_walkable_limit_does_not_end_the_climb`.
+
+Whether to do more about these three is for the author to decide after the first play test.
 
 ### What the crate changes
 
@@ -1053,7 +1064,7 @@ The client simulates its own player ahead of the server, and it replays old tick
 - [HYPOTHESIS] The byte is 0 when a Climb is created. The default was not read. Any value is safe: a hold sets it, and a stray value can only shorten the grace.
 - [HYPOTHESIS] All of this at run time. Nothing has run in the game. The first test should watch a seam on a client with some latency.
 
-What the crate keeps in the byte: 0 for no natural hold, 1 for a natural hold, and 1 plus the ticks forgiven so far. +3 stays free. A hold that passes sets 0 or 1. The hook writes it only inside program 244, after the game's check. A drop clears it. A climb that ends another way leaves it, and the first hold of the next climb sets it. If that first hold fails, the old value can give that one tick some grace. The first build had the same gap.
+What the crate keeps in the byte: 0 for no natural hold, 1 for a natural hold, and 1 plus the ticks forgiven so far. +3 stays free. A hold that passes sets 0 or 1. The hook writes it only inside program 244, after the game's check. A drop clears it. A climb that ends another way leaves it, and the first hold of the next climb sets it. If that first hold fails, the old value can give that climb what is left of the grace, even on a lattice. The first build had the same gap.
 
 ### Body tilt
 
@@ -1071,7 +1082,7 @@ Whether a climber's body tilts is not settled, and `crates/ember-climb` must not
   - Receipt: `rtype.py ecs.Actor`.
 - [HYPOTHESIS] Modes 2, 4 and up. Their code was not read. The tilt line reads the body's real up vector, so it catches them too.
 
-The move check gives the log thread the speed, the mode, the climb normal and the orientation. The log thread writes one `climb body:` line per climb, about a second in. To read it, climb a face near 70 degrees. If `body leans` follows `surface leans`, the body tilts. If it stays near 0, the mod must set the rotation itself, and the stand-off and the ray patch need a rethink.
+The move check gives the log thread the speed, the mode, the climb normal and the orientation. The log thread writes one `climb body:` line per climb, about a second in. To read it, climb a face near 70 degrees. If `body leans` follows `surface leans`, the body tilts. If it stays near 0, the mod must set the rotation itself, and the stand-off and the ray patch need a rethink. Under an overhang `surface leans` goes negative and `body leans` stays positive, because the second is an angle from straight up.
 
 ### Numbers that are starting values
 
@@ -1084,8 +1095,10 @@ All of these are HYPOTHESIS until a play test. Most are settings.
 - [HYPOTHESIS] The exit's numbers: ring 0.35 m and 3 of 4 rays, level ray 0.5 m above ray A's end, reaching planes 3 degrees flatter than `WalkableAngle`, a face at a rise 8 degrees flatter, 0.7 m off the climb plane for another rock. A closed-loop simulation of rough rock chose them. It proves nothing about the game's rock.
 - [HYPOTHESIS] A running climb may pass `OverhangAngle` by 15 degrees, the same margin as on the walkable side.
 - [HYPOTHESIS] Mask bit 2 covers terrain and player walls, and bit 5 covers rock props. Prop flags are data.
-- [HYPOTHESIS] Actors do not carry `Walkable`, and enemies and trees carry `Solid`. A start casts Solid-only rays, 0.02 m short of each surface hit and once from the chest. The game's own clearance mask adds bits 1 and 5, but bit 1 is the undisplaced body, which can stand in front of the rock, and bit 5 is the surface itself.
+- [HYPOTHESIS] Actors do not carry `Walkable`, and enemies and trees carry `Solid`. A start casts Solid-only rays, 0.02 m short of each surface hit, and once from the chest. The game's own clearance mask adds bits 1 and 5, but bit 1 is the undisplaced body, which can stand in front of the rock, and bit 5 is the surface itself.
   - Receipt: Mask {1,3,5} at 0x14024ad54. Bits from `ecs.ColliderFlags`. The flags of a given prop are data, and were not read.
+- [HYPOTHESIS] The chest ray stops 0.2 m in front of the fit plane, along the normal. A rock prop can be Solid and Walkable at once, and rock between the four hits stands proud of the plane through them: 0.14 m on a ball of radius 1 m, and up to 0.184 m on rock displaced by 0.15 m either way. So 0.2 m covers those. A trunk that stands less than 0.2 m off the rock does not block a start. `PlaneTolerance` is no use here: at its default 0.45 m, a ray from 0.8 m off the rock ends 0.35 m out, inside a capsule of radius 0.4 m.
+  - Receipt: `crates/ember-climb/src/surface.rs`, `the_chest_ray_stops_two_tenths_off_the_fit_plane`, `rough_solid_rock_does_not_block_itself`, `a_trunk_in_the_path_starts_nothing`.
 
 ### Open at the first play test
 

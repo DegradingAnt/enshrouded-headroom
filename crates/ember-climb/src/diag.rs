@@ -897,8 +897,8 @@ mod tests {
         assert_eq!(ending(text), "updates 1/s");
     }
 
-    /// A body turned 20 degrees about z, on a face that leans 20 degrees back, as the game's
-    /// rotation would leave it.
+    /// A body tipped 20 degrees back along a face that leans 20 degrees back, as the game's
+    /// rotation would leave it. The player looks along +x, so the head goes toward +x.
     fn tilted() -> BodySample {
         let half = 10f32.to_radians();
         BodySample {
@@ -906,7 +906,7 @@ mod tests {
             speed: 8.0,
             mode: 1,
             normal: Vec3::new(-0.939_692_6, 0.342_020_14, 0.0),
-            orientation: [0.0, 0.0, half.sin(), half.cos()],
+            orientation: [0.0, 0.0, -half.sin(), half.cos()],
         }
     }
 
@@ -916,8 +916,34 @@ mod tests {
         assert_eq!(
             body_text(&tilted()),
             "climb body: entity 3, rotation speed 8.00 mode 1 (ExponentialLerp), normal -0.940 \
-             0.342 0.000, body up -0.342 0.940 0.000, surface leans 20.0 degrees, body leans 20.0 \
+             0.342 0.000, body up 0.342 0.940 0.000, surface leans 20.0 degrees, body leans 20.0 \
              degrees"
+        );
+    }
+
+    /// A body along the surface has its up at right angles to the normal, as the sample has it.
+    #[test]
+    fn the_sample_body_lies_along_its_surface() {
+        let sample = tilted();
+        let across = up_of(sample.orientation).dot(sample.normal);
+        assert!(across.abs() < 1e-5, "{across}");
+    }
+
+    /// Under an overhang the normal points down, so the surface's lean goes negative. The body's
+    /// lean is an angle from straight up and has no sign.
+    #[test]
+    fn an_overhang_gives_a_negative_surface_lean() {
+        let half = 10f32.to_radians();
+        let sample = BodySample {
+            normal: Vec3::new(-0.939_692_6, -0.342_020_14, 0.0),
+            orientation: [0.0, 0.0, half.sin(), half.cos()],
+            ..tilted()
+        };
+        assert!(up_of(sample.orientation).dot(sample.normal).abs() < 1e-5);
+        let text = body_text(&sample);
+        assert!(
+            text.ends_with("surface leans -20.0 degrees, body leans 20.0 degrees"),
+            "{text}"
         );
     }
 

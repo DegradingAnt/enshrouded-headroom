@@ -28,6 +28,9 @@ static RAYS: AtomicU32 = AtomicU32::new(0);
 static LOST_CALLS: AtomicU32 = AtomicU32::new(0);
 /// What the fake exit query answers: 0 is no exit, otherwise the floor's `ny` in hundredths.
 static EXIT_NY: AtomicU32 = AtomicU32::new(0);
+/// How much up the wall's normal has, in hundredths. The wall stays where it is, so this is a
+/// surface that reads walkable at the height of a player's rays.
+static WALL_NY: AtomicU32 = AtomicU32::new(0);
 
 /// A raycast with the game's signature, against the wall.
 ///
@@ -53,12 +56,13 @@ unsafe extern "system" fn plane_raycast(
     let mut hit = None;
     if WALL_THERE.load(Ordering::Relaxed) && fx < WALL_X && tx >= WALL_X {
         let t = (WALL_X - fx) / (tx - fx);
+        let ny = WALL_NY.load(Ordering::Relaxed) as f32 / 100.0;
         hit = Some([
             WALL_X,
             fy + (ty - fy) * t,
             fz + (tz - fz) * t,
-            -1.0,
-            0.0,
+            -(1.0 - ny * ny).sqrt(),
+            ny,
             0.0,
         ]);
     }
@@ -277,6 +281,11 @@ impl Player {
         self.transform[0] = (f64::from(x) * 4_294_967_296.0) as i64;
     }
 
+    /// Put the feet at this height.
+    fn set_y(&mut self, y: f32) {
+        self.transform[1] = (f64::from(y) * 4_294_967_296.0) as i64;
+    }
+
     /// Store a climb normal.
     fn set_normal(&mut self, normal: Vec3) {
         let at = self.climb[4..16].as_mut_ptr().cast::<f32>();
@@ -417,6 +426,13 @@ fn a_climb_runs_through_the_detours() {
     assert_eq!(player.low_entry()[0], OK);
     player.set_state(true, false, false);
 
+    // A clearance ray with no way left to go is not cast. A start from right at the wall costs its
+    // four surface rays and nothing else, so no ray runs backward out of the rock.
+    player.set_x(WALL_X - 0.01);
+    let rays = RAYS.load(Ordering::Relaxed);
+    assert_eq!(player.low_entry()[0], OK);
+    assert_eq!(RAYS.load(Ordering::Relaxed), rays + 4);
+
     // A stick well along the wall finds the surface, and both angle tests refuse it. The log must
     // call that an angle, not a failed probe, or it blames the wrong step.
     player.set_x(0.45);
@@ -535,9 +551,37 @@ fn a_climb_runs_through_the_detours() {
     assert_eq!(player.exit_query(0.03)[0], MISS);
     FLOOR_THERE.store(true, Ordering::Relaxed);
     assert_eq!(player.exit_query(0.03)[0], OK);
+    // Only a rise can end a climb. The same good floor is no exit with no rise, or with a fall.
+    assert_eq!(player.exit_query(0.0)[0], MISS);
+    assert_eq!(player.exit_query(-0.03)[0], MISS);
     FLOOR_THERE.store(false, Ordering::Relaxed);
     EXIT_NY.store(0, Ordering::Relaxed);
     assert_eq!(player.exit_query(0.03)[0], MISS);
+
+    // A hold belongs to its climber. Another entity's exit stays the game's, even on steep rock.
+    EXIT_NY.store(30, Ordering::Relaxed);
+    assert_eq!(player.exit_query(0.03)[0], MISS);
+    player.ctx[6] = PLAYER + 1;
+    assert_eq!(player.exit_query(0.03)[0], OK);
+    player.ctx[6] = PLAYER;
+    EXIT_NY.store(0, Ordering::Relaxed);
+
+    // The hold's fit reaches the decision. Here the fit reads walkable, 0.8 m above flat ground,
+    // and the game has no exit. Only the look down from the fit finds that ground, and the head
+    // ray alone finds no area to stand on.
+    WALL_NY.store(80, Ordering::Relaxed);
+    FLOOR_THERE.store(true, Ordering::Relaxed);
+    player.set_y(-0.825);
+    assert_eq!(player.wall_lost(), HELD);
+    let exit = player.exit_query(0.03);
+    assert_eq!(exit[0], OK);
+    let (ground, up) = fields(&exit);
+    assert!((ground.x - WALL_X).abs() < 1e-4, "{ground:?}");
+    assert!(ground.y.abs() < 1e-4, "{ground:?}");
+    assert!((up.y - 1.0).abs() < 1e-4, "{up:?}");
+    player.set_y(0.0);
+    FLOOR_THERE.store(false, Ordering::Relaxed);
+    WALL_NY.store(0, Ordering::Relaxed);
 
     // A player the move check stopped is judged by the area alone, so one steep triangle in good
     // ground stands as the game's floor. The next frame starts clean, and the search goes past

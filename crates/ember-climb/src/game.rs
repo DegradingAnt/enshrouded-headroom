@@ -335,9 +335,9 @@ impl Ctx {
         unsafe { pointer_at(self.0, CTX_CLIMB).add(CLIMB_NORMAL).cast() }
     }
 
-    /// Where the grace count is stored: a padding byte of the Climb component, which the game
-    /// copies and sends with the rest of the component and never reads (docs/re-notes.md, "Replay
-    /// and the grace byte").
+    /// Where the grace count is stored: a padding byte of the Climb component. The game copies and
+    /// sends the component whole, so the byte goes with it. No store to it was found, and no field
+    /// names it (docs/re-notes.md, "Replay and the grace byte").
     ///
     /// # Safety
     ///
