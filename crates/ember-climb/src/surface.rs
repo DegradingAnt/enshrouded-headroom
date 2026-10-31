@@ -26,6 +26,12 @@ const MAX_RAY_TILT: f32 = 0.95;
 /// How far inside [`MAX_RAY_TILT`] the climb normal stays, so that rounding in a later frame
 /// cannot push it past the limit and drop the player.
 const TILT_MARGIN: f32 = 0.01;
+/// How far behind its origin a ray of a running climb starts, in metres. Where a bench tips the
+/// climb normal, the ray patch swings up against the rock above the bench, and an origin can lie
+/// behind that rock. A ray from there meets no front face, so the move check finds no surface and
+/// the hold can fail. In the closed-loop model 0.2 m leaves more such stops, and 0.5 m ends almost
+/// none that 0.3 m leaves. HYPOTHESIS: what the game's ray returns from inside rock. No note says.
+const RAY_BACK: f32 = 0.3;
 /// Extra reach for the hold check, so a move that passed cannot lose the wall a frame later.
 const STAY_EXTRA: f32 = 0.4;
 /// Extra reach of the entry rays past the farthest face they must touch, in metres.
@@ -45,8 +51,9 @@ const MASK_SOLID: u32 = 0x08;
 const CLEARANCE_GAP: f32 = 0.02;
 /// How far in front of the fit plane the chest clearance ray stops, in metres, along the normal.
 /// No surface ray ran on that line, so the plane is all that is known there, and rock between the
-/// hits stands proud of it: 0.14 m on a ball of radius 1 m, and up to 0.184 m on rock displaced by
-/// 0.15 m either way. A Solid rock prop must not block itself on that. `plane_tolerance` is too
+/// hits stands proud of it: 0.14 m on a ball of radius 1 m, and, head on, up to 0.184 m on rock
+/// displaced by 0.15 m either way. At a yaw of 44 degrees that rock reaches 0.221 m, and it refuses
+/// 2 of 8963 starts. A Solid rock prop must not block itself on that. `plane_tolerance` is too
 /// large for this: at its default 0.45 m a ray from 0.8 m off the rock ends 0.35 m out, inside a
 /// capsule of radius 0.4 m. Rock in the existing tests also needs this under 0.3 m.
 const CHEST_MARGIN: f32 = 0.2;
@@ -201,6 +208,15 @@ impl Mode {
             Mode::Stay => t.hold_reach + STAY_EXTRA,
         }
     }
+
+    /// How far behind its origin a ray starts for this question. A start has no tipped frame, so
+    /// its origins stand over the feet.
+    fn back(self) -> f32 {
+        match self {
+            Mode::Entry => 0.0,
+            Mode::Move | Mode::Stay => RAY_BACK,
+        }
+    }
 }
 
 /// Why a surface was refused.
@@ -298,7 +314,8 @@ impl Frame {
         })
     }
 
-    /// Where the rays start for a player at `pos`, upper row first.
+    /// The ray origins for a player at `pos`, upper row first. A reach counts from here. The rays
+    /// of a running climb start a little behind these points.
     pub fn origins(&self, pos: Vec3) -> [Vec3; RAY_COUNT] {
         let [top, low] = RAY_ROWS;
         let at = |height: f32, side: f32| pos + self.up * height + self.right * side;
@@ -473,11 +490,12 @@ pub fn scan<C: Caster>(
     let mut hits = 0usize;
     let mut misses = 0usize;
     for origin in frame.origins(pos) {
-        match caster.cast(origin, origin + frame.along * reach, t.mask) {
+        let from = origin - frame.along * mode.back();
+        match caster.cast(from, origin + frame.along * reach, t.mask) {
             Some(hit) => {
                 if let (Some(slot), Some(start)) = (found.get_mut(hits), starts.get_mut(hits)) {
                     *slot = hit;
-                    *start = origin;
+                    *start = from;
                 }
                 hits = hits.saturating_add(1);
             }
@@ -932,6 +950,52 @@ mod tests {
             .is_ok());
     }
 
+    /// A rock that keeps every surface ray cast at it.
+    struct Kept {
+        /// The rock.
+        rock: Plane,
+        /// Each ray's start and end.
+        rays: std::cell::RefCell<Vec<(Vec3, Vec3)>>,
+    }
+
+    impl Caster for Kept {
+        fn cast(&self, from: Vec3, to: Vec3, mask: u32) -> Option<Hit> {
+            if mask != 0x08 {
+                self.rays.borrow_mut().push((from, to));
+            }
+            self.rock.cast(from, to, mask)
+        }
+    }
+
+    /// The rays of a running climb start 0.3 m behind their origins, and end where they always
+    /// did, so an origin behind rock still finds that rock. A start keeps its rays at the origins.
+    #[test]
+    fn a_running_climb_starts_its_rays_behind_their_origins() {
+        let t = tuning();
+        let pos = Vec3::new(0.2, 1.0, 0.0);
+        let origins = Frame::along(AHEAD).unwrap().origins(pos);
+        let modes = [
+            (Mode::Entry, 0.0, t.entry_ray),
+            (Mode::Move, 0.3, t.hold_reach),
+            (Mode::Stay, 0.3, t.hold_reach + STAY_EXTRA),
+        ];
+        for (mode, back, reach) in modes {
+            let world = Kept {
+                rock: Plane::wall(0.8),
+                rays: Default::default(),
+            };
+            assert!(scan(&world, pos, AHEAD, mode, &t, CAPSULE).verdict.is_ok());
+            let rays = world.rays.borrow();
+            assert_eq!(rays.len(), RAY_COUNT, "{mode:?}");
+            for ((from, to), origin) in rays.iter().zip(origins) {
+                let start = origin - AHEAD * back;
+                assert!((*from - start).length() < 1e-5, "{mode:?}: {from:?}");
+                let end = origin + AHEAD * reach;
+                assert!((*to - end).length() < 1e-5, "{mode:?}: {to:?}");
+            }
+        }
+    }
+
     /// The first hit's entity is reported, so a prop's id reaches the game.
     #[test]
     fn the_fit_reports_the_first_entity() {
@@ -1374,9 +1438,10 @@ mod tests {
     }
 
     /// The chest ray stops 0.2 m off the fit plane, measured along the normal. Rough rock in the
-    /// tests stands up to 0.184 m proud of its plane, so less than that blocks the rock itself. A
-    /// trunk just past the margin still blocks, and the same trunk just inside it does not. This
-    /// holds at normal reach on a face that leans either way, so the margin is pinned both ways.
+    /// tests stands up to 0.184 m proud of its plane head on, so less than that blocks the rock
+    /// itself. A trunk just past the margin still blocks, and the same trunk just inside it does
+    /// not. This holds at normal reach on a face that leans either way, so the margin is pinned
+    /// both ways.
     #[test]
     fn the_chest_ray_stops_two_tenths_off_the_fit_plane() {
         let t = tuning();

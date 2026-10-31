@@ -15,11 +15,18 @@ const WALL_X: f32 = 1.0;
 const PLAYER: usize = 77;
 /// A frame at 60 fps.
 const DT: f32 = 1.0 / 60.0;
+/// What the fake move check leaves in `rax` above `al`, as the game's can.
+const RAX_ABOVE_AL: u64 = 0x1234_5678_9abc_de00;
 
 /// Does the fake raycast hit anything?
 static WALL_THERE: AtomicBool = AtomicBool::new(true);
 /// Is there flat ground at height 0 for the rays to find?
 static FLOOR_THERE: AtomicBool = AtomicBool::new(false);
+/// How much up the ground's normal has, in hundredths. The ground stays flat, so a value under 100
+/// is ground that reads as a slope.
+static FLOOR_NY: AtomicU32 = AtomicU32::new(100);
+/// The entity a ray that hits the ground reports.
+static FLOOR_ENTITY: AtomicU32 = AtomicU32::new(0);
 /// Does the fake game probe pass, as on a lattice?
 static LATTICE: AtomicBool = AtomicBool::new(false);
 /// Rays cast so far.
@@ -54,6 +61,7 @@ unsafe extern "system" fn plane_raycast(
     let mut bytes = [0u8; 0x70];
     bytes[0] = MISS;
     let mut hit = None;
+    let mut entity = 0;
     if WALL_THERE.load(Ordering::Relaxed) && fx < WALL_X && tx >= WALL_X {
         let t = (WALL_X - fx) / (tx - fx);
         let ny = WALL_NY.load(Ordering::Relaxed) as f32 / 100.0;
@@ -68,10 +76,14 @@ unsafe extern "system" fn plane_raycast(
     }
     if FLOOR_THERE.load(Ordering::Relaxed) && fy >= 0.0 && ty < 0.0 {
         let t = fy / (fy - ty);
-        hit = Some([fx + (tx - fx) * t, 0.0, fz + (tz - fz) * t, 0.0, 1.0, 0.0]);
+        let ny = FLOOR_NY.load(Ordering::Relaxed) as f32 / 100.0;
+        let lean = -(1.0 - ny * ny).sqrt();
+        hit = Some([fx + (tx - fx) * t, 0.0, fz + (tz - fz) * t, lean, ny, 0.0]);
+        entity = FLOOR_ENTITY.load(Ordering::Relaxed);
     }
     if let Some(fields) = hit {
         bytes[0] = OK;
+        bytes[0x0c..0x10].copy_from_slice(&entity.to_le_bytes());
         let (slots, _) = bytes[0x14..0x2c].as_chunks_mut::<4>();
         for (slot, field) in slots.iter_mut().zip(fields) {
             *slot = field.to_le_bytes();
@@ -139,7 +151,7 @@ unsafe extern "system" fn game_wall_lost(ctx: *mut u8) -> u32 {
     }
 }
 
-/// The game's move check, cut down to its first probe.
+/// The game's move check, cut down to its first probe. The answer is in `al` alone.
 ///
 /// # Safety
 ///
@@ -160,7 +172,7 @@ unsafe extern "system" fn game_move_check(
     };
     // SAFETY: the function's contract.
     let out = unsafe { call_probe(ctx, pos + velocity * dt, -normal, 0.0) };
-    u64::from(out[0] == OK)
+    RAX_ABOVE_AL | u64::from(out[0] == OK)
 }
 
 /// The game's exit query, with a scripted answer.
@@ -332,8 +344,9 @@ impl Player {
         unsafe { wall_lost_detour(ctx) }
     }
 
-    /// Run the hooked move check on this velocity, and give back the velocity and the answer.
-    fn move_check(&mut self, velocity: Vec3) -> (Vec3, u64) {
+    /// Run the hooked move check on this velocity, and give back the velocity and `al`. The rest
+    /// of `rax` must come back as the game left it.
+    fn move_check(&mut self, velocity: Vec3) -> (Vec3, u8) {
         let mut v = [velocity.x, velocity.y, velocity.z];
         let ctx = self.ctx();
         // SAFETY: the context lives through the call.
@@ -341,7 +354,8 @@ impl Player {
         let pos = [pos.x, pos.y, pos.z];
         // SAFETY: all buffers live through the call.
         let passed = unsafe { move_check_detour(v.as_mut_ptr(), ctx, pos.as_ptr(), DT) };
-        (Vec3::new(v[0], v[1], v[2]), passed)
+        assert_eq!(passed & !0xff, RAX_ABOVE_AL);
+        (Vec3::new(v[0], v[1], v[2]), passed as u8)
     }
 
     /// Run the hooked exit query for a predicted position this far above the feet.
@@ -566,11 +580,26 @@ fn a_climb_runs_through_the_detours() {
     player.ctx[6] = PLAYER;
     EXIT_NY.store(0, Ordering::Relaxed);
 
-    // The hold's fit reaches the decision. Here the fit reads walkable, 0.8 m above flat ground,
-    // and the game has no exit. Only the look down from the fit finds that ground, and the head
-    // ray alone finds no area to stand on.
+    // The steering is the same. Here the player is 0.15 m too far out, and the hold is not the
+    // other entity's, so its velocity and normal stay as the game left them.
+    player.set_x(0.3);
+    assert_eq!(player.wall_lost(), HELD);
+    player.ctx[6] = PLAYER + 1;
+    let normal = player.normal();
+    let (velocity, _) = player.move_check(UP * 1.95);
+    assert_eq!(velocity, UP * 1.95);
+    assert_eq!(player.normal(), normal);
+    player.ctx[6] = PLAYER;
+    player.set_x(0.45);
+
+    // The hold's fit reaches the decision. Here the fit reads walkable, 0.8 m above ground, and
+    // the game has no exit. Only the look down from the fit finds that ground, and the head ray
+    // alone finds no area to stand on. The ground is a slope of its own entity, and the result
+    // hands over that normal and that entity.
     WALL_NY.store(80, Ordering::Relaxed);
     FLOOR_THERE.store(true, Ordering::Relaxed);
+    FLOOR_NY.store(80, Ordering::Relaxed);
+    FLOOR_ENTITY.store(4321, Ordering::Relaxed);
     player.set_y(-0.825);
     assert_eq!(player.wall_lost(), HELD);
     let exit = player.exit_query(0.03);
@@ -578,7 +607,16 @@ fn a_climb_runs_through_the_detours() {
     let (ground, up) = fields(&exit);
     assert!((ground.x - WALL_X).abs() < 1e-4, "{ground:?}");
     assert!(ground.y.abs() < 1e-4, "{ground:?}");
-    assert!((up.y - 1.0).abs() < 1e-4, "{up:?}");
+    assert!((up - Vec3::new(-0.6, 0.8, 0.0)).length() < 1e-4, "{up:?}");
+    // SAFETY: `exit` is a whole result.
+    assert_eq!(unsafe { result_entity(exit.as_ptr()) }, 4321);
+    FLOOR_NY.store(100, Ordering::Relaxed);
+    FLOOR_ENTITY.store(0, Ordering::Relaxed);
+
+    // The same ground under a steep fit is no exit. Only the fit's own normal tells the two apart.
+    WALL_NY.store(30, Ordering::Relaxed);
+    assert_eq!(player.wall_lost(), HELD);
+    assert_eq!(player.exit_query(0.03)[0], MISS);
     player.set_y(0.0);
     FLOOR_THERE.store(false, Ordering::Relaxed);
     WALL_NY.store(0, Ordering::Relaxed);

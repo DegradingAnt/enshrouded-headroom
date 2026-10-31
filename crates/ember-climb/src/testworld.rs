@@ -557,6 +557,8 @@ pub struct Climber {
 const SPEED: f32 = 1.95;
 /// How fast the game moves velocity toward its target (`FUN_140419b60`, its fourth argument).
 const ACCELERATION: f32 = 50.0;
+/// Rays that stand in for the head sphere.
+const HEAD_SPHERE_RAYS: u8 = 32;
 
 impl Climber {
     /// A climber standing at the game's distance from `surface`, which is under the point
@@ -599,6 +601,20 @@ impl Climber {
             return None;
         }
         world.cast(reach, reach - UP * 1.35, 0x21)
+    }
+
+    /// Does the head sphere fit over `landing`? The game tests it on the exit's answer in the same
+    /// frame, and a sphere that does not fit blocks the exit (`FUN_14024bf60`, `FUN_14023c0e0`).
+    /// Rays out of the centre stand in for it, in the plane of the rock lines. Only front faces
+    /// answer, so a centre that already lies inside rock reads free.
+    fn head_fits<C: Caster>(&self, world: &C, landing: Vec3) -> bool {
+        let Capsule { radius, height } = self.capsule;
+        let centre = landing + UP * (height - radius);
+        (0..HEAD_SPHERE_RAYS).all(|ray| {
+            let turn = f32::from(ray) / f32::from(HEAD_SPHERE_RAYS) * std::f32::consts::TAU;
+            let side = Vec3::new(turn.cos(), turn.sin(), 0.0) * radius;
+            world.cast(centre, centre + side, 0).is_none()
+        })
     }
 
     /// May the player stand at `pos`? The native probe never passes here, so this is the mod's
@@ -701,7 +717,8 @@ impl Climber {
             Exit::Refuse => None,
             Exit::Take(hit) => Some(hit),
         };
-        if let Some(hit) = target.filter(|_| stick.1 > 0.0) {
+        let open = |hit: &Hit| stick.1 > 0.0 && self.head_fits(world, hit.point);
+        if let Some(hit) = target.filter(open) {
             return Frame::Mantle(hit.point);
         }
         self.pos = self.pos + self.velocity * dt;
@@ -715,7 +732,7 @@ pub const FRAME_TIMES: [f32; 3] = [1.0 / 120.0, 1.0 / 60.0, 1.0 / 20.0];
 #[cfg(test)]
 mod climbs {
     use super::*;
-    use crate::surface::{Capsule, GAME_STANDOFF};
+    use crate::surface::{Capsule, Reject, GAME_STANDOFF};
 
     /// Climb straight up until `height` metres are gained. Panics on a drop, a stall or a mantle.
     fn climb_up<C: Caster>(world: &C, mut climber: Climber, height: f32, dt: f32) -> Climber {
@@ -965,6 +982,35 @@ mod climbs {
         assert!(climber.native_exit(&rock, climber.pos).is_some());
     }
 
+    /// The game's head sphere stands between the exit's answer and the mantle, so a good ledge is
+    /// no exit when the head does not fit over it. The sphere has the capsule's radius.
+    #[test]
+    fn no_mantle_where_the_head_does_not_fit() {
+        /// A ledge with a roof that only the sphere's rays meet.
+        struct Roof(Profile);
+
+        impl Caster for Roof {
+            fn cast(&self, from: Vec3, to: Vec3, mask: u32) -> Option<Hit> {
+                let roof = Hit {
+                    point: to,
+                    normal: -UP,
+                    entity: 0,
+                };
+                (mask == 0).then_some(roof).or(self.0.cast(from, to, mask))
+            }
+        }
+
+        let rock = Profile::ledge(0.0, 5.0);
+        let climber = Climber::on(&rock, Vec3::new(-1.0, 0.0, 0.0), face(90.0));
+        assert!(climber.head_fits(&Plane::wall(0.41), Vec3::default()));
+        assert!(!climber.head_fits(&Plane::wall(0.39), Vec3::default()));
+        let roof = |y: f32| Plane::through(UP * y, -UP);
+        assert!(climber.head_fits(&roof(2.01), Vec3::default()));
+        assert!(!climber.head_fits(&roof(1.99), Vec3::default()));
+        assert_eq!(hold_up(&rock, &mut { climber }), End::Mantle);
+        assert_eq!(hold_up(&Roof(rock), &mut { climber }), End::Stall);
+    }
+
     /// A wall that ends on the way up with nothing to stand on (a thin fin) stops the player.
     /// It must not throw them off.
     #[test]
@@ -1051,8 +1097,7 @@ mod climbs {
     /// a 60 degree face, or of 0.6 m in a sheer wall, stops the climber for good while the stick is
     /// up. The move check refuses the walkable shelf, and the wall behind it reads as the face
     /// going on. The climber hangs on, and can go down or sideways. On the 60 degree face a shelf
-    /// of 1 m or more ends in a mantle. These widths stall with or without the game's head sphere,
-    /// which this model leaves out.
+    /// of 1 m or more ends in a mantle. These widths stall with or without the game's head sphere.
     #[test]
     fn a_short_shelf_stops_the_climber() {
         for (lower, width) in [(60.0, 0.3), (60.0, 0.5), (60.0, 0.7), (90.0, 0.6)] {
@@ -1070,27 +1115,105 @@ mod climbs {
         }
     }
 
-    /// The hard end of the same limit, pinned the same way. A bench of 10 or 20 degrees and 0.3 m
-    /// in a sheer wall tips the climb normal so far that the upper ray row starts behind the wall
-    /// above the bench. The move check then finds no surface in any direction, and the hold still
-    /// passes on the lower row. So the climber does not fall, and does not go down or sideways
-    /// either. Only the game's own jump ends this, and this model has no jump.
+    /// A narrow bench tips the climb normal so far that the upper ray row reaches the wall above
+    /// the bench, and an origin can lie behind that wall. A ray that starts there meets no front
+    /// face. The rays of a running climb start behind their origins for this, so the climb goes on
+    /// up the wall to the top. Without that the climber stops under the bench, and no stick moves
+    /// them.
     #[test]
-    fn a_narrow_bench_in_a_sheer_wall_holds_the_climber_in_place() {
+    fn a_narrow_bench_in_a_sheer_wall_lets_the_climber_past() {
+        for tilt in [10.0, 15.0, 20.0] {
+            for width in [0.25, 0.3, 0.35] {
+                let rock = shelf(90.0, tilt, width);
+                let climber = Climber::on(&rock, Vec3::new(-1.0, 0.0, 0.0), face(90.0));
+                let target = climb_to_exit(&rock, climber, 1.0 / 60.0);
+                assert!(target.y > 8.0, "{tilt}, {width}: under the top: {target:?}");
+            }
+        }
+    }
+
+    /// The hard end of the short shelf, pinned the same way. A bench of 15 degrees and 0.7 to 0.8 m
+    /// in a 60 degree face leaves the climber 1.2 m from the wall behind it, with the normal on
+    /// that wall. The hold reaches it and the move check does not. So the climber does not fall,
+    /// and no stick moves them. Only the game's own jump ends this, and this model has no jump.
+    #[test]
+    fn a_bench_in_a_leaning_face_can_hold_the_climber() {
         let t = tuning();
-        for tilt in [10.0, 20.0] {
-            let rock = shelf(90.0, tilt, 0.3);
-            let mut climber = Climber::on(&rock, Vec3::new(-1.0, 0.0, 0.0), face(90.0));
-            assert_eq!(hold_up(&rock, &mut climber), End::Stall, "{tilt}");
+        for width in [0.7, 0.75, 0.8] {
+            let rock = shelf(60.0, 15.0, width);
+            let mut climber = Climber::on(&rock, Vec3::new(-1.0, 0.0, 0.0), face(60.0));
+            assert_eq!(hold_up(&rock, &mut climber), End::Stall, "{width}");
+            let (pos, capsule) = (climber.pos, climber.capsule);
+            let probe = |mode| scan(&rock, pos, -climber.normal, mode, &t, capsule);
+            assert!(probe(Mode::Stay).verdict.is_ok(), "{width}");
+            assert_eq!(probe(Mode::Move).verdict, Err(Reject::Hits), "{width}");
             for stick in [(0.0, -1.0), (1.0, 0.0), (-1.0, 0.0)] {
                 let mut moving = climber;
                 for frame in 0..120 {
                     let step = moving.step(&rock, stick, 1.0 / 60.0, &t);
-                    assert_eq!(step, Frame::Blocked, "{tilt}, {stick:?}, frame {frame}");
+                    assert_eq!(step, Frame::Blocked, "{width}, {stick:?}, frame {frame}");
                 }
-                assert_eq!(moving.pos, climber.pos, "{tilt}, {stick:?}");
+                assert_eq!(moving.pos, climber.pos, "{width}, {stick:?}");
             }
         }
+        for width in [0.65, 0.85] {
+            let rock = shelf(60.0, 15.0, width);
+            let mut climber = Climber::on(&rock, Vec3::new(-1.0, 0.0, 0.0), face(60.0));
+            assert_eq!(hold_up(&rock, &mut climber), End::Mantle, "{width}");
+        }
+    }
+
+    /// A rough bench in a face at `lower` degrees, with the rock around it as in [`shelf`], and a
+    /// foot just below the climber so that a ray has few rows to search.
+    fn rough_bench(lower: f32, tilt: f32, width: f32, depth: f32, seed: u32) -> Faceted {
+        let lean = lower.to_radians();
+        let knee = (5.0 / lean.tan(), 5.0);
+        let turn = tilt.to_radians();
+        let inner = (knee.0 + turn.cos() * width, knee.1 + turn.sin() * width);
+        let top = (inner.0, inner.1 + 3.0);
+        let line = [
+            (-FACETED_FOOT / lean.tan(), -FACETED_FOOT),
+            knee,
+            inner,
+            top,
+            (top.0 + 6.0, top.1),
+        ];
+        Faceted::new(&line, depth, 0.5, seed)
+    }
+
+    /// The narrow benches in rough rock, in a sheer wall and in a face of 80 degrees. Nobody falls,
+    /// with no grace at all, and more than nine climbs in ten end in a mantle. With the rays
+    /// starting at their origins, 75 of these 2880 climbs fall and 771 stop.
+    #[test]
+    fn a_rough_bench_drops_nobody() {
+        let (mut climbs, mut mantles) = (0, 0);
+        for lower in [90.0, 80.0] {
+            for tilt in [0.0, 5.0, 10.0, 15.0, 20.0] {
+                for width in [0.25, 0.35, 0.45, 0.55, 0.65, 0.75] {
+                    for depth in [0.05, 0.1, 0.15, 0.2] {
+                        for seed in 1..=6 {
+                            let rock = rough_bench(lower, tilt, width, depth, seed);
+                            let mut run = |rock: &Faceted, kind: &str| {
+                                let mut climber =
+                                    Climber::on(rock, Vec3::new(-1.0, 0.0, 0.0), face(lower));
+                                let end = hold_up(rock, &mut climber);
+                                let label = format!(
+                                    "{lower} degrees, tilt {tilt}, {width} m, +-{depth} m, \
+                                     seed {seed}, {kind}: {climber:?}"
+                                );
+                                assert_ne!(end, End::Drop, "{label}");
+                                climbs += 1;
+                                mantles += u32::from(end == End::Mantle);
+                            };
+                            run(&rock, "clean normals");
+                            run(&rock.rough_normals(), "rough normals");
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(climbs, 2880);
+        assert!(mantles >= 2600, "{mantles} of {climbs}");
     }
 
     /// A wall at 90 degrees that bends along an arc of 2 m radius into a long slope at `to`.

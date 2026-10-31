@@ -130,8 +130,9 @@ Evidence for every game fact is in [docs/re-notes.md](../../docs/re-notes.md), "
 ## Limits
 
 - A surface must reach 2 m above your feet to start a climb. A lower wall starts nothing, and neither does a ledge you jump at when it is less than 2 m above your feet at that moment. Use the game's jump there. This may change after the first play test.
-- A short walkable shelf in a face stops you while the stick is up. In the simulation a flat shelf of 0.3 to 0.7 m in a 60 degree face does this. On that face a shelf of 1 m or more ends in a mantle. You do not fall. Go sideways or go down, or jump off.
-- A narrow bench in a sheer wall can hold you in place. In the simulation a bench of 10 or 20 degrees and 0.3 m does this. You do not fall, but going down and going sideways do not move you either. Jump off.
+- A short walkable shelf in a face can stop you while the stick is up. In the simulation a flat shelf of 0.2 to 0.8 m in a 60 degree face does this, and so does one of 0.5 to 0.9 m in a sheer wall. On the 60 degree face a shelf of 1 m or more ends in a mantle. Go sideways or go down, or jump off.
+- A few of these stops hold you in place. On clean rock in the simulation that is a bench of 15 degrees and 0.7 to 0.8 m in a 60 degree face. Going down and going sideways do not move you there. Jump off: the game's jump ends a climb wherever you are.
+- Rough rock adds to both. The simulation ran 7200 climbs up rough benches, 0.25 to 0.75 m wide and tilted 0 to 20 degrees, in faces of 60 to 90 degrees. Of those, 6470 ended in a mantle, 609 stopped where a stick still moves you, and 121 stopped where only the jump helps. None fell. All of these climbs held the stick straight up.
 - A long slope close to `WalkableAngle` does not end the climb. With the default of 50 that is a slope of 47 to 50 degrees. You can walk on it, but the mod reads it as the face going on, so no mantle comes. Go sideways, go down or jump off.
 
 ## Server
