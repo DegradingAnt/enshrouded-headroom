@@ -3,7 +3,8 @@
 //! The first in-game test of climbing failed and its log was lost, so nobody knows which step
 //! failed. This keeps that from happening again. The hooks only bump atomic counters: they do not
 //! allocate, take a lock or log on a game thread. A `climb-diag` thread wakes once a second and
-//! writes one `climb diag:` line when something that only moves with climb activity has changed.
+//! writes one `climb diag:` line when a climb moved a count. A surface that was near with no climb
+//! writes one much less often, because a start that failed must leave a trace too.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
@@ -16,6 +17,8 @@ use crate::Feature;
 
 /// How often the log thread looks at the counts.
 const LOG_INTERVAL: Duration = Duration::from_secs(1);
+/// The fewest ticks between two lines when no climb ran.
+const NEAR_TICKS: u32 = 30;
 /// The last probe code before any probe ran. It is above every `u8` code.
 const NO_CODE: u32 = 0x100;
 
@@ -87,6 +90,8 @@ counters! {
     reject_overhang,
     /// Refused: the surface is too far away.
     reject_far,
+    /// Refused: something solid stands in the way.
+    reject_blocked,
     /// Natural entries found while walking.
     by_walk,
     /// Natural entries found while jumping or falling.
@@ -248,6 +253,7 @@ impl Diag {
             Err(Reject::Walkable) => bump(&c.reject_walkable),
             Err(Reject::Overhang) => bump(&c.reject_overhang),
             Err(Reject::TooFar) => bump(&c.reject_far),
+            Err(Reject::Blocked) => bump(&c.reject_blocked),
         }
         self.lasts
             .hits
@@ -402,10 +408,27 @@ impl Default for Diag {
 }
 
 impl Snapshot {
-    /// The counts that move only near a climb. What runs every frame anywhere is zeroed: the start
-    /// check's calls, and the open-air probes of a held stick. A player crossing a field must not
-    /// fill the log.
-    fn activity(&self) -> Snapshot {
+    /// The counts that move only while a climb starts, runs or ends. Anything else is left out, so
+    /// a count added later stays quiet until someone decides otherwise.
+    fn climbing(&self) -> Snapshot {
+        Snapshot {
+            top_ok: self.top_ok,
+            low_ok: self.low_ok,
+            move_tried: self.move_tried,
+            stay_tried: self.stay_tried,
+            lost_calls: self.lost_calls,
+            steered: self.steered,
+            stop: self.stop,
+            exit_top: self.exit_top,
+            exit_bottom: self.exit_bottom,
+            ..Snapshot::default()
+        }
+    }
+
+    /// The counts that also move when a surface is near but no climb runs. What runs every frame
+    /// anywhere is zeroed: the start check's calls, and the open-air probes of a held stick. A
+    /// player crossing a field must not fill the log.
+    fn near(&self) -> Snapshot {
         Snapshot {
             start_calls: 0,
             top_calls: 0,
@@ -440,11 +463,11 @@ pub fn line(s: &Snapshot, l: &LastValues) -> String {
     format!(
         "climb diag: probe ok {}, 0x15 {}, 0x1e {}, 0x1f {}, other {} (last code {}, last entity \
          {entity}) | natural entry {}/{}, move {}/{}, stay {}/{} (refused dir {}, hits {}, bumpy \
-         {}, walkable {}, overhang {}, far {}; last hits {} spread {:.2} ny {:.2} gap {:+.2}) | \
-         found walk {} jump {} sprint {} glide {} off {} | start {}/{} (top {}/{}, low {}/{}: no \
-         input {}, angle {}, cone {}, cooldown {}, probe {}, other {}) | lost {}/{} (voxel {}, \
-         grace {}, no probe {}) | steer {} | stop {} | exit top {} bottom {} (refused {}, taken \
-         {}) | capsule {:.2} x {:.2}",
+         {}, walkable {}, overhang {}, far {}, blocked {}; last hits {} spread {:.2} ny {:.2} gap \
+         {:+.2}) | found walk {} jump {} sprint {} glide {} off {} | start {}/{} (top {}/{}, low \
+         {}/{}: no input {}, angle {}, cone {}, cooldown {}, probe {}, other {}) | lost {}/{} \
+         (voxel {}, grace {}, no probe {}) | steer {} | stop {} | exit top {} bottom {} (refused \
+         {}, taken {}) | capsule {:.2} x {:.2}",
         s.probe_ok,
         s.probe_plane,
         s.probe_clear,
@@ -463,6 +486,7 @@ pub fn line(s: &Snapshot, l: &LastValues) -> String {
         s.reject_walkable,
         s.reject_overhang,
         s.reject_far,
+        s.reject_blocked,
         l.hits,
         l.spread,
         l.ny,
@@ -500,20 +524,55 @@ pub fn line(s: &Snapshot, l: &LastValues) -> String {
     )
 }
 
-/// The line when the activity counts changed since `last`, else `None`. `last` becomes `now`
-/// either way.
-pub fn changed_line(last: &mut Snapshot, now: Snapshot, lasts: &LastValues) -> Option<String> {
-    let changed = now.activity() != last.activity();
-    *last = now;
-    changed.then(|| line(&now, lasts))
+/// What the log thread remembers from tick to tick.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pace {
+    /// The counts at the last tick.
+    last: Snapshot,
+    /// The counts at the last line.
+    logged: Snapshot,
+    /// Ticks since the last line.
+    quiet: u32,
+}
+
+impl Pace {
+    /// No counts yet, and free to write a line at once.
+    pub fn new() -> Pace {
+        Pace {
+            last: Snapshot::default(),
+            logged: Snapshot::default(),
+            quiet: NEAR_TICKS,
+        }
+    }
+}
+
+impl Default for Pace {
+    fn default() -> Pace {
+        Pace::new()
+    }
+}
+
+/// The line for this tick, if one is due. A climb writes one on every tick it moved a count. A
+/// surface that was near writes one at most every `NEAR_TICKS`, so a start that failed leaves a
+/// trace and a walk along a cliff does not fill the log.
+pub fn changed_line(pace: &mut Pace, now: Snapshot, lasts: &LastValues) -> Option<String> {
+    let climbing = now.climbing() != pace.last.climbing();
+    pace.last = now;
+    pace.quiet = pace.quiet.saturating_add(1);
+    let near = now.near() != pace.logged.near() && pace.quiet >= NEAR_TICKS;
+    (climbing || near).then(|| {
+        pace.logged = now;
+        pace.quiet = 0;
+        line(&now, lasts)
+    })
 }
 
 /// The diagnostics of this process.
 pub static DIAG: Diag = Diag::new();
 
 /// One tick of the log thread.
-fn tick(last: &mut Snapshot) {
-    if let Some(text) = changed_line(last, DIAG.snapshot(), &DIAG.lasts()) {
+fn tick(pace: &mut Pace) {
+    if let Some(text) = changed_line(pace, DIAG.snapshot(), &DIAG.lasts()) {
         log::info!("{text}");
     }
 }
@@ -523,10 +582,10 @@ pub fn spawn() -> Result<(), String> {
     std::thread::Builder::new()
         .name("climb-diag".to_owned())
         .spawn(|| {
-            let mut last = Snapshot::default();
+            let mut pace = Pace::new();
             loop {
                 std::thread::sleep(LOG_INTERVAL);
-                guard(Feature::Diag, || (), || tick(&mut last));
+                guard(Feature::Diag, || (), || tick(&mut pace));
             }
         })
         .map(drop)
@@ -574,11 +633,11 @@ mod tests {
             line(&diag.snapshot(), &diag.lasts()),
             "climb diag: probe ok 0, 0x15 0, 0x1e 0, 0x1f 0, other 0 (last code none, last \
              entity none) | natural entry 0/0, move 0/0, stay 0/0 (refused dir 0, hits 0, bumpy \
-             0, walkable 0, overhang 0, far 0; last hits 0 spread 0.00 ny 0.00 gap +0.00) | \
-             found walk 0 jump 0 sprint 0 glide 0 off 0 | start 0/0 (top 0/0, low 0/0: no input \
-             0, angle 0, cone 0, cooldown 0, probe 0, other 0) | lost 0/0 (voxel 0, grace 0, no \
-             probe 0) | steer 0 | stop 0 | exit top 0 bottom 0 (refused 0, taken 0) | capsule \
-             0.00 x 0.00"
+             0, walkable 0, overhang 0, far 0, blocked 0; last hits 0 spread 0.00 ny 0.00 gap \
+             +0.00) | found walk 0 jump 0 sprint 0 glide 0 off 0 | start 0/0 (top 0/0, low 0/0: \
+             no input 0, angle 0, cone 0, cooldown 0, probe 0, other 0) | lost 0/0 (voxel 0, \
+             grace 0, no probe 0) | steer 0 | stop 0 | exit top 0 bottom 0 (refused 0, taken 0) \
+             | capsule 0.00 x 0.00"
         );
     }
 
@@ -598,7 +657,9 @@ mod tests {
         diag.natural(Mode::Stay, &refused(Reject::Hits));
         diag.natural(Mode::Stay, &refused(Reject::Overhang));
         diag.natural(Mode::Stay, &refused(Reject::TooFar));
+        diag.natural(Mode::Stay, &refused(Reject::TooFar));
         diag.natural(Mode::Stay, &refused(Reject::Direction));
+        diag.natural(Mode::Entry, &refused(Reject::Blocked));
         diag.found_by(Trigger::Walk);
         diag.found_by(Trigger::Jump);
         diag.found_by(Trigger::Jump);
@@ -632,12 +693,12 @@ mod tests {
         assert_eq!(
             line(&diag.snapshot(), &diag.lasts()),
             "climb diag: probe ok 1, 0x15 2, 0x1e 3, 0x1f 4, other 1 (last code 0x09, last \
-             entity 4242) | natural entry 1/2, move 0/1, stay 0/4 (refused dir 1, hits 1, bumpy \
-             1, walkable 1, overhang 1, far 1; last hits 1 spread 0.12 ny 0.25 gap -0.04) | \
-             found walk 1 jump 2 sprint 1 glide 1 off 1 | start 2/1 (top 1/2, low 1/6: no input \
-             1, angle 1, cone 1, cooldown 1, probe 1, other 1) | lost 2/5 (voxel 1, grace 1, no \
-             probe 1) | steer 1 | stop 1 | exit top 1 bottom 1 (refused 1, taken 1) | capsule \
-             0.80 x 1.90"
+             entity 4242) | natural entry 1/3, move 0/1, stay 0/5 (refused dir 1, hits 1, bumpy \
+             1, walkable 1, overhang 1, far 2, blocked 1; last hits 1 spread 0.12 ny 0.25 gap \
+             -0.04) | found walk 1 jump 2 sprint 1 glide 1 off 1 | start 2/1 (top 1/2, low 1/6: \
+             no input 1, angle 1, cone 1, cooldown 1, probe 1, other 1) | lost 2/5 (voxel 1, \
+             grace 1, no probe 1) | steer 1 | stop 1 | exit top 1 bottom 1 (refused 1, taken 1) \
+             | capsule 0.80 x 1.90"
         );
     }
 
@@ -655,7 +716,7 @@ mod tests {
     #[test]
     fn open_ground_stays_quiet() {
         let diag = Diag::new();
-        let mut last = Snapshot::default();
+        let mut pace = Pace::new();
         for _ in 0..1000 {
             diag.start();
             diag.top_entry(MISS);
@@ -665,49 +726,114 @@ mod tests {
             diag.start_is_off();
         }
         assert_eq!(
-            changed_line(&mut last, diag.snapshot(), &diag.lasts()),
+            changed_line(&mut pace, diag.snapshot(), &diag.lasts()),
             None
         );
+    }
+
+    /// One second of walking beside rock: the probes find a surface, and no climb starts.
+    fn walk_beside_rock(diag: &Diag) {
+        for _ in 0..60 {
+            diag.start();
+            diag.low_entry(NOT_NOW, Some(OK));
+            diag.probe(MISS, 0);
+            diag.natural(Mode::Entry, &refused(Reject::Walkable));
+            diag.natural(Mode::Entry, &refused(Reject::TooFar));
+            diag.natural(Mode::Entry, &refused(Reject::Bumpy));
+            diag.natural(Mode::Entry, &refused(Reject::Overhang));
+            diag.natural(Mode::Entry, &passed(4, 0.1, 0.1));
+            diag.found_by(Trigger::Walk);
+        }
+    }
+
+    /// Walking beside a slope or a wall for ten minutes is no climb, and must not write a line a
+    /// second. A few lines stay, so a start that failed still leaves a trace in the log.
+    #[test]
+    fn walking_beside_rock_does_not_fill_the_log() {
+        let diag = Diag::new();
+        let mut pace = Pace::new();
+        let mut lines = 0;
+        for _ in 0..600 {
+            walk_beside_rock(&diag);
+            if changed_line(&mut pace, diag.snapshot(), &diag.lasts()).is_some() {
+                lines += 1;
+            }
+        }
+        assert!((20..=21).contains(&lines), "{lines} lines in 600 seconds");
+    }
+
+    /// The first failed start shows at once, or a session with no climb at all leaves no line,
+    /// which is how the first test of climbing lost its evidence.
+    #[test]
+    fn the_first_failed_start_logs_a_line() {
+        let diag = Diag::new();
+        let mut pace = Pace::new();
+        walk_beside_rock(&diag);
+        assert!(changed_line(&mut pace, diag.snapshot(), &diag.lasts()).is_some());
+    }
+
+    /// A failed start right after a climb waits its turn, and then still shows.
+    #[test]
+    fn a_failed_start_after_a_climb_waits_its_turn() {
+        let diag = Diag::new();
+        let mut pace = Pace::new();
+        diag.steered(0.0);
+        assert!(changed_line(&mut pace, diag.snapshot(), &diag.lasts()).is_some());
+        walk_beside_rock(&diag);
+        for _ in 1..NEAR_TICKS {
+            assert_eq!(
+                changed_line(&mut pace, diag.snapshot(), &diag.lasts()),
+                None
+            );
+        }
+        assert!(changed_line(&mut pace, diag.snapshot(), &diag.lasts()).is_some());
     }
 
     /// Standing still logs nothing either.
     #[test]
     fn no_change_logs_nothing() {
         let diag = Diag::new();
-        let mut last = Snapshot::default();
+        let mut pace = Pace::new();
         diag.steered(0.0);
-        assert!(changed_line(&mut last, diag.snapshot(), &diag.lasts()).is_some());
+        assert!(changed_line(&mut pace, diag.snapshot(), &diag.lasts()).is_some());
         assert_eq!(
-            changed_line(&mut last, diag.snapshot(), &diag.lasts()),
+            changed_line(&mut pace, diag.snapshot(), &diag.lasts()),
             None
         );
     }
 
-    /// Everything that means a climb is happening logs a line.
+    /// Everything that means a climb is happening logs a line, on every tick.
     #[test]
-    fn climb_activity_logs_a_line() {
-        let events: [fn(&Diag); 6] = [
+    fn climb_activity_logs_a_line_every_tick() {
+        let events: [fn(&Diag); 11] = [
             |diag| diag.dropped(true),
             |diag| diag.held(true),
             |diag| diag.graced(),
             |diag| diag.stop(),
             |diag| diag.exit_top(true),
-            |diag| diag.natural(Mode::Entry, &refused(Reject::Bumpy)),
+            |diag| diag.exit_bottom(OK),
+            |diag| diag.top_entry(OK),
+            |diag| diag.low_entry(OK, Some(OK)),
+            |diag| diag.steered(0.0),
+            |diag| diag.natural(Mode::Move, &refused(Reject::Overhang)),
+            |diag| diag.natural(Mode::Stay, &refused(Reject::Hits)),
         ];
         for event in events {
             let diag = Diag::new();
-            let mut last = Snapshot::default();
-            event(&diag);
-            let text = changed_line(&mut last, diag.snapshot(), &diag.lasts());
-            assert!(text.is_some());
+            let mut pace = Pace::new();
+            for _ in 0..5 {
+                event(&diag);
+                let text = changed_line(&mut pace, diag.snapshot(), &diag.lasts());
+                assert!(text.is_some());
+            }
         }
     }
 
     /// The thread's tick reads the shared counts without trouble.
     #[test]
     fn a_tick_runs_on_the_shared_counts() {
-        let mut last = Snapshot::default();
-        tick(&mut last);
-        assert_eq!(last, DIAG.snapshot());
+        let mut pace = Pace::new();
+        tick(&mut pace);
+        assert_eq!(pace.last, DIAG.snapshot());
     }
 }

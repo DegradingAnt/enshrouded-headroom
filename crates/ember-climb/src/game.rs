@@ -22,8 +22,10 @@ pub const MISS: u8 = 0x1f;
 pub const NOT_NOW: u8 = 6;
 /// The size of a probe result: code, position, normal, entity.
 pub const RESULT_SIZE: usize = 0x24;
-/// Where a probe result holds the up part of its normal.
-const RESULT_NORMAL_Y: usize = 0x18;
+/// Where a probe result holds its position.
+const RESULT_POSITION: usize = 0x08;
+/// Where a probe result holds its normal.
+const RESULT_NORMAL: usize = 0x14;
 /// Where a probe result holds its entity.
 const RESULT_ENTITY: usize = 0x20;
 
@@ -256,15 +258,25 @@ pub unsafe fn result_entity(result: *const u8) -> u32 {
     u32::from_le_bytes(bytes)
 }
 
-/// The up part of the normal in the probe result at `result`.
+/// The hit in the bytes of a probe result that passed, or `None` for broken numbers.
+pub fn parse_result(bytes: &[u8; RESULT_SIZE]) -> Option<Hit> {
+    let point = vec3_at(bytes, RESULT_POSITION).filter(|point| point.is_finite())?;
+    let normal = vec3_at(bytes, RESULT_NORMAL).and_then(Vec3::normalized)?;
+    Some(Hit {
+        point,
+        normal,
+        entity: u32_at(bytes, RESULT_ENTITY)?,
+    })
+}
+
+/// The hit in the probe result at `result`, or `None` for broken numbers.
 ///
 /// # Safety
 ///
 /// `result` is a probe result the game just wrote, so all [`RESULT_SIZE`] bytes are readable.
-pub unsafe fn result_normal_y(result: *const u8) -> f32 {
-    // SAFETY: the caller's contract. The field is inside the result.
-    let bytes = unsafe { bytes_at::<4>(result, RESULT_NORMAL_Y) };
-    f32::from_le_bytes(bytes)
+pub unsafe fn result_hit(result: *const u8) -> Option<Hit> {
+    // SAFETY: the caller's contract.
+    parse_result(&unsafe { bytes_at::<RESULT_SIZE>(result, 0) })
 }
 
 /// Replace the probe result at `result`.
@@ -631,13 +643,31 @@ mod tests {
     /// `result_*` read what `encode_result` wrote.
     #[test]
     fn result_fields_round_trip() {
-        let bytes = encode_result(OK, Vec3::default(), Vec3::new(0.0, 0.7, 0.0), 42);
+        let point = Vec3::new(1.0, 2.0, 3.0);
+        let normal = Vec3::new(0.0, 0.6, 0.8);
+        let bytes = encode_result(OK, point, normal, 42);
         // SAFETY: `bytes` is a whole probe result.
         unsafe {
             assert_eq!(result_code(bytes.as_ptr()), OK);
             assert_eq!(result_entity(bytes.as_ptr()), 42);
-            assert_eq!(result_normal_y(bytes.as_ptr()), 0.7);
+            let hit = result_hit(bytes.as_ptr()).unwrap();
+            assert_eq!(hit.point, point);
+            assert!((hit.normal - normal).length() < 1e-6, "{hit:?}");
+            assert_eq!(hit.entity, 42);
         }
+    }
+
+    /// Broken numbers from memory are no hit.
+    #[test]
+    fn a_result_with_broken_numbers_is_no_hit() {
+        let up = Vec3::new(0.0, 1.0, 0.0);
+        let nan = Vec3::new(f32::NAN, 0.0, 0.0);
+        assert_eq!(parse_result(&encode_result(OK, nan, up, 1)), None);
+        assert_eq!(parse_result(&encode_result(OK, up, nan, 1)), None);
+        assert_eq!(
+            parse_result(&encode_result(OK, up, Vec3::default(), 1)),
+            None
+        );
     }
 
     /// `write_result` fills exactly the result and nothing past it.

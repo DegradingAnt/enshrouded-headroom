@@ -17,6 +17,8 @@ use windows_sys::Win32::System::Threading::GetCurrentProcess;
 /// The name ClimbAnywhere's DLL is chained under.
 const CHAINED_NAME: &str = "dinput8hooked.dll";
 /// The loader's name. A real loader sits next to the exe, so this name in `plugins\` is not one.
+/// ClimbAnywhere's server build has this name next to the exe too. It then keeps the loader out, so
+/// this mod does not start and has nothing to refuse.
 const LOADER_NAME: &str = "dinput8.dll";
 /// The folder plugins load from.
 const PLUGIN_FOLDER: &str = "plugins";

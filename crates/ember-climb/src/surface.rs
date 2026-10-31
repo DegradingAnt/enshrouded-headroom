@@ -23,6 +23,9 @@ pub const GAME_STANDOFF: f32 = 0.55;
 const CAPSULE_GAP: f32 = 0.05;
 /// A ray direction with more up in it than this has no sideways axis worth using.
 const MAX_RAY_TILT: f32 = 0.95;
+/// How far inside [`MAX_RAY_TILT`] the climb normal stays, so that rounding in a later frame
+/// cannot push it past the limit and drop the player.
+const TILT_MARGIN: f32 = 0.01;
 /// Extra reach for the hold check, so a move that passed cannot lose the wall a frame later.
 const STAY_EXTRA: f32 = 0.4;
 /// Extra reach of the entry rays past the farthest face they must touch, in metres.
@@ -32,6 +35,14 @@ const MOVE_ROUGHNESS: f32 = 1.5;
 /// Degrees of slope that stay holdable past the walkable limit. The player keeps hold there, so
 /// the climb can end with a mantle instead of a drop.
 const HOLD_MARGIN_DEGREES: f32 = 15.0;
+/// Degrees of overhang a running climb may pass the limit for starting one. A rough patch can read
+/// this much steeper than the rock as a whole, and a hard limit would stop the climb there.
+const OVERHANG_MARGIN_DEGREES: f32 = 15.0;
+/// The collider flag Solid (bit 3). The default surface mask does not ask for it.
+const MASK_SOLID: u32 = 0x08;
+/// How far short of a hit the clearance rays stop, in metres. A rock prop can be Solid and Walkable
+/// at once, and must not block itself.
+const CLEARANCE_GAP: f32 = 0.02;
 /// The widest angle between the stick and the wall that starts a climb, as a cosine. The game's
 /// limit is 0.7853982 radians (45 degrees); only the way it is measured differs here.
 const ENTRY_CONE_COS: f32 = 0.707_106_77;
@@ -109,14 +120,19 @@ pub struct Tuning {
     /// A surface with more up in it than this cannot be moved onto. It is less steep than
     /// walkable, so a climb that reaches it can still end with a mantle.
     pub hold_ny: f32,
-    /// A surface whose normal has less up in it than this hangs over too far.
+    /// A surface whose normal has less up in it than this hangs over too far to start a climb.
     pub overhang_ny: f32,
+    /// A surface whose normal has less up in it than this cannot be moved onto.
+    pub move_overhang_ny: f32,
     /// The farthest the player may be from a surface and still start a climb, in metres.
     pub entry_reach: f32,
-    /// How far the rays reach during a climb, in metres.
+    /// How far the rays reach during a climb, in metres. A wider stand-off under an overhang adds
+    /// to it.
     pub hold_reach: f32,
     /// How far the rays reach when a climb starts, in metres.
     pub entry_ray: f32,
+    /// The exit's ray for the face going on.
+    pub face: crate::exit::FaceRay,
 }
 
 impl Tuning {
@@ -132,17 +148,20 @@ impl Tuning {
         let (entry_reach, hold_reach) = reach;
         let walkable = walkable_angle.to_radians();
         let hold = (walkable_angle - HOLD_MARGIN_DEGREES).to_radians();
+        let past_overhang = (overhang_angle + OVERHANG_MARGIN_DEGREES).to_radians();
         let [top, _] = RAY_ROWS;
         Tuning {
             mask,
             plane_tolerance,
             walkable_ny: walkable.cos(),
-            hold_ny: hold.cos(),
+            hold_ny: hold.cos().min(MAX_RAY_TILT - TILT_MARGIN),
             overhang_ny: overhang_angle.to_radians().cos(),
+            move_overhang_ny: past_overhang.cos(),
             entry_reach,
             hold_reach,
             // A level ray at the top row reaches a leaning face this far past its foot.
             entry_ray: top / walkable.tan() + ENTRY_RAY_SPARE,
+            face: crate::exit::FaceRay::new(walkable_angle),
         }
     }
 }
@@ -192,6 +211,8 @@ pub enum Reject {
     Overhang,
     /// The surface is too far away to start a climb.
     TooFar,
+    /// Something solid stands between the player and the surface.
+    Blocked,
 }
 
 /// A surface fitted through the rays' hits.
@@ -357,10 +378,14 @@ pub fn standoff_target(ny: f32, capsule: Capsule) -> f32 {
 
 /// Is `fit` good enough for `mode`?
 fn judge(fit: &Fit, mode: Mode, t: &Tuning, pos: Vec3, capsule: Capsule) -> Result<(), Reject> {
-    let (tolerance, top) = match mode {
+    let (tolerance, top, bottom) = match mode {
         Mode::Stay => return Ok(()),
-        Mode::Entry => (t.plane_tolerance, t.walkable_ny),
-        Mode::Move => (t.plane_tolerance * MOVE_ROUGHNESS, t.hold_ny),
+        Mode::Entry => (t.plane_tolerance, t.walkable_ny, t.overhang_ny),
+        Mode::Move => (
+            t.plane_tolerance * MOVE_ROUGHNESS,
+            t.hold_ny,
+            t.move_overhang_ny,
+        ),
     };
     if fit.spread > tolerance {
         return Err(Reject::Bumpy);
@@ -368,13 +393,33 @@ fn judge(fit: &Fit, mode: Mode, t: &Tuning, pos: Vec3, capsule: Capsule) -> Resu
     if fit.normal.y > top {
         return Err(Reject::Walkable);
     }
-    if fit.normal.y < t.overhang_ny {
+    if fit.normal.y < bottom {
         return Err(Reject::Overhang);
     }
     if mode == Mode::Entry && near_distance(pos, fit, capsule) > t.entry_reach {
         return Err(Reject::TooFar);
     }
     Ok(())
+}
+
+/// Does something solid stand between the rays' `starts` and their `hits`? The surface rays do not
+/// ask for Solid, so they pass through a tree, a fence or an enemy. These rays stop just short of
+/// each hit. A ray from the chest covers the gap between the side rays, where a thin trunk fits.
+fn blocked<C: Caster>(caster: &C, frame: &Frame, pos: Vec3, starts: &[Vec3], hits: &[Hit]) -> bool {
+    let [top, low] = RAY_ROWS;
+    let chest = pos + frame.up * ((top + low) * 0.5);
+    let rays = || {
+        starts
+            .iter()
+            .zip(hits)
+            .map(|(start, hit)| (*start, (hit.point - *start).dot(frame.along)))
+    };
+    let nearest = rays().map(|(_, length)| length).fold(f32::MAX, f32::min);
+    let in_way = |start: Vec3, length: f32| {
+        let end = start + frame.along * (length - CLEARANCE_GAP);
+        length > CLEARANCE_GAP && caster.cast(start, end, MASK_SOLID).is_some()
+    };
+    in_way(chest, nearest) || rays().any(|(start, length)| in_way(start, length))
 }
 
 /// Probe for a surface from `pos` along `dir`, and answer `mode`.
@@ -392,7 +437,9 @@ pub fn scan<C: Caster>(
     let Some(frame) = Frame::along(dir) else {
         return Scan::refused(0, Reject::Direction);
     };
-    let reach = mode.reach(t);
+    // An overhang holds the player farther out, and the rays must still get to the rock.
+    let wider = standoff_target(-frame.along.y, capsule) - GAME_STANDOFF;
+    let reach = mode.reach(t) + wider;
     let needed = usize::from(mode.needed());
     let spare = RAY_COUNT.saturating_sub(needed);
     let mut found = [Hit {
@@ -400,13 +447,15 @@ pub fn scan<C: Caster>(
         normal: Vec3::default(),
         entity: 0,
     }; RAY_COUNT];
+    let mut starts = [Vec3::default(); RAY_COUNT];
     let mut hits = 0usize;
     let mut misses = 0usize;
     for origin in frame.origins(pos) {
         match caster.cast(origin, origin + frame.along * reach, t.mask) {
             Some(hit) => {
-                if let Some(slot) = found.get_mut(hits) {
+                if let (Some(slot), Some(start)) = (found.get_mut(hits), starts.get_mut(hits)) {
                     *slot = hit;
+                    *start = origin;
                 }
                 hits = hits.saturating_add(1);
             }
@@ -430,10 +479,17 @@ pub fn scan<C: Caster>(
     };
     let stand =
         pos + fit.normal * (standoff_target(fit.normal.y, capsule) - fit.distance(pos, fit.normal));
+    let mut verdict = judge(&fit, mode, t, pos, capsule).map(|()| stand);
+    if mode == Mode::Entry && verdict.is_ok() {
+        let starts = starts.get(..hits).unwrap_or_default();
+        if blocked(caster, &frame, pos, starts, &found) {
+            verdict = Err(Reject::Blocked);
+        }
+    }
     Scan {
         hits: fit.hits,
         fit: Some(fit),
-        verdict: judge(&fit, mode, t, pos, capsule).map(|()| stand),
+        verdict,
         steady: judge(&fit, Mode::Move, t, pos, capsule).is_ok() && fit.hits >= Mode::Move.needed(),
     }
 }
@@ -1126,6 +1182,131 @@ mod tests {
         bad.velocity = UP;
         bad.normal = Vec3::default();
         assert_eq!(steer(&bad, &t, CAPSULE), None);
+    }
+
+    /// A collider that only mask bit 3 sees, and the rock.
+    struct InFront {
+        /// The Solid collider.
+        prop: Plane,
+        /// The surface.
+        rock: Plane,
+    }
+
+    impl Caster for InFront {
+        fn cast(&self, from: Vec3, to: Vec3, mask: u32) -> Option<Hit> {
+            if mask == 0x08 {
+                self.prop.cast(from, to, mask)
+            } else {
+                self.rock.cast(from, to, mask)
+            }
+        }
+    }
+
+    /// The surface rays do not see a Solid-only collider. A tree, a fence or an enemy in front of
+    /// the rock must not let the player latch through it.
+    #[test]
+    fn a_solid_collider_in_the_way_starts_nothing() {
+        let t = tuning();
+        let world = InFront {
+            prop: Plane::wall(0.5),
+            rock: Plane::wall(0.8),
+        };
+        let scan = scan(&world, Vec3::default(), AHEAD, Mode::Entry, &t, CAPSULE);
+        assert_eq!(scan.verdict, Err(Reject::Blocked));
+    }
+
+    /// A Solid collider across one part of the path, as a range of z, and the rock behind it.
+    struct Post(std::ops::Range<f32>);
+
+    impl Caster for Post {
+        fn cast(&self, from: Vec3, to: Vec3, mask: u32) -> Option<Hit> {
+            let solid = mask == 0x08;
+            let wall = if solid { 0.5 } else { 0.8 };
+            let hit = Plane::wall(wall).cast(from, to, mask);
+            hit.filter(|_| !solid || self.0.contains(&from.z))
+        }
+    }
+
+    /// A thin trunk straight ahead fits between the side rays, so the ray from the chest must see
+    /// it. A trunk at the side must not slip past that one ray.
+    #[test]
+    fn a_trunk_in_the_path_starts_nothing() {
+        let t = tuning();
+        for path in [-0.1..0.1, 0.2..0.5, -0.5..-0.2] {
+            let world = Post(path);
+            let scan = scan(&world, Vec3::default(), AHEAD, Mode::Entry, &t, CAPSULE);
+            assert_eq!(scan.verdict, Err(Reject::Blocked), "{:?}", world.0);
+        }
+    }
+
+    /// A rock prop can be Solid and Walkable at once, and rough rock can stand a little proud of
+    /// a hit. The ray stops short of each hit, so rock does not block itself.
+    #[test]
+    fn a_solid_collider_at_the_surface_changes_nothing() {
+        let t = tuning();
+        let world = InFront {
+            prop: Plane::wall(0.79),
+            rock: Plane::wall(0.8),
+        };
+        let scan = scan(&world, Vec3::default(), AHEAD, Mode::Entry, &t, CAPSULE);
+        assert!(scan.verdict.is_ok(), "{scan:?}");
+    }
+
+    /// Only a start asks. During a climb the capsule itself meets what stands in the way.
+    #[test]
+    fn a_running_climb_casts_no_solid_ray() {
+        let t = tuning();
+        let world = InFront {
+            prop: Plane::wall(0.5),
+            rock: Plane::wall(0.8),
+        };
+        for mode in [Mode::Move, Mode::Stay] {
+            let scan = scan(&world, Vec3::default(), AHEAD, mode, &t, CAPSULE);
+            assert!(scan.verdict.is_ok(), "{mode:?}: {scan:?}");
+        }
+    }
+
+    /// Whatever the settings, the climb normal stays a direction a ray patch can be built from.
+    /// At `WalkableAngle` 30 the hold limit alone would pass the limit of the rays, and the next
+    /// hold would drop the player.
+    #[test]
+    fn the_normal_limits_stay_inside_the_ray_limit() {
+        for walkable_angle in [30.0, 33.0, 40.0, 50.0, 75.0] {
+            for overhang_angle in [90.0, 110.0, 135.0] {
+                let settings = crate::config::Settings {
+                    walkable_angle,
+                    overhang_angle,
+                    ..Default::default()
+                };
+                let t = settings.tuning();
+                for ny in [t.hold_ny, t.move_overhang_ny] {
+                    let normal = Vec3::new(-(1.0 - ny * ny).sqrt(), ny, 0.0);
+                    assert!(Frame::along(-normal).is_some(), "{walkable_angle}: {ny}");
+                }
+                assert!(t.hold_ny > t.walkable_ny, "{walkable_angle}: {t:?}");
+            }
+        }
+    }
+
+    /// At the overhang limit the feet hang about 1 m out. The rays must still reach the surface,
+    /// with the same margin as on a sheer wall, whatever the capsule.
+    #[test]
+    fn the_rays_reach_an_overhang_at_the_limit() {
+        for overhang in [100.0, 110.0, 125.0, 135.0] {
+            let settings = crate::config::Settings {
+                overhang_angle: overhang,
+                ..Default::default()
+            };
+            let t = settings.tuning();
+            let normal = face(overhang);
+            let wide = Capsule::from_config(1.0, 2.2);
+            for capsule in [CAPSULE, wide] {
+                let out = standoff_target(normal.y, capsule) + 0.3;
+                let rock = Plane::through(Vec3::default() - normal * out, normal);
+                let scan = scan(&rock, Vec3::default(), -normal, Mode::Move, &t, capsule);
+                assert!(scan.verdict.is_ok(), "{overhang}/{capsule:?}: {scan:?}");
+            }
+        }
     }
 
     /// A curved rock gives a usable fit, and a steady one to steer by.

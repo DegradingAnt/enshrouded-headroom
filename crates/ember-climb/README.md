@@ -8,7 +8,7 @@ Free climbing for Enshrouded, in the style of Breath of the Wild. Climb any stee
 
 The mod needs [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader) as `dinput8.dll` in the game folder.
 
-1. **Remove ClimbAnywhere first.** The two must never run together. Delete `climb-anywhere.asi` and any `dinput8.dll` from `plugins\`, and `dinput8Hooked.dll` from the game folder. You can delete `climb-anywhere.ini` and `climb-anywhere.log` too.
+1. **Remove ClimbAnywhere first.** The two must never run together. Delete `climb-anywhere.asi` and any `dinput8.dll` from `plugins\`, and `dinput8Hooked.dll` from the game folder. You can delete `climb-anywhere.ini` and `climb-anywhere.log` too. If you also used its server build, see "On a dedicated server" below.
 2. Put `ember-climb.asi` and `ember-climb.ini` in `plugins\` in the game folder.
 3. Start the game. `plugins\ember-climb.log` shows what happened.
 
@@ -18,7 +18,16 @@ ember-climb refuses to patch while it sees ClimbAnywhere loaded, and the log say
 
 To remove the mod, delete those two files and the log.
 
-For a dedicated server, do the same in the server folder. The server decides where players are, so the mod must run there for its players to climb. **The server build is not tested at all yet.** See "Server" below.
+### On a dedicated server
+
+The server decides where players are, so the mod must run there for its players to climb. **It has never run on a server yet.** See "Server" below for what was checked.
+
+1. **Remove ClimbAnywhere first.** Its server build is itself a `dinput8.dll` next to `enshrouded_server.exe`, with `climb-anywhere.ini` and `climb-anywhere.log`. Delete all three. While that file stays there, Ultimate ASI Loader cannot take its place, so this mod does not load.
+2. Put Ultimate ASI Loader as `dinput8.dll` next to `enshrouded_server.exe`.
+3. Put `ember-climb.asi` and `ember-climb.ini` in `plugins\` in the server folder.
+4. **Every player needs the mod too**, with the same values in `ember-climb.ini`. Other values on the two sides would pull a climber back and forth. This is the expected behaviour, and it has not been tested.
+
+Under Wine or Proton, the server also needs `WINEDLLOVERRIDES="dinput8=n,b"`, or Wine loads its own `dinput8`.
 
 ## What you should see
 
@@ -45,11 +54,13 @@ If the mod stays off, the log says why in one line:
 
 ## Reading the diagnostics
 
-While climbing happens, the log gets one line a second, like this (shortened):
+While a climb starts, runs or ends, the log gets one line a second, like this (shortened):
 
 ```text
-climb diag: probe ok 0, 0x15 0, 0x1e 0, 0x1f 412 ... | natural entry 3/90, move 180/190, stay 200/200 (refused dir 0, hits 12, bumpy 8, walkable 0, overhang 0, far 67; last hits 4 spread 0.12 ny 0.21 gap +0.02) | ... | lost 0/200 (voxel 200, grace 0, no probe 0) | steer 180 | ...
+climb diag: probe ok 0, 0x15 0, 0x1e 0, 0x1f 412 ... | natural entry 3/90, move 180/190, stay 200/200 (refused dir 0, hits 12, bumpy 8, walkable 0, overhang 0, far 67, blocked 0; last hits 4 spread 0.12 ny 0.21 gap +0.02) | ... | lost 0/200 (voxel 200, grace 0, no probe 0) | steer 180 | ...
 ```
+
+If a surface was near and no climb started, the log gets one line at most every 30 seconds. A start that failed still leaves a trace, and a walk along a cliff does not fill the log.
 
 The counts add up over the session. `natural entry 3/90` means 90 tries to start a climb on natural rock and 3 that could start.
 
@@ -57,7 +68,7 @@ The counts add up over the session. `natural entry 3/90` means 90 tries to start
 |---|---|
 | `probe ok` | The game's own probe passed: a lattice. |
 | `natural entry`, `move`, `stay` | The mod's surface fit, for starting, moving and holding. |
-| `refused` | Why a surface was refused: `hits` too few rays hit, `bumpy` not one surface, `walkable` too flat, `overhang` hangs over too far, `far` out of reach. |
+| `refused` | Why a surface was refused: `hits` too few rays hit, `bumpy` not one surface, `walkable` too flat, `overhang` hangs over too far, `far` out of reach, `blocked` something solid stands in the way. |
 | `last hits`, `spread`, `ny`, `gap` | The last fit: rays that hit, unevenness in metres, how much the surface faces up, and how far the player is past the wanted distance. |
 | `found` | How the player was moving when a surface was found. `off` counts starts that a setting refused. |
 | `low` | The game's start check: `angle` the stick was too far off, `cone` the mod's own test let it through. |
@@ -82,9 +93,9 @@ All settings are in `ember-climb.ini`, and all need a restart. A value that is n
 | Start | Sprint | 1 | 0 or 1 | Sprinting into one starts a climb. |
 | Start | Glide | 0 | 0 or 1 | Gliding into one starts a climb. Experimental, see below. |
 | Tuning | WalkableAngle | 50 | 30 to 75 | Surfaces less steep than this, in degrees, can be walked on. They start no climb, and a climb can end on them. |
-| Tuning | OverhangAngle | 110 | 90 to 135 | The farthest a face may hang over, in degrees. 90 is a sheer wall. |
+| Tuning | OverhangAngle | 110 | 90 to 135 | The farthest a face may hang over to start a climb, in degrees. 90 is a sheer wall. A running climb gets 15 degrees more, so that one rough patch does not stop it. |
 | Tuning | EntryReach | 0.95 | 0.6 to 1.4 | How close you must be to start a climb, in metres. |
-| Tuning | HoldReach | 1 | 0.8 to 1.6 | How far the mod looks for the surface during a climb, in metres. |
+| Tuning | HoldReach | 1 | 0.8 to 1.6 | How far the mod looks for the surface during a climb, in metres. Under an overhang you hang farther out, and it looks that much farther. |
 | Tuning | GraceSeconds | 0.15 | 0 to 1 | How long a lost surface is forgiven before you fall. |
 | Debug | Diagnostics | 1 | 0 or 1 | The one-line-a-second log. It also adds five small hooks. |
 
@@ -101,15 +112,19 @@ The game already climbs, but only on flat iron lattices. Its wall probe wants fo
 - The game's probe always runs first, so a lattice stays exactly as it was. No mask or tolerance in the game is changed.
 - When the probe fails, the mod casts four rays of its own at the surface, averages what they hit, and asks whether it is steep and flat enough.
 - The game moves a climber along world up, which walks straight off any face that leans. The mod turns the movement into the surface, keeps the speed, and holds the game's 0.55 m distance.
-- The game has no exit where a wall turns into a slope, and it mantles onto steep rock. The mod refuses the second and finds the first.
+- The game has no exit where a wall turns into a slope, and it mantles onto steep rock. The mod refuses the second and finds the first. One triangle of rough rock can look like a floor, so the mod judges a floor as an area, and it looks whether the face goes on ahead of your head.
 - A half-pressed stick fails the game's start test however straight you run at a wall. The mod tests only the heading.
 - A surface lost for a moment is forgiven, so a seam in the rock does not drop you.
 
 Evidence for every game fact is in [docs/re-notes.md](../../docs/re-notes.md), "Free climbing".
 
+## Limits
+
+- A surface must reach 2 m above your feet to start a climb. A lower wall starts nothing, and neither does a ledge you jump at when it is less than 2 m above your feet at that moment. Use the game's jump there. This may change after the first play test.
+
 ## Server
 
-The mod is built for the dedicated server build `d7baa768-server`, and the code path is the same. **The server exe was not available when this was written, so nothing here has been checked against it.** If any signature does not match exactly once there, the mod logs which one and installs nothing. Before a server test:
+The mod is built for the dedicated server build `d7baa768-server`. All 15 signatures match exactly once in that exe. The functions the mod hooks are the same as the client's, instruction by instruction, with addresses set aside. **It has never run on a server**, so how it behaves there and how a modded server looks to a client are not known. If a signature does not match exactly once, the mod logs which one and installs nothing. To check an exe again:
 
 ```text
 set ENSHROUDED_SERVER_EXE=<path to enshrouded_server.exe>

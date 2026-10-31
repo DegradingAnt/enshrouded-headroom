@@ -42,7 +42,7 @@ pub struct Settings {
     pub glide: bool,
     /// Surfaces less steep than this are walkable, in degrees.
     pub walkable_angle: f32,
-    /// The farthest a face may hang over, in degrees.
+    /// The farthest a face may hang over to start a climb, in degrees.
     pub overhang_angle: f32,
     /// How close the player must be to start a climb, in metres.
     pub entry_reach: f32,
@@ -310,7 +310,7 @@ pub fn schema() -> &'static [Setting] {
             "OverhangAngle",
             (90.0, 135.0),
             "110",
-            "The farthest a face may hang over, in degrees.",
+            "The farthest a face may hang over to start a climb, in degrees.",
         ),
         number(
             "Tuning",
@@ -337,7 +337,7 @@ pub fn schema() -> &'static [Setting] {
             "Debug",
             "Diagnostics",
             "1",
-            "One log line a second while climbing happens.",
+            "Log what each step of a climb did, to show which step failed.",
         ),
     ];
     &SCHEMA
@@ -517,6 +517,8 @@ mod tests {
         assert!(t.hold_ny > t.walkable_ny);
         assert!((t.overhang_ny - 110f32.to_radians().cos()).abs() < 1e-6);
         assert!(t.overhang_ny < 0.0);
+        assert!((t.move_overhang_ny - 125f32.to_radians().cos()).abs() < 1e-6);
+        assert_eq!(t.face, crate::exit::FaceRay::new(50.0));
         assert_eq!(t.mask, 0x124);
     }
 

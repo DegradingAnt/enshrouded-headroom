@@ -18,6 +18,8 @@ const DT: f32 = 1.0 / 60.0;
 
 /// Does the fake raycast hit anything?
 static WALL_THERE: AtomicBool = AtomicBool::new(true);
+/// Is there flat ground at height 0 for the rays to find?
+static FLOOR_THERE: AtomicBool = AtomicBool::new(false);
 /// Does the fake game probe pass, as on a lattice?
 static LATTICE: AtomicBool = AtomicBool::new(false);
 /// Rays cast so far.
@@ -48,17 +50,24 @@ unsafe extern "system" fn plane_raycast(
     let [fx, fy, fz, _, tx, ty, tz, _] = unsafe { ray.cast::<[f32; 8]>().read_unaligned() };
     let mut bytes = [0u8; 0x70];
     bytes[0] = MISS;
+    let mut hit = None;
     if WALL_THERE.load(Ordering::Relaxed) && fx < WALL_X && tx >= WALL_X {
         let t = (WALL_X - fx) / (tx - fx);
-        bytes[0] = OK;
-        let fields = [
+        hit = Some([
             WALL_X,
             fy + (ty - fy) * t,
             fz + (tz - fz) * t,
             -1.0,
             0.0,
             0.0,
-        ];
+        ]);
+    }
+    if FLOOR_THERE.load(Ordering::Relaxed) && fy >= 0.0 && ty < 0.0 {
+        let t = fy / (fy - ty);
+        hit = Some([fx + (tx - fx) * t, 0.0, fz + (tz - fz) * t, 0.0, 1.0, 0.0]);
+    }
+    if let Some(fields) = hit {
+        bytes[0] = OK;
         let (slots, _) = bytes[0x14..0x2c].as_chunks_mut::<4>();
         for (slot, field) in slots.iter_mut().zip(fields) {
             *slot = field.to_le_bytes();
@@ -160,11 +169,12 @@ unsafe extern "system" fn game_exit_query(
     _ctx: *mut u8,
     _pos: *const f32,
 ) -> *mut u8 {
-    let ny = EXIT_NY.load(Ordering::Relaxed);
-    let bytes = if ny == 0 {
+    let ny = EXIT_NY.load(Ordering::Relaxed) as f32 / 100.0;
+    let bytes = if ny == 0.0 {
         failed_result(MISS)
     } else {
-        encode_result(OK, Vec3::default(), UP * (ny as f32 / 100.0), 0)
+        let normal = Vec3::new(-(1.0 - ny * ny).sqrt(), ny, 0.0);
+        encode_result(OK, Vec3::default(), normal, 0)
     };
     // SAFETY: the function's contract.
     unsafe { write_result(out, &bytes) };
@@ -448,14 +458,36 @@ fn a_climb_runs_through_the_detours() {
     assert_eq!(player.wall_lost(), 0, "past the limit the player drops");
     WALL_THERE.store(true, Ordering::Relaxed);
 
-    // Steep rock is no exit for a climber, and a real floor stays the game's exit.
+    // Steep rock is no exit for a climber, and a real floor stays the game's exit. The hook hands
+    // over where the game's floor lies: with no ground around that spot it is one stray triangle.
     assert_eq!(player.wall_lost(), HELD);
     EXIT_NY.store(30, Ordering::Relaxed);
     assert_eq!(player.exit_query(0.03)[0], MISS);
     EXIT_NY.store(95, Ordering::Relaxed);
+    assert_eq!(player.exit_query(0.03)[0], MISS);
+    FLOOR_THERE.store(true, Ordering::Relaxed);
     assert_eq!(player.exit_query(0.03)[0], OK);
+    FLOOR_THERE.store(false, Ordering::Relaxed);
     EXIT_NY.store(0, Ordering::Relaxed);
     assert_eq!(player.exit_query(0.03)[0], MISS);
+
+    // A player the move check stopped is judged by the area alone, so one steep triangle in good
+    // ground stands as the game's floor. The next frame starts clean, and the search goes past
+    // that triangle.
+    assert_eq!(player.wall_lost(), HELD);
+    WALL_THERE.store(false, Ordering::Relaxed);
+    let (_, passed) = player.move_check(UP * 1.95);
+    assert_eq!(passed, 0);
+    WALL_THERE.store(true, Ordering::Relaxed);
+    FLOOR_THERE.store(true, Ordering::Relaxed);
+    EXIT_NY.store(30, Ordering::Relaxed);
+    let (kept, _) = fields(&player.exit_query(0.03));
+    assert_eq!(kept, Vec3::default(), "the game's floor stands");
+    assert_eq!(player.wall_lost(), HELD);
+    let (found, _) = fields(&player.exit_query(0.03));
+    assert!(found.x > 1.0, "the search's floor: {found:?}");
+    FLOOR_THERE.store(false, Ordering::Relaxed);
+    EXIT_NY.store(0, Ordering::Relaxed);
 
     // A lattice is the game's alone. No ray is cast, the velocity stands, the normal stands, and
     // the game's exit stands even on a steep floor.

@@ -842,11 +842,47 @@ These are the spike's proposed steps, including its then-pending documentation p
 
 ## Free climbing (ember-climb)
 
-Every game fact `crates/ember-climb` relies on is here. Addresses are the client's. All of them come from the reference exe sha256 `b28b448a…`, whose `.text` is identical to the Steam exe sha256 `d64966e2…`. `crates/ember-climb/tests/real_exe.rs` re-checks the signatures on the Steam exe file.
+Every game fact `crates/ember-climb` relies on is here. Addresses are the client's. All of them come from the reference exe sha256 `b28b448a…`, whose `.text` is identical to the Steam exe sha256 `d64966e2…`. `crates/ember-climb/tests/real_exe.rs` re-checks the signatures on the Steam exe file and on the server exe.
 
 **Nothing below has run in the game.** VERIFIED means read from the exe. It does not mean the mod works. Every statement about feel is a HYPOTHESIS until a play test says otherwise.
 
-**The server is unproven.** The server exe was not on disk when this crate was written, so no fact here was read from it. The build table and the signature list are the only link to it. If a signature does not match exactly once in that exe, the mod logs which one and installs nothing.
+**The server exe has been checked, and nothing has run on a server.** See "Server exe checks". How the mod behaves on a server is a HYPOTHESIS. If a signature does not match exactly once in that exe, the mod logs which one and installs nothing.
+
+### Server exe checks
+
+The file is `enshrouded_server.exe`, build 26083076, sha256 `d7baa768eb00aa895d9f5a1cd8747ccf66858c7b542f50983092b2e3261588ee`. Its image base is 0x140000000, the same as the client's.
+
+- [VERIFIED] All 15 signatures match exactly once in the server's `.text`, and every real-exe test passes on both exes.
+  - Receipt: `cargo test -p ember-climb --test real_exe -- --ignored` with `ENSHROUDED_SERVER_EXE` set gives 11 passed, 0 failed. The addresses below come from the same run, with `--nocapture`.
+- [VERIFIED] 17 functions are the same in both exes, instruction by instruction, with addresses masked: probe (344 instructions), wall-lost check (65), exit query (173), bottom entry (133), top entry (324), bottom exit (63), exit-top check (28), stop (52), move check (173), start check (223), raycast (57), raycast backend (261), climb update (478), state reader (15), ability reader (29), spark test (3), `FUN_14024c040` (33).
+  - Receipt: Each pair disassembled with iced, addresses replaced by one token, then diffed: 0 lines differ.
+- [VERIFIED] `ecs.Climb`, `ecs.MovementColliderConfig`, `ecs.MovementCollider` and `ecs.MovementCollisionResults` have the same fields at the same offsets in both exes.
+  - Receipt: `python -I rtype.py <exe> ecs.Climb ecs.MovementColliderConfig ecs.MovementCollider ecs.MovementCollisionResults` on each exe, descriptor addresses masked: `diff` is empty over 86 lines.
+- [VERIFIED] The server imports `DINPUT8.dll`, so Ultimate ASI Loader can load there under that name.
+  - Receipt: The PE import directory lists 17 DLLs, `DINPUT8.dll` among them.
+- [HYPOTHESIS] `world+0x1a0` is set on the server. The code that reads it is the same, and nobody has seen its value at run time.
+- [HYPOTHESIS] Client and server both need the mod, with the same `ember-climb.ini`. A client without it, or with other limits, would disagree with the server about where a climber may be.
+  - Receipt: No test yet. The climb programs read authoritative ECS. ClimbAnywhere's public server README asks the same of that mod.
+- [HYPOTHESIS] `dinput8.dll` next to `enshrouded_server.exe` is Ultimate ASI Loader. `coexist.rs` cannot tell it from ClimbAnywhere's server build, which has the same name in the same place. That build normally keeps the loader out, so this mod does not start at all. The overlap needs a second proxy.
+  - Receipt: Public README text only. No third-party DLL was opened.
+
+| Site | Client | Server |
+|---|---|---|
+| `PROBE_FN` | 0x14024abc0 | 0x14005f390 |
+| `WALL_LOST_FN` | 0x14024b390 | 0x14005fb60 |
+| `WALL_LOST_RET` match | 0x14024b48b | 0x14005fc5b |
+| `ATTACH_STORE` | 0x140418db8 | 0x1401b9d08 |
+| `MOVE_CHECK_FN` | 0x140417d90 | 0x1401b8ce0 |
+| `EXIT_QUERY_FN` | 0x14024a6f0 | 0x14005eec0 |
+| `START_FN` | 0x140419570 | 0x1401ba4c0 |
+| `ENTER_LAYER` match | 0x140419935 | 0x1401ba885 |
+| `RAYCAST_FN` | 0x1409fff60 | 0x1406a18e0 |
+| `LOW_ENTRY_FN` | 0x14024c0d0 | 0x1400608a0 |
+| `TOP_ENTRY_FN` | 0x14024c320 | 0x140060af0 |
+| `STOP_FN` | 0x14024a090 | 0x14005e860 |
+| `EXIT_TOP_FN` | 0x14024c9f0 | 0x1400611c0 |
+| `EXIT_LOW_FN` | 0x14024c8f0 | 0x1400610c0 |
+| `STAMINA_CALL` | 0x1402eb77e | 0x1400d8a6e |
 
 ### Corrections to the climbing spike
 
@@ -931,6 +967,29 @@ The first experiment widened the wall-probe mask and the plane tolerance. Its te
 - [VERIFIED] `FUN_14024a360` has two twins with the same body and another key, so no pattern on the function matches once. Its only caller is the stamina program.
   - Receipt: A 113-byte pattern with the two rel32s as wildcards still matches 3 times in the Steam exe. `procedure_callers 0x14024a360` gives 0x1402eb420.
 
+### The exit
+
+- [VERIFIED] The exit query's result has two readers, both right behind it in the climb update: `FUN_14024bf60`, which runs the head sphere, and `FUN_14024bc90`, which builds the mantle. So a refused result changes nothing else.
+  - Receipt: `FUN_140418c50`: `FUN_14024a6f0(&local_e8,…)`, then `FUN_14024bf60(&local_168,local_118)`, then `FUN_14024c9f0` and `FUN_14024bc90(&local_168,uVar15,&local_188)`. No other use of `local_e8`.
+- [VERIFIED] The head sphere runs in the same frame. A failed result casts nothing and blocks the exit.
+  - Receipt: `FUN_14023c0e0`: `FUN_1409999a0` inline, flag byte +0x1d. `cVar6 != 0` stores flag 1. `FUN_14023c0b0` passes only with flags 1 and 2 clear.
+- [VERIFIED] The mantle's first two points use the climb normal, not the normal in the result. The result gives only the position.
+  - Receipt: `FUN_14024bc90`: `uVar1 = *(climb + 4)`, then `fVar2 + uVar1 * 1.05`.
+- [VERIFIED] The exit needs `ActorInput+0x194 > 0`, the stick, and not movement. After going down the stick is up while the velocity still points down, for up to 39 ms. A one-triangle floor can fire in those frames unless the exit is refused while the player does not rise.
+  - Receipt: `FUN_14024c9f0`. The time is arithmetic: 1.95 m/s at the 50 m/s² in `FUN_140418c50`.
+- [VERIFIED] Mask 0x24 reaches the same positions as the game's floor mask 0x21, and it gets normals from before displacement.
+  - Receipt: Bodies and flags under "Why the old approach failed": flag 1 and flag 4 both have displaced positions, and only flag 1 has displaced normals.
+- [VERIFIED] On a smooth face under a flat top, the upper ray row lands on the top first. Then the move check sees two rays on the flat and two on the face, and refuses with Walkable. The hold still sees the face, one frame behind. For faces below about 62 degrees every exit ray of the first build stayed short of the corner, so the player stopped for good: at 60 degrees the search reached 0.83 m past the feet and the corner lay 0.87 m on.
+  - Receipt: Arithmetic from the ray rows and `FUN_14024a6f0`. `crates/ember-climb/src/testworld.rs`, `a_leaning_face_with_a_flat_top_ends_in_a_mantle`, fails on the first build.
+- [HYPOTHESIS] How rough the undisplaced mesh is. The tests run with clean undisplaced normals and with normals as rough as the positions. Nobody has measured the game's triangles.
+
+What the crate does, in order, when the player rises:
+
+1. A level ray from 0.5 m above ray A's end looks ahead. With the ground under its start it gives the slope of the rock over a metre or more, from positions alone. A steep rise on the plane of the climb means the face goes on, and there is no exit.
+2. A floor must be walkable as an area: at least 3 of 4 rays, 0.35 m around it, and their averaged normal.
+3. The candidates are the game's floor, the ground under a walkable patch, a slope at head height, and four columns from 0 to 1.2 m past ray A's end.
+4. A player the move check stopped gets no second look at the same spot, so one triangle does not decide there, and a walkable patch overrides step 1.
+
 ### What the crate changes
 
 | Site | Client address | Change | Signature |
@@ -940,7 +999,7 @@ The first experiment widened the wall-probe mask and the plane tolerance. Its te
 | Wall-lost return | 0x14024b4a5 | 12 bytes: id 0 returns 0xffffffff | `WALL_LOST_RET` +26 |
 | Attachment store | 0x140418db8 | 19 bytes: reordered, see below | `ATTACH_STORE` |
 | Move check | 0x140417d90 | pre-hook: steering | `MOVE_CHECK_FN` |
-| Exit query | 0x14024a6f0 | post-hook: walkable test | `EXIT_QUERY_FN` |
+| Exit query | 0x14024a6f0 | post-hook: see "The exit" | `EXIT_QUERY_FN` |
 | Bottom entry | 0x14024c0d0 | hook: trigger and cone test | `LOW_ENTRY_FN` |
 | Start check | 0x140419570 | hook: glider, diagnostics | `START_FN` |
 | Enter layer | 0x140419947 | 1 byte 0x13 to 0x10, only with `Glide = 1` | `ENTER_LAYER` +18 |
@@ -967,15 +1026,18 @@ All of these are HYPOTHESIS until a play test. Most are settings.
 - [HYPOTHESIS] `PlaneTolerance` 0.45 m, measured along the fitted normal.
 - [HYPOTHESIS] `HoldReach` 1.0 m, `EntryReach` 0.95 m, `GraceSeconds` 0.15, `OverhangAngle` 110.
 - [HYPOTHESIS] Ray side offset 0.35 m, normal time 0.12 s, stand-off gain 6 per second, speed 1.2 m/s, deadband 0.03 m.
+- [HYPOTHESIS] The exit's numbers: ring 0.35 m and 3 of 4 rays, level ray 0.5 m above ray A's end, reaching planes 3 degrees flatter than `WalkableAngle`, a face at a rise 8 degrees flatter, 0.7 m off the climb plane for another rock. A closed-loop simulation of rough rock chose them. It proves nothing about the game's rock.
+- [HYPOTHESIS] A running climb may pass `OverhangAngle` by 15 degrees, the same margin as on the walkable side.
 - [HYPOTHESIS] Mask bit 2 covers terrain and player walls, and bit 5 covers rock props. Prop flags are data.
-- [HYPOTHESIS] Actors do not carry `Walkable`.
+- [HYPOTHESIS] Actors do not carry `Walkable`, and enemies and trees carry `Solid`. A start casts Solid-only rays, 0.02 m short of each surface hit and once from the chest. The game's own clearance mask adds bits 1 and 5, but bit 1 is the undisplaced body, which can stand in front of the rock, and bit 5 is the surface itself.
+  - Receipt: Mask {1,3,5} at 0x14024ad54. Bits from `ecs.ColliderFlags`. The flags of a given prop are data, and were not read.
 
 ### Open at the first play test
 
 - [HYPOTHESIS] Glider start: three points are unproven. A sequence may not preempt the glider on layer 0x10, HangGliding may not end when Enter replaces it, and world move input may be zero while gliding.
 - [HYPOTHESIS] The capsule width is data and was not read. The 0.55 m stand-off may leave little gap. The diagnostics line prints the real width and height.
-- [HYPOTHESIS] Whether the server exe matches any of this. Run `cargo test -p ember-climb --test real_exe -- --ignored` with `ENSHROUDED_SERVER_EXE` set, and open that exe in REA to confirm `world+0x1a0`.
 - [HYPOTHESIS] Whether a client without the mod shows a modded server's climber correctly.
+- Open for the author: a surface that tops out under 2 m above the feet starts no climb, because a start needs 3 of 4 rays and the upper row is at 2 m. It also covers a jump at a ledge just above the player. One option is a start on the lower row alone when a floor sits above it, so the climb goes straight to the mantle. The build keeps the limit until the author decides.
 
 
 ## Glass and window materials (2026-10-26 spike)

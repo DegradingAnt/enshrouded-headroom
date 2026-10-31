@@ -2,10 +2,11 @@
 //!
 //! The order inside one climbing frame (`FUN_140418c50`) is what ties these together:
 //! 1. the wall-lost check runs the probe in [`Mode::Stay`], and the fit is kept for this frame;
-//! 2. the move check steers with that fit, then runs the probe in [`Mode::Move`];
-//! 3. the exit query is corrected, using that fit.
+//! 2. the move check steers with that fit, then runs the probe in [`Mode::Move`], and its answer
+//!    is kept for this frame;
+//! 3. the exit query is corrected, using that fit and that answer.
 //!
-//! All of that happens in one call on one thread, so the fit lives in a thread-local. State that
+//! All of that happens in one call on one thread, so both live in thread-locals. State that
 //! must last between frames is the climb normal, in the game's own component, and the grace
 //! table. Nothing here allocates, takes a lock or logs.
 
@@ -20,7 +21,7 @@ use crate::config::Settings;
 use crate::diag::DIAG;
 use crate::exit::{self, Exit};
 use crate::game::{
-    self, encode_result, failed_result, read_vec3, result_code, result_entity, result_normal_y,
+    self, encode_result, failed_result, read_vec3, result_code, result_entity, result_hit,
     write_result, write_vec3, Actor, Ctx, GameCaster, RaycastFn, Trigger, MISS, NOT_NOW, OK,
     RESULT_SIZE,
 };
@@ -150,6 +151,8 @@ thread_local! {
     static NESTED: Cell<Option<u8>> = const { Cell::new(None) };
     /// This frame's hold.
     static HOLD: Cell<Option<Hold>> = const { Cell::new(None) };
+    /// Did the move check find no way on this frame?
+    static STUCK: Cell<bool> = const { Cell::new(false) };
     /// The trigger of the entry running now, if a natural surface may answer it.
     static TRIGGER: Cell<Option<Trigger>> = const { Cell::new(None) };
     /// The natural surface the entry running now found.
@@ -403,6 +406,7 @@ unsafe fn wall_lost_original(ctx: *mut u8) -> (u32, Option<u8>) {
     let lost = unsafe { std::mem::transmute::<usize, WallLostFn>(trampoline) };
     clear_nested();
     set(&HOLD, None);
+    set(&STUCK, false);
     set(&MODE, Some(Mode::Stay));
     // SAFETY: the game's own argument, passed on unchanged.
     let id = unsafe { lost(ctx) };
@@ -610,6 +614,8 @@ unsafe fn move_check_original(velocity: *mut f32, ctx: *mut u8, pos: *const f32,
     // SAFETY: the game's own arguments, passed on unchanged.
     let passed = unsafe { check(velocity, ctx, pos, dt) };
     set(&MODE, None);
+    // `al` is the answer. The upper bits are whatever the check left in `rax`.
+    set(&STUCK, passed as u8 == 0);
     passed
 }
 
@@ -675,9 +681,13 @@ unsafe fn correct_exit(result: *mut u8, ctx: Ctx, pos: *const f32) {
         normal,
         moving_up: pos.y > current.y + MOVING_UP,
         // SAFETY: the function's contract: the query writes a whole result on every path.
-        floor_ny: (code == OK).then(|| unsafe { result_normal_y(result) }),
+        floor: (code == OK)
+            .then(|| unsafe { result_hit(result) })
+            .flatten(),
         patch: hold.fit.map(patch_of),
         walkable_ny: runtime.tuning.walkable_ny,
+        face: runtime.tuning.face,
+        stuck: get(&STUCK, false),
     };
     let bytes = match exit::decide(&caster, &query) {
         Exit::Keep => return,

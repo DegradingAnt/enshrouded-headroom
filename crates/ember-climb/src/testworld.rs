@@ -239,6 +239,192 @@ impl Caster for Profile {
     }
 }
 
+/// A rock line in the x-y plane, stretched along z and cut into flat triangles, like the game's
+/// voxel mesh. Every corner is set in or out by a fixed pattern of up to `depth` metres, which is
+/// the displacement. As with the game's voxel bodies, a ray always stops at the displaced rock.
+/// Mask bit 0 gets the flat normal of the displaced triangle. Any other mask gets the flat normal
+/// of the same triangle before displacement. Only front faces answer.
+pub struct Faceted {
+    /// The grid size, in metres.
+    cell: f32,
+    /// Corners in one row.
+    width: usize,
+    /// The corners before displacement, row by row.
+    plain: Vec<Vec3>,
+    /// The corners after displacement.
+    rough: Vec<Vec3>,
+    /// Each row of cells as lowest x, highest x, lowest y and highest y, so a ray skips most rows.
+    bounds: Vec<[f32; 4]>,
+}
+
+/// How far a [`Faceted`] rock runs to each side of the climber, in metres.
+const FACETED_SIDE: f32 = 4.0;
+/// How far a [`Faceted`] rock runs below the feet of a climber at height 0, in metres.
+const FACETED_FOOT: f32 = 4.0;
+
+impl Faceted {
+    /// The rock along `line`, bottom first, with the rock on its right.
+    pub fn new(line: &[(f32, f32)], depth: f32, cell: f32, seed: u32) -> Faceted {
+        let mut samples = Vec::new();
+        for pair in line.windows(2) {
+            let (from, to) = (pair[0], pair[1]);
+            let steps = ((to.0 - from.0).hypot(to.1 - from.1) / cell)
+                .round()
+                .max(1.0) as u32;
+            for step in 0..steps {
+                let share = step as f32 / steps as f32;
+                samples.push((
+                    from.0 + (to.0 - from.0) * share,
+                    from.1 + (to.1 - from.1) * share,
+                ));
+            }
+        }
+        samples.extend(line.last());
+        let width = (FACETED_SIDE * 2.0 / cell) as usize + 1;
+        // xorshift: the same seed gives the same rock on every machine.
+        let mut state = seed.wrapping_mul(2_654_435_761) | 1;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as f32 / u32::MAX as f32 * 2.0 - 1.0
+        };
+        let (mut plain, mut rough) = (Vec::new(), Vec::new());
+        for (index, &(x, y)) in samples.iter().enumerate() {
+            let before = samples[index.saturating_sub(1)];
+            let after = samples[(index + 1).min(samples.len() - 1)];
+            let normal = Vec3::new(before.1 - after.1, after.0 - before.0, 0.0)
+                .normalized()
+                .expect("the corners differ");
+            for column in 0..width {
+                let corner = Vec3::new(x, y, column as f32 * cell - FACETED_SIDE);
+                plain.push(corner);
+                rough.push(corner + normal * (next() * depth));
+            }
+        }
+        let bounds = rough
+            .chunks(width)
+            .collect::<Vec<_>>()
+            .windows(2)
+            .map(|rows| {
+                let (mut low_x, mut high_x) = (f32::MAX, f32::MIN);
+                let (mut low_y, mut high_y) = (f32::MAX, f32::MIN);
+                for corner in rows[0].iter().chain(rows[1]) {
+                    low_x = low_x.min(corner.x);
+                    high_x = high_x.max(corner.x);
+                    low_y = low_y.min(corner.y);
+                    high_y = high_y.max(corner.y);
+                }
+                [low_x, high_x, low_y, high_y]
+            })
+            .collect();
+        Faceted {
+            cell,
+            width,
+            plain,
+            rough,
+            bounds,
+        }
+    }
+
+    /// The same rock with its roughness in the mesh itself, so the undisplaced normals are just as
+    /// rough as the displaced ones. Nobody knows yet how rough the game's undisplaced mesh is.
+    pub fn rough_normals(mut self) -> Faceted {
+        self.plain.clone_from(&self.rough);
+        self
+    }
+
+    /// A face at `angle` degrees through the origin, as far up as anyone climbs in a test.
+    pub fn face(angle: f32, depth: f32, seed: u32) -> Faceted {
+        Faceted::bent(angle, angle, 14.0, depth, seed)
+    }
+
+    /// A face at `lower` degrees through the origin up to height `corner`, then 6 m at `upper`.
+    pub fn bent(lower: f32, upper: f32, corner: f32, depth: f32, seed: u32) -> Faceted {
+        let lean = lower.to_radians();
+        let foot = (-FACETED_FOOT / lean.tan(), -FACETED_FOOT);
+        let knee = (corner / lean.tan(), corner);
+        let turn = upper.to_radians();
+        let end = (knee.0 + turn.cos() * 6.0, knee.1 + turn.sin() * 6.0);
+        Faceted::new(&[foot, knee, end], depth, 0.5, seed)
+    }
+
+    /// The three corners of one triangle of a cell.
+    fn triangle(&self, row: usize, column: usize, second: bool) -> [usize; 3] {
+        let at = row * self.width + column;
+        let (up, side) = (at + self.width, at + 1);
+        if second {
+            [up + 1, side, up]
+        } else {
+            [at, up, side]
+        }
+    }
+
+    /// The flat normal of a triangle, facing the player.
+    fn normal_of(corners: &[Vec3], [a, b, c]: [usize; 3]) -> Option<Vec3> {
+        (corners[c] - corners[a])
+            .cross(corners[b] - corners[a])
+            .normalized()
+    }
+}
+
+impl Caster for Faceted {
+    fn cast(&self, from: Vec3, to: Vec3, mask: u32) -> Option<Hit> {
+        let ray = to - from;
+        let (low_x, high_x) = (from.x.min(to.x), from.x.max(to.x));
+        let (low_y, high_y) = (from.y.min(to.y), from.y.max(to.y));
+        let column_of = |z: f32| (z + FACETED_SIDE) / self.cell;
+        let first = column_of(from.z.min(to.z)).floor().max(0.0) as usize;
+        let last = (column_of(from.z.max(to.z)).floor() as usize + 1).min(self.width - 1);
+        let mut best: Option<(f32, [usize; 3])> = None;
+        for (row, row_box) in self.bounds.iter().enumerate() {
+            let [left, right, bottom, top] = *row_box;
+            if right < low_x || left > high_x || top < low_y || bottom > high_y {
+                continue;
+            }
+            for column in first..last {
+                for second in [false, true] {
+                    let triangle = self.triangle(row, column, second);
+                    let Some(normal) = Faceted::normal_of(&self.rough, triangle) else {
+                        continue;
+                    };
+                    if normal.dot(ray) >= 0.0 {
+                        continue;
+                    }
+                    let [a, b, c] = triangle.map(|corner| self.rough[corner]);
+                    let (edge_b, edge_c) = (b - a, c - a);
+                    let across = ray.cross(edge_c);
+                    let scale = 1.0 / edge_b.dot(across);
+                    let gap = from - a;
+                    let u = gap.dot(across) * scale;
+                    let turned = gap.cross(edge_b);
+                    let v = ray.dot(turned) * scale;
+                    let t = edge_c.dot(turned) * scale;
+                    if u >= 0.0
+                        && v >= 0.0
+                        && u + v <= 1.0
+                        && (0.0..=1.0).contains(&t)
+                        && best.is_none_or(|(nearest, _)| t < nearest)
+                    {
+                        best = Some((t, triangle));
+                    }
+                }
+            }
+        }
+        let (t, triangle) = best?;
+        let corners = if mask & 1 == 0 {
+            &self.plain
+        } else {
+            &self.rough
+        };
+        Some(Hit {
+            point: from + ray * t,
+            normal: Faceted::normal_of(corners, triangle)?,
+            entity: 0,
+        })
+    }
+}
+
 /// What one climbing frame did.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Frame {
@@ -358,6 +544,7 @@ impl Climber {
         // The game takes this prediction before the move check changes the velocity.
         let predicted = self.pos + self.velocity * dt;
         let mut frame = Frame::Blocked;
+        let mut stuck = false;
         if self.velocity.length() > 1e-5 {
             let input = SteerInput {
                 velocity: self.velocity,
@@ -373,6 +560,8 @@ impl Climber {
             }
             if self.check_move(world, dt, t) {
                 frame = Frame::Moved;
+            } else {
+                stuck = true;
             }
         }
         let native = self.native_exit(world, predicted);
@@ -380,13 +569,15 @@ impl Climber {
             pos: predicted,
             normal: self.normal,
             moving_up: predicted.y > self.pos.y,
-            floor_ny: native.map(|hit| hit.normal.y),
+            floor: native,
             patch: hold.fit.map(|fit| Hit {
                 point: fit.point,
                 normal: fit.normal,
                 entity: fit.entity,
             }),
             walkable_ny: t.walkable_ny,
+            face: t.face,
+            stuck,
         };
         let target = match exit::decide(world, &query) {
             Exit::Keep => native,
@@ -670,6 +861,135 @@ mod climbs {
             );
         }
         assert!(climber.pos.y < 9.0, "{climber:?}");
+    }
+
+    /// Climb `height` metres up rough rock. Panics on a mantle, a drop or a long stall.
+    fn climb_rough(rock: &Faceted, angle: f32, height: f32, dt: f32, label: &str) {
+        let t = tuning();
+        let mut climber = Climber::on(rock, Vec3::new(-1.0, 0.0, 0.0), face(angle));
+        let start = climber.pos.y;
+        let mut stuck = 0;
+        for frame in 0..((height * 3.0 / SPEED / dt) as u32) {
+            let before = climber.pos;
+            match climber.step(rock, (0.0, 1.0), dt, &t) {
+                Frame::Moved | Frame::Blocked => {}
+                other => panic!(
+                    "{label}: {other:?} at frame {frame}, {} m up: {climber:?}",
+                    climber.pos.y - start
+                ),
+            }
+            if (climber.pos - before).length() < 1e-4 {
+                stuck += 1;
+                assert!(stuck < 30, "{label}: stalled at {climber:?}");
+            } else {
+                stuck = 0;
+            }
+            if climber.pos.y - start >= height {
+                return;
+            }
+        }
+        panic!("{label}: too slow: {climber:?}");
+    }
+
+    /// One flat triangle in a steep face must not play the mantle. A triangle of the displaced
+    /// body can lie 20 degrees flatter than the rock around it, and the game's floor ray lands on
+    /// the rock every frame in this band.
+    #[test]
+    fn rough_leaning_rock_never_mantles() {
+        for angle in [55.0, 60.0, 65.0, 70.0] {
+            for seed in 1..=6 {
+                for depth in [0.08, 0.15] {
+                    let rock = Faceted::face(angle, depth, seed);
+                    let label = format!("{angle} degrees, +-{depth} m, seed {seed}");
+                    climb_rough(&rock, angle, 6.0, 1.0 / 60.0, &label);
+                    let label = format!("{label}, rough normals");
+                    climb_rough(&rock.rough_normals(), angle, 6.0, 1.0 / 60.0, &label);
+                }
+            }
+        }
+    }
+
+    /// The floor test must not cost the real exits: rough rock that turns walkable still ends in
+    /// a mantle on the ground above the bend, and never in a stall or a drop.
+    #[test]
+    fn rough_rock_that_turns_walkable_ends_in_a_mantle() {
+        let bends = [
+            (90.0, 35.0),
+            (90.0, 20.0),
+            (90.0, 0.0),
+            (75.0, 30.0),
+            (75.0, 0.0),
+            (60.0, 20.0),
+            (60.0, 0.0),
+            (70.0, 45.0),
+        ];
+        for (lower, upper) in bends {
+            for seed in 1..=4 {
+                let rock = Faceted::bent(lower, upper, 6.0, 0.15, seed);
+                let climber = Climber::on(&rock, Vec3::new(-1.0, 0.0, 0.0), face(lower));
+                let target = climb_to_exit(&rock, climber, 1.0 / 60.0);
+                assert!(
+                    target.y > 5.3,
+                    "{lower}->{upper}, seed {seed}: a mantle at {target:?}, under the bend"
+                );
+                let rock = rock.rough_normals();
+                let target = climb_to_exit(&rock, climber, 1.0 / 60.0);
+                assert!(target.y > 5.3, "{lower}->{upper}, seed {seed}: {target:?}");
+            }
+        }
+    }
+
+    /// A smooth face that leans back and has a flat top. The upper rays reach the top long before
+    /// any ray of the exit does, so the move check says "walkable" while the exit still sees the
+    /// face. Without a look past the lip the player stops under the top for good.
+    #[test]
+    fn a_leaning_face_with_a_flat_top_ends_in_a_mantle() {
+        for dt in FRAME_TIMES {
+            for angle in [52.0, 55.0, 60.0, 65.0, 70.0, 75.0] {
+                let rise = 7.0 / f32::to_radians(angle).tan();
+                let rock =
+                    Profile::new(vec![(-rise * 3.0, -21.0), (rise, 7.0), (rise + 50.0, 7.0)]);
+                let climber = Climber::on(&rock, Vec3::new(-1.0, 0.0, 0.0), face(angle));
+                let target = climb_to_exit(&rock, climber, dt);
+                assert!((target.y - 7.0).abs() < 1e-3, "{angle}/{dt}: {target:?}");
+            }
+        }
+    }
+
+    /// One rough patch can read 15 degrees past the rock as a whole, and more where a wall bends
+    /// into an overhang. A climb must not stop at the limit for starting one.
+    #[test]
+    fn a_rough_overhang_does_not_stop_a_climb() {
+        for (angle, depth) in [(100.0, 0.15), (105.0, 0.08)] {
+            for seed in 1..=6 {
+                let rock = Faceted::bent(90.0, angle, 3.0, depth, seed).rough_normals();
+                let label = format!("90 to {angle} degrees, +-{depth} m, seed {seed}");
+                climb_rough(&rock, 90.0, 5.0, 1.0 / 60.0, &label);
+            }
+        }
+    }
+
+    /// A low `WalkableAngle` lets the climb normal tip far back. If it passes what a ray patch can
+    /// be built from, the next hold is refused and the player drops. A slope of 17 degrees is
+    /// past the hold limit there, so the normal runs into that limit.
+    #[test]
+    fn a_low_walkable_angle_keeps_the_ray_direction() {
+        let settings = crate::config::Settings {
+            walkable_angle: 30.0,
+            ..Default::default()
+        };
+        let t = settings.tuning();
+        let rock = Plane::through(Vec3::default(), face(17.0));
+        let mut climber = Climber {
+            pos: face(17.0) * GAME_STANDOFF,
+            velocity: Vec3::default(),
+            normal: face(30.0),
+            capsule: Capsule::FALLBACK,
+        };
+        for frame in 0..300 {
+            let step = climber.step(&rock, (0.0, 1.0), 1.0 / 60.0, &t);
+            assert_ne!(step, Frame::Dropped, "frame {frame}: {climber:?}");
+        }
     }
 
     /// The fixed normal the game uses cannot climb a leaning face. This pins the numbers the
