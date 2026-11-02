@@ -64,7 +64,7 @@ If a surface was near and no climb started, the log gets one line at most every 
 
 The counts add up over the session. `natural entry 3/90` means 90 tries to start a climb on natural rock and 3 that could start. Only `updates` is per second.
 
-With diagnostics on, the existing log thread also writes at most one latest `climb motion:` record per second. One invocation supplies its feet, fresh fit, raw velocity, steered velocity, native check output, duration, contact flag and native AL. The line distinguishes missing and non-finite fits. `check output V` is captured before the native caller zeros a rejected velocity; it is not measured post-collision movement. Busy records are dropped without waiting. These observations never make movement decisions.
+With diagnostics on, the existing log thread also writes at most one latest `climb move:` record per second. One invocation supplies its feet, fresh fit, raw velocity, steered velocity, native check output, duration, contact flag and native AL. The line distinguishes missing and non-finite fits. `check output V` is captured before the native caller zeros a rejected velocity; it is not measured post-collision movement. Busy records are dropped without waiting. These observations never make movement decisions.
 
 About a second into each climb that moves, the log gets one body line, once per climb:
 

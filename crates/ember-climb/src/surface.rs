@@ -703,8 +703,8 @@ pub fn steer(input: &SteerInput, t: &Tuning, capsule: Capsule) -> Option<Steered
         .map_or(Vec3::default(), |direction| direction * speed);
     let (pull, error) = match &fit {
         Some(fit) => {
-            // The hit point belongs to the fresh plane. The eased direction is for movement and
-            // body rotation; using it to measure this plane invents a gap when the centroid moves.
+            // The hit point belongs to the fresh plane. The eased normal remains a body/probe
+            // direction hint; using it here invents a gap when the hit centroid moves.
             let error = fit.distance(pos, fit.normal) - standoff_target(fit.normal.y, capsule);
             (standoff_speed(error, dt, contact), error)
         }
