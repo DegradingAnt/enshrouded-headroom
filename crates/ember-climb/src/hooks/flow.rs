@@ -50,6 +50,10 @@ static MOVE_CALLS: AtomicU32 = AtomicU32::new(0);
 static CORNER_CALLS: AtomicU32 = AtomicU32::new(0);
 /// Force the native fixture to reject after one custom successful probe.
 static CORNER_REJECT: AtomicBool = AtomicBool::new(false);
+/// Remove fixture geometry after planning, before the native original asks about actual Q.
+static CORNER_DROP_SCENE: AtomicBool = AtomicBool::new(false);
+/// Whether the current corner geometry has vanished from actual scene queries.
+static CORNER_HIDDEN: AtomicBool = AtomicBool::new(false);
 /// Select a vertical fallback despite full-candidate support, then rewrite velocity as native does.
 static CORNER_VERTICAL: AtomicBool = AtomicBool::new(false);
 /// Reenter once from an original movement call.
@@ -150,7 +154,10 @@ unsafe extern "system" fn plane_raycast(
     let mut entity = 0;
     let kind = CORNER_KIND.load(Ordering::Relaxed);
     if kind != 0 {
-        if let Some(hit) = corner_hit(Vec3::new(fx, fy, fz), Vec3::new(tx, ty, tz), kind) {
+        if let Some(hit) = (!CORNER_HIDDEN.load(Ordering::Relaxed))
+            .then(|| corner_hit(Vec3::new(fx, fy, fz), Vec3::new(tx, ty, tz), kind))
+            .flatten()
+        {
             bytes[0] = OK;
             bytes[0x0c..0x10].copy_from_slice(&hit.entity.to_le_bytes());
             let values = [
@@ -308,6 +315,9 @@ unsafe extern "system" fn game_move_check(
                 read_vec3(Ctx(ctx).normal_at()),
             )
         };
+        if CORNER_DROP_SCENE.swap(false, Ordering::Relaxed) {
+            CORNER_HIDDEN.store(true, Ordering::Relaxed);
+        }
         let mut full = true;
         for candidate_v in [v, UP * v.y, v.flat()] {
             // SAFETY: the whole live fixture context and copied finite local coordinates.
@@ -995,6 +1005,7 @@ fn a_climb_runs_through_the_detours() {
 /// Real Rust detours and native-shaped initialized buffers across both corner directions/rates.
 /// This does not run the native engine or simulate its exact climbing capsule/animation solver.
 fn exercise_corner_hooks() {
+    let mut maximum_rays = 0;
     for kind in [1, 2] {
         CORNER_KIND.store(kind, Ordering::Relaxed);
         for sign in [-1.0, 1.0] {
@@ -1034,6 +1045,11 @@ fn exercise_corner_hooks() {
                         "hold kind{kind} sign{sign} dt{dt} tick{tick} p{p:?} n{:?}",
                         player.normal()
                     );
+                    let hold = get(&HOLD, None).expect("corner hold is current");
+                    assert!(
+                        hold.natural && hold.patch.is_some(),
+                        "corner progress must use fresh hold rays, never fixture-only grace"
+                    );
                     let before = RAYS.load(Ordering::Relaxed);
                     let calls = MOVE_CALLS.load(Ordering::Relaxed);
                     let raw = UP.cross(player.normal()) * (1.95 * sign);
@@ -1050,10 +1066,9 @@ fn exercise_corner_hooks() {
                         v.length() <= raw.length() + 1.21,
                         "baseline gap correction remains separately bounded"
                     );
-                    assert!(
-                        RAYS.load(Ordering::Relaxed) - before
-                            <= u32::from(crate::corner::MAX_NATIVE_RAYS)
-                    );
+                    let used = RAYS.load(Ordering::Relaxed) - before;
+                    maximum_rays = maximum_rays.max(used);
+                    assert!(used <= u32::from(crate::corner::MAX_NATIVE_RAYS));
                     assert!(!corner_call::inside_move() && !corner_call::querying());
                     p = p + v * dt;
                     if player.normal().dot(target) > 0.995 {
@@ -1061,6 +1076,11 @@ fn exercise_corner_hooks() {
                         for _ in 0..5 {
                             player.set_position(p);
                             assert_eq!(player.wall_lost(), HELD);
+                            assert!(
+                                get(&HOLD, None)
+                                    .is_some_and(|hold| hold.natural && hold.patch.is_some()),
+                                "ordinary new-face handoff also needs fresh geometry"
+                            );
                             let (v, al) =
                                 player.move_check_dt(UP.cross(player.normal()) * (1.95 * sign), dt);
                             assert_eq!(al, 1);
@@ -1097,6 +1117,18 @@ fn exercise_corner_hooks() {
         "false AL must not commit a corner-facing trial"
     );
     CORNER_REJECT.store(false, Ordering::Relaxed);
+    // A valid prior hold/plan cannot authorize movement when actual geometry disappears.
+    assert_eq!(player.wall_lost(), HELD);
+    let normal = player.normal();
+    CORNER_DROP_SCENE.store(true, Ordering::Relaxed);
+    let calls = MOVE_CALLS.load(Ordering::Relaxed);
+    let rays = RAYS.load(Ordering::Relaxed);
+    assert_eq!(player.move_check(Vec3::new(0.0, 0.3, 1.95)).1, 0);
+    assert_eq!(MOVE_CALLS.load(Ordering::Relaxed), calls + 1);
+    assert!(RAYS.load(Ordering::Relaxed) - rays <= u32::from(crate::corner::MAX_NATIVE_RAYS));
+    assert_eq!(player.normal(), normal);
+    assert!(!corner_call::inside_move() && !corner_call::querying());
+    CORNER_HIDDEN.store(false, Ordering::Relaxed);
     // The native vertical fallback uses a different actual Q and its rewritten velocity.
     assert_eq!(player.wall_lost(), HELD);
     CORNER_VERTICAL.store(true, Ordering::Relaxed);
@@ -1119,6 +1151,7 @@ fn exercise_corner_hooks() {
         assert_eq!(MOVE_CALLS.load(Ordering::Relaxed), calls + 2);
         assert!(!corner_call::inside_move() && !corner_call::querying());
     }
+    eprintln!("corner hook model: maximum observed {maximum_rays} custom rays/move; both routes/directions at120/60/20Hz");
     CORNER_KIND.store(0, Ordering::Relaxed);
     CORNER_CTX.store(0, Ordering::Relaxed);
 }

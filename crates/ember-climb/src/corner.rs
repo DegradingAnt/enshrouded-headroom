@@ -2201,4 +2201,56 @@ mod tests {
         });
         assert!(!call::inside_move());
     }
+
+    /// Analogue magnitude and vertical intent remain inside the original native movement budget.
+    #[test]
+    fn native_corner_analogue_and_vertical_inputs_keep_speed_and_height() {
+        for dt in [1.0 / 120.0, 1.0 / 60.0, 1.0 / 20.0] {
+            for speed in [0.2, 0.75, 1.95] {
+                for vertical in [-0.7, 0.0, 0.7] {
+                    let world = Convex {
+                        calls: Cell::new(0),
+                    };
+                    let input = Request {
+                        velocity: Vec3::new(0.0, vertical, speed),
+                        dt,
+                        ..approach()
+                    };
+                    let stay = crate::surface::scan(
+                        &world,
+                        input.position,
+                        -input.normal,
+                        crate::surface::Mode::Stay,
+                        &tuning(),
+                        Capsule::FALLBACK,
+                    );
+                    let budget = NativeBudget::new();
+                    let counted = BudgetCaster::new(&world, &budget);
+                    let plan = prepare_from_patch(
+                        &counted,
+                        &input,
+                        FreshPatch {
+                            position: input.position,
+                            hits: stay.samples,
+                        },
+                        true,
+                        &tuning(),
+                        Capsule::FALLBACK,
+                    )
+                    .unwrap();
+                    assert!(plan.velocity.length() <= input.velocity.length() + 1e-4);
+                    assert!((plan.position.y - input.position.y - vertical * dt).abs() < 1e-6);
+                    assert!((plan.velocity.y - vertical).abs() < 1e-5);
+                    assert!(
+                        fresh_support(&counted, &plan, plan.position, &tuning(), Capsule::FALLBACK)
+                            .unwrap()
+                            .fit
+                            .hits
+                            >= 3
+                    );
+                    assert!(budget.rays() <= 9);
+                }
+            }
+        }
+    }
 }

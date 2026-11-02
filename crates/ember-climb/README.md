@@ -155,6 +155,8 @@ The [balance and animation research](DESIGN.md) records the hanging-stamina and 
 
 Start with a private offline world. Check a tall vertical wall, a leaning rock face, sideways movement, jump-off near a flat top, and an ordinary iron lattice. Near the ground, verify that the stamina bar drains while still, that slow and normal movement cost appropriately, that exhaustion releases the hold, and that food/equipment modifiers and recovery behave normally. Natural rock must not trigger an automatic climb-up animation; leave it with the normal Jump control. Lattices should still top out normally. Repeat with the controller. Keep `ember-climb.log`, especially if a grab fails, a hold drops, or the character tries to mantle too soon. Failed entry attempts are logged at most once every thirty seconds; idle checks stay quiet.
 
+Near the ground, move sideways around a simple outside corner, then an inside corner. Try both directions, slow stick movement and reversing before the turn finishes. Check that grip continues onto the next face and that stopping the stick stops movement. Try upward/downward movement during the turn. These are first-session checks for the new corner path; keep a normal Jump escape available.
+
 The client and server use the same plugin and settings. Test multiplayer only after the offline session works. This package is a candidate; native-file checks and simulated climbs do not establish runtime reliability.
 
 ## Limits

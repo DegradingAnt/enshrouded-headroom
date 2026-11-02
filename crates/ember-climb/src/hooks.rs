@@ -835,6 +835,18 @@ impl Drop for NestedMove {
         set(&STUCK, self.stuck);
     }
 }
+/// Forward a native move while protecting any in-flight outer custom owner.
+/// This also runs in the disabled-feature fallback, before entering a native callback.
+fn native_forward(original: impl FnOnce() -> u64) -> u64 {
+    if corner_call::inside_move() {
+        return corner_call::with_move(None, || {
+            let _restore = NestedMove::save();
+            original()
+        });
+    }
+    original()
+}
+
 /// Restore a prior probe mode after the synchronous native move returns or Rust unwinds.
 struct MoveMode(Option<Mode>);
 impl Drop for MoveMode {
@@ -951,54 +963,55 @@ unsafe extern "system" fn move_check_detour(
         completed.set(Some(value));
         value
     };
-    guard(Feature::Steer, original, || {
-        let nested = corner_call::inside_move();
-        if nested {
-            return corner_call::with_move(None, || {
-                let _restore = NestedMove::save();
-                original()
-            });
-        }
-        // SAFETY: the complete native move owns these initialized arguments throughout the call.
-        let call = unsafe { corner_before(velocity, Ctx(ctx), pos, dt) };
-        corner_call::with_move(call, || {
-            // SAFETY: original native velocity/context remain live through one move check.
-            let value = unsafe {
-                observed_move(
-                    Feature::Steer,
-                    velocity,
-                    || {
-                        // SAFETY: the game's own context; diagnostic failure cannot stop steering.
-                        guard(Feature::Diag, || (), || note_body(Ctx(ctx)));
-                        let mut sample = steer_frame(velocity, Ctx(ctx), pos, dt);
-                        if corner_call::has_call() {
-                            if let Some(caster) = GameCaster::new(runtime()?.raycast, Ctx(ctx)) {
-                                let direction = -read_vec3(Ctx(ctx).normal_at());
-                                let steered = read_vec3(velocity);
-                                if let Some(requested) =
-                                    corner_call::prepare(&caster, direction, steered)
+    guard(
+        Feature::Steer,
+        || native_forward(original),
+        || {
+            if corner_call::inside_move() {
+                return native_forward(original);
+            }
+            // SAFETY: the complete native move owns these initialized arguments throughout the call.
+            let call = unsafe { corner_before(velocity, Ctx(ctx), pos, dt) };
+            corner_call::with_move(call, || {
+                // SAFETY: original native velocity/context remain live through one move check.
+                let value = unsafe {
+                    observed_move(
+                        Feature::Steer,
+                        velocity,
+                        || {
+                            // SAFETY: the game's own context; diagnostic failure cannot stop steering.
+                            guard(Feature::Diag, || (), || note_body(Ctx(ctx)));
+                            let mut sample = steer_frame(velocity, Ctx(ctx), pos, dt);
+                            if corner_call::has_call() {
+                                if let Some(caster) = GameCaster::new(runtime()?.raycast, Ctx(ctx))
                                 {
-                                    write_vec3(velocity, requested);
-                                    if let Some(sample) = sample.as_mut() {
-                                        sample.steered_velocity = requested;
+                                    let direction = -read_vec3(Ctx(ctx).normal_at());
+                                    let steered = read_vec3(velocity);
+                                    if let Some(requested) =
+                                        corner_call::prepare(&caster, direction, steered)
+                                    {
+                                        write_vec3(velocity, requested);
+                                        if let Some(sample) = sample.as_mut() {
+                                            sample.steered_velocity = requested;
+                                        }
                                     }
                                 }
                             }
-                        }
-                        sample
-                    },
-                    original,
-                    |sample| {
-                        guard(Feature::Diag, || (), || DIAG.movement(&sample));
-                    },
-                )
-            };
-            // completed already holds the entire native RAX. A post failure cannot forward twice.
-            // SAFETY: this synchronous native context remains the same owner after the original.
-            unsafe { finish_corner(Ctx(ctx), velocity, value) };
-            value
-        })
-    })
+                            sample
+                        },
+                        original,
+                        |sample| {
+                            guard(Feature::Diag, || (), || DIAG.movement(&sample));
+                        },
+                    )
+                };
+                // completed already holds the entire native RAX. A post failure cannot forward twice.
+                // SAFETY: this synchronous native context remains the same owner after the original.
+                unsafe { finish_corner(Ctx(ctx), velocity, value) };
+                value
+            })
+        },
+    )
 }
 
 /// The hit a fit stands for, to hand to the exit decision.
@@ -1751,6 +1764,81 @@ mod tests {
         assert_eq!(hit.point, fit.point);
         assert_eq!(hit.normal, fit.normal);
         assert_eq!(hit.entity, 9);
+    }
+
+    /// A feature kill-switch cannot let a reentrant native move consume the outer call scope.
+    #[test]
+    fn disabled_steering_fallback_still_suspends_nested_custom_work() {
+        // Disable an isolated feature bit, leaving the actual shared Steer bit untouched.
+        post_hook(
+            TestFeature(25),
+            || 0_u64,
+            |_| panic!("disable fixture feature"),
+        );
+        let outer_hold = holding(true);
+        set(&MODE, Some(Mode::Stay));
+        set(&HOLD, outer_hold);
+        set(&NESTED, Some(MISS));
+        set(&STUCK, true);
+        let key = Key {
+            context: 1,
+            entity: 2,
+            world: 3,
+        };
+        let p = Vec3::default();
+        let owned = Call::new(
+            key,
+            Request {
+                position: p,
+                velocity: Vec3::new(0.0, 0.0, 1.0),
+                normal: Vec3::new(-1.0, 0.0, 0.0),
+                dt: 1.0 / 60.0,
+            },
+            FreshPatch {
+                position: p,
+                hits: [None; 4],
+            },
+            None,
+            Settings::default().tuning(),
+            crate::surface::Capsule::FALLBACK,
+        )
+        .unwrap();
+        let calls = Cell::new(0);
+        let native = 0x1234_5678_9abc_de00_u64;
+        corner_call::with_move(Some(owned), || {
+            let result = guard(
+                TestFeature(25),
+                || {
+                    native_forward(|| {
+                        calls.set(calls.get() + 1);
+                        assert!(
+                            corner_call::blocked(),
+                            "disabled nested fallback must suspend custom work"
+                        );
+                        assert!(!corner_call::has_call());
+                        assert_eq!(get(&MODE, None), None);
+                        assert_eq!(get(&HOLD, None), None);
+                        set(&MODE, Some(Mode::Move));
+                        set(&NESTED, Some(OK));
+                        set(&STUCK, false);
+                        native
+                    })
+                },
+                || panic!("disabled guard body must not run"),
+            );
+            assert_eq!(result, native);
+            assert_eq!(calls.get(), 1);
+            assert!(!corner_call::blocked() && corner_call::has_call());
+            assert_eq!(get(&MODE, None), Some(Mode::Stay));
+            assert_eq!(get(&HOLD, None), outer_hold);
+            assert_eq!(get(&NESTED, None), Some(MISS));
+            assert!(get(&STUCK, false));
+        });
+        assert!(!corner_call::inside_move());
+        set(&MODE, None);
+        set(&HOLD, None);
+        set(&NESTED, None);
+        set(&STUCK, false);
     }
 }
 
