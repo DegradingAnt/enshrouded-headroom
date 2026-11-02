@@ -2706,3 +2706,82 @@ nonblocking atomic claim protects copies by both readers and writers, dropping b
 Only the existing log thread formats output, at most one latest movement record per second. The
 native check output precedes caller-side AL=false zeroing and ordinary collision resolution.
 Telemetry state never feeds gameplay, and no component pointer is retained by these observations.
+
+
+### W52 ordinary corner eligibility
+
+[VERIFIED] Climb type/state are initialized bytes at+0/+1: Wall1 and steady state2.
+Actor Climbing34 and ClimbingTransition35 use the existing sequence-aware native state predicate.
+MovementCollider isWorldColliderReady and isEnabled are bytes+4/+5. These fields and the ordinary
+motion/collision consumers are checked across all four supported images. A conservative optional
+corner gate requires those native wall/actor states, no transition, and ready/enabled values1.
+It does not disable baseline climbing when optional components or that gate are absent.
+Reference: the existing four-image NATIVE-CORNER-MOTION.md and accepted Jump predicate evidence.
+No padding or collider-position override is read or changed by that gate.
+
+### W52 diagnostic request and impulse observation
+
+[VERIFIED] A read-only three-observer set can observe acceptance and calculated impulse under
+normal native return. All addresses in this subsection are hexadecimal image-relative values.
+
+| Boundary | Previous client | Current client | Previous server | Current server |
+|---|---:|---:|---:|---:|
+| Accepted helper |2c3f90|2c8f60|b08a0|b4590|
+| Native ActorInput accessor |213220|216b70|30a00|33ba0|
+| Jump dispatcher |41a5c0|421510|1bb510|1c0dd0|
+| Native EntityId getter |9b4230|9bf920|654ab0|65b870|
+
+Accepted has ABI u8(iterator*); accessor is pointer(view*); dispatcher is
+out20*(out20*,context*,JumpType_u8), under Windows x64. Native originals and all output bytes
+must remain unchanged and execute exactly once. Whole-set preflight precedes installation.
+
+The accepted iterator's ActorInput view is+0xe8. Native accessor returns[view+0] after its native
+history bookkeeping. Both direct calls at accepted+0x730 and+0x79f must resolve to the same
+verified accessor; a generic accessor pattern is not unique (87 client,82 server matches).
+The first accessor post precedes native type publication and the second precedes time publication.
+Final scalars belong in the accepted helper's post, before its suspended caller advances the
+owner iterator. Require the expected view and matching current view[0], copy scalars, then discard
+all native pointers and restore lexical TLS before returning. Reentry/unwind may drop observations;
+it must never change the native invocation or leave a cross-frame pointer.
+
+Initialized ActorInput fields are type u8+0x179, time i64+0x180 and processed local Z f32+0x194.
+Dispatcher context+0x20 supplies its live ActorInput. Result ErrorId is u8+0 and calculated
+delta float3+8 is readable only on ErrorId0; error padding/payload must not be sampled.
+This is before native application/collision, not measured displacement.
+
+Both phases supply ProgramContext through their slot+0. The native EntityId leaf reads one-based
+index u32 at ProgramContext+8. Index0 gives EntityId0. Otherwise registry=[ProgramContext+0],
+table=[registry+tableOffset], ID=u32[table+(index-1)*16]. Table offset is0x828 in both previous
+images and0x830 in both current images. A read-only mirror needs checked address arithmetic and
+the live native owner's index/table contract. It makes no added native call. Unknown identity and
+repeated entity/type/time keys remain ambiguous, especially under replay; no gameplay deduplication
+or paid-UP marker is admitted. Observer storage contains copied scalars only.
+
+Complete initial entry-copy spans are5/6/7 bytes for accepted/accessor/dispatcher; they contain no
+relative transfer or RIP operand. Original unwind prologues are32/6/101 bytes. This supports the
+existing MinHook/no-foreign-unwind contract, not new SEH/foreign-exception or generated-trampoline
+unwind guarantees. Rust guards/RAII cover Rust return/unwind paths only.
+
+The following exact patterns have the stated four-image receipts. The first two are unique;
+the accessor pattern is a full-body verification after call-following, never a unique scanner.
+
+Accepted unique prefix:
+
+```text
+48 89 4c 24 08 55 53 56 57 41 54 41 55 41 56 41 57 48 8d ac 24 a8 fe ff ff 48 81 ec 58 02 00 00 4c 8b 81 18 04 00 00 4c 8b f1 48 8b 91 88 00 00 00
+```
+
+Dispatcher unique prefix:
+
+```text
+48 8b c4 48 89 58 08 55 56 57 41 54 41 55 41 56 41 57 48 8d 68 98 48 81 ec 30 01 00 00 0f 29 70 b8 48 8b f2 0f 29 78 a8 48 8b f9 44 0f 29 40 98 44 0f 29 48 88 44 0f 29 90 78 ff ff ff 44 0f 29 98 68 ff ff ff 44 0f 29 a0 58 ff ff ff 44 0f 29 a8 48 ff ff ff 44 0f 29 b0 38 ff ff ff 44 0f 29 b8 28 ff ff ff 45 0f b6 f8
+```
+
+Accessor full body, native call displacement masked:
+
+```text
+40 53 48 83 ec 30 48 8b d9 48 8b 49 28 48 85 c9 74 22 0f b6 43 22 4c 8b 4b 18 4c 8b 43 10 48 8b 53 08 88 44 24 28 0f b7 43 20 66 89 44 24 20 e8 ?? ?? ?? ?? 48 8b 03 48 83 c4 30 5b c3
+```
+
+Receipt: private observation-boundary/OBSERVATION-BOUNDARY.md SHA256
+BA572176FF5F337753D361DD0DA97C2B418D82D7D253B040031FC34C058BCABF.

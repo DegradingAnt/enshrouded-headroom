@@ -213,7 +213,7 @@ pub struct Slot(AtomicUsize);
 
 impl Slot {
     /// An empty slot.
-    const fn new() -> Slot {
+    pub(crate) const fn new() -> Slot {
         Slot(AtomicUsize::new(0))
     }
 
@@ -223,7 +223,7 @@ impl Slot {
     }
 
     /// The trampoline, or 0 before start-up stored it.
-    fn get(&self) -> usize {
+    pub(crate) fn get(&self) -> usize {
         self.0.load(Ordering::Acquire)
     }
 }

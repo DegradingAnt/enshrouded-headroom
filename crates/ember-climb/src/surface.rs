@@ -263,6 +263,9 @@ impl Fit {
 /// The answer to one probe.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Scan {
+    /// Raw hits in ray-origin order after fitting; early refusals expose no guidance.
+    /// These are discovery hints only and never grant a future candidate permission.
+    pub samples: [Option<Hit>; RAY_COUNT],
     /// The rays that hit something.
     pub hits: u8,
     /// The fit, when enough rays hit.
@@ -277,6 +280,7 @@ impl Scan {
     /// A probe that found no fit.
     fn refused(hits: u8, why: Reject) -> Scan {
         Scan {
+            samples: [None; RAY_COUNT],
             hits,
             fit: None,
             verdict: Err(why),
@@ -487,12 +491,16 @@ pub fn scan<C: Caster>(
         entity: 0,
     }; RAY_COUNT];
     let mut starts = [Vec3::default(); RAY_COUNT];
+    let mut samples = [None; RAY_COUNT];
     let mut hits = 0usize;
     let mut misses = 0usize;
-    for origin in frame.origins(pos) {
+    for (ray, origin) in frame.origins(pos).into_iter().enumerate() {
         let from = origin - frame.along * mode.back();
         match caster.cast(from, origin + frame.along * reach, t.mask) {
             Some(hit) => {
+                if let Some(sample) = samples.get_mut(ray) {
+                    *sample = Some(hit);
+                }
                 if let (Some(slot), Some(start)) = (found.get_mut(hits), starts.get_mut(hits)) {
                     *slot = hit;
                     *start = from;
@@ -527,6 +535,7 @@ pub fn scan<C: Caster>(
         }
     }
     Scan {
+        samples,
         hits: fit.hits,
         fit: Some(fit),
         verdict,
@@ -1954,5 +1963,30 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Fresh discovery preserves the actual ray slots, including misses, without substituting
+    /// averaged fit points or ray origins. It does not run an extra raycast.
+    #[test]
+    fn completed_scan_keeps_ordered_fresh_ray_witnesses() {
+        let origins = Frame::along(AHEAD).unwrap().origins(Vec3::default());
+        let mut rays = origins.map(|origin| {
+            Some(Hit {
+                point: origin + AHEAD * 0.8,
+                normal: -AHEAD,
+                entity: 0,
+            })
+        });
+        rays[1] = None;
+        let result = scan(
+            &Scripted::new(&rays),
+            Vec3::default(),
+            AHEAD,
+            Mode::Stay,
+            &tuning(),
+            CAPSULE,
+        );
+        assert!(result.verdict.is_ok());
+        assert_eq!(result.samples, rays);
     }
 }

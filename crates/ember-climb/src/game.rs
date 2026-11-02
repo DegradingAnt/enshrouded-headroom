@@ -57,6 +57,10 @@ const CTX_COLLIDER: usize = 0x20;
 const CTX_ENTITY: usize = 0x30;
 /// The climb context's ColliderSystem pointer.
 const CTX_WORLD: usize = 0x38;
+/// Initialized `Climb.climbType`: Wall is1.
+const CLIMB_TYPE: usize = 0;
+/// Initialized `Climb.climbState`: steady wall motion is2.
+const CLIMB_STATE: usize = 1;
 /// `Climb.climbNormal`.
 const CLIMB_NORMAL: usize = 0x04;
 /// Padding in Climb, between `climbState` and `climbNormal`. This mod keeps its grace count here.
@@ -64,6 +68,10 @@ const CLIMB_NORMAL: usize = 0x04;
 const CLIMB_GRACE: usize = 0x02;
 /// `CurrentTransform.transform.orientation`: x, y, z, w.
 const TRANSFORM_ORIENTATION: usize = 0x18;
+/// `MovementCollider.isWorldColliderReady`.
+const COLLIDER_READY: usize = 4;
+/// `MovementCollider.isEnabled`.
+const COLLIDER_ENABLED: usize = 5;
 /// `MovementCollider.results.m_isSet`.
 const COLLIDER_RESULTS_SET: usize = 0x50;
 /// `MovementCollider.results.m_value.hasSpheroidCollision`.
@@ -88,6 +96,10 @@ const ACTOR_ROTATION_MODE: usize = 0xee4;
 const CAN_CLIMB: u32 = 1 << 16;
 /// `StateFlag` 0, Grounded.
 const STATE_GROUNDED: u8 = 0;
+/// `StateFlag`34, Climbing.
+const STATE_CLIMBING: u8 = 34;
+/// `StateFlag`35, ClimbingTransition.
+const STATE_CLIMB_TRANSITION: u8 = 35;
 /// `StateFlag` 37, HangGliding.
 const STATE_GLIDING: u8 = 37;
 /// `ActorInput.desiredWorldMoveInput`.
@@ -437,6 +449,46 @@ impl Ctx {
             collider.add(COLLIDER_RESULTS_SET).read() != 0
                 && collider.add(COLLIDER_CONTACT).read() != 0
         }
+    }
+
+    /// Whether optional corner requests are eligible under the native ordinary-wall states.
+    /// Baseline movement remains native when this conservative gate refuses.
+    ///
+    /// # Safety
+    ///
+    /// `self` is null or a live native climb context whose non-null component pointers are valid
+    /// for this invocation. Only initialized fields from the W52 native contract are inspected.
+    pub unsafe fn ordinary_wall_motion(self) -> bool {
+        if self.0.is_null() {
+            return false;
+        }
+        // SAFETY: the caller supplies the complete context and live native components.
+        let (climb, collider) = unsafe {
+            (
+                pointer_at(self.0, CTX_CLIMB),
+                pointer_at(self.0, CTX_COLLIDER),
+            )
+        };
+        if climb.is_null() || collider.is_null() {
+            return false;
+        }
+        // SAFETY: initialized type/state and ready/enabled bytes are within their components.
+        // Optional corner work deliberately refuses noncanonical Boolean values.
+        let ordinary = unsafe {
+            climb.add(CLIMB_TYPE).read() == 1
+                && climb.add(CLIMB_STATE).read() == 2
+                && collider.add(COLLIDER_READY).read() == 1
+                && collider.add(COLLIDER_ENABLED).read() == 1
+        };
+        if !ordinary {
+            return false;
+        }
+        // SAFETY: the actor and its initialized state/sequence masks belong to this invocation.
+        let Some(actor) = (unsafe { self.actor() }) else {
+            return false;
+        };
+        // SAFETY: same live native actor; use the existing sequence-aware state predicate.
+        unsafe { actor.state(STATE_CLIMBING) && !actor.state(STATE_CLIMB_TRANSITION) }
     }
 
     /// The actor, or `None` if the context has none.
@@ -1076,5 +1128,73 @@ mod tests {
         let ctx = Ctx(fields.as_ptr() as *mut u8);
         // SAFETY: `fields` is a whole context.
         assert!(unsafe { GameCaster::new(fake_raycast, ctx) }.is_none());
+    }
+
+    /// Optional corner motion requires a steady wall, active climbing, no transition and a
+    /// ready/enabled collider. Sequence state masks must be honored by the gate too.
+    #[test]
+    fn ordinary_corner_gate_requires_native_wall_actor_and_collider_states() {
+        let mut actor = actor_bytes();
+        actor[ACTOR_STATE..ACTOR_STATE + 8].copy_from_slice(&(1_u64 << 34).to_le_bytes());
+        let mut climb = [0_u8; 0x98];
+        climb[0] = 1;
+        climb[1] = 2;
+        let mut collider = [0_u8; 0x54];
+        collider[4] = 1;
+        collider[5] = 1;
+        let fields = [
+            actor.as_mut_ptr() as usize,
+            climb.as_mut_ptr() as usize,
+            0,
+            0,
+            collider.as_mut_ptr() as usize,
+            0,
+            1,
+            0,
+        ];
+        let ctx = Ctx(fields.as_ptr() as *mut u8);
+        // SAFETY: every component pointer refers to a complete initialized fixture until return.
+        assert!(unsafe { ctx.ordinary_wall_motion() });
+        for (field, refused) in [(0, 0), (0, 2), (1, 0), (1, 1), (1, 3)] {
+            let before = climb[field];
+            climb[field] = refused;
+            // SAFETY: the fixture pointers remain alive; only initialized state bytes change.
+            assert!(!unsafe { ctx.ordinary_wall_motion() });
+            climb[field] = before;
+        }
+        for field in [4, 5] {
+            for refused in [0, 2] {
+                collider[field] = refused;
+                // SAFETY: as above, with a valid initialized collider component.
+                assert!(!unsafe { ctx.ordinary_wall_motion() });
+            }
+            collider[field] = 1;
+        }
+        actor[ACTOR_STATE..ACTOR_STATE + 8].copy_from_slice(&0_u64.to_le_bytes());
+        // SAFETY: the actor buffer remains live and complete.
+        assert!(!unsafe { ctx.ordinary_wall_motion() });
+        actor[ACTOR_SEQUENCE] = 1;
+        actor[ACTOR_STATE_ADD..ACTOR_STATE_ADD + 8].copy_from_slice(&(1_u64 << 34).to_le_bytes());
+        // SAFETY: sequence masks are initialized inside the same actor buffer.
+        assert!(unsafe { ctx.ordinary_wall_motion() });
+        actor[ACTOR_STATE_ADD..ACTOR_STATE_ADD + 8]
+            .copy_from_slice(&((1_u64 << 34) | (1_u64 << 35)).to_le_bytes());
+        // SAFETY: the same actor mask now requests the native transition state.
+        assert!(!unsafe { ctx.ordinary_wall_motion() });
+        actor[ACTOR_STATE_ADD..ACTOR_STATE_ADD + 8].copy_from_slice(&(1_u64 << 34).to_le_bytes());
+        actor[ACTOR_STATE_REMOVE..ACTOR_STATE_REMOVE + 8]
+            .copy_from_slice(&(1_u64 << 34).to_le_bytes());
+        // SAFETY: the existing sequence-aware state predicate must apply this removal mask.
+        assert!(!unsafe { ctx.ordinary_wall_motion() });
+    }
+
+    /// Missing optional data cannot enable a new corner request.
+    #[test]
+    fn ordinary_corner_gate_refuses_missing_components() {
+        let fields = [0_usize; 8];
+        // SAFETY: a whole initialized context with no components; nulls must be refused.
+        assert!(!unsafe { Ctx(fields.as_ptr() as *mut u8).ordinary_wall_motion() });
+        // SAFETY: the reader explicitly accepts a null context as unavailable.
+        assert!(!unsafe { Ctx(std::ptr::null_mut()).ordinary_wall_motion() });
     }
 }

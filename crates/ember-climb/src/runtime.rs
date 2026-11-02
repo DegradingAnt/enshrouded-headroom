@@ -28,6 +28,7 @@ use crate::hooks as detours;
 use crate::plan;
 use crate::sigs;
 use crate::Feature;
+use crate::{jump_trace, trace_sigs};
 
 /// The log file's name, next to the `.asi`.
 const LOG_FILE_NAME: &str = "ember-climb.log";
@@ -152,16 +153,46 @@ fn find_signatures() -> Result<sigs::Found, String> {
     })
 }
 
+/// Resolve the complete optional observation set before any hook is queued.
+/// Disabled diagnostics does not scan or read any of the new native targets.
+fn jump_observation_targets(
+    enabled: bool,
+    label: &str,
+    find: impl FnMut(&sigs::Sig) -> Result<Vec<usize>, String>,
+    read: impl FnMut(usize, usize) -> Option<Vec<u8>>,
+) -> Result<Option<trace_sigs::Targets>, String> {
+    if !enabled {
+        return Ok(None);
+    }
+    trace_sigs::preflight(label, find, read).map(Some)
+}
+
 /// The checks, the writes and the hooks. `Err` says why climbing stays off.
 ///
 /// Hooks are queued first, because a queued hook changes nothing. The writes go in next. The
 /// queue is enabled last, and the detours only act after that, so a failure at any point leaves
 /// them forwarding to the game.
-fn install(settings: &Settings) -> Result<String, String> {
+fn install(settings: &Settings, label: &str) -> Result<String, String> {
     effort::require_cpu(std::is_x86_feature_detected!("sse4.1"))?;
     let found = find_signatures()?;
     log::info!("all {} signatures matched once", sigs::ALL.len());
-    let base = main_module().base;
+    let module = main_module();
+    let observations = jump_observation_targets(
+        settings.diagnostics,
+        label,
+        |sig| {
+            Pattern::parse(sig.pattern)
+                .and_then(|pattern| find_in_sections(&module, &[CODE_SECTION], &pattern))
+                .map(|address| vec![address])
+                .map_err(|error| error.to_string())
+        },
+        |addr, len| {
+            // SAFETY: startup only, under the exact known-image gate. Preflight follows two
+            // validated native calls; read_checked rejects an unavailable complete byte range.
+            unsafe { read_checked(addr, len) }.ok()
+        },
+    )?;
+    let base = module.base;
     let snapshot = plan::snapshot(&found, base, |addr, len| {
         // SAFETY: start-up only, on one thread, before the game runs. Each address is inside a
         // signature match or its proven offset in `.text`. `read_checked` checks the full range.
@@ -187,6 +218,18 @@ fn install(settings: &Settings) -> Result<String, String> {
             .map_err(|why| format!("{}: {why}", site.sig.name))?;
         site.slot.set(trampoline);
     }
+    if let Some(targets) = observations {
+        jump_trace::prepare(targets.layout);
+        for site in jump_trace::sites(&targets) {
+            // SAFETY: whole-set preflight and the exact image gate establish these three native
+            // entries/ABIs before any queue is enabled. File oracles check their complete initial
+            // copy spans and original unwind headers. The existing native no-foreign-unwind
+            // assumption remains; this does not claim generated trampoline unwind support.
+            let trampoline = unsafe { hooks::create_and_queue(site.target, site.detour) }
+                .map_err(|why| format!("{}: {why}", site.name))?;
+            site.slot.set(trampoline);
+        }
+    }
     plan::apply_with(&writes, |addr, old, new| {
         // SAFETY: start-up only, on one thread, before the game runs this code. `plan` proved the
         // bytes are the game's, and `write_checked` checks them again.
@@ -210,6 +253,12 @@ fn install(settings: &Settings) -> Result<String, String> {
         return Err(format!("{why}; {back}"));
     }
     detours::activate();
+    jump_trace::set_enabled(observations.is_some());
+    if observations.is_some() {
+        log::info!(
+            "native Jump observations are on: three read-only hooks; correlation candidates only"
+        );
+    }
     // Climbing is on from here. A thread that cannot start costs a log line, not the climbing.
     if settings.diagnostics {
         if let Err(why) = diag::spawn() {
@@ -238,6 +287,7 @@ fn spawn_late_check() -> std::io::Result<()> {
             .unwrap_or_else(Some);
         if let Some(line) = refusal {
             detours::deactivate();
+            jump_trace::set_enabled(false);
             log::warn!("{line}; dynamic climbing is disabled, but startup code patches remain until exit. Restart after resolving the conflict.");
         }
     };
@@ -280,7 +330,7 @@ fn start_in_game(settings: &Settings, build: &Build) {
         log::warn!("{why}");
         return;
     }
-    match install(settings) {
+    match install(settings, label) {
         Ok(line) => log::info!("{line}"),
         Err(why) => log::warn!("climbing is off: {why}"),
     }
@@ -478,5 +528,29 @@ mod tests {
         assert_eq!(settings, Settings::default());
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("cannot create"), "{warnings:?}");
+    }
+
+    /// Diagnostics off must preserve the earlier native surface without touching observer bytes.
+    #[test]
+    fn disabled_jump_observations_do_not_scan_or_read() {
+        let result = jump_observation_targets(
+            false,
+            "unknown",
+            |_| panic!("disabled observations must not scan"),
+            |_, _| panic!("disabled observations must not read"),
+        );
+        assert_eq!(result, Ok(None));
+    }
+
+    /// Whole-set layout refusal happens before new native reads or any queue installation.
+    #[test]
+    fn unknown_jump_observation_layout_refuses_before_native_access() {
+        let result = jump_observation_targets(
+            true,
+            "unknown",
+            |_| panic!("unknown layout must not scan"),
+            |_, _| panic!("unknown layout must not read"),
+        );
+        assert!(result.is_err());
     }
 }

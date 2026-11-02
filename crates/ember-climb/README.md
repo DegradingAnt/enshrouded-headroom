@@ -39,7 +39,8 @@ settings: <game folder>\plugins\ember-climb.ini
 build 1283531-steam
 all 15 signatures matched once
 wrote the wall-lost return at exe+0x24f4e5, the attachment store at exe+0x41fd08, the wall-climb effort at exe+0x2f0789
-hooks: 10 enabled
+hooks: 13 enabled
+native Jump observations are on: three read-only hooks; correlation candidates only
 climbing is on: surface mask 0x124, plane tolerance 0.45 m, walkable below 50 degrees, stamina x1, idle effort 0.5 m/s, a climb starts by walk, jump, sprint, diagnostics on
 ```
 
@@ -65,6 +66,10 @@ If a surface was near and no climb started, the log gets one line at most every 
 The counts add up over the session. `natural entry 3/90` means 90 tries to start a climb on natural rock and 3 that could start. Only `updates` is per second.
 
 With diagnostics on, the existing log thread also writes at most one latest `climb move:` record per second. One invocation supplies its feet, fresh fit, raw velocity, steered velocity, native check output, duration, contact flag and native AL. The line distinguishes missing and non-finite fits. `check output V` is captured before the native caller zeros a rejected velocity; it is not measured post-collision movement. Busy records are dropped without waiting. These observations never make movement decisions.
+
+Diagnostics also records native Jump acceptance and the original calculated Jump delta. The existing log thread drains up to 32 copied records per second, labelled `climb jump correlation candidate:`. `Accepted` includes the unchanged return byte, final request type/time and upward-input bits. `CalculatedDelta` includes the native error byte and, only on success, the calculated float3 bits. This is before native application and collision. It is not measured displacement or a completed upward climbing hop.
+
+The queue keeps at most 32 records. Busy/full queues drop new records without waiting; a separate line reports losses. Missing identity/input and repeated replay keys remain ambiguous. These records cannot establish a unique paid action or justify a stamina charge. The hooks keep no native pointer after its owner returns, add no accessor call and leave native arguments/results unchanged. `Diagnostics = 0` skips all three new targets and their hooks.
 
 About a second into each climb that moves, the log gets one body line, once per climb:
 
@@ -108,7 +113,7 @@ All settings are in `ember-climb.ini`, and all need a restart. A value that is n
 | Tuning | EntryReach | 0.95 | 0.6 to 1.4 | How close you must be to start a climb, in metres. |
 | Tuning | HoldReach | 1 | 0.8 to 1.6 | How far the mod looks for the surface during a climb, in metres. Under an overhang you hang farther out, and it looks that much farther. |
 | Tuning | GraceSeconds | 0 | 0 to 1 | Reserved. Native seam forgiveness is unavailable; nonzero values warn and remain inactive. |
-| Debug | Diagnostics | 1 | 0 or 1 | Per-second counters and paired movement records. It also adds five small hooks. |
+| Debug | Diagnostics | 1 | 0 or 1 | Per-second counters, paired movement records and native Jump observations. It adds eight diagnostic hooks. |
 
 `SurfaceMask` is a sum of these bits, in hex or decimal: `0x4` terrain and player walls, `0x20` rock props, `0x100` iron lattices, `0x8` other solid props such as trees. Other bits are refused. Bits 0 and 1 are other copies of the terrain, and asking for them gives a different surface per ray.
 
@@ -187,6 +192,8 @@ cargo test -p ember-climb --test real_exe -- --ignored
 ```
 
 `cargo asi-climb` writes `target/release/ember-climb.asi`. Copy `ember-climb.default.ini` as `ember-climb.ini`, or let the mod create it on first start.
+
+The additional `trace_exe` file tests validate the complete three-observer target set, both accessor call sites, initial instruction-copy spans and original unwind headers in all four exact images. They require explicit `ENSHROUDED_PREVIOUS_STEAM_EXE`, `ENSHROUDED_STEAM_EXE`, `ENSHROUDED_PREVIOUS_SERVER_EXE` and `ENSHROUDED_SERVER_EXE` paths. Run `cargo test -p ember-climb --test trace_exe -- --ignored --test-threads=1`. They check file bytes only and do not execute copied native code.
 
 The ignored tests read the real exes, and they fail if a file is missing. They set `ENSHROUDED_STEAM_EXE` and `ENSHROUDED_SERVER_EXE`, or use the default Steam folders. They never start the game.
 

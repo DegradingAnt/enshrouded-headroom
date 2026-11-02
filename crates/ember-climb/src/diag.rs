@@ -969,6 +969,26 @@ fn tick(pace: &mut Pace) {
     }
 }
 
+/// Format copied diagnostic scalars only; repeated keys remain correlation candidates.
+fn jump_observation_text(record: &crate::jump_trace::Record) -> String {
+    format!("climb jump correlation candidate: {record:?}")
+}
+
+/// Drain a bounded number of owned records on the existing background thread.
+/// No native pointer, hook execution or gameplay decision is involved in this consumer.
+fn drain_jump_observations() {
+    for _ in 0..32 {
+        let Some(record) = crate::jump_trace::take() else {
+            break;
+        };
+        log::info!("{}", jump_observation_text(&record));
+    }
+    let dropped = crate::jump_trace::take_dropped();
+    if dropped != 0 {
+        log::info!("climb jump observations: {dropped} records dropped; correlation is incomplete");
+    }
+}
+
 /// Start the log thread. It runs until the process ends.
 pub fn spawn() -> Result<(), String> {
     std::thread::Builder::new()
@@ -977,7 +997,14 @@ pub fn spawn() -> Result<(), String> {
             let mut pace = Pace::new();
             loop {
                 std::thread::sleep(LOG_INTERVAL);
-                guard(Feature::Diag, || (), || tick(&mut pace));
+                guard(
+                    Feature::Diag,
+                    || (),
+                    || {
+                        tick(&mut pace);
+                        drain_jump_observations();
+                    },
+                );
             }
         })
         .map(drop)
@@ -993,6 +1020,7 @@ mod tests {
     /// A scan that passed, with these numbers.
     fn passed(hits: u8, spread: f32, ny: f32) -> Scan {
         Scan {
+            samples: [None; crate::surface::RAY_COUNT],
             hits,
             fit: Some(Fit {
                 normal: Vec3::new(0.0, ny, -1.0),
@@ -1009,6 +1037,7 @@ mod tests {
     /// A scan refused for `why`.
     fn refused(why: Reject) -> Scan {
         Scan {
+            samples: [None; crate::surface::RAY_COUNT],
             hits: 1,
             fit: None,
             verdict: Err(why),
@@ -1497,5 +1526,24 @@ mod tests {
         let mut pace = Pace::new();
         tick(&mut pace);
         assert_eq!(pace.last, DIAG.snapshot());
+    }
+
+    /// A diagnostic label must not imply payment, unique replay identity or physical motion.
+    #[test]
+    fn jump_observation_line_keeps_calculation_and_correlation_limits() {
+        let record =
+            crate::jump_trace::Record::CalculatedDelta(crate::jump_trace::CalculatedDelta {
+                entity: None,
+                jump_type: 13,
+                status: crate::jump_trace::SampleStatus::NullPointer,
+                request: None,
+                error: Some(30),
+                delta_bits: None,
+            });
+        let text = jump_observation_text(&record);
+        assert!(text.starts_with("climb jump correlation candidate:"));
+        assert!(text.contains("CalculatedDelta"));
+        assert!(text.contains("entity: None"));
+        assert!(text.contains("delta_bits: None"));
     }
 }

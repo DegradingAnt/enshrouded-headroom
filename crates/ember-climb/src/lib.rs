@@ -22,10 +22,12 @@ pub mod game;
 pub mod geom;
 pub mod grace;
 pub mod hooks;
+pub mod jump_trace;
 pub mod plan;
 pub mod runtime;
 pub mod sigs;
 pub mod surface;
+pub mod trace_sigs;
 
 #[cfg(test)]
 mod testworld;
