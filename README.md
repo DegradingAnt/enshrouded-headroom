@@ -37,7 +37,7 @@ Experimental shadow overrides can raise the existing Ultra constants. All four s
 
 ## Build under test and release gates
 
-The Steam verification target is **`f68140a3-steam`**. Executable SHA-256 recognition is implemented for that build and `f68140a3`; see [the shared build table](crates/emberkit/src/build_id.rs). Recognition is not proof of a successful game boot or feature validation.
+The current static compatibility target is **Patch 1.0.1.0**, internal 1283531, Steam build 26320373 (`1283531-steam`). Its exact executable identity, async override and saved-menu prefix are verified separately from the older `f68140a3` clients; see [the W51 native evidence](docs/re-notes.md#w51-patch-1010-client-internal-1283531) and [the shared build table](crates/emberkit/src/build_id.rs). The older client identities remain supported. Recognition and offline checks do not prove a successful game boot or feature validation.
 
 After an unrecognised game update, code patches and hooks stay off until the build is known. Checked texture data and Vulkan API wrappers still run. `AllowUnknownBuild=1` permits attempts at your own risk; signatures and original-byte checks still apply.
 

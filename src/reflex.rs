@@ -209,6 +209,53 @@ mod wiring_tests {
             );
         }
     }
+    /// The new identity must select its prefix even when the old slots hold valid enums.
+    #[test]
+    fn patch_1283531_menu_prefix_does_not_read_legacy_slots() {
+        const CHILD: &str = "W51_MENU_LAYOUT_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "reflex::wiring_tests::patch_1283531_menu_prefix_does_not_read_legacy_slots",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let mut buffer = [0u64; 32];
+        let base = buffer.as_mut_ptr().cast::<u8>();
+        // SAFETY: both observed prefixes and preferences lie inside this aligned fixture.
+        unsafe {
+            let render = base.add(32);
+            render.sub(16).cast::<u32>().write(2);
+            render.sub(19).write(1);
+            render.sub(8).cast::<u32>().write(0);
+            render.sub(11).write(0);
+            configure_menu_layout(Some(&crate::build_id::Build::Known("1283531-steam")));
+            assert_eq!(read_menu(render, render.add(0x54)), Some((2, true)));
+            configure_menu_layout(Some(&crate::build_id::Build::Known("f68140a3-steam")));
+            assert_eq!(read_menu(render, render.add(0x54)), Some((0, false)));
+            for build in [
+                None,
+                Some(crate::build_id::Build::Unknown([0; 32])),
+                Some(crate::build_id::Build::Known("unproved")),
+                Some(crate::build_id::Build::Known("d7baa768-server")),
+            ] {
+                configure_menu_layout(build.as_ref());
+                assert_eq!(read_menu(render, render.add(0x54)), None);
+            }
+        }
+    }
+
     /// The real reader accepts only the verified options relationship and both enum ranges.
     #[test]
     fn menu_guard_and_ranges() {
@@ -219,16 +266,32 @@ mod wiring_tests {
             let render = base.add(16);
             render.sub(8).cast::<u32>().write(2);
             render.sub(11).write(1);
-            assert_eq!(read_menu(render, render.add(0x54)), Some((2, true)));
-            assert_eq!(read_menu(render, render.add(0x50)), None);
+            assert_eq!(
+                read_menu_for_layout(MenuLayout::Legacy, render, render.add(0x54)),
+                Some((2, true))
+            );
+            assert_eq!(
+                read_menu_for_layout(MenuLayout::Legacy, render, render.add(0x50)),
+                None
+            );
             render.sub(8).cast::<u32>().write(3);
-            assert_eq!(read_menu(render, render.add(0x54)), None);
+            assert_eq!(
+                read_menu_for_layout(MenuLayout::Legacy, render, render.add(0x54)),
+                None
+            );
             render.sub(8).cast::<u32>().write(1);
             render.sub(11).write(2);
-            assert_eq!(read_menu(render, render.add(0x54)), None);
-            assert_eq!(read_menu(std::ptr::null(), std::ptr::null()), None);
             assert_eq!(
-                read_menu(
+                read_menu_for_layout(MenuLayout::Legacy, render, render.add(0x54)),
+                None
+            );
+            assert_eq!(
+                read_menu_for_layout(MenuLayout::Legacy, std::ptr::null(), std::ptr::null()),
+                None
+            );
+            assert_eq!(
+                read_menu_for_layout(
+                    MenuLayout::Legacy,
                     std::ptr::without_provenance(usize::MAX - 8),
                     std::ptr::without_provenance(0x4b)
                 ),
@@ -240,25 +303,69 @@ mod wiring_tests {
 /// Saved Reflex and vsync values, published together; all ones means unknown.
 static MENU: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
 
-/// Read the verified settings relationship without logging or allocation.
+/// Verified prefix layout for a client identity. Zero remains unavailable.
+#[derive(Clone, Copy)]
+#[repr(u32)]
+enum MenuLayout {
+    Legacy = 1,
+    Patch1283531 = 2,
+}
+
+/// Identity-selected native prefix, published before any scene hook can run.
+static MENU_LAYOUT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Select only a client layout whose allocation and field offsets were verified.
+pub(crate) fn configure_menu_layout(build: Option<&crate::build_id::Build>) {
+    use crate::build_id::Build;
+    let layout = match build {
+        Some(Build::Known("f68140a3" | "f68140a3-steam")) => MenuLayout::Legacy as u32,
+        Some(Build::Known("1283531-steam")) => MenuLayout::Patch1283531 as u32,
+        _ => 0,
+    };
+    MENU_LAYOUT.store(layout, std::sync::atomic::Ordering::Release);
+    publish_menu(None);
+}
+
+/// Read only the prefix selected for the admitted executable identity.
 ///
 /// # Safety
-/// When the checked relationship holds, `render` must belong to the live options allocation
-/// described in re-notes. Its preceding eleven bytes must be readable. The game's render
-/// thread owns this access; volatile reads preserve its native aligned loads.
+/// When the pointer relationship holds, `render` belongs to the live options allocation
+/// documented for the selected build. Its verified prefix (eleven or nineteen bytes) is
+/// readable. The game's render thread owns this access; native aligned loads remain volatile.
 pub unsafe fn read_menu(render: *const u8, prefs: *const u8) -> Option<(u32, bool)> {
+    let layout = match MENU_LAYOUT.load(std::sync::atomic::Ordering::Acquire) {
+        1 => MenuLayout::Legacy,
+        2 => MenuLayout::Patch1283531,
+        _ => return None,
+    };
+    // SAFETY: the caller supplies the live options allocation for the published build layout.
+    unsafe { read_menu_for_layout(layout, render, prefs) }
+}
+
+/// Read the two documented fields after checking the common preferences relationship.
+/// # Safety
+/// `render` and its selected prefix have the allocation and ownership contract of `read_menu`.
+unsafe fn read_menu_for_layout(
+    layout: MenuLayout,
+    render: *const u8,
+    prefs: *const u8,
+) -> Option<(u32, bool)> {
+    let (reflex_offset, vsync_offset) = match layout {
+        MenuLayout::Legacy => (8, 11),
+        MenuLayout::Patch1283531 => (16, 19),
+    };
     let address = render as usize;
     if address == 0
         || address.checked_add(0x54) != Some(prefs as usize)
-        || address.checked_sub(11).is_none()
+        || address.checked_sub(vsync_offset).is_none()
         || !address.is_multiple_of(4)
     {
         return None;
     }
-    // SAFETY: the caller supplies the verified live allocation when the relationship holds.
-    let reflex = unsafe { render.sub(8).cast::<u32>().read_volatile() };
-    // SAFETY: the same allocation contains the byte eleven bytes before render.
-    let vsync = unsafe { render.sub(11).read_volatile() };
+    // SAFETY: both selected fields are in the caller's verified live allocation.
+    let reflex = unsafe { render.sub(reflex_offset).cast::<u32>().read_volatile() };
+    // SAFETY: the selected byte is in that same allocation.
+    let vsync = unsafe { render.sub(vsync_offset).read_volatile() };
     (reflex <= 2 && vsync <= 1).then_some((reflex, vsync != 0))
 }
 

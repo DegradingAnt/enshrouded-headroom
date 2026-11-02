@@ -55,13 +55,18 @@ use windows_sys::Win32::System::Environment::GetCommandLineW;
 use crate::config::AsyncCompute;
 use crate::entry;
 use crate::patch::{write_checked, PatchError};
-use crate::scan::{find_in_sections, main_module, Module, Pattern};
-use crate::sigs::ASYNC_OVERRIDE;
+use crate::scan::{find_in_sections, main_module, Module, Pattern, ScanError};
+use crate::sigs::{ASYNC_OVERRIDE, ASYNC_OVERRIDE_PATCH_1283531};
 
 /// The 16 bytes at +3 of the signature's match, as the game has them: `cmp [rsi+0x35289], r14b`,
 /// `je +10` (displacement `0x0a`), `movzx eax, byte [rsi+0x35288]`.
 pub const ORIGINAL: [u8; 16] = [
     0x44, 0x38, 0xb6, 0x89, 0x52, 0x03, 0x00, 0x74, 0x0a, 0x0f, 0xb6, 0x86, 0x88, 0x52, 0x03, 0x00,
+];
+
+/// Patch 1283531 originals: the optional value and has-value moved by 0x20.
+pub const ORIGINAL_PATCH_1283531: [u8; 16] = [
+    0x44, 0x38, 0xb6, 0xa9, 0x52, 0x03, 0x00, 0x74, 0x0a, 0x0f, 0xb6, 0x86, 0xa8, 0x52, 0x03, 0x00,
 ];
 
 /// What they become: `mov al, 1`, `nop dword [rax+rax+0]` (8 bytes), `nop word [rax+rax+0]`
@@ -166,16 +171,16 @@ fn command_line() -> String {
     String::from_utf16_lossy(units)
 }
 
-/// Replace [`ORIGINAL`] with [`NEW`] at `site`, if memory holds all 16 original bytes.
+/// Replace the selected sixteen original bytes with [`NEW`] after checking every byte.
 ///
 /// # Safety
 ///
 /// The contract of [`write_checked`] for the 16 bytes at `site`: they are code that no thread is
 /// running. So: start-up only, before the game's threads run.
-unsafe fn write_site(site: usize) -> Result<(), PatchError> {
+unsafe fn write_site(site: usize, original: &[u8; 16]) -> Result<(), PatchError> {
     // SAFETY: the caller's contract for `write_site` is the contract of `write_checked`.
-    // `ORIGINAL` and `NEW` are constants in this module's data, not the target.
-    unsafe { write_checked(site, &ORIGINAL, &NEW) }.map(|_| ())
+    // The selected originals and `NEW` are constants in this module, not the target.
+    unsafe { write_checked(site, original, &NEW) }.map(|_| ())
 }
 
 /// The log text for a patch that failed at `site`, starting with what became of the feature.
@@ -193,9 +198,9 @@ fn failure_text(site: usize, error: PatchError) -> String {
     }
 }
 
-/// Find `ASYNC_OVERRIDE` in `m`, add its patch offset (3) and write [`NEW`] over [`ORIGINAL`].
+/// Find exactly one supported async variant and patch only its checked sixteen-byte span.
 ///
-/// The signature must match exactly once. Every one of the 16 bytes is compared before anything
+/// Both variants together must match exactly once. Every one of the 16 bytes is compared before anything
 /// is written, so bytes that differ (including the one the signature does not look at) leave the
 /// code as it is. `Err` is the reason for the log, and starts with what became of the feature
 /// (`off: ...`) except for a read-back failure, where the bytes were written.
@@ -212,21 +217,42 @@ fn failure_text(site: usize, error: PatchError) -> String {
 /// [`Decision::Patch`]. `m` must describe mapped, readable memory of the module (as
 /// `main_module()` does).
 pub unsafe fn apply(m: &Module) -> Result<(), String> {
-    let name = ASYNC_OVERRIDE.name;
-    let pattern =
-        Pattern::parse(ASYNC_OVERRIDE.pattern).map_err(|error| format!("off: {name}: {error}"))?;
-    let found = find_in_sections(m, ASYNC_OVERRIDE.sections, &pattern).map_err(|error| {
-        log::debug!("async compute: {name}: {error}");
-        format!("off: {}", error.player_text())
+    let mut selected = None;
+    for (sig, original) in [
+        (&ASYNC_OVERRIDE, &ORIGINAL),
+        (&ASYNC_OVERRIDE_PATCH_1283531, &ORIGINAL_PATCH_1283531),
+    ] {
+        let pattern =
+            Pattern::parse(sig.pattern).map_err(|error| format!("off: {}: {error}", sig.name))?;
+        match find_in_sections(m, sig.sections, &pattern) {
+            Ok(found) => {
+                if selected.is_some() {
+                    return Err(format!("off: {}", ScanError::Multiple(2).player_text()));
+                }
+                selected = Some((sig, original, found));
+            }
+            Err(ScanError::NotFound) => {}
+            Err(error) => {
+                log::debug!("async compute: {}: {error}", sig.name);
+                return Err(format!("off: {}", error.player_text()));
+            }
+        }
+    }
+    let (sig, original, found) =
+        selected.ok_or_else(|| format!("off: {}", ScanError::NotFound.player_text()))?;
+    let site = found.checked_add(sig.patch_offset()).ok_or_else(|| {
+        format!(
+            "off: {}: the patch site is past the end of memory",
+            sig.name
+        )
     })?;
-    let site = found
-        .checked_add(ASYNC_OVERRIDE.patch_offset())
-        .ok_or_else(|| format!("off: {name}: the patch site is past the end of memory"))?;
-    log::debug!("async compute: {name} matched at {found:#x}, patching {site:#x}");
-    // SAFETY: the caller's contract for `apply`: start-up only, so no thread runs the code at
-    // `site`. The 16 bytes at `site` end at the end of the 19-byte match `find_in_sections` just
-    // found in `.text`, in the mapped, readable memory of `m`.
-    unsafe { write_site(site) }.map_err(|error| failure_text(site, error))
+    log::debug!(
+        "async compute: {} matched at {found:#x}, patching {site:#x}",
+        sig.name
+    );
+    // SAFETY: the caller guarantees stable startup code. The unique complete variant contains
+    // all sixteen bytes at site; write_site also compares every original byte before writing.
+    unsafe { write_site(site, original) }.map_err(|error| failure_text(site, error))
 }
 
 /// The body of [`init`], with the command line, the code-patch answer and the patching passed in.
@@ -625,7 +651,7 @@ mod tests {
         let code = site_code();
         mem.put(0x100, &code);
         // SAFETY: `mem` is read-write memory of this test; no thread runs the bytes in it.
-        unsafe { write_site(mem.base + 0x103) }.expect("original bytes are there");
+        unsafe { write_site(mem.base + 0x103, &ORIGINAL) }.expect("original bytes are there");
         let got = mem.get(0x100, code.len());
         assert_eq!(&got[..3], &code[..3], "mov [rbp+0x3e], cl before the patch");
         assert_eq!(&got[3..19], &NEW);
@@ -642,7 +668,7 @@ mod tests {
             code[3 + index] ^= 0x01;
             mem.put(0x100, &code);
             // SAFETY: as above.
-            let result = unsafe { write_site(mem.base + 0x103) };
+            let result = unsafe { write_site(mem.base + 0x103, &ORIGINAL) };
             assert!(
                 matches!(result, Err(PatchError::Mismatch { .. })),
                 "index {index}: {result:?}"
@@ -660,10 +686,10 @@ mod tests {
         let mem = Mem::rw(0x1000);
         mem.put(0x100, &site_code());
         // SAFETY: as above.
-        unsafe { write_site(mem.base + 0x103) }.expect("first");
+        unsafe { write_site(mem.base + 0x103, &ORIGINAL) }.expect("first");
         let after_first = mem.get(0x100, 0x20);
         // SAFETY: as above.
-        let second = unsafe { write_site(mem.base + 0x103) };
+        let second = unsafe { write_site(mem.base + 0x103, &ORIGINAL) };
         assert!(
             matches!(second, Err(PatchError::Mismatch { .. })),
             "{second:?}"
@@ -729,6 +755,46 @@ mod tests {
         // `.text` has no such code, so nothing is written there. No thread runs any of the bytes
         // that can be written.
         unsafe { apply(m) }
+    }
+
+    /// The new override uses the same patch boundary with a changed option and stack layout.
+    #[test]
+    fn apply_patch_1283531_checks_and_writes_only_its_override() {
+        let (mem, module) = image();
+        let code = [
+            0x88, 0x4d, 0x3d, 0x44, 0x38, 0xb6, 0xa9, 0x52, 0x03, 0x00, 0x74, 0x0a, 0x0f, 0xb6,
+            0x86, 0xa8, 0x52, 0x03, 0x00, 0x88, 0x45, 0x3d, 0x88, 0x8d, 0x98, 0x0a, 0x00, 0x00,
+        ];
+        mem.put(0x1100, &code);
+        assert_eq!(apply_here(&module), Ok(()));
+        let got = mem.get(0x1100, code.len());
+        assert_eq!(&got[..3], &code[..3]);
+        assert_eq!(&got[3..19], &NEW);
+        assert_eq!(&got[19..], &code[19..]);
+    }
+
+    /// A stale optional-bool address or destination must leave the new code untouched.
+    #[test]
+    fn patch_1283531_refuses_changed_fields_and_cross_variant_ambiguity() {
+        let new_code: Vec<u8> = ASYNC_OVERRIDE_PATCH_1283531
+            .pattern
+            .split_ascii_whitespace()
+            .map(|byte| u8::from_str_radix(byte, 16).unwrap())
+            .collect();
+        for index in 0..new_code.len() {
+            let (mem, module) = image();
+            let mut changed = new_code.clone();
+            changed[index] ^= 1;
+            mem.put(0x1100, &changed);
+            assert!(apply_here(&module).is_err(), "changed byte {index}");
+            assert_eq!(mem.get(0x1100, changed.len()), changed);
+        }
+        let (mem, module) = image();
+        mem.put(0x1100, &new_code);
+        mem.put(0x1200, &site_code());
+        let before = mem.get(0x1000, 0x1000);
+        assert!(apply_here(&module).unwrap_err().contains("matched 2 times"));
+        assert_eq!(mem.get(0x1000, 0x1000), before);
     }
 
     #[test]
@@ -901,19 +967,35 @@ mod tests {
         let file = std::fs::read(&path).expect("read the game exe");
         let (text_va, text) = text_of(&file);
 
-        // The signature matches once in `.text`, where the RE notes say.
-        let pattern = Pattern::parse(ASYNC_OVERRIDE.pattern).unwrap();
+        let (sig, original, match_va, stack_byte) = match build {
+            Build::Known("f68140a3" | "f68140a3-steam") => {
+                (&ASYNC_OVERRIDE, &ORIGINAL, MATCH_VA, 0x3e)
+            }
+            Build::Known("1283531-steam") => (
+                &ASYNC_OVERRIDE_PATCH_1283531,
+                &ORIGINAL_PATCH_1283531,
+                0x140852f91,
+                0x3d,
+            ),
+            other => panic!("no verified async profile for {other:?}"),
+        };
+        // The signature matches once in `.text`, at the anchor for this exact identity.
+        let pattern = Pattern::parse(sig.pattern).unwrap();
         let at = find_unique(text, &pattern).expect("the signature is in .text exactly once");
-        assert_eq!(text_va + at as u64, MATCH_VA);
+        assert_eq!(text_va + at as u64, match_va);
 
         // All 16 original bytes are on disk at +3, the byte the signature skips included, and the
         // instructions around the patch are the ones the module docs show.
-        let site = at + ASYNC_OVERRIDE.patch_offset();
-        assert_eq!(&text[site..site + 16], &ORIGINAL);
-        assert_eq!(&text[at..site], &[0x88, 0x4d, 0x3e], "mov [rbp+0x3e], cl");
+        let site = at + sig.patch_offset();
+        assert_eq!(&text[site..site + 16], original);
+        assert_eq!(
+            &text[at..site],
+            &[0x88, 0x4d, stack_byte],
+            "automatic CL store"
+        );
         assert_eq!(
             &text[site + 16..site + 25],
-            &[0x88, 0x45, 0x3e, 0x88, 0x8d, 0x98, 0x0a, 0x00, 0x00],
+            &[0x88, 0x45, stack_byte, 0x88, 0x8d, 0x98, 0x0a, 0x00, 0x00],
             "mov [rbp+0x3e], al; mov [rbp+0xa98], cl"
         );
         // The `je` at +10 is two bytes long and lands on +22: past `mov [rbp+0x3e], al`.
@@ -930,9 +1012,9 @@ mod tests {
         want[0x80 + 3..0x80 + 19].copy_from_slice(&NEW);
         assert_eq!(got, want, "only the 16 bytes at +3 changed");
         println!(
-            "signature at {MATCH_VA:#x}, patch site {:#x}; apply over a copy of {} bytes of the \
+            "signature at {match_va:#x}, patch site {:#x}; apply over a copy of {} bytes of the \
              code changed exactly {} bytes",
-            MATCH_VA + 3,
+            match_va + 3,
             around.len(),
             got.iter().zip(around).filter(|(a, b)| a != b).count()
         );

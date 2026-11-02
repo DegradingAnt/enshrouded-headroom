@@ -1166,28 +1166,35 @@ mod tests {
             unsafe { hook_at(target) }.unwrap();
             assert_eq!(apply_queued(), Ok(1));
             let mut scene = vec![0u8; 0x420];
-            let mut options = [0u64; 32];
-            let base = options.as_mut_ptr().cast::<u8>();
-            // SAFETY: the aligned fake options allocation contains all accesses made by the native fake
-            // and by the post-hook, including the negative settings offsets and preferences.
-            unsafe {
-                let render = base.add(16);
-                let prefs = render.add(0x54).cast::<u32>();
-                render.sub(8).cast::<u32>().write(2);
-                render.sub(11).write(1);
-                let f: SceneSettingsFn = std::hint::black_box(fake_scene_settings);
-                f(scene.as_mut_ptr(), render, prefs);
-                assert_eq!(crate::reflex::game_menu(), Some(2));
-                assert_eq!(FAKE_CALLS.load(Relaxed), 1);
-                render.sub(8).cast::<u32>().write(9);
-                f(scene.as_mut_ptr(), render, prefs);
-                assert_eq!(crate::reflex::game_menu(), None);
-                render.sub(8).cast::<u32>().write(1);
-                f(scene.as_mut_ptr(), render, prefs.add(1));
-                assert_eq!(crate::reflex::game_menu(), None);
-                assert_eq!(FAKE_CALLS.load(Relaxed), 3);
-                MinHook::remove_hook(target as *mut c_void).unwrap();
+            for (label, reflex_back, vsync_back) in
+                [("f68140a3-steam", 8, 11), ("1283531-steam", 16, 19)]
+            {
+                crate::reflex::configure_menu_layout(Some(&crate::build_id::Build::Known(label)));
+                let before = FAKE_CALLS.load(Relaxed);
+                let mut options = [0u64; 32];
+                let base = options.as_mut_ptr().cast::<u8>();
+                // SAFETY: this aligned fixture contains both verified prefixes and preferences.
+                // Only this child's thread calls the fake native function and its post-hook.
+                unsafe {
+                    let render = base.add(32);
+                    let prefs = render.add(0x54).cast::<u32>();
+                    render.sub(reflex_back).cast::<u32>().write(2);
+                    render.sub(vsync_back).write(1);
+                    let f: SceneSettingsFn = std::hint::black_box(fake_scene_settings);
+                    f(scene.as_mut_ptr(), render, prefs);
+                    assert_eq!(crate::reflex::game_menu(), Some(2), "{label}");
+                    assert_eq!(FAKE_CALLS.load(Relaxed), before + 1);
+                    render.sub(reflex_back).cast::<u32>().write(9);
+                    f(scene.as_mut_ptr(), render, prefs);
+                    assert_eq!(crate::reflex::game_menu(), None);
+                    render.sub(reflex_back).cast::<u32>().write(1);
+                    f(scene.as_mut_ptr(), render, prefs.add(1));
+                    assert_eq!(crate::reflex::game_menu(), None);
+                    assert_eq!(FAKE_CALLS.load(Relaxed), before + 3);
+                }
             }
+            // SAFETY: this child has finished every call to its owned fake hook.
+            unsafe { MinHook::remove_hook(target as *mut c_void) }.unwrap();
         });
     }
     /// Following the saved Reflex setting still installs the reader when all distance knobs are off.

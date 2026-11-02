@@ -1283,9 +1283,15 @@ mod tests {
             rdata.len(),
             started.elapsed()
         );
-        assert_eq!(table_va, TABLE_VA);
-        assert_eq!(table_va + 72, TOP_VALUE_VA);
-        assert_eq!(TOP_VALUE_VA % 8, 0, "the top value is 8-byte aligned");
+        assert_eq!(TABLE_VA + 72, TOP_VALUE_VA);
+        let expected = match build {
+            Build::Known("1283531-steam") => 0x1413d66d0,
+            Build::Known("f68140a3" | "f68140a3-steam") => TABLE_VA,
+            other => panic!("no verified texture table for {other:?}"),
+        };
+        assert_eq!(table_va, expected);
+        assert_eq!(table_va + 72, expected + 72);
+        assert_eq!((expected + 72) % 8, 0, "the top value is 8-byte aligned");
         // Nowhere else in the file either.
         let anywhere = prepare_in(&file);
         assert!(

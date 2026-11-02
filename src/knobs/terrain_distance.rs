@@ -599,12 +599,13 @@ mod install_tests {
         ) else {
             return;
         };
+        let expected = crate::scan::tests::game_anchor(&path, TERRAIN_UPDATE_FN.name);
         let bytes = std::fs::read(path).unwrap();
         let pe = crate::scan::parse_pe_file(&bytes).unwrap();
         let (va, text) = pe.section_va_bytes(&bytes, ".text").unwrap();
         let pattern = Pattern::parse(TERRAIN_UPDATE_FN.pattern).unwrap();
         let at = crate::scan::find_unique(text, &pattern).unwrap();
-        assert_eq!(va + at as u64, 0x1401e2e80);
+        assert_eq!(va + at as u64, expected);
         let body = &text[at + pattern.len()..at + pattern.len() + 0x80];
         assert!(
             body.windows(BODY_BYTES.len()).any(|w| w == BODY_BYTES),
