@@ -687,6 +687,40 @@ fn a_climb_runs_through_the_detours() {
     EXIT_NY.store(0, Ordering::Relaxed);
     LATTICE.store(false, Ordering::Relaxed);
 
+    // A steady hold beyond ordinary movement reach admits only correction toward that hold.
+    player.set_x(-0.2);
+    player.set_y(0.0);
+    player.set_normal(Vec3::new(-1.0, 0.0, 0.0));
+    assert_eq!(player.wall_lost(), HELD);
+    let (recovered, passed) = player.move_check(UP * 1.95);
+    assert_eq!(passed, 1);
+    assert!(recovered.x > 0.0 && recovered.y > 0.0, "{recovered:?}");
+    let saved = get(&HOLD, None).unwrap();
+    for unsupported in [
+        None,
+        Some(Hold {
+            entity: PLAYER as u32 + 1,
+            ..saved
+        }),
+        Some(Hold {
+            natural: false,
+            ..saved
+        }),
+        Some(Hold {
+            steady: false,
+            ..saved
+        }),
+    ] {
+        set(&HOLD, unsupported);
+        assert_eq!(
+            player.move_check(UP * 1.95).1,
+            0,
+            "unsupported hold must not extend movement"
+        );
+    }
+    player.set_x(0.45);
+    assert_eq!(player.wall_lost(), HELD);
+
     // The game's function runs once per call, with or without the mod's work.
     let calls = LOST_CALLS.load(Ordering::Relaxed);
     player.wall_lost();

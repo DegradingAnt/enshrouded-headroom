@@ -9,7 +9,10 @@ use std::ops::Range;
 
 use crate::exit::{self, Exit};
 use crate::geom::{Vec3, UP};
-use crate::surface::{scan, steer, Capsule, Caster, Hit, Mode, SteerInput, Tuning};
+use crate::surface::{
+    scan, scan_move_from_hold, steer, Capsule, Caster, Fit, Hit, Mode, MoveProbe, SteerInput,
+    Tuning,
+};
 
 /// The settings' defaults as limits.
 pub fn tuning() -> Tuning {
@@ -619,26 +622,38 @@ impl Climber {
 
     /// May the player stand at `pos`? The native probe never passes here, so this is the mod's
     /// answer.
-    fn may_stand<C: Caster>(&self, world: &C, pos: Vec3, t: &Tuning) -> bool {
-        scan(world, pos, -self.normal, Mode::Move, t, self.capsule)
-            .verdict
-            .is_ok()
+    fn may_stand<C: Caster>(&self, world: &C, pos: Vec3, t: &Tuning, held: Option<Fit>) -> bool {
+        let probe = match held {
+            Some(held) => scan_move_from_hold(
+                world,
+                MoveProbe {
+                    current: self.pos,
+                    candidate: pos,
+                    direction: -self.normal,
+                    held,
+                },
+                t,
+                self.capsule,
+            ),
+            None => scan(world, pos, -self.normal, Mode::Move, t, self.capsule),
+        };
+        probe.verdict.is_ok()
     }
 
     /// The game's move check: the whole velocity, else its vertical part, else its sideways part,
     /// else nothing.
-    fn check_move<C: Caster>(&mut self, world: &C, dt: f32, t: &Tuning) -> bool {
+    fn check_move<C: Caster>(&mut self, world: &C, dt: f32, t: &Tuning, held: Option<Fit>) -> bool {
         let v = self.velocity;
-        if self.may_stand(world, self.pos + v * dt, t) {
+        if self.may_stand(world, self.pos + v * dt, t, held) {
             return true;
         }
         let up = UP * v.y;
-        if self.may_stand(world, self.pos + up * dt, t) {
+        if self.may_stand(world, self.pos + up * dt, t, held) {
             self.velocity = up;
             return true;
         }
         let side = v.flat();
-        if side.length() > 1e-5 && self.may_stand(world, self.pos + side * dt, t) {
+        if side.length() > 1e-5 && self.may_stand(world, self.pos + side * dt, t, held) {
             self.velocity = side;
             return true;
         }
@@ -691,7 +706,7 @@ impl Climber {
                 self.velocity = out.velocity;
                 self.normal = out.normal;
             }
-            if self.check_move(world, dt, t) {
+            if self.check_move(world, dt, t, hold.fit.filter(|_| hold.steady)) {
                 frame = Frame::Moved;
             } else {
                 stuck = true;
@@ -732,7 +747,7 @@ pub const FRAME_TIMES: [f32; 3] = [1.0 / 120.0, 1.0 / 60.0, 1.0 / 20.0];
 #[cfg(test)]
 mod climbs {
     use super::*;
-    use crate::surface::{Capsule, Reject, GAME_STANDOFF};
+    use crate::surface::{Capsule, GAME_STANDOFF};
 
     /// Climb straight up until `height` metres are gained. Panics on a drop, a stall or a mantle.
     fn climb_up<C: Caster>(world: &C, mut climber: Climber, height: f32, dt: f32) -> Climber {
@@ -754,6 +769,34 @@ mod climbs {
             }
         }
         panic!("too slow: {climber:?}");
+    }
+
+    /// A wall can be held outside ordinary move reach. The correction must not deadlock there.
+    #[test]
+    fn a_held_wall_outside_move_reach_recovers_without_grace() {
+        let wall = Plane::wall(1.0);
+        let t = tuning();
+        for dt in FRAME_TIMES {
+            for stick in [(0.0, 1.0), (0.0, -1.0), (1.0, 0.0)] {
+                let mut climber = Climber::on(&wall, Vec3::default(), face(90.0));
+                climber.pos.x = -0.2;
+                for _ in 0..((2.0 / dt) as u32) {
+                    assert_eq!(
+                        climber.step(&wall, stick, dt, &t),
+                        Frame::Moved,
+                        "{dt}/{stick:?}: {climber:?}"
+                    );
+                }
+                assert!(
+                    climber.gap(&wall).unwrap() <= 0.61,
+                    "{dt}/{stick:?}: {climber:?}"
+                );
+                assert!(
+                    climber.pos.y.abs() + climber.pos.z.abs() > 1.0,
+                    "movement must continue"
+                );
+            }
+        }
     }
 
     /// The design's test plan: 10 m of plain face at every steepness, at every frame rate, with
@@ -1132,31 +1175,11 @@ mod climbs {
         }
     }
 
-    /// The hard end of the short shelf, pinned the same way. A bench of 15 degrees and 0.7 to 0.8 m
-    /// in a 60 degree face leaves the climber 1.2 m from the wall behind it, with the normal on
-    /// that wall. The hold reaches it and the move check does not. So the climber does not fall,
-    /// and no stick moves them. Only the game's own jump ends this, and this model has no jump.
+    /// The old hold/move reach mismatch trapped these benches permanently. Recovery now lets
+    /// the initialized proposed model reach a walkable exit, rather than accepting missing rock.
     #[test]
-    fn a_bench_in_a_leaning_face_can_hold_the_climber() {
-        let t = tuning();
-        for width in [0.7, 0.75, 0.8] {
-            let rock = shelf(60.0, 15.0, width);
-            let mut climber = Climber::on(&rock, Vec3::new(-1.0, 0.0, 0.0), face(60.0));
-            assert_eq!(hold_up(&rock, &mut climber), End::Stall, "{width}");
-            let (pos, capsule) = (climber.pos, climber.capsule);
-            let probe = |mode| scan(&rock, pos, -climber.normal, mode, &t, capsule);
-            assert!(probe(Mode::Stay).verdict.is_ok(), "{width}");
-            assert_eq!(probe(Mode::Move).verdict, Err(Reject::Hits), "{width}");
-            for stick in [(0.0, -1.0), (1.0, 0.0), (-1.0, 0.0)] {
-                let mut moving = climber;
-                for frame in 0..120 {
-                    let step = moving.step(&rock, stick, 1.0 / 60.0, &t);
-                    assert_eq!(step, Frame::Blocked, "{width}, {stick:?}, frame {frame}");
-                }
-                assert_eq!(moving.pos, climber.pos, "{width}, {stick:?}");
-            }
-        }
-        for width in [0.65, 0.85] {
+    fn a_leaning_bench_no_longer_traps_all_movement() {
+        for width in [0.65, 0.7, 0.75, 0.8, 0.85] {
             let rock = shelf(60.0, 15.0, width);
             let mut climber = Climber::on(&rock, Vec3::new(-1.0, 0.0, 0.0), face(60.0));
             assert_eq!(hold_up(&rock, &mut climber), End::Mantle, "{width}");

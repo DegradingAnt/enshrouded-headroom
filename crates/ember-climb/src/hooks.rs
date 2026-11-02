@@ -30,7 +30,9 @@ use crate::geom::Vec3;
 use crate::grace;
 use crate::plan::{self, HELD};
 use crate::sigs::{self, Sig};
-use crate::surface::{cone_ok, scan, steer, Fit, Hit, Mode, Scan, SteerInput, Tuning};
+use crate::surface::{
+    cone_ok, scan, scan_move_from_hold, steer, Fit, Hit, Mode, MoveProbe, Scan, SteerInput, Tuning,
+};
 use crate::Feature;
 
 /// The least rise of a predicted position that counts as moving up, in metres.
@@ -300,7 +302,30 @@ unsafe fn natural_probe(
     let Some(caster) = caster else {
         return;
     };
-    let scan = scan(&caster, pos, dir, mode, &runtime.tuning, capsule);
+    let held = (mode == Mode::Move)
+        .then(|| get(&HOLD, None))
+        .flatten()
+        .filter(|hold| hold.natural && hold.steady && hold.entity == entity)
+        .and_then(|hold| hold.fit);
+    let scan = match held {
+        Some(held) => {
+            // SAFETY: the native context's CurrentTransform is alive for this call. This is the
+            // same entity/update whose wall-lost probe just supplied the confirmed steady fit.
+            let current = unsafe { ctx.position() };
+            scan_move_from_hold(
+                &caster,
+                MoveProbe {
+                    current,
+                    candidate: pos,
+                    direction: dir,
+                    held,
+                },
+                &runtime.tuning,
+                capsule,
+            )
+        }
+        None => scan(&caster, pos, dir, mode, &runtime.tuning, capsule),
+    };
     DIAG.natural(mode, &scan);
     DIAG.capsule(capsule.radius * 2.0, capsule.height);
     if mode == Mode::Stay {

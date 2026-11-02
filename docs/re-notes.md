@@ -2376,3 +2376,30 @@ The inert hook-flow regression checks natural-success refusal, failure preservat
 lattice results. This is a first-test prevention policy, not proof that every collision/warp cause
 has been solved. Receipts: private W52 mantle-safety-boundary.md, owned-exit-safety.json and full
 head/query/builder assembly; no game or third-party mod was executed or modified.
+
+
+### W52 follow-up: recover movement toward a confirmed hold
+
+A closed-loop regression isolated a reach deadlock with no game execution: a vertical wall at1.2m
+passes Stay's1.4m range, but Move's1.0m range rejects the small steering correction toward it. The
+native-style move check then clears velocity. Up, down and sideways input repeat the same refusal.
+No frame-count grace or collision API can fix that range mismatch on its own.
+
+Movement now tries its ordinary fresh scan first. Only a missing-hit refusal may retry, only with
+this entity's same-call confirmed steady natural hold, and only while the candidate remains in front
+of and strictly closer to that fit. The retry adds exactly the existing Stay margin to Move's range;
+it remains a fresh Move scan with the existing hit-count, slope and roughness checks. Its fresh fit
+must also show movement toward the surface. It never substitutes the old hold for new geometry.
+Missing/wrong-entity/lattice/unsteady holds and parallel/away/cross-plane steps do not extend reach.
+There is no new persistent state, native offset, setting, collision bypass or timed forgiveness.
+
+The inert hook-flow regression exercises the actual movement/probe detours. Closed-loop tests cover
+up/down/side input at120/60/20Hz, convergence within the existing0.03m stand-off deadband, and the
+formerly trapped clean leaning benches0.7–0.8m wide. Fresh invalid slopes, rough fits, missing geometry
+and the ordinary range limit remain refusals. These are algorithm/fixture results, not live physics
+or controller acceptance. Native grace and automatic natural top-outs remain unavailable.
+
+This supersedes the earlier current-stall claim and historical receipt name
+`a_bench_in_a_leaning_face_can_hold_the_climber`; the new regression is
+`a_leaning_bench_no_longer_traps_all_movement`. Earlier rough-bench outcome counts are not a new
+performance or behavior measurement for this candidate.

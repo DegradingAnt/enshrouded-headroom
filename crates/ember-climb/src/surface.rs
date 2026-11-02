@@ -534,6 +534,75 @@ pub fn scan<C: Caster>(
     }
 }
 
+/// A movement probe supported by the steady natural hold confirmed in this same update.
+#[derive(Clone, Copy, Debug)]
+pub struct MoveProbe {
+    /// The feet before movement.
+    pub current: Vec3,
+    /// The candidate feet the native move check is testing.
+    pub candidate: Vec3,
+    /// The native probe direction.
+    pub direction: Vec3,
+    /// A steady fit from this entity's hold in the same call; never a previous-frame snapshot.
+    pub held: Fit,
+}
+
+/// Ordinary movement first, with bounded recovery toward a confirmed hold when needed.
+pub fn scan_move_from_hold<C: Caster>(
+    caster: &C,
+    probe: MoveProbe,
+    t: &Tuning,
+    capsule: Capsule,
+) -> Scan {
+    let ordinary = scan(
+        caster,
+        probe.candidate,
+        probe.direction,
+        Mode::Move,
+        t,
+        capsule,
+    );
+    if ordinary.verdict != Err(Reject::Hits)
+        || !approaches_hold(probe.current, probe.candidate, &probe.held)
+    {
+        return ordinary;
+    }
+    let recovering = Tuning {
+        hold_reach: t.hold_reach + STAY_EXTRA,
+        ..*t
+    };
+    let fresh = scan(
+        caster,
+        probe.candidate,
+        probe.direction,
+        Mode::Move,
+        &recovering,
+        capsule,
+    );
+    if fresh.verdict.is_ok()
+        && !fresh
+            .fit
+            .is_some_and(|fit| approaches_hold(probe.current, probe.candidate, &fit))
+    {
+        return ordinary;
+    }
+    fresh
+}
+
+/// Both positions remain in front of a finite fit, and the candidate reduces its signed gap.
+/// This cannot authorize a parallel step, a step away, or crossing the fitted plane.
+fn approaches_hold(current: Vec3, candidate: Vec3, fit: &Fit) -> bool {
+    if !current.is_finite() || !candidate.is_finite() || !fit.point.is_finite() {
+        return false;
+    }
+    let Some(normal) = fit.normal.normalized() else {
+        return false;
+    };
+    let before = fit.distance(current, normal);
+    let after = fit.distance(candidate, normal);
+    before.is_finite() && after.is_finite() && before > after && after > 0.0
+}
+
 /// Does the stick point at the wall? The game asks `acos(dot(-normal, input)) <= 45 degrees` with
 /// the raw input, so a half-pressed stick or a leaning wall fails it however straight the player
 /// runs at the wall. Here both are flat and length 1, which leaves only the heading.
@@ -1071,6 +1140,144 @@ mod tests {
         let fit = fit_of([under].iter()).unwrap();
         let high = (UP * CAPSULE.top() - under.point).dot(under.normal);
         assert!((near_distance(Vec3::default(), &fit, CAPSULE) - high).abs() < 1e-5);
+    }
+
+    /// The steady four-hit wall used to test movement recovery independently of the new rays.
+    fn held_wall_probe(candidate: Vec3) -> MoveProbe {
+        MoveProbe {
+            current: Vec3::new(-0.2, 0.0, 0.0),
+            candidate,
+            direction: AHEAD,
+            held: Fit {
+                normal: Vec3::new(-1.0, 0.0, 0.0),
+                point: Vec3::new(1.0, 1.625, 0.0),
+                hits: 4,
+                spread: 0.0,
+                entity: 0,
+            },
+        }
+    }
+
+    /// No spatial recovery can admit a parallel/away/cross-plane candidate or invalid data.
+    #[test]
+    fn movement_recovery_does_not_extend_other_directions_or_invalid_inputs() {
+        for candidate in [
+            Vec3::new(-0.2, 0.03, 0.0),
+            Vec3::new(-0.22, 0.0, 0.0),
+            Vec3::new(1.01, 0.0, 0.0),
+            Vec3::new(f32::NAN, 0.0, 0.0),
+        ] {
+            let world = Scripted::new(&[None, None]);
+            let answer =
+                scan_move_from_hold(&world, held_wall_probe(candidate), &tuning(), CAPSULE);
+            assert_eq!(answer.verdict, Err(Reject::Hits));
+            assert_eq!(world.casts(), 2, "no recovery rays for {candidate:?}");
+        }
+        for change in 0..3 {
+            let mut probe = held_wall_probe(Vec3::new(-0.18, 0.0, 0.0));
+            match change {
+                0 => probe.current.x = f32::INFINITY,
+                1 => probe.held.point.y = f32::NAN,
+                _ => probe.held.normal = Vec3::default(),
+            }
+            let world = Scripted::new(&[None, None]);
+            assert_eq!(
+                scan_move_from_hold(&world, probe, &tuning(), CAPSULE).verdict,
+                Err(Reject::Hits)
+            );
+            assert_eq!(world.casts(), 2);
+        }
+    }
+
+    /// A previous fit is never substituted for a fresh hit after the surface goes away.
+    #[test]
+    fn recovery_requires_fresh_geometry_and_stays_inside_the_hold_range() {
+        let empty = Scripted::new(&[None, None, None, None]);
+        let probe = held_wall_probe(Vec3::new(-0.18, 0.03, 0.0));
+        assert_eq!(
+            scan_move_from_hold(&empty, probe, &tuning(), CAPSULE).verdict,
+            Err(Reject::Hits)
+        );
+        assert_eq!(empty.casts(), 4, "one ordinary probe and one bounded retry");
+        let too_far = Plane::wall(2.0);
+        assert_eq!(
+            scan_move_from_hold(&too_far, probe, &tuning(), CAPSULE).verdict,
+            Err(Reject::Hits)
+        );
+    }
+
+    /// A wider ray never turns the hold's permissive test into movement admission.
+    #[test]
+    fn recovery_preserves_move_slope_and_roughness_checks() {
+        let probe = held_wall_probe(Vec3::new(-0.18, 0.03, 0.0));
+        let walkable = Plane::through(Vec3::new(-0.2, 1.25, 0.0), face(30.0));
+        assert_eq!(
+            scan_move_from_hold(&walkable, probe, &tuning(), CAPSULE).verdict,
+            Err(Reject::Walkable)
+        );
+        let overhang = Plane::through(Vec3::new(1.13, 1.25, 0.0), face(140.0));
+        assert_eq!(
+            scan_move_from_hold(&overhang, probe, &tuning(), CAPSULE).verdict,
+            Err(Reject::Overhang)
+        );
+        let bumpy: Vec<_> = [None, None]
+            .into_iter()
+            .chain([0.0, 0.9, 1.8, 2.7].into_iter().map(|z| {
+                Some(Hit {
+                    point: Vec3::new(z, 1.5, 0.0),
+                    normal: Vec3::new(-1.0, 0.0, 0.0),
+                    entity: 0,
+                })
+            }))
+            .collect();
+        let world = Scripted::new(&bumpy);
+        assert_eq!(
+            scan_move_from_hold(&world, probe, &tuning(), CAPSULE).verdict,
+            Err(Reject::Bumpy)
+        );
+    }
+
+    /// A non-hit rejection never triggers a recovery scan.
+    #[test]
+    fn a_rejected_move_is_not_retried_for_reasons_other_than_missing_hits() {
+        let answers: Vec<_> = [0.0, 0.9, 1.8, 2.7]
+            .into_iter()
+            .map(|x| Some(wall_hit(x, 1.5)))
+            .collect();
+        let world = Scripted::new(&answers);
+        let probe = held_wall_probe(Vec3::new(-0.18, 0.0, 0.0));
+        assert_eq!(
+            scan_move_from_hold(&world, probe, &tuning(), CAPSULE).verdict,
+            Err(Reject::Bumpy)
+        );
+        assert_eq!(world.casts(), 4);
+    }
+
+    /// A confirmed hold must let a fresh movement probe admit a small correction toward it.
+    #[test]
+    fn a_move_can_recover_toward_its_confirmed_hold() {
+        let wall = Plane::wall(1.0);
+        let current = Vec3::new(-0.2, 0.0, 0.0);
+        let t = tuning();
+        let hold = scan(&wall, current, AHEAD, Mode::Stay, &t, CAPSULE);
+        assert!(hold.verdict.is_ok() && hold.steady);
+        let candidate = current + Vec3::new(0.02, 0.03, 0.0);
+        assert_eq!(
+            scan(&wall, candidate, AHEAD, Mode::Move, &t, CAPSULE).verdict,
+            Err(Reject::Hits)
+        );
+        let result = scan_move_from_hold(
+            &wall,
+            MoveProbe {
+                current,
+                candidate,
+                direction: AHEAD,
+                held: hold.fit.unwrap(),
+            },
+            &t,
+            CAPSULE,
+        );
+        assert!(result.verdict.is_ok(), "{result:?}");
     }
 
     /// A half-pressed stick aimed straight at the wall starts a climb. The game's own test
