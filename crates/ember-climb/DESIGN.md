@@ -12,6 +12,17 @@ The author wants reliable climbing that feels like part of Enshrouded. Hanging m
 
 These are design references. No code, animations or assets from those games are included.
 
+## Zelda-like movement direction
+
+The author wants the freedom and predictable controls of Breath of the Wild climbing while keeping Enshrouded's balance. This means automatic grabs, continuous analogue movement over rock, smooth changes in orientation, clear exhaustion, and the normal Jump control to leave a wall.
+
+[Nintendo's Eldin climbing advice](https://www.nintendo.com/ph/zelda/botw/discovery/eldin.html) explicitly says that remaining still on a cliff does not consume stamina in Breath of the Wild. The author separately requested stamina drain while clinging here. The candidate therefore retains its minimum hanging effort as a deliberate balance difference.
+
+The next movement correction separates geometry from animation easing. A hit point and the fresh fitted normal define the physical plane. Distance and capsule clearance use that normal, while movement and body direction keep their eased normal. An accepted three-hit patch must not pull differently merely because one corner ray missed the same plane. Regression tests cover changing centroids, bends and overhangs at 120/60/20 Hz. This adds no rays, persistent state, speed increase or native collision bypass. It is a source/fixture result, not measured in-game smoothness.
+
+Sharp perpendicular convex corners remain a traversal limit: the current wide, parallel patch can lose enough support before seeing the next face. The correction does not relax all movement to two hits or fabricate a hold. A later corner-transfer feature needs fresh directional support and native movement admission.
+
+A deliberate upward climbing hop is a separate follow-up. The native game currently supplies a detached push-off and a 375 ms re-grab block. Its input, accepted impulse and stamina ownership are separate. Charging at a convenient Jump hook could bill a refused request or repeat on replay. Preserve native push-off until a proven accepted-action cost transaction is available. Automatic natural top-outs and surface IK retain their existing gates.
 ## Stamina rule in the test candidate
 
 The owned executable's climbing program charges for distance moved. At zero movement it skips both the debit and the exhaustion check. Raising the existing per-metre cost cannot fix free stationary hanging because that cost getter is never called on an idle tick.

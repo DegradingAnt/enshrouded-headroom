@@ -133,7 +133,7 @@ The game already climbs, but only on flat iron lattices. Its wall probe wants fo
 
 - The game's probe always runs first, so its successful lattice answer is kept. No mask or tolerance in the game is changed. The attachment patch skips only the synthetic voxel-hold marker; ordinary IDs, including high-bit IDs, use the native accessor/store. That store also runs when the ID is unchanged.
 - When the probe fails, the mod casts four rays of its own at the surface, averages what they hit, and asks whether it is steep and flat enough.
-- The game moves a climber along world up, which walks straight off any face that leans. The mod turns the movement into the surface, keeps the speed, and holds the game's 0.55 m distance. If a confirmed hold is beyond normal movement reach, a fresh probe can use the existing hold margin while moving closer to it. This avoids a permanent hold/move deadlock; it adds no timer or permission to move away.
+- The game moves a climber along world up, which walks straight off any face that leans. The mod turns the movement into the surface, keeps the speed, and holds the game's 0.55 m distance. Physical distance uses the fresh fitted plane while body direction eases separately; a changing ray-hit centroid must not invent an inward or outward pull. If a confirmed hold is beyond normal movement reach, a fresh probe can use the existing hold margin while moving closer to it. This avoids a permanent hold/move deadlock; it adds no timer or permission to move away.
 - Automatic climb-up animations on natural rock and walls are disabled in this test build. The current native head-sphere check does not prove that the whole character or animation path is clear. Use the game's jump-off to leave the surface. Ordinary iron lattices keep their native exits. The proposed area-based top-out model remains in inert tests for later integration with a proven body/path guard.
 - A half-pressed stick fails the game's start test however straight you run at a wall. The mod tests only the heading.
 - The persistent seam-forgiveness model is tested on initialized simulated state, but its native binding stays unavailable. This build never reads or writes the game's spare grace byte. The hold and movement fits still use their longer reach and relaxed surface checks.
@@ -151,6 +151,7 @@ The client and server use the same plugin and settings. Test multiplayer only af
 ## Limits
 
 - Automatic natural-wall top-outs are unavailable. This includes a valid-looking flat top; use Jump to leave the wall. Whole-body landing and animation-path checks must be proven before this feature can be enabled. The staged prevention does not establish the cause of a different mod's reported terrain/spawn recovery.
+- Sharp perpendicular outside corners can still stop movement before the next face is sampled. Rounded-surface steering is supported; this build does not grant a corner transfer from missing geometry.
 - Seam forgiveness is unavailable. A complete loss of the hold rays drops the climber without a timed grace period. The pure proposed grace model needs proven initialization and lifecycle ownership before a later build can enable it.
 
 - A surface must reach 2 m above your feet to start a climb. A lower wall starts nothing, and neither does a ledge you jump at when it is less than 2 m above your feet at that moment. Use the game's jump there. This may change after the first play test.
@@ -173,7 +174,7 @@ The server decides from its own probe. The client sends only its stick and butto
 
 - **The server needs the mod**, and so does **every player who climbs**. The client predicts its own player, and it needs the same probe to agree with the server.
 - **A player who only watches does not need the mod.** A player is predicted only on that player's own client. A watcher gets the position and the animation from the server.
-- **A client with the mod on a vanilla server** gets a stuck start and a snap back at natural walls. This is a hypothesis until it is tested. Lattices stay vanilla.
+- **A client with the mod on a vanilla server** gets a stuck start and a snap back at natural walls. This is a hypothesis until it is tested. Lattice geometry and exit answers stay native, but the candidate's hanging effort needs the matching server too.
 
 ## Build and test
 

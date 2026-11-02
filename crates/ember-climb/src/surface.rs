@@ -700,7 +700,9 @@ pub fn steer(input: &SteerInput, t: &Tuning, capsule: Capsule) -> Option<Steered
         .map_or(Vec3::default(), |direction| direction * speed);
     let (pull, error) = match &fit {
         Some(fit) => {
-            let error = fit.distance(pos, normal) - standoff_target(normal.y, capsule);
+            // The hit point belongs to the fresh plane. The eased direction is for movement and
+            // body rotation; using it to measure this plane invents a gap when the centroid moves.
+            let error = fit.distance(pos, fit.normal) - standoff_target(fit.normal.y, capsule);
             (standoff_speed(error, dt, contact), error)
         }
         None => (0.0, 0.0),
@@ -1786,5 +1788,108 @@ mod tests {
         assert_eq!(scan.hits, 4);
         assert!(scan.steady, "{scan:?}");
         assert!(scan.verdict.is_ok(), "{scan:?}");
+    }
+
+    /// A bend changes the eased heading, not the actual distance to the newly sampled wall.
+    #[test]
+    fn a_correct_gap_on_a_bend_does_not_pull_when_the_hit_count_changes() {
+        let t = tuning();
+        let old_normal = Vec3::new(-1.0, 0.0, 0.0);
+        let origins = Frame::along(AHEAD).unwrap().origins(Vec3::default());
+        for yaw in [20.0f32, 30.0, 45.0] {
+            let turn = yaw.to_radians();
+            let fresh_normal = Vec3::new(-turn.cos(), 0.0, -turn.sin());
+            let rock = Plane::through(-fresh_normal * GAME_STANDOFF, fresh_normal);
+            let answers = origins.map(|origin| {
+                rock.cast(
+                    origin - AHEAD * Mode::Stay.back(),
+                    origin + AHEAD * Mode::Stay.reach(&t),
+                    t.mask,
+                )
+            });
+            assert!(answers.iter().all(Option::is_some));
+            for omit in 0..=RAY_COUNT {
+                let mut kept = answers;
+                if omit < RAY_COUNT {
+                    kept[omit] = None;
+                }
+                let world = Scripted::new(&kept);
+                let fresh = scan(&world, Vec3::default(), AHEAD, Mode::Stay, &t, CAPSULE);
+                assert!(fresh.verdict.is_ok() && fresh.steady);
+                assert_eq!(world.casts(), RAY_COUNT);
+                for dt in [1.0 / 120.0, 1.0 / 60.0, 1.0 / 20.0] {
+                    let mut frame = input(UP * 1.95, old_normal, fresh.fit);
+                    frame.dt = dt;
+                    let out = steer(&frame, &t, CAPSULE).unwrap();
+                    assert!(
+                        out.error.abs() < 1e-5,
+                        "yaw{yaw}, missing{omit},dt{dt}: {out:?}"
+                    );
+                    assert!(
+                        out.velocity.dot(out.normal).abs() < 1e-5,
+                        "no invented pull: {out:?}"
+                    );
+                    assert!((out.velocity.length() - 1.95).abs() < 1e-5);
+                    assert!(out.normal.dot(old_normal) > old_normal.dot(fresh_normal));
+                }
+            }
+        }
+    }
+
+    /// Any point on one plane must produce the same measured gap during normal smoothing.
+    #[test]
+    fn changing_the_hit_centroid_on_one_plane_does_not_change_the_pull() {
+        let t = tuning();
+        for (old, fresh) in [(90.0, 60.0), (60.0, 90.0), (90.0, 105.0), (105.0, 90.0)] {
+            let normal = face(fresh);
+            let plane = Frame::along(-normal).unwrap();
+            for gap_error in [-0.1, 0.0, 0.1] {
+                let base = fit_at(normal, standoff_target(normal.y, CAPSULE) + gap_error);
+                for dt in [1.0 / 120.0, 1.0 / 60.0, 1.0 / 20.0] {
+                    let mut frame = input(UP * 1.95, face(old), Some(base));
+                    frame.dt = dt;
+                    let reference = steer(&frame, &t, CAPSULE).unwrap();
+                    for along in [-0.35, 0.0, 0.35, 1.625] {
+                        frame.fit = Some(Fit {
+                            point: base.point + plane.up * along + plane.right * 0.35,
+                            ..base
+                        });
+                        let out = steer(&frame, &t, CAPSULE).unwrap();
+                        assert!(
+                            (out.error - gap_error).abs() < 1e-5,
+                            "{old}->{fresh}, shift{along}: {out:?}"
+                        );
+                        assert!((out.velocity - reference.velocity).length() < 1e-5);
+                        assert_eq!(out.normal, reference.normal);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Upright capsule clearance belongs to the physical overhang while body rotation catches up.
+    #[test]
+    fn an_overhang_uses_its_fresh_capsule_gap_during_normal_smoothing() {
+        let t = tuning();
+        for angle in [100.0, 105.0, 110.0, 115.0] {
+            let normal = face(angle);
+            let gap = standoff_target(normal.y, CAPSULE);
+            let fit = fit_at(normal, gap);
+            let out = steer(&input(UP * 1.95, face(90.0), Some(fit)), &t, CAPSULE).unwrap();
+            assert!(out.error.abs() < 1e-5, "{angle}: {out:?}");
+            assert!(out.velocity.dot(out.normal).abs() < 1e-5);
+            assert!(
+                out.normal.y > normal.y,
+                "body still eases rather than snapping"
+            );
+            if angle > 110.0 {
+                let capped = steer(&input(UP * 1.95, face(110.0), Some(fit)), &t, CAPSULE).unwrap();
+                assert!(
+                    capped.error.abs() < 1e-5,
+                    "clamped direction still uses physical clearance"
+                );
+                assert!((capped.normal.y - t.overhang_ny).abs() < 1e-5);
+            }
+        }
     }
 }

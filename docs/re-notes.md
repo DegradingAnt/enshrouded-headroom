@@ -2526,3 +2526,42 @@ it remains until exit after a late conflict, like the existing startup hold patc
 startup refusals install none of these bytes. Checked rollback now also attempts the failed range
 when a write's read-back is unconfirmed; any failed restoration is named instead of claiming that
 the range was never written. The read-back regression failed before this correction.
+
+### W52 Zelda-like movement: physical gap and orientation easing
+
+[VERIFIED] A pure-source regression found that steering measured a fresh fitted plane through its
+hit centroid using the eased/clamped orientation normal. At a correctly spaced30-degree yaw bend,
+four accepted ray hits produced a false0.083707m gap error and0.322244m/s inward pull. Missing one
+low corner ray leaves a valid three-hit fit on the same plane but raised that pull to0.679423m/s;
+at45degrees it could reach the1.2m/s correction cap. These are f32 analytical/fixture observations,
+not measurements of the running game.
+
+The geometric metric now uses the fresh fit normal for both distance and the upright capsule's
+standoff target. Eased direction remains authoritative for movement/body orientation and correction
+direction. Three new Rust regressions fail before the change: real analytic Plane scans with every
+single-corner omission, equivalent tangential hit-centroid shifts, and overhang clearance while
+orientation lags. They cover120/60/20Hz, retain the normal-easing/speed/step caps, and add zero rays,
+state, offsets, settings or native bindings. Existing full closed-loop/replay tests remain unchanged.
+This does not admit sharp perpendicular corner transfer, body/path clearance or automatic top-outs.
+Receipt: private W52 zelda-movement-audit.md and zelda-movement-fixture.json, with red/green Rust logs.
+
+### W52 native climbing Jump feasibility
+
+[VERIFIED] The bounded owned-image Jump family has22 equal old/current function comparisons across
+client/server and368 explicit jump-table destinations verified at matching instruction boundaries.
+Input Jump32 and jump type FreeClimbing13 feed the existing native wall gate: Wall1/state2 and no
+ClimbingTransition35. Native abort/exit clears Climbing34 and applies a375000000ns re-grab block.
+The native impulse is a detached push-off built from Climb.normal and normal jump tuning.
+
+[VERIFIED] Current client native_apply_jump0x422780 rejects a failed dispatcher result before adding
+Velocity at0x42295b..0x422980, then updates native jump time/count/type. This identifies a future
+accepted-impulse boundary; it does not establish a one-shot stamina transaction. Abort/jump programs
+have no Stamina or StaminaDepletion write ownership. Action-sequence control owns Stamina, but its
+accepted Jump/cost ownership and replay deduplication are not proven here.
+
+[UNKNOWN] A deliberate upward climbing hop needs an accepted input/impulse and native cost contract.
+Debiting at a request/abort hook risks charging failures or repeats. No new Jump binding, component
+write, event marker or runtime behavior is admitted; native push-off remains. No third-party mod
+code or game process was used. Receipt: private zelda-jump-followup/FEASIBILITY.md SHA256
+FCFDAA9F0042C1D690660612C3565678C01DA0F2B092E397D8AD6480933D8EE0; native-jump-contract.json SHA256
+FFCE80EA16EA4C62FB3C617E16501A62DA64F8D9F3AA3CDF59CAFCABED39483E.
