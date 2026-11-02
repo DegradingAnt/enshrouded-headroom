@@ -1800,3 +1800,146 @@ When this path's token and selector checks match, it skips the table copy. Chang
 Before enabling runtime writes, establish the quality-refresh boundary, its exact ABI and owner thread, the cache object's lifetime, synchronization and GPU resource retirement. Distinguish a cheap per-frame workload limit from a change that resizes resources. Do not force repeated quality toggles or resource/shader rebuilds to simulate adaptation. Prove applied-state readback and manual-control arbitration, then use the existing governor with explicit quality bounds and rollback. Unknown builds, layouts or ownership must leave the adapter unavailable.
 
 Particle lifetime, debris, extra shadow lights and fog need separate live-consumer and lifetime receipts. This GI analysis does not authorize adapting those controls or show that either mod caused the reported stalls.
+
+
+## W51: Patch 1.0.1.0 client (internal 1283531)
+
+The Steam client build is 26320373. The independently hashed executable has SHA-256
+`0403981fd2e8ad18bd8c5698dff03c8d505b5a46677832c496db9c645513f2a6`.
+The reference executable for the comparison has SHA-256
+`b28b448a8dbf48c932b717f035031f5a89712a7cccfcc2d6cac0d47e6421c12a`.
+These are offline byte and decoder observations. They do not establish gameplay acceptance.
+
+### Saved Reflex menu prefix changed
+
+The new machine-settings reflection rows at `0x1417e91c0`, `0x1417e9250`,
+`0x1417e9280`, `0x1417e9310` and `0x1417e9340` record `vsync +0x29`,
+`nvidiaReflex +0x2c`, `nvidiaReflexDefaultOff +0x30`, `render +0x3c` and
+`renderPreferences +0x90`. The old offsets were +0x29, +0x2c, +0x30, +0x34
+and +0x88. A second matching descriptor has the same new offsets.
+The preferences-to-render delta remains `0x54`; that check alone does not identify the prefix.
+For the new client the saved Reflex u32 is `render-0x10`, and the vsync byte is
+`render-0x13`. The old client uses `render-8` and `render-11`.
+Unknown identities must not select either layout.
+
+### Async override moved
+
+The new automatic-value store is `0x140852f91: 88 4d 3d`.
+The optional override then occupies the sixteen bytes at `0x140852f94`:
+`44 38 b6 a9 52 03 00 74 0a 0f b6 86 a8 52 03 00`.
+It tests the has-value byte at `RSI+0x352a9` and loads the value at `RSI+0x352a8`.
+The following store is `0x140852fa4: 88 45 3d`; it still stores AL.
+At `0x140852fa7` the automatic CL value is stored to `RBP+0xa98`.
+The new stack destination is +0x3d; the old one was +0x3e.
+The sixteen-byte `mov al,1` and NOP replacement can preserve the same boundary,
+but it must check the complete matching build-specific bytes before writing.
+
+
+### Verified sites and hook contracts
+
+The existing thirteen non-async signatures remain unique in `.text`. The new exact
+async variant is also unique. These addresses are image-base VAs for this exact client:
+
+| Signature | Patch 1283531 VA |
+|---|---|
+| SCENE_SETTINGS_FN | `0x1400f8f90` |
+| SCATTER_BRICK_LOAD | `0x140079e82` |
+| SCATTER_INSTANCE_LOADS | `0x1400772f8` |
+| SCATTER_CAP_CONST | `0x14007570c` |
+| SCATTER_CAP_ALLOC | `0x140074f88` |
+| DECO_HIGH_IMM | `0x1400d90d3` |
+| DISTANT_HIGH_IMM | `0x1400d9126` |
+| VOXEL_HIGH_IMMS | `0x1400f9bff` |
+| ASYNC_OVERRIDE_PATCH_1283531 | `0x140852f91` |
+| HDR_PAPER_WHITE | `0x14090381c` |
+| TERRAIN_UPDATE_FN | `0x1401e6680` |
+| SCATTER_FRAME_FN | `0x140077180` |
+| MLS_QUALITY_TABLE_LEA | `0x1400c9d4c` |
+| SUN_SHADOW_ULTRA | `0x140166dd1` |
+
+**Scene and menu.** The complete leaf `[0x1400f8f90,0x1400f93f1)` has 203
+instructions, with the same instructions, branch topology, fields and constants as
+the old leaf after resolving relocated RIP operands. Its three loaded constants are
+byte-identical. It uses RCX, RDX and R8, makes no calls, and has no stack arguments.
+Its minimum internal branch target is entry+0x37, after MinHook's eleven-byte prefix.
+The only decoded direct caller is `0x1408616df`, in the unwind-grouped function
+starting at `0x140861310`. Its complete 1460 bytes have the same instruction
+sequence after address relocation. It passes RCX=`RBP-0x10`, RDX=`[RDI+0x50]`
+and R8=`[RDI+0x58]`, checks both input pointers, and retains that stack scene until
+the renderer call at `0x140861727`. The object fields +0x33c/+0x340 and scatter
+level +0x290 are unchanged. The scene HDR byte +0x408 and peak u16 +0x41e remain
+inside the caller's owned scene. The original leaf does not overwrite those fields.
+
+The parent `0x14085faf0` calls the new render getter `0x140e3ea40`, whose complete
+leaf is `lea rax,[rcx+0xa00]; ret`. It calls machine getter `0x140e3e770`, still
+`lea rax,[rcx+0x9c0]; ret`. At `0x14086031d` it adds `0x94` to the latter result,
+so preferences are options+0xa54. At `0x14086030b/+0x323` it stores these pointers
+in the child's +0x50/+0x58 slots. The options allocator `0x140e3b300` requests
+0xd88 bytes and alignment 8. It writes the saved Reflex default at options+0x9f0
+and render defaults at options+0xa00. This independently agrees with the reflection
+rows and proves the new 19-byte prefix lies within the same live allocation.
+
+**Terrain.** The complete unwind-grouped update has 2050 bytes. Compared with the
+old 2037 bytes, the only instruction changes are a commuted base/index address
+and an added assertion-report store on the failure path. Its argument handling
+and 40-byte copy to manager+0xc478 are unchanged. Its only decoded direct caller
+is `0x14012c7ef`. Instructions `0x14012c75c` through `0x14012c7ef` build all ten
+dwords at caller-stack `RBP+0x670` and pass that address in R8. The camera stays
+RDX, with three signed 64-bit coordinates. The caller owns the temporary buffer
+after return, so the hook's 32-byte save, scale and restore stays within that buffer.
+
+**Scatter.** The frame function's complete unwind group is 9185 bytes. Its
+register allocation and frame size changed; its prologue alone was not used as
+layout proof. RDX still supplies pass, `[pass+8]` supplies owner, `[pass+0x18]`
+supplies object, and `[owner+0x20]` supplies the counter pool. The sole decoded
+direct caller at `0x140123c65` belongs to `0x1401233a0`. That complete 2274-byte
+caller has the same instruction sequence after relocation. It supplies RCX,
+RDX and XMM2; the callee reads no further register argument before its first call.
+The early exit produces no return value, and the caller reads none. The new fixed
+frame is six pushes and `sub rsp,0x608`; the highest accesses remain within the
+four Win64 home slots. No stack argument was introduced.
+
+The counter constructor `0x140074e90` has the same complete 970-byte instruction
+sequence after relocation, including object handles +8/+0xc/+0x10 and A/B warning
+0xf000 and capacity 0x14000. Wrapper `0x1400a9400` is unchanged after relocation.
+Allocator `0x1400a9440`, accessor `0x1400aa830`, reset `0x1400aaf50`, and update
+`0x1400a9c50` retain entry stride 0x40, pool entries +0x48, handle +0x38,
+last +0x14, peak +0x1c, warning +0x20 and capacity +0x24. The allocator, reset
+and updater add assertion-report stores on failure paths. The accessor's complete
+40-byte leaf is unchanged. The probe still uses checked ReadProcessMemory copies
+and matching handles; this comparison does not newly prove asynchronous lifetime
+or once-per-frame assumptions that were already open for the old build.
+
+The brick distance still resolves to 90.0 at `0x1413d45fc`, and the three High instance constants
+remain density 1.0, threshold 14.0 and distance 90.0. The capacity shader constant
+and allocation operand remain 0x14000. Deco/distant/voxel original operands remain
+1.5, 2.5 and 32/128/160. Their quality selectors and destinations are unchanged.
+
+**Data and HDR/shadows.** The unique complete 80-byte texture table moves to
+`0x1413d66d0`, SHA-256 `e098a6e3919553f03a2eebcd7605ad25e57e850b17daf08613adc9b17691afe9`.
+The selector still walks five 16-byte threshold/budget records. Its output fields
+moved within the game's own config; Headroom only changes the checked table.
+The complete 220-byte shadow table moves to `0x1413d58f0`; its SHA-256 remains
+`d225dc778199e1ee9b08ab80f824b0e667c0993763ec915628963ac17c6ea447`.
+The table reader's complete 457-byte instruction sequence is unchanged after
+relocation. The Ultra sun setting still writes six cascades and resolution 2048;
+only its checked resolution immediate is replaced. The paper-white function
+retains the same stack block, 250.0 immediate, following 0.6 store, and upload
+sequence. Its resource-owner offsets moved by 0x10; Headroom does not access them.
+
+**Async replacement boundary.** The new span is exactly `cmp` (7 bytes), `je`
+(2 bytes), and `movzx` (7 bytes). The next store begins at +19, followed by the
+automatic CL store at +22. No decoded direct branch in the complete enclosing
+unwind group targets the interior of the replacement. The next call, `0x140e3ea90`,
+is the complete leaf `lea rax,[rcx+0x9b0]; ret`: it does not consume incoming RAX
+or flags. The replacement keeps CL and this call's only input RCX unchanged.
+The new exact signature also covers both following stores. Both supported
+variants must total exactly one match; ambiguity or any original-byte mismatch
+leaves async compute unavailable.
+
+**Evidence limits.** This is static compatibility evidence for the named client
+only. It preserves existing runtime guards and ownership rules. Unresolved
+indirect transfers, driver behavior, shader results, and long-session stability
+are not established by this comparison. No server identity is inferred from the
+client. Headroom remains a client rendering plugin. A new server executable
+requires its own evidence for any server-targeted mod.

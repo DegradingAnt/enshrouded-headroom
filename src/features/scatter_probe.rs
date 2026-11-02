@@ -1619,10 +1619,6 @@ mod tests {
 
     // ---- the real game exe (ignored: reads ENSHROUDED_EXE, else the Steam install) -------------
 
-    /// Where `SCATTER_FRAME_FN` matches in build f68140a3 (the Steam exe has the same code at the
-    /// same addresses; docs/re-notes.md).
-    const FRAME_FN_VA: u64 = 0x1_4007_67a0;
-
     #[test]
     #[ignore = "reads the game exe (ENSHROUDED_EXE, else the Steam path); a skip shows only with -- --ignored --nocapture"]
     fn scatter_frame_fn_is_unique_in_game_exe_at_its_anchor() {
@@ -1649,7 +1645,10 @@ mod tests {
             SCATTER_FRAME_FN.name,
             va + SCATTER_FRAME_FN.patch_offset() as u64
         );
-        assert_eq!(va, FRAME_FN_VA);
+        assert_eq!(
+            va,
+            crate::scan::tests::game_anchor(&path, SCATTER_FRAME_FN.name)
+        );
         // The first instruction, which MinHook moves into the trampoline: `mov [rsp+0x10],rdx`.
         let head = pe.bytes_at_va(&file, va, 5).unwrap();
         assert_eq!(head, [0x48, 0x89, 0x54, 0x24, 0x10]);

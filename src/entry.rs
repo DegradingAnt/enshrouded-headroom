@@ -282,6 +282,7 @@ pub fn start() {
             features::hdr_peak::init(&cfg.hdr, &cfg.knobs);
 
             // 10. Publish both parsed latency modes before Vulkan wrappers can create a device or swapchain.
+            crate::reflex::configure_menu_layout(build.as_ref().ok());
             crate::reflex::init(cfg.general.reflex);
             crate::antilag::init(cfg.general.anti_lag);
 

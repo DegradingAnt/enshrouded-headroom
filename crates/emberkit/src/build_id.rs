@@ -1,7 +1,6 @@
 //! Which game build is this?
 //!
-//! The patches in this plugin are written against one build of Enshrouded (it ships as two exes,
-//! see [`KNOWN`]). [`sha256_file`] hashes the game's exe and [`classify`] says whether that hash
+//! The patches use individually verified Enshrouded builds (see [`KNOWN`]). [`sha256_file`] hashes the game's exe and [`classify`] says whether that hash
 //! is a build we know.
 
 use std::fs::File;
@@ -20,7 +19,8 @@ use windows_sys::Win32::Security::Cryptography::{
 /// `f68140a3-steam` (Steam buildid 26082781) is the same code as `f68140a3`: all of `.text`,
 /// `.rdata`, `.data`, `.pdata`, `.rsrc` and `.reloc` are byte-identical at the same addresses.
 /// Only the PE headers and the Steam DRM stub (`.bind`) differ. The label lets the log say which
-/// of the two files is running.
+/// of the two files is running. Patch 1283531 has separately verified native contracts,
+/// a distinct async override, and a different saved-menu prefix. See the W51 RE notes.
 pub const KNOWN: &[(&str, &str)] = &[
     (
         "b28b448a8dbf48c932b717f035031f5a89712a7cccfcc2d6cac0d47e6421c12a",
@@ -33,6 +33,10 @@ pub const KNOWN: &[(&str, &str)] = &[
     (
         "d7baa768eb00aa895d9f5a1cd8747ccf66858c7b542f50983092b2e3261588ee",
         "d7baa768-server",
+    ),
+    (
+        "0403981fd2e8ad18bd8c5698dff03c8d505b5a46677832c496db9c645513f2a6",
+        "1283531-steam",
     ),
 ];
 
@@ -428,6 +432,16 @@ mod tests {
     const STEAM_SHA256: &str = "d64966e23b1a458ee6f147bcbceac0b577fa7e39a212f371287d8cc119817882";
     /// sha256 of the exe of the old install (35,338,752 bytes).
     const OLD_SHA256: &str = "b28b448a8dbf48c932b717f035031f5a89712a7cccfcc2d6cac0d47e6421c12a";
+
+    /// Only the byte-proved client identity is admitted; an adjacent digest stays unknown.
+    #[test]
+    fn patch_1283531_client_identity_is_exact() {
+        let hash = unhex("0403981fd2e8ad18bd8c5698dff03c8d505b5a46677832c496db9c645513f2a6");
+        assert_eq!(classify(hash), Build::Known("1283531-steam"));
+        let mut changed = hash;
+        changed[31] ^= 1;
+        assert_eq!(classify(changed), Build::Unknown(changed));
+    }
 
     #[test]
     fn steam_exe_is_build_f68140a3() {

@@ -1167,8 +1167,6 @@ mod tests {
     /// Where the signatures match, and the constant both loads read, in build f68140a3 (the
     /// Steam exe has the same code at the same addresses). Dispatch ruling 6 (controller, from
     /// the bytes) and docs/re-notes.md.
-    const BRICK_MATCH_VA: u64 = 0x1_4007_9502;
-    const INSTANCE_MATCH_VA: u64 = 0x1_4007_691c;
     const DISTANCE_CONST_VA: usize = 0x1_413b_65fc;
 
     #[test]
@@ -1185,14 +1183,17 @@ mod tests {
             path.display(),
             classify(sha256_file(&path).expect("hash the game exe"))
         );
+        let expected_distance = match classify(sha256_file(&path).expect("hash the game exe")) {
+            crate::build_id::Build::Known("1283531-steam") => 0x1413d45fc,
+            crate::build_id::Build::Known("f68140a3" | "f68140a3-steam") => DISTANCE_CONST_VA,
+            other => panic!("no verified scatter constants for {other:?}"),
+        };
         let file = std::fs::read(&path).expect("read the game exe");
         let pe = parse_pe_file(&file).expect("PE headers of the game exe");
         let (text_va, text) = pe.section_va_bytes(&file, ".text").unwrap();
         let mut found = Vec::new();
-        for (sig, anchor) in [
-            (&SCATTER_BRICK_LOAD, BRICK_MATCH_VA),
-            (&SCATTER_INSTANCE_LOADS, INSTANCE_MATCH_VA),
-        ] {
+        for sig in [&SCATTER_BRICK_LOAD, &SCATTER_INSTANCE_LOADS] {
+            let anchor = crate::scan::tests::game_anchor(&path, sig.name);
             let pattern = Pattern::parse(sig.pattern).unwrap();
             let at = find_unique(text, &pattern).expect("the signature is in .text exactly once");
             let va = text_va + at as u64;
@@ -1217,13 +1218,13 @@ mod tests {
                 sig.name,
                 f32::from_bits(bits)
             );
-            assert_eq!(target, DISTANCE_CONST_VA, "{}", sig.name);
+            assert_eq!(target, expected_distance, "{}", sig.name);
             assert_eq!(bits, VANILLA_BITS, "{}", sig.name);
             found.push((target, bits));
         }
         let decision = vanilla_target(found[0], found[1]);
         println!("vanilla decision: {decision:x?}");
-        assert_eq!(decision, Ok(DISTANCE_CONST_VA));
+        assert_eq!(decision, Ok(expected_distance));
     }
 
     #[test]

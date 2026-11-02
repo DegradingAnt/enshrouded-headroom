@@ -1,4 +1,4 @@
-//! The signature table for game build f68140a3 (exe sha256 b28b448a...).
+//! Verified signature profiles for the original game build and Patch 1283531.
 //!
 //! Each entry is a byte pattern (`??` is a wildcard for rel32 / rip-relative displacements) that
 //! must match exactly once in the named sections, plus the offsets inside the match where later
@@ -109,6 +109,16 @@ pub const ASYNC_OVERRIDE: Sig = Sig {
     patch_offsets: &[3],
 };
 
+/// Patch 1283531 async override. The option moves by 0x20 and its stack byte to +0x3d.
+/// The complete suffix fixes both stack stores and the automatic CL store.
+/// Source: `docs/re-notes.md`, W51. The sixteen-byte patch remains at +3.
+pub const ASYNC_OVERRIDE_PATCH_1283531: Sig = Sig {
+    name: "ASYNC_OVERRIDE_PATCH_1283531",
+    pattern: "88 4d 3d 44 38 b6 a9 52 03 00 74 0a 0f b6 86 a8 52 03 00 88 45 3d 88 8d 98 0a 00 00",
+    sections: &[".text"],
+    patch_offsets: &[3],
+};
+
 /// HDR composite paper-white immediate. Anchor 0x1408f88bc; imm32 at +3.
 /// Source: `docs/re-notes.md`, "HDR paper white". Wildcard the immediate so the checked
 /// write can report a value changed by another tool; the following clamp store stays fixed.
@@ -156,7 +166,8 @@ pub const SUN_SHADOW_ULTRA: Sig = Sig {
     patch_offsets: &[10],
 };
 
-/// Every signature in this file, in table order.
+/// The original build signature profile, in table order.
+/// Patch-specific alternatives are listed separately beside the corresponding entry.
 pub const ALL: &[&Sig] = &[
     &SCENE_SETTINGS_FN,
     &SCATTER_BRICK_LOAD,
@@ -167,6 +178,24 @@ pub const ALL: &[&Sig] = &[
     &DISTANT_HIGH_IMM,
     &VOXEL_HIGH_IMMS,
     &ASYNC_OVERRIDE,
+    &HDR_PAPER_WHITE,
+    &TERRAIN_UPDATE_FN,
+    &SCATTER_FRAME_FN,
+    &MLS_QUALITY_TABLE_LEA,
+    &SUN_SHADOW_ULTRA,
+];
+
+/// Patch 1283531 profile. Shared sites retain their original operand contracts.
+pub const PATCH_1283531: &[&Sig] = &[
+    &SCENE_SETTINGS_FN,
+    &SCATTER_BRICK_LOAD,
+    &SCATTER_INSTANCE_LOADS,
+    &SCATTER_CAP_CONST,
+    &SCATTER_CAP_ALLOC,
+    &DECO_HIGH_IMM,
+    &DISTANT_HIGH_IMM,
+    &VOXEL_HIGH_IMMS,
+    &ASYNC_OVERRIDE_PATCH_1283531,
     &HDR_PAPER_WHITE,
     &TERRAIN_UPDATE_FN,
     &SCATTER_FRAME_FN,

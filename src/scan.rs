@@ -1,13 +1,13 @@
 //! Headroom scanner API and signature-specific tests.
 pub use emberkit::scan::*;
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::sigs;
     use emberkit::scan::test_support::synth_pe;
     #[test]
     fn every_sig_parses() {
-        for s in sigs::ALL {
+        for s in sigs::ALL.iter().chain(sigs::PATCH_1283531) {
             Pattern::parse(s.pattern).unwrap();
         }
     }
@@ -34,6 +34,49 @@ mod tests {
         ("SUN_SHADOW_ULTRA", 0x1_4016_4451),
     ];
 
+    /// Exact documented anchors for the separately verified Patch 1283531 client.
+    const PATCH_1283531_ANCHORS: [(&str, u64); 14] = [
+        ("SCENE_SETTINGS_FN", 0x1400f8f90),
+        ("SCATTER_BRICK_LOAD", 0x140079e82),
+        ("SCATTER_INSTANCE_LOADS", 0x1400772f8),
+        ("SCATTER_CAP_CONST", 0x14007570c),
+        ("SCATTER_CAP_ALLOC", 0x140074f88),
+        ("DECO_HIGH_IMM", 0x1400d90d3),
+        ("DISTANT_HIGH_IMM", 0x1400d9126),
+        ("VOXEL_HIGH_IMMS", 0x1400f9bff),
+        ("ASYNC_OVERRIDE_PATCH_1283531", 0x140852f91),
+        ("HDR_PAPER_WHITE", 0x14090381c),
+        ("TERRAIN_UPDATE_FN", 0x1401e6680),
+        ("SCATTER_FRAME_FN", 0x140077180),
+        ("MLS_QUALITY_TABLE_LEA", 0x1400c9d4c),
+        ("SUN_SHADOW_ULTRA", 0x140166dd1),
+    ];
+
+    /// Select a known client profile; never treat an unknown executable as either version.
+    fn game_profile(
+        path: &std::path::Path,
+    ) -> (
+        &'static [&'static sigs::Sig],
+        &'static [(&'static str, u64)],
+    ) {
+        use crate::build_id::{classify, sha256_file, Build};
+        match classify(sha256_file(path).expect("hash executable for its native profile")) {
+            Build::Known("f68140a3" | "f68140a3-steam") => (sigs::ALL, &ANCHORS),
+            Build::Known("1283531-steam") => (sigs::PATCH_1283531, &PATCH_1283531_ANCHORS),
+            other => panic!("no verified client signature profile for {other:?}"),
+        }
+    }
+
+    /// Resolve a feature test's anchor through the exact executable profile.
+    pub(crate) fn game_anchor(path: &std::path::Path, name: &str) -> u64 {
+        let (_, anchors) = game_profile(path);
+        anchors
+            .iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, address)| *address)
+            .expect("feature anchor is in the verified profile")
+    }
+
     #[test]
     #[ignore = "reads the game exe (ENSHROUDED_EXE, else the Steam path); a skip shows only with -- --ignored --nocapture"]
     fn sigs_unique_in_game_exe() {
@@ -43,9 +86,10 @@ mod tests {
         };
         let file = std::fs::read(&path).expect("read the game exe");
         let info = parse_pe(&file).expect("PE headers of the game exe");
+        let (profile, anchors) = game_profile(&path);
         let mut failures = Vec::new();
         let mut drift = Vec::new();
-        for sig in sigs::ALL {
+        for sig in profile {
             let p = Pattern::parse(sig.pattern).unwrap();
             // Map each named section by file offset: the part of it that is both in the file and
             // in memory (the lesser of raw size and virtual size).
@@ -67,7 +111,7 @@ mod tests {
                 sig.name,
                 sig.sections
             );
-            let anchor = ANCHORS
+            let anchor = anchors
                 .iter()
                 .find(|(n, _)| *n == sig.name)
                 .map(|(_, a)| *a)
@@ -156,9 +200,17 @@ mod tests {
                 | "SCATTER_INSTANCE_LOADS"
                 | "DECO_HIGH_IMM"
                 | "DISTANT_HIGH_IMM" => Mnemonic::Cmp,
-                "SCENE_SETTINGS_FN" | "TERRAIN_UPDATE_FN" | "SCATTER_FRAME_FN"
-                | "SCATTER_CAP_CONST" | "SCATTER_CAP_ALLOC" | "VOXEL_HIGH_IMMS"
-                | "ASYNC_OVERRIDE" | "HDR_PAPER_WHITE" => Mnemonic::Mov,
+                "SCENE_SETTINGS_FN"
+                | "TERRAIN_UPDATE_FN"
+                | "SCATTER_FRAME_FN"
+                | "SCATTER_CAP_CONST"
+                | "SCATTER_CAP_ALLOC"
+                | "VOXEL_HIGH_IMMS"
+                | "ASYNC_OVERRIDE"
+                | "ASYNC_OVERRIDE_PATCH_1283531"
+                | "HDR_PAPER_WHITE"
+                | "MLS_QUALITY_TABLE_LEA"
+                | "SUN_SHADOW_ULTRA" => Mnemonic::Mov,
                 name => return Err(format!("no documented oracle contract for {name}")),
             };
             if first.start != 0
@@ -240,7 +292,7 @@ mod tests {
                 }
                 return Ok(rows.iter().map(Decoded::summary).collect());
             }
-            if sig.name == "ASYNC_OVERRIDE" {
+            if matches!(sig.name, "ASYNC_OVERRIDE" | "ASYNC_OVERRIDE_PATCH_1283531") {
                 if sig.patch_offsets.len() != 1 {
                     return Err("ASYNC_OVERRIDE requires one 16-byte span".into());
                 }
@@ -264,10 +316,15 @@ mod tests {
                 exact_field(sig.name, &rows, 6, 4, Field::Displacement(Mnemonic::Cmp))?;
                 exact_field(sig.name, &rows, 11, 1, Field::Branch)?;
                 exact_field(sig.name, &rows, 15, 4, Field::Displacement(Mnemonic::Movzx))?;
+                let value_offset = if sig.name == "ASYNC_OVERRIDE_PATCH_1283531" {
+                    0x352a8
+                } else {
+                    0x35288
+                };
                 if span[0].instruction.memory_base() != Register::RSI
-                    || span[0].instruction.memory_displacement64() != 0x35289
+                    || span[0].instruction.memory_displacement64() != value_offset + 1
                     || span[2].instruction.memory_base() != Register::RSI
-                    || span[2].instruction.memory_displacement64() != 0x35288
+                    || span[2].instruction.memory_displacement64() != value_offset
                 {
                     return Err("ASYNC_OVERRIDE: unexpected optional-bool addresses in decoded instructions".into());
                 }
@@ -285,6 +342,19 @@ mod tests {
                     Field::Immediate(160.0f32.to_bits()),
                 ],
                 "HDR_PAPER_WHITE" => vec![Field::Immediate(250.0f32.to_bits())],
+                "SUN_SHADOW_ULTRA" => vec![Field::Immediate(2048)],
+                "MLS_QUALITY_TABLE_LEA" => {
+                    let lea = rows
+                        .iter()
+                        .find(|row| row.start == 9)
+                        .ok_or("missing shadow-table LEA")?;
+                    if lea.instruction.memory_base() != Register::RIP
+                        || lea.instruction.op0_register() != Register::RAX
+                    {
+                        return Err("shadow-table LEA must resolve RIP-relative RAX".into());
+                    }
+                    vec![Field::Displacement(Mnemonic::Lea)]
+                }
                 name => return Err(format!("oracle layout not implemented for {name}")),
             };
             if sig.patch_offsets.len() != fields.len() {
@@ -582,11 +652,16 @@ mod tests {
             let Some((bytes, pe)) = steam_image("instruction_fields_match_steam_exe") else {
                 return;
             };
+            let path = crate::build_id::test_support::steam_exe_or_skip(
+                "instruction_fields_match_steam_exe",
+            )
+            .expect("steam_image already read this explicit target");
+            let (profile, anchors) = game_profile(&path);
             let (text_va, text) = pe
                 .section_va_bytes(&bytes, ".text")
                 .expect("file .text bytes");
             let mut failures = Vec::new();
-            for sig in sigs::ALL {
+            for sig in profile {
                 assert_eq!(
                     sig.sections,
                     [".text"],
@@ -609,7 +684,7 @@ mod tests {
                     sig.name, sig.patch_offsets
                 );
                 // The addresses are the existing, documented anchors, not a global linear sweep.
-                match ANCHORS.iter().find(|(name, _)| *name == sig.name) {
+                match anchors.iter().find(|(name, _)| *name == sig.name) {
                     Some((_, anchor)) if *anchor == ip => (),
                     other => failures.push(format!(
                         "{}: start {ip:#x} differs from verified anchor {other:?}",
@@ -656,6 +731,16 @@ mod tests {
             for line in lines {
                 println!("{line}");
             }
+        }
+
+        /// New async fields must not accidentally use the old optional-bool offsets.
+        #[test]
+        fn patch_1283531_async_oracle_rejects_legacy_option_offsets() {
+            let mut bytes = signature_bytes(&sigs::ASYNC_OVERRIDE_PATCH_1283531);
+            assert!(validate_sig(&sigs::ASYNC_OVERRIDE_PATCH_1283531, &bytes, 0).is_ok());
+            bytes[6] = 0x89;
+            bytes[15] = 0x88;
+            assert!(validate_sig(&sigs::ASYNC_OVERRIDE_PATCH_1283531, &bytes, 0).is_err());
         }
 
         /// The distance is the third load; another valid RIP displacement is not interchangeable.

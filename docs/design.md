@@ -19,7 +19,8 @@ Success criteria:
 In scope:
 - Game build `f68140a3`, in two exes that have the same game code (checked section by section, see RE-NOTES). Both are known builds:
   - the old install's exe, sha256 `b28b448a8dbf48c932b717f035031f5a89712a7cccfcc2d6cac0d47e6421c12a`, label `f68140a3`;
-  - the Steam exe (Steam buildid 26082781), sha256 `d64966e23b1a458ee6f147bcbceac0b577fa7e39a212f371287d8cc119817882`, label `f68140a3-steam`. This is the build on the author's machine now. Only the PE headers and Steam's DRM stub (the `.bind` section) differ from the old exe.
+  - the Steam exe (Steam buildid 26082781), sha256 `d64966e23b1a458ee6f147bcbceac0b577fa7e39a212f371287d8cc119817882`, label `f68140a3-steam`. This is the original Steam verification build. Only the PE headers and Steam's DRM stub (the `.bind` section) differ from the old exe.
+- Patch 1.0.1.0, internal 1283531, Steam build 26320373, exact SHA-256 `0403981fd2e8ad18bd8c5698dff03c8d505b5a46677832c496db9c645513f2a6`, label `1283531-steam`. W51 separately verifies native contracts, the changed async override and the changed saved-menu prefix. This is offline compatibility evidence; gameplay acceptance remains separate.
 - Windows x64 with the Vulkan renderer (the game default).
 - Discrete GPUs from NVIDIA, AMD and Intel. On integrated GPUs, the texture budget is left unchanged (section 6.1). Reflex is NVIDIA only.
 
