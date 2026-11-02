@@ -653,7 +653,8 @@ fn a_climb_runs_through_the_detours() {
 
     // A player the move check stopped is judged by the area alone, so one steep triangle in good
     // ground stands as the game's floor. The next frame starts clean, and the search goes past
-    // that triangle.
+    // that triangle. The proposed upward destination must remain above the fake feet.
+    player.set_y(-1.0);
     assert_eq!(player.wall_lost(), HELD);
     WALL_THERE.store(false, Ordering::Relaxed);
     let (_, passed) = player.move_check(UP * 1.95);
@@ -669,6 +670,7 @@ fn a_climb_runs_through_the_detours() {
     FLOOR_THERE.store(false, Ordering::Relaxed);
     EXIT_NY.store(0, Ordering::Relaxed);
 
+    player.set_y(0.0);
     // A lattice is the game's alone. No ray is cast, the velocity stands, the normal stands, and
     // the game's exit stands even on a steep floor.
     LATTICE.store(true, Ordering::Relaxed);
