@@ -33,6 +33,8 @@ static LATTICE: AtomicBool = AtomicBool::new(false);
 static RAYS: AtomicU32 = AtomicU32::new(0);
 /// Calls of the game's wall-lost check so far.
 static LOST_CALLS: AtomicU32 = AtomicU32::new(0);
+/// Calls of the native stop function.
+static STOP_CALLS: AtomicU32 = AtomicU32::new(0);
 /// What the fake exit query answers: 0 is no exit, otherwise the floor's `ny` in hundredths.
 static EXIT_NY: AtomicU32 = AtomicU32::new(0);
 /// How much up the wall's normal has, in hundredths. The wall stays where it is, so this is a
@@ -238,6 +240,21 @@ unsafe extern "system" fn game_stamina(_data: *mut u8) -> f32 {
     8.0
 }
 
+/// The native stop clears climb fields while leaving the mod's padding byte alone.
+///
+/// # Safety
+///
+/// `ctx` is a live fake climbing context with a writable Climb component.
+unsafe extern "system" fn game_stop(ctx: *mut u8, time: i64) {
+    STOP_CALLS.fetch_add(1, Ordering::Relaxed);
+    // SAFETY: the fake context's Climb pointer and native initialized fields.
+    unsafe {
+        let climb = ctx.add(8).cast::<*mut u8>().read_unaligned();
+        climb.cast::<u16>().write_unaligned(0);
+        climb.add(0x10).cast::<i64>().write_unaligned(time);
+    }
+}
+
 /// One player's components, in memory that lasts as long as the test process.
 struct Player {
     /// The Actor, the size of the component.
@@ -390,6 +407,7 @@ fn install() {
     EXIT_QUERY.set(query as usize);
     LOW_ENTRY.set(entry as usize);
     STAMINA.set(stamina as usize);
+    STOP.set(game_stop as StopFn as usize);
     let raycast: RaycastFn = plane_raycast;
     let settings = Settings {
         grace_seconds: 0.05,
@@ -663,6 +681,25 @@ fn a_climb_runs_through_the_detours() {
     // The stamina cost is the game's times the setting.
     // SAFETY: the fake reads nothing.
     assert_eq!(unsafe { stamina_detour(std::ptr::null_mut()) }, 16.0);
+
+    // A committed stop must clear the replicated grace before a new climb can inherit it.
+    player.climb[2] = grace::HOLDING + 2;
+    let calls = STOP_CALLS.load(Ordering::Relaxed);
+    // SAFETY: the fake player's components live through this native stop.
+    unsafe { stop_detour(player.ctx(), 123) };
+    assert_eq!(STOP_CALLS.load(Ordering::Relaxed), calls + 1);
+    assert_eq!(
+        player.climb[2],
+        grace::NOT_NATURAL,
+        "a new climb cannot inherit old grace"
+    );
+    WALL_THERE.store(false, Ordering::Relaxed);
+    assert_eq!(
+        player.wall_lost(),
+        0,
+        "the next failed hold cannot borrow the old climb's grace"
+    );
+    WALL_THERE.store(true, Ordering::Relaxed);
 
     // With the mod off the detours only forward: rock is the game's "no" again, and no byte of the
     // game's component moves.

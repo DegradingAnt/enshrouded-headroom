@@ -864,7 +864,7 @@ unsafe extern "system" fn top_entry_detour(
     })
 }
 
-/// Post-hook on stop climbing, for the diagnostics.
+/// Clear replayed grace at a committed native stop, then record the diagnostic.
 ///
 /// # Safety
 ///
@@ -880,7 +880,15 @@ unsafe extern "system" fn stop_detour(ctx: *mut u8, time: i64) {
         // SAFETY: the game's own arguments, passed on unchanged.
         unsafe { stop(ctx, time) }
     };
-    post_hook(Feature::Diag, original, |()| DIAG.stop());
+    post_hook(Feature::Surface, original, |()| {
+        if runtime().is_some() {
+            // SAFETY: the native stop writes Climb in every path and leaves the context alive.
+            // All callers already hold writable Climb in their ECS program. The W52 native
+            // receipt verifies this on both client and server, including action-sequence exits.
+            unsafe { Ctx(ctx).grace_at().write(grace::NOT_NATURAL) };
+        }
+        DIAG.stop();
+    });
 }
 
 /// Post-hook on the exit-top check, for the diagnostics.
@@ -1014,16 +1022,16 @@ pub fn wanted(settings: &Settings) -> Vec<Site> {
     }
     if settings.diagnostics {
         let top: TopEntryFn = top_entry_detour;
-        let stop: StopFn = stop_detour;
         let exit_top: ExitTopFn = exit_top_detour;
         let exit_low: ExitLowFn = exit_low_detour;
         sites.extend([
             Site::on(&sigs::TOP_ENTRY_FN, top as usize, &TOP_ENTRY),
-            Site::on(&sigs::STOP_FN, stop as usize, &STOP),
             Site::on(&sigs::EXIT_TOP_FN, exit_top as usize, &EXIT_TOP),
             Site::on(&sigs::EXIT_LOW_FN, exit_low as usize, &EXIT_LOW),
         ]);
     }
+    let stop: StopFn = stop_detour;
+    sites.push(Site::on(&sigs::STOP_FN, stop as usize, &STOP));
     if settings.stamina_multiplier != 1.0 {
         let stamina: StaminaFn = stamina_detour;
         sites.push(Site {
@@ -1118,9 +1126,9 @@ mod tests {
                 "EXIT_QUERY_FN",
                 "START_FN",
                 "TOP_ENTRY_FN",
-                "STOP_FN",
                 "EXIT_TOP_FN",
-                "EXIT_LOW_FN"
+                "EXIT_LOW_FN",
+                "STOP_FN"
             ]
         );
     }
@@ -1132,7 +1140,10 @@ mod tests {
             diagnostics: false,
             ..Settings::default()
         };
-        assert_eq!(wanted(&settings).len(), 5);
+        assert_eq!(wanted(&settings).len(), 6);
+        assert!(wanted(&settings)
+            .iter()
+            .any(|site| site.sig.name == "STOP_FN"));
     }
 
     /// The glider needs the start check even without diagnostics.

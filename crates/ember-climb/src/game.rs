@@ -282,10 +282,23 @@ pub fn parse_result(bytes: &[u8; RESULT_SIZE]) -> Option<Hit> {
 ///
 /// # Safety
 ///
-/// `result` is a probe result the game just wrote, so all [`RESULT_SIZE`] bytes are readable.
+/// `result` is a successful native probe or exit result. The position, normal and entity fields
+/// are initialized and readable. Padding does not have to be initialized.
 pub unsafe fn result_hit(result: *const u8) -> Option<Hit> {
-    // SAFETY: the caller's contract.
-    parse_result(&unsafe { bytes_at::<RESULT_SIZE>(result, 0) })
+    // SAFETY: the successful native result initializes these fields. Its padding need not be
+    // initialized, so reading a whole result as `[u8; RESULT_SIZE]` would be invalid.
+    let (point, normal, entity) = unsafe {
+        (
+            read_vec3(result.add(RESULT_POSITION).cast()),
+            read_vec3(result.add(RESULT_NORMAL).cast()),
+            result_entity(result),
+        )
+    };
+    Some(Hit {
+        point: point.is_finite().then_some(point)?,
+        normal: normal.normalized()?,
+        entity,
+    })
 }
 
 /// Replace the probe result at `result`.
@@ -710,6 +723,26 @@ mod tests {
             assert!((hit.normal - normal).length() < 1e-6, "{hit:?}");
             assert_eq!(hit.entity, 42);
         }
+    }
+
+    /// Native padding can be uninitialized. Only the three initialized fields form a hit.
+    #[test]
+    fn a_native_hit_does_not_require_initialized_padding() {
+        let mut storage = std::mem::MaybeUninit::<[u8; RESULT_SIZE]>::uninit();
+        let result = storage.as_mut_ptr().cast::<u8>();
+        let point = Vec3::new(1.0, 2.0, 3.0);
+        let normal = Vec3::new(0.0, 0.0, -2.0);
+        // SAFETY: storage is a writable result allocation. Initialize only native hit fields;
+        // `result_hit` may read those fields, not the unwritten prefix or padding.
+        let hit = unsafe {
+            write_vec3(result.add(RESULT_POSITION).cast(), point);
+            write_vec3(result.add(RESULT_NORMAL).cast(), normal);
+            result.add(RESULT_ENTITY).cast::<u32>().write_unaligned(42);
+            result_hit(result).unwrap()
+        };
+        assert_eq!(hit.point, point);
+        assert_eq!(hit.normal, Vec3::new(0.0, 0.0, -1.0));
+        assert_eq!(hit.entity, 42);
     }
 
     /// Broken numbers from memory are no hit.

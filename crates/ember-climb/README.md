@@ -2,19 +2,19 @@
 
 Free climbing for Enshrouded, in the style of Breath of the Wild. Climb any steep rock, cliff or wall. There is no button. A climb starts when you walk, sprint or jump into a steep surface. The mod uses the game's own climb moves, stamina and collision.
 
-**This is a first test build.** It has never run in the game. The geometry is tested in simulated worlds, and the hooks are tested against fakes. Nobody knows yet how it feels. The diagnostics line is on so that one play session shows which step fails.
+**This is a first test build for Patch 1.0.1.0 (internal build 1283531).** It has never run in the game. The geometry is tested in simulated worlds, and the hooks are tested against fakes. Nobody knows yet how it feels. The diagnostics line is on so that one play session shows which step fails.
 
 ## Install
 
 The mod needs [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader) as `dinput8.dll` in the game folder.
 
-1. **Remove ClimbAnywhere first.** The two must never run together. Delete `climb-anywhere.asi` and any `dinput8.dll` from `plugins\`, and `dinput8Hooked.dll` from the game folder. You can delete `climb-anywhere.ini` and `climb-anywhere.log` too. If you also used its server build, see "On a dedicated server" below.
+1. **Disable ClimbAnywhere first.** The two must never run together. Back up and rename `climb-anywhere.asi` and any `dinput8.dll` from `plugins\`, and `dinput8Hooked.dll` from the game folder. Keep its settings and log in the backup so the previous installation can be restored. If you also used its server build, see "On a dedicated server" below.
 2. Put `ember-climb.asi` and `ember-climb.ini` in `plugins\` in the game folder.
 3. Start the game. `plugins\ember-climb.log` shows what happened.
 
 **No `plugins\ember-climb.log` after a game start?** The loader did not load the plugin. Check that `dinput8.dll` in the game folder is Ultimate ASI Loader. Other mods ship a file with the same name.
 
-ember-climb refuses to patch while it sees ClimbAnywhere loaded, and the log says why. It goes by the names of loaded modules: anything with "climb anywhere" in its name in any spelling, `dinput8Hooked.dll`, or a `dinput8.dll` inside `plugins\`. If another mod uses one of those names, the log names the file. It looks again ten seconds after start-up, because a plugin can load after this one. It only reads names. It never opens another mod's files.
+ember-climb refuses to patch while it finds a conflicting installed binary name in the standard loader folders or sees ClimbAnywhere loaded, and the log says why. It goes by the names of loaded modules: anything with "climb anywhere" in its name in any spelling, `dinput8Hooked.dll`, or a `dinput8.dll` inside `plugins\`. If another mod uses one of those names, the log names the file. It looks again ten seconds after start-up, because a plugin can load after this one. It only reads directory and module names. It never opens another mod's binary. An unreadable module list refuses startup. The late check disables custom climbing, but the startup code patches remain until exit; restart after resolving a late conflict. Arbitrary hot-loading of another climbing mod is unsupported.
 
 To remove the mod, delete those two files and the log.
 
@@ -22,7 +22,7 @@ To remove the mod, delete those two files and the log.
 
 The server decides where players are, so the mod must run there for its players to climb. **It has never run on a server yet.** See "Server" below for what was checked.
 
-1. **Remove ClimbAnywhere first.** Its server build is itself a `dinput8.dll` next to `enshrouded_server.exe`, with `climb-anywhere.ini` and `climb-anywhere.log`. Delete all three. While that file stays there, Ultimate ASI Loader cannot take its place, so this mod does not load.
+1. **Disable ClimbAnywhere first.** Its server build is itself a `dinput8.dll` next to `enshrouded_server.exe`, with `climb-anywhere.ini` and `climb-anywhere.log`. Back up all three outside the server folder before replacing the proxy. While that file stays there, Ultimate ASI Loader cannot take its place, so this mod does not load.
 2. Put Ultimate ASI Loader as `dinput8.dll` next to `enshrouded_server.exe`.
 3. Put `ember-climb.asi` and `ember-climb.ini` in `plugins\` in the server folder.
 4. **Every player who climbs needs the mod too**, with the same values in `ember-climb.ini`. Other values on the two sides would pull a climber back and forth. This is the expected behaviour, and it has not been tested. A player who only watches does not need the mod. See "Who needs the mod" below.
@@ -36,9 +36,9 @@ The log starts like this on a supported game:
 ```text
 ember-climb 0.1.0 loaded
 settings: <game folder>\plugins\ember-climb.ini
-build f68140a3-steam
+build 1283531-steam
 all 15 signatures matched once
-wrote the wall-lost return at exe+0x24b4a5, the attachment store at exe+0x418db8
+wrote the wall-lost return at exe+0x24f4e5, the attachment store at exe+0x41fd08
 hooks: 10 enabled
 climbing is on: surface mask 0x124, plane tolerance 0.45 m, walkable below 50 degrees, stamina x1, a climb starts by walk, jump, sprint, diagnostics on
 ```
@@ -110,6 +110,10 @@ All settings are in `ember-climb.ini`, and all need a restart. A value that is n
 
 `SurfaceMask` is a sum of these bits, in hex or decimal: `0x4` terrain and player walls, `0x20` rock props, `0x100` iron lattices, `0x8` other solid props such as trees. Other bits are refused. Bits 0 and 1 are other copies of the terrain, and asking for them gives a different surface per ray.
 
+## Controller input
+
+Movement uses the game's own processed input, including an analogue stick. No keyboard emulation or extra grab button is added. Existing PlayStation controller support through the game or Steam Input stays in use. Controller feel and jump-off still need the first play test.
+
 ## Gliding
 
 `Glide = 1` is off by default because three things about it are unproven: whether a climb can replace the glider sequence, whether the glider state ends cleanly, and whether the game gives move input while gliding. It also changes how the game requests every climb, lattices too. Turn it on to test it, and keep the log.
@@ -123,11 +127,19 @@ The game already climbs, but only on flat iron lattices. Its wall probe wants fo
 - The game moves a climber along world up, which walks straight off any face that leans. The mod turns the movement into the surface, keeps the speed, and holds the game's 0.55 m distance.
 - The game has no exit where a wall turns into a slope, and it mantles onto steep rock. The mod refuses the second and finds the first. One triangle of rough rock can look like a floor, so the mod judges a floor as an area, and it looks whether the face goes on ahead of your head.
 - A half-pressed stick fails the game's start test however straight you run at a wall. The mod tests only the heading.
-- A surface lost for a moment is forgiven, so a seam in the rock does not drop you. The count is in ticks, in one spare byte of the game's own climb data. A client replays old ticks, and this way a replay decides what the server decided, as long as the rays on both sides see the same rock.
+- After a confirmed natural hold, a surface lost for a moment is forgiven. The count is in ticks, in one spare byte of the game's own climb data. The native stop clears it, including when diagnostics are off. A new climb's first unconfirmed miss is not forgiven. A client replays old ticks, and this way a replay decides what the server decided, as long as the rays on both sides see the same rock.
 
 Evidence for every game fact is in [docs/re-notes.md](../../docs/re-notes.md), "Free climbing".
 
+## First play test
+
+Start with a private offline world. Check a tall vertical wall, a leaning rock face, sideways movement, a real flat top, jump-off, stamina, and an ordinary iron lattice. Repeat with the controller. Keep `ember-climb.log`, especially if a grab fails, a hold drops, or the character tries to mantle too soon. Failed entry attempts are logged at most once every thirty seconds; idle checks stay quiet.
+
+The client and server use the same plugin and settings. Test multiplayer only after the offline session works. This package is a candidate; native-file checks and simulated climbs do not establish runtime reliability.
+
 ## Limits
+
+- The native stop clears the grace byte. Some mantle/jump endings bypass that function and can leave up to the configured grace allowance for a later climb's first missed hold. This known limit is bounded by `GraceSeconds` (default 0.15 s); it is not a wall-clock timer or an accumulated movement boost.
 
 - A surface must reach 2 m above your feet to start a climb. A lower wall starts nothing, and neither does a ledge you jump at when it is less than 2 m above your feet at that moment. Use the game's jump there. This may change after the first play test.
 - A short walkable shelf in a face can stop you while the stick is up. In the simulation a flat shelf of 0.2 to 0.8 m in a 60 degree face does this, and so does one of 0.5 to 0.9 m in a sheer wall. On the 60 degree face a shelf of 1 m or more ends in a mantle. Go sideways or go down, or jump off.
@@ -137,7 +149,7 @@ Evidence for every game fact is in [docs/re-notes.md](../../docs/re-notes.md), "
 
 ## Server
 
-The mod is built for the dedicated server build `d7baa768-server`. All 15 signatures match exactly once in that exe. The functions the mod hooks are the same as the client's, instruction by instruction, with addresses set aside. **It has never run on a server**, so how it behaves there and how a modded server looks to a client are not known. If a signature does not match exactly once, the mod logs which one and installs nothing. To check an exe again:
+The mod admits the current `1283531-steam` client and `1283531-server` dedicated server, plus the previous `f68140a3-steam` and `d7baa768-server` builds. All 15 signatures match exactly once in all four executable images. The complete directly used function groups, layouts, patch guards and scheduling contracts were compared across the update; their bounded evidence is in the W52 section of `docs/re-notes.md`. **It has never run on a server**, so how it behaves there and how a modded server looks to a client are not known. If a signature does not match exactly once, the mod logs which one and installs nothing. To check an exe again:
 
 ```text
 set ENSHROUDED_SERVER_EXE=<path to enshrouded_server.exe>

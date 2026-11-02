@@ -35,7 +35,12 @@ const FALLBACK_DIR_NAME: &str = "ember-climb";
 /// The processes this mod runs in. The server decides where players are, so it runs there too.
 const TARGETS: &[Process] = &[Process::Client, Process::DedicatedServer];
 /// The builds this mod was written against, by the label in `emberkit::build_id::KNOWN`.
-const SUPPORTED: [&str; 2] = ["f68140a3-steam", "d7baa768-server"];
+const SUPPORTED: [&str; 4] = [
+    "f68140a3-steam",
+    "d7baa768-server",
+    "1283531-steam",
+    "1283531-server",
+];
 /// The section that holds the game's code.
 const CODE_SECTION: &str = ".text";
 /// How long after start-up to look for another climb mod again. Every plugin has loaded by then.
@@ -221,13 +226,17 @@ fn late_refusal(modules: &[PathBuf]) -> Option<String> {
 }
 
 /// Look once more for another climb mod. Plugins load in name order, so one can load after this
-/// mod. If one did, the detours go back to only forwarding, which takes this mod's work out of the
-/// game without touching code the other mod may have hooked too.
+/// mod. If one did, custom detour work stops. Permanent startup patches remain until exit;
+/// undoing them here could overwrite code the other mod now owns. Startup preflight prevents
+/// the normal loader-order conflict; this late check only reports unsupported hot-loading.
 fn spawn_late_check() -> std::io::Result<()> {
     let check = || {
-        if let Some(line) = late_refusal(&coexist::loaded_modules()) {
+        let refusal = coexist::loaded_modules()
+            .map(|modules| late_refusal(&modules))
+            .unwrap_or_else(Some);
+        if let Some(line) = refusal {
             detours::deactivate();
-            log::warn!("{line}");
+            log::warn!("{line}; dynamic climbing is disabled, but startup code patches remain until exit. Restart after resolving the conflict.");
         }
     };
     std::thread::Builder::new()
@@ -249,9 +258,21 @@ fn start_in_game(settings: &Settings, build: &Build) {
         }
     };
     log::info!("build {label}");
-    let modules = coexist::loaded_modules();
-    if let Some(path) = coexist::find_climb_anywhere(&modules) {
-        log::warn!("{}", coexist::refusal(path));
+    let preflight = || -> Result<(), String> {
+        let exe =
+            std::env::current_exe().map_err(|error| format!("cannot locate the game: {error}"))?;
+        let folder = exe.parent().ok_or("cannot locate the game's folder")?;
+        if let Some(path) = coexist::installed_conflict(folder)? {
+            return Err(coexist::refusal(&path));
+        }
+        let modules = coexist::loaded_modules()?;
+        if let Some(path) = coexist::find_climb_anywhere(&modules) {
+            return Err(coexist::refusal(path));
+        }
+        Ok(())
+    };
+    if let Err(why) = preflight() {
+        log::warn!("{why}");
         return;
     }
     match install(settings) {
@@ -317,6 +338,14 @@ mod tests {
             check_build(&Build::Known("d7baa768-server")),
             Ok("d7baa768-server")
         );
+    }
+
+    /// Patch 1283531 needs both prediction and authority on the same native contracts.
+    #[test]
+    fn patch_1283531_client_and_server_are_supported() {
+        for label in ["1283531-steam", "1283531-server"] {
+            assert_eq!(check_build(&Build::Known(label)), Ok(label));
+        }
     }
 
     /// Every supported label is a build `emberkit` can recognise. A typo here would switch the

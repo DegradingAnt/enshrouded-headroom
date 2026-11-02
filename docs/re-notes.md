@@ -2215,3 +2215,91 @@ indirect transfers, driver behavior, shader results, and long-session stability
 are not established by this comparison. No server identity is inferred from the
 client. Headroom remains a client rendering plugin. A new server executable
 requires its own evidence for any server-targeted mod.
+
+
+## W52: clean-room climbing on Patch 1283531
+
+The author requested continuing the owned `ember-climb` implementation after unreliable starts,
+holds and exits in the installed third-party mod. This work uses the owned game and the existing
+owned climbing source. It does not inspect or copy a third-party climbing binary.
+
+Exact images: client SHA-256 `0403981fd2e8ad18bd8c5698dff03c8d505b5a46677832c496db9c645513f2a6`
+(`1283531-steam`, Steam build 26320373); dedicated server
+`4429653ac0cfa154bc08e138853caa5d8557f82129b7488031f40345816aa6dc` (`1283531-server`).
+The previous owned reference client `b28b448a...` has the same native code as `f68140a3-steam`;
+the previous server is `d7baa768-server`.
+
+- [VERIFIED] Every one of the 15 owned climbing signatures matches once in each old/new client/server
+  `.text`. The complete 11 directly used function groups, including chained unwind fragments,
+  normalize identically across each update (7,303 bytes per image). This permits relocation of
+  external calls and RIP operands; it does not claim arbitrary callees unchanged.
+- [VERIFIED] All 44 candidate hook prologues are relocatable under the existing first-five-byte rule.
+  Mandatory wall-return/attachment writes, optional entry-layer byte, and the attachment skip target's
+  RCX reload have the same guarded bytes. The existing patterns need no changes.
+
+| Owned site | Current client RVA | Current server RVA |
+|---|---:|---:|
+| Wall probe | 0x24ec00 | 0x62a80 |
+| Wall-lost function | 0x24f3d0 | 0x63250 |
+| Wall-lost return pattern | 0x24f4cb | 0x6334b |
+| Attachment store | 0x41fd08 | 0x1bf5c8 |
+| Move check | 0x41ece0 | 0x1be5a0 |
+| Exit query | 0x24e730 | 0x625b0 |
+| Start check | 0x4204c0 | 0x1bfd80 |
+| Entry-layer pattern | 0x420885 | 0x1c0145 |
+| Raycast | 0xa0c8a0 | 0x6a99d0 |
+| Low entry | 0x250110 | 0x63f90 |
+| Top entry | 0x250360 | 0x641e0 |
+| Stop | 0x24e0d0 | 0x61f50 |
+| Exit top | 0x250a30 | 0x648b0 |
+| Exit low | 0x250930 | 0x647b0 |
+| Stamina call pattern | 0x2f095e | 0xdc9de |
+| Stamina callee | 0x24e3a0 | 0x62220 |
+
+- [VERIFIED] Ten reflected schemas agree across all four images: Climb, Actor, ActorInput,
+  MovementCollider, MovementColliderConfig, CurrentTransform, WorldTransform,
+  RotationInterpolation and the two nested collision-result types. The existing context remains
+  Actor+0, Climb+8, transform+0x10, collider config+0x18, collider+0x20, PlayerState+0x28,
+  entity u32+0x30, world+0x38. Climb is 0x98 bytes; +2 remains padding, normal is +4.
+  Actor state/ability predicate bodies separately confirm the inherited Actor fields.
+- [VERIFIED] All 90 paired RIP data operands in the directly used functions retain identical data.
+  The main raycast helper and Jolt/filter boundary normalize identically. The null-world fallback's
+  fatal exception tail changed; the normal path and consumed result fields did not. No complete
+  behavioral proof of the physics engine is claimed.
+- [VERIFIED] Each image has 816 program registrations. All nine Climb writers retain their flags
+  and component lists. Four unrelated descriptors changed: area_loot, environment_effects,
+  impact_simulation and player_ui. The wall-lost/move/exit functions still run in that order in
+  one unchanged per-entity update, preserving same-call thread-local state. The action-sequence
+  body changed and is not claimed equivalent; its relevant write ownership and stop call agree.
+- [VERIFIED] The native stop keeps its borrowed context and Climb alive. Its reset leaf clears the
+  Climb type/state word and attachment, without freeing or moving the component. The stop then
+  writes Climb+0x10 on every return. All four known caller routes already own Climb and Actor for
+  writing: action-sequence control, climbing stamina, wall teleport, and the wall update. Resetting
+  the grace byte after the original stop is therefore within native ownership. This broadens the
+  previous padding-write ownership statement beyond program 244. The stop remains hooked when
+  diagnostics are off.
+- [VERIFIED] Some endings bypass the stop and the shared reset leaf: the current wall program
+  clears Climb inline at 0x41f926, 0x41f932 and 0x41f93b. The stop reset is a bounded fix, not universal
+  lifecycle coverage. A later first missed hold can retain the remaining configured grace after such
+  an ending. A fresh climb without a confirmed natural hold receives no invented grace.
+- [VERIFIED] Successful native probe/exit results initialize position+8, normal+0x14 and entity+0x20;
+  padding at +1..+3 is not guaranteed initialized. The Rust hit reader now reads the initialized
+  fields individually instead of copying the entire 0x24-byte result into a typed byte array.
+- [VERIFIED] Standard loader directory entries are checked before any patch, as well as loaded
+  module names. Failure to enumerate modules refuses startup. Late detection can disable custom
+  detour work but cannot safely undo permanent startup patches while another mod may own them;
+  the log therefore requires a restart. Arbitrary hot-loading is unsupported.
+- [VERIFIED] The exact new server hash is classified as DedicatedServer before any filename rule.
+  A renamed server, even one named `enshrouded.exe`, cannot enter a client-only renderer startup.
+  Unknown identities remain unsupported by climbing.
+
+Receipts: private W52 native ledger contains hash-pinned signature census, complete normalized
+function/caller comparisons, reflection schemas, RIP data, program registries, patch bytes, relocation
+checks and the stop ownership boundary. These scripts read only the legitimate owned images.
+Regression tests cover exact admission/server isolation, failed-entry log bounds, initialized native
+hit fields, and stop grace cleanup through the inert hook-flow fixture.
+
+[UNVERIFIED] No current-build climb, controller feel, body tilt or multiplayer reconciliation has
+been observed. The candidate still has the disclosed low-wall and rough-shelf limits. Native-file
+checks and simulated worlds are insufficient to call it reliable in play. Gliding stays experimental
+and disabled by default. First acceptance is an offline climbing session before server deployment.

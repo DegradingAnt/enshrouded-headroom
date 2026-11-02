@@ -9,7 +9,7 @@
 //! wall turns walkable.
 //!
 //! The same code runs in the client and in the dedicated server. Every game fact it relies on is in
-//! docs/re-notes.md, "Free climbing". It runs on two exact builds. Any other build, a signature that
+//! docs/re-notes.md, "Free climbing". It runs on four exact client/server builds. Any other build, a signature that
 //! does not match exactly once, or a loaded ClimbAnywhere leaves the game untouched.
 
 pub mod coexist;

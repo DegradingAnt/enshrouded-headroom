@@ -36,6 +36,8 @@ struct Exe {
     bytes: Vec<u8>,
     /// Its headers.
     pe: PeInfo,
+    /// The exact identity, so version-specific assertions cannot silently use another build.
+    label: &'static str,
 }
 
 impl Exe {
@@ -49,31 +51,39 @@ impl Exe {
             )
         });
         let pe = parse_pe_file(&bytes).unwrap();
-        Exe { path, bytes, pe }
+        let hash = build_id::sha256_file(&path).unwrap();
+        let Build::Known(label) = build_id::classify(hash) else {
+            panic!("{} is not a verified game build", path.display());
+        };
+        Exe {
+            path,
+            bytes,
+            pe,
+            label,
+        }
     }
 
     /// The Steam client.
     fn client() -> Exe {
         let exe = Exe::open("ENSHROUDED_STEAM_EXE", STEAM_EXE);
-        exe.assert_build("f68140a3-steam");
+        exe.assert_build(&["f68140a3", "f68140a3-steam", "1283531-steam"]);
         exe
     }
 
     /// The dedicated server.
     fn server() -> Exe {
         let exe = Exe::open("ENSHROUDED_SERVER_EXE", SERVER_EXE);
-        exe.assert_build("d7baa768-server");
+        exe.assert_build(&["d7baa768-server", "1283531-server"]);
         exe
     }
 
     /// The file is the build this mod was written against.
-    fn assert_build(&self, label: &'static str) {
-        let hash = build_id::sha256_file(&self.path).unwrap();
-        assert_eq!(
-            build_id::classify(hash),
-            Build::Known(label),
-            "{}",
-            self.path.display()
+    fn assert_build(&self, labels: &[&str]) {
+        assert!(
+            labels.contains(&self.label),
+            "{}: {} is the wrong process family",
+            self.path.display(),
+            self.label
         );
     }
 
@@ -228,7 +238,12 @@ fn the_stamina_call_leads_to_the_cost_function_in_the_client() {
     let target = site
         .target(&found, |addr, len| exe.read(addr, len))
         .unwrap();
-    assert_eq!(target, 0x1_4024_a360);
+    let expected = if exe.label == "1283531-steam" {
+        0x1_4024_e3a0
+    } else {
+        0x1_4024_a360
+    };
+    assert_eq!(target, expected);
 }
 
 /// The Steam client: MinHook on a private copy.

@@ -9,13 +9,14 @@
 //! ticks. Nothing here reads a clock or keeps state of its own, so a replayed tick with the same
 //! rays decides what its first run decided. Client and server agree only if their rays do.
 //!
-//! A hold on a lattice clears the byte, and a failed hold after that is the game's own drop. One
-//! gap remains: a climb that ends without a drop leaves the byte set. If the first hold of the next
-//! climb fails, it can get that grace, even on a lattice.
+//! A hold on a lattice clears the byte, and a failed hold after that is the game's own drop.
+//! The native committed stop also clears it. Endings that bypass that stop can still leave the
+//! previous count; see the README's limits. A fresh zero count gets no grace before a confirmed
+//! natural hold.
 
 /// The ticks in one second. The tick is 0xfe502b ns in both exes.
 pub const TICKS_PER_SECOND: f32 = 60.0;
-/// The state after a lattice hold or a drop. A climb that ends another way leaves the old state.
+/// The state after a lattice hold, a drop, or a committed native stop.
 pub const NOT_NATURAL: u8 = 0;
 /// The state after a natural hold that passed. Each tick forgiven adds one to it.
 pub const HOLDING: u8 = 1;

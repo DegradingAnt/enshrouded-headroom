@@ -38,6 +38,10 @@ pub const KNOWN: &[(&str, &str)] = &[
         "0403981fd2e8ad18bd8c5698dff03c8d505b5a46677832c496db9c645513f2a6",
         "1283531-steam",
     ),
+    (
+        "4429653ac0cfa154bc08e138853caa5d8557f82129b7488031f40345816aa6dc",
+        "1283531-server",
+    ),
 ];
 
 /// How many bytes of the file are read, and handed to the hash, at a time.
@@ -438,6 +442,16 @@ mod tests {
     fn patch_1283531_client_identity_is_exact() {
         let hash = unhex("0403981fd2e8ad18bd8c5698dff03c8d505b5a46677832c496db9c645513f2a6");
         assert_eq!(classify(hash), Build::Known("1283531-steam"));
+        let mut changed = hash;
+        changed[31] ^= 1;
+        assert_eq!(classify(changed), Build::Unknown(changed));
+    }
+
+    /// The dedicated-server identity is exact and does not admit a neighbouring digest.
+    #[test]
+    fn patch_1283531_server_identity_is_exact() {
+        let hash = unhex("4429653ac0cfa154bc08e138853caa5d8557f82129b7488031f40345816aa6dc");
+        assert_eq!(classify(hash), Build::Known("1283531-server"));
         let mut changed = hash;
         changed[31] ^= 1;
         assert_eq!(classify(changed), Build::Unknown(changed));

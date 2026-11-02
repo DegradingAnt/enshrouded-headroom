@@ -520,9 +520,8 @@ impl Snapshot {
         }
     }
 
-    /// The counts that also move when a surface is near but no climb runs. What runs every frame
-    /// anywhere is zeroed: the start check's calls, and the open-air probes of a held stick. A
-    /// player crossing a field must not fill the log.
+    /// Entry attempts also count when every ray misses. They use the same thirty-second limit
+    /// as other failed starts. Native probes without a natural entry attempt stay quiet.
     fn near(&self) -> Snapshot {
         Snapshot {
             start_calls: 0,
@@ -531,8 +530,6 @@ impl Snapshot {
             low_no_input: 0,
             low_probe: 0,
             probe_miss: 0,
-            entry_tried: 0,
-            reject_hits: 0,
             start_off: 0,
             ..*self
         }
@@ -1053,7 +1050,23 @@ mod tests {
         assert_eq!(diag.lasts().code, u32::from(MISS));
     }
 
-    /// Walking across a field with the stick held logs nothing.
+    /// Entirely missed entry probes still leave bounded evidence for a failed first session.
+    #[test]
+    fn entirely_missed_starts_leave_a_throttled_trace() {
+        let diag = Diag::new();
+        let mut pace = Pace::new();
+        let mut lines = 0;
+        for _ in 0..600 {
+            diag.probe(MISS, 0);
+            diag.natural(Mode::Entry, &refused(Reject::Hits));
+            if changed_line(&mut pace, diag.snapshot(), &diag.lasts()).is_some() {
+                lines += 1;
+            }
+        }
+        assert!((20..=21).contains(&lines), "{lines} lines in ten minutes");
+    }
+
+    /// Native open-air checks with no natural entry attempt stay quiet.
     #[test]
     fn open_ground_stays_quiet() {
         let diag = Diag::new();
@@ -1063,7 +1076,6 @@ mod tests {
             diag.top_entry(MISS);
             diag.low_entry(MISS, Some(MISS));
             diag.probe(MISS, 0);
-            diag.natural(Mode::Entry, &refused(Reject::Hits));
             diag.start_is_off();
         }
         assert_eq!(
