@@ -32,7 +32,7 @@ pub const HOLD: [u8; SIZE] = [
     0x0f, 0x2f, 0xc8, 0x72, 0x19,
     // Zero squared floor skips to the original next entity. Its relocated displacement is0x232.
     0x44, 0x0f, 0x2f, 0xe1, 0x0f, 0x83, 0x32, 0x02, 0x00, 0x00,
-    // Otherwise give the native debit a distance of abs(dt)*0.5. These are locals, not Velocity.
+    // Otherwise give the native debit a distance of abs(dt)*0.5. These are local distances, not MovementVector writes.
     0xf3, 0x44, 0x0f, 0x51, 0xd1, 0x0f, 0x57, 0xf6, 0x45, 0x0f, 0x57, 0xc9, 0x90, 0x90, 0x90,
 ];
 
@@ -53,7 +53,7 @@ mod tests {
 
     /// A private executable wrapper and its complete backing allocation.
     struct Harness {
-        /// The initialized executable pages; no game code or process memory is used.
+        /// Private arithmetic code: original span or owned replacement, with no game calls/process access.
         memory: Mem,
     }
 

@@ -2459,7 +2459,7 @@ Receipt: private W52 capsule-narrow-frontier.md SHA256
 ### W52 hanging-stamina calculation contract
 
 [VERIFIED] The owned wall-climb stamina program gates on Climb.type=Wall(1), a nonzero climb state,
-and absence of Actor.ClimbingTransition(35). Ladders do not enter its debit. It reads Velocity and
+and absence of Actor.ClimbingTransition(35). Ladders do not enter its debit. It reads MovementVector.velocity and
 the simulation tick duration, multiplies each velocity component by dt, and skips debit AND the
 Exhausted stop branch when all three distances are at most1e-20 in magnitude. Its normal movement
 charge is8 points/metre times the native attribute modifier; native finalize/exhaustion handling
@@ -2492,7 +2492,7 @@ must remain unchanged.
 The proposed owned replacement stays within these82 bytes. It computes the native squared distance
 order(y*y+x*x)+z*z with DPPS, then compares it with squared half-dt. Fast or unordered movement keeps
 the original local distances. Below the floor it sets a local distance of abs(dt)*0.5 and clears the
-other two local scalar distances. It never writes Velocity, current Stamina, or a persistent marker.
+other two local scalar distances. It never writes MovementVector, current Stamina, or a persistent marker.
 The original native attribute, accumulator, exhaustion, UI and authority paths still run. This
 chosen minimum effort also applies to ordinary wall lattices. It does not change ladders or other
 stamina programs. Default StaminaMultiplier remains1.
@@ -2507,7 +2507,7 @@ The balance choice is4 stamina points/second while motionless before native modi
 0.5m/s at the existing8points/m. It is not a discovered vanilla idle cost. Gameplay balance and live
 client/server exhaustion acceptance still require the author's later play test.
 Receipt: private W52 stamina-followup full four-image program/iterator/attribute evidence and site
-contracts. This is static owned-game evidence; no game or third-party mod was executed.
+contracts. This is static owned-image evidence; no game process or third-party mod was launched.
 
 The completed private stamina-native-contract.md has SHA256
 FA3184785769A653C45F979B5BB3E7D40256EB99389EE3245B2EE9AC5FFBEECB.

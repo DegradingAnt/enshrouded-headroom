@@ -19,7 +19,7 @@ The owned executable's climbing program charges for distance moved. At zero move
 The implemented rule is a minimum climbing effort. Each simulation tick charges for the greater of actual movement and a small reference movement over that tick:
 
 ```text
-charged distance = max(native movement distance, idle reference speed * native tick duration)
+charged distance = max(native movement distance, idle reference speed * abs(native tick duration))
 ```
 
 A reference speed of 0.5 metres per second is the first test tuning point. With the game's unmodified base cost of 8 stamina points per metre, that is 4 points per second before its normal modifiers. The floor is a chosen balance value, not a discovered vanilla idle rule. Normal full-speed movement keeps its existing cost. Slow movement pays at least the hanging cost, without adding a second charge on top of movement.
