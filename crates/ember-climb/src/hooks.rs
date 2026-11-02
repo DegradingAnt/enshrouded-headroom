@@ -19,6 +19,8 @@ use std::sync::OnceLock;
 use emberkit::guard::{guard, FeatureId};
 
 use crate::config::Settings;
+use crate::corner::{FreshPatch, Request};
+use crate::corner_call::{self, Answer, Call, Key, StayPatch};
 use crate::diag::{BodySample, MoveSample, DIAG};
 use crate::exit::{self, Exit};
 use crate::game::{
@@ -142,6 +144,8 @@ struct Hold {
     fit: Option<Fit>,
     /// Is the fit good enough to steer by?
     steady: bool,
+    /// Same-update discovery hints keyed to the exact live context/world/feet.
+    patch: Option<StayPatch>,
 }
 
 /// A natural surface found for the entry running on this thread.
@@ -274,6 +278,38 @@ type ExitLowFn = unsafe extern "system" fn(*mut u8, *mut u8, *mut u8) -> *mut u8
 /// `FUN_14024a360`, the stamina cost per metre.
 type StaminaFn = unsafe extern "system" fn(*mut u8) -> f32;
 
+/// Copy opaque identities from this live context; only equality uses its addresses.
+///
+/// # Safety
+///
+/// The native context is live for this invocation and its entity/world slots are initialized.
+unsafe fn corner_key(ctx: Ctx) -> Key {
+    // SAFETY: initialized fields of the same native context supplied by the caller.
+    unsafe {
+        Key {
+            context: ctx.0 as usize,
+            entity: ctx.entity(),
+            world: ctx.world() as usize,
+        }
+    }
+}
+
+/// Ordinary surface policy over either the raw or the same-call counted caster.
+fn natural_scan<C: crate::surface::Caster>(
+    caster: &C,
+    held: Option<MoveProbe>,
+    pos: Vec3,
+    dir: Vec3,
+    mode: Mode,
+    tuning: &Tuning,
+    capsule: crate::surface::Capsule,
+) -> Scan {
+    match held {
+        Some(probe) => scan_move_from_hold(caster, probe, tuning, capsule),
+        None => scan(caster, pos, dir, mode, tuning, capsule),
+    }
+}
+
 /// A natural surface for `mode` from `pos` along `dir`, if the game's own probe failed. The answer
 /// goes to the game as if its probe had found it.
 ///
@@ -307,29 +343,54 @@ unsafe fn natural_probe(
         .flatten()
         .filter(|hold| hold.natural && hold.steady && hold.entity == entity)
         .and_then(|hold| hold.fit);
-    let scan = match held {
-        Some(held) => {
-            // SAFETY: the native context's CurrentTransform is alive for this call. This is the
-            // same entity/update whose wall-lost probe just supplied the confirmed steady fit.
-            let current = unsafe { ctx.position() };
-            scan_move_from_hold(
-                &caster,
-                MoveProbe {
-                    current,
-                    candidate: pos,
-                    direction: dir,
-                    held,
-                },
-                &runtime.tuning,
-                capsule,
-            )
+    let held = held.map(|held| {
+        // SAFETY: this same entity/update owns the initialized CurrentTransform.
+        let current = unsafe { ctx.position() };
+        MoveProbe {
+            current,
+            candidate: pos,
+            direction: dir,
+            held,
         }
-        None => scan(&caster, pos, dir, mode, &runtime.tuning, capsule),
+    });
+    // SAFETY: this context supplies its own initialized identity slots throughout the probe.
+    let key = unsafe { corner_key(ctx) };
+    let scan = if mode == Mode::Move && corner_call::has_call() {
+        match corner_call::answer(&caster, key, pos) {
+            Answer::Refused => return,
+            Answer::Supported(supported) => Scan {
+                samples: [None; crate::surface::RAY_COUNT],
+                hits: supported.fit.hits,
+                fit: Some(supported.fit),
+                verdict: Ok(pos),
+                steady: true,
+            },
+            Answer::Ordinary => {
+                let Some(scan) = corner_call::ordinary(&caster, key, |counted| {
+                    natural_scan(counted, held, pos, dir, mode, &runtime.tuning, capsule)
+                }) else {
+                    return;
+                };
+                scan
+            }
+        }
+    } else {
+        natural_scan(&caster, held, pos, dir, mode, &runtime.tuning, capsule)
     };
     DIAG.natural(mode, &scan);
     DIAG.capsule(capsule.radius * 2.0, capsule.height);
     if mode == Mode::Stay {
-        remember_hold(entity, &scan);
+        remember_hold(
+            entity,
+            &scan,
+            Some(StayPatch {
+                key,
+                patch: FreshPatch {
+                    position: pos,
+                    hits: scan.samples,
+                },
+            }),
+        );
     }
     let (Ok(stand), Some(fit)) = (scan.verdict, scan.fit) else {
         return;
@@ -355,13 +416,14 @@ unsafe fn natural_probe(
 }
 
 /// Keep this frame's natural hold for the move check and the exit query.
-fn remember_hold(entity: u32, scan: &Scan) {
+fn remember_hold(entity: u32, scan: &Scan, patch: Option<StayPatch>) {
     if scan.verdict.is_ok() {
         let hold = Hold {
             entity,
             natural: true,
             fit: scan.fit,
             steady: scan.steady,
+            patch,
         };
         set(&HOLD, Some(hold));
     }
@@ -392,6 +454,9 @@ unsafe extern "system" fn probe_detour(
         unsafe { probe(out, ctx, pos, dir, len) }
     };
     post_hook(Feature::Surface, original, |result| {
+        if corner_call::blocked() || corner_call::querying() {
+            return result;
+        }
         if trampoline == 0 || result.is_null() {
             return result;
         }
@@ -404,6 +469,9 @@ unsafe extern "system" fn probe_detour(
             return result;
         };
         if code == OK {
+            if mode == Mode::Move {
+                corner_call::native_success();
+            }
             if mode == Mode::Stay {
                 // SAFETY: the game's own context, alive for this call.
                 let entity = unsafe { ctx.entity() };
@@ -412,6 +480,7 @@ unsafe extern "system" fn probe_detour(
                     natural: false,
                     fit: None,
                     steady: false,
+                    patch: None,
                 };
                 set(&HOLD, Some(hold));
             }
@@ -465,6 +534,7 @@ fn after_wall_lost(id: u32, probed: bool, state: u8, limit: u8, entity: u32) -> 
                 natural: true,
                 fit: None,
                 steady: false,
+                patch: None,
             };
             set(&HOLD, Some(hold));
             return (HELD, next);
@@ -730,6 +800,114 @@ unsafe fn steer_frame(
     sample
 }
 
+/// The baseline TLS fields a nested native move must not overwrite in its owner.
+struct NestedMove {
+    /// Previous mode, including an outer probe question.
+    mode: Option<Mode>,
+    /// Previous same-update hold.
+    hold: Option<Hold>,
+    /// Previous probe answer.
+    nested: Option<u8>,
+    /// Previous native move result.
+    stuck: bool,
+}
+impl NestedMove {
+    /// Suspend baseline custom state while the nested call forwards natively.
+    fn save() -> Self {
+        let previous = Self {
+            mode: get(&MODE, None),
+            hold: get(&HOLD, None),
+            nested: get(&NESTED, None),
+            stuck: get(&STUCK, false),
+        };
+        set(&MODE, None);
+        set(&HOLD, None);
+        set(&NESTED, None);
+        set(&STUCK, false);
+        previous
+    }
+}
+impl Drop for NestedMove {
+    fn drop(&mut self) {
+        set(&MODE, self.mode);
+        set(&HOLD, self.hold);
+        set(&NESTED, self.nested);
+        set(&STUCK, self.stuck);
+    }
+}
+/// Restore a prior probe mode after the synchronous native move returns or Rust unwinds.
+struct MoveMode(Option<Mode>);
+impl Drop for MoveMode {
+    fn drop(&mut self) {
+        set(&MODE, self.0);
+    }
+}
+
+/// Prepare owned corner state only for matching current wall/actor/collider data.
+///
+/// # Safety
+///
+/// The native move owns the initialized context and three-float argument buffers for this call.
+unsafe fn corner_before(velocity: *const f32, ctx: Ctx, pos: *const f32, dt: f32) -> Option<Call> {
+    let runtime = runtime()?;
+    // SAFETY: same live native move and the documented initialized ordinary-wall fields.
+    if !unsafe { ctx.ordinary_wall_motion() } {
+        return None;
+    }
+    // SAFETY: this context and every initialized component remain live for this native move.
+    let (key, current, input_position, velocity, normal, capsule) = unsafe {
+        (
+            corner_key(ctx),
+            ctx.position(),
+            read_vec3(pos),
+            read_vec3(velocity),
+            read_vec3(ctx.normal_at()),
+            ctx.capsule(),
+        )
+    };
+    let hold = get(&HOLD, None).filter(|hold| hold.natural && hold.entity == key.entity)?;
+    let patch = hold.patch.filter(|patch| patch.key == key)?.patch;
+    if current != input_position {
+        return None;
+    }
+    Call::new(
+        key,
+        Request {
+            position: current,
+            velocity,
+            normal,
+            dt,
+        },
+        patch,
+        hold.fit.filter(|_| hold.steady),
+        runtime.tuning,
+        capsule,
+    )
+}
+
+/// Commit only the facing supported at the actual final native candidate and unchanged context.
+///
+/// # Safety
+///
+/// The same native context and velocity buffer remain live after its original move check returns.
+unsafe fn finish_corner(ctx: Ctx, velocity: *const f32, native: u64) {
+    if !corner_call::has_call() || runtime().is_none() {
+        return;
+    }
+    // SAFETY: initialized native state/context slots still belong to this synchronous move.
+    if !unsafe { ctx.ordinary_wall_motion() } {
+        return;
+    }
+    // SAFETY: unchanged owner; the original may rewrite the live three-float velocity buffer.
+    let (key, position, velocity) =
+        unsafe { (corner_key(ctx), ctx.position(), read_vec3(velocity)) };
+    if let Some(facing) = corner_call::finish(key, position, velocity, native) {
+        // SAFETY: the native climbing program owns Climb for this call; finish proved finite
+        // facing from fresh actual-Q support after native AL success. No transform is written.
+        unsafe { write_vec3(ctx.normal_at(), facing) };
+    }
+}
+
 /// Run the move check with the probe in [`Mode::Move`].
 ///
 /// # Safety
@@ -742,10 +920,10 @@ unsafe fn move_check_original(velocity: *mut f32, ctx: *mut u8, pos: *const f32,
     }
     // SAFETY: non-zero, so MinHook's trampoline for the check, which has this type.
     let check = unsafe { std::mem::transmute::<usize, MoveCheckFn>(trampoline) };
+    let _mode = MoveMode(get(&MODE, None));
     set(&MODE, Some(Mode::Move));
     // SAFETY: the game's own arguments, passed on unchanged.
     let passed = unsafe { check(velocity, ctx, pos, dt) };
-    set(&MODE, None);
     // `al` is the answer. The upper bits are whatever the check left in `rax`.
     set(&STUCK, passed as u8 == 0);
     passed
@@ -763,25 +941,64 @@ unsafe extern "system" fn move_check_detour(
     pos: *const f32,
     dt: f32,
 ) -> u64 {
-    // SAFETY: the game's own arguments.
-    let original = || unsafe { move_check_original(velocity, ctx, pos, dt) };
-    // SAFETY: the native velocity and context remain alive through this one move-check call.
-    // Observations reuse steering's inputs and cannot feed a movement decision.
-    unsafe {
-        observed_move(
-            Feature::Steer,
-            velocity,
-            || {
-                // SAFETY: the game's own context. Diagnostics cannot stop the steering.
-                guard(Feature::Diag, || (), || note_body(Ctx(ctx)));
-                steer_frame(velocity, Ctx(ctx), pos, dt)
-            },
-            original,
-            |sample| {
-                guard(Feature::Diag, || (), || DIAG.movement(&sample));
-            },
-        )
-    }
+    let completed = Cell::new(None);
+    let original = || {
+        if let Some(value) = completed.get() {
+            return value;
+        }
+        // SAFETY: the native caller's unchanged arguments, forwarded once.
+        let value = unsafe { move_check_original(velocity, ctx, pos, dt) };
+        completed.set(Some(value));
+        value
+    };
+    guard(Feature::Steer, original, || {
+        let nested = corner_call::inside_move();
+        if nested {
+            return corner_call::with_move(None, || {
+                let _restore = NestedMove::save();
+                original()
+            });
+        }
+        // SAFETY: the complete native move owns these initialized arguments throughout the call.
+        let call = unsafe { corner_before(velocity, Ctx(ctx), pos, dt) };
+        corner_call::with_move(call, || {
+            // SAFETY: original native velocity/context remain live through one move check.
+            let value = unsafe {
+                observed_move(
+                    Feature::Steer,
+                    velocity,
+                    || {
+                        // SAFETY: the game's own context; diagnostic failure cannot stop steering.
+                        guard(Feature::Diag, || (), || note_body(Ctx(ctx)));
+                        let mut sample = steer_frame(velocity, Ctx(ctx), pos, dt);
+                        if corner_call::has_call() {
+                            if let Some(caster) = GameCaster::new(runtime()?.raycast, Ctx(ctx)) {
+                                let direction = -read_vec3(Ctx(ctx).normal_at());
+                                let steered = read_vec3(velocity);
+                                if let Some(requested) =
+                                    corner_call::prepare(&caster, direction, steered)
+                                {
+                                    write_vec3(velocity, requested);
+                                    if let Some(sample) = sample.as_mut() {
+                                        sample.steered_velocity = requested;
+                                    }
+                                }
+                            }
+                        }
+                        sample
+                    },
+                    original,
+                    |sample| {
+                        guard(Feature::Diag, || (), || DIAG.movement(&sample));
+                    },
+                )
+            };
+            // completed already holds the entire native RAX. A post failure cannot forward twice.
+            // SAFETY: this synchronous native context remains the same owner after the original.
+            unsafe { finish_corner(Ctx(ctx), velocity, value) };
+            value
+        })
+    })
 }
 
 /// The hit a fit stands for, to hand to the exit decision.
@@ -1455,6 +1672,7 @@ mod tests {
             natural,
             fit: None,
             steady: false,
+            patch: None,
         })
     }
 

@@ -147,6 +147,8 @@ The game already climbs, but only on flat iron lattices. Its wall probe wants fo
 
 Evidence for every game fact is in [docs/re-notes.md](../../docs/re-notes.md), "Free climbing".
 
+Corner transfers use one shared limit of 36 actual custom raycasts per native move, including prechecks, failed discovery and full/vertical/horizontal candidates. A denied ray refuses the whole candidate, even if three earlier rays hit. The current-frame hints are keyed to the exact context, entity, world and feet. Only owned scalar state enters the lexical move scope; no borrowed frame pointer or cross-frame corner cache is retained. Nested moves forward natively and restore the outer custom state. Native successful probe answers remain unchanged. These are source/fixture properties, not measured native physics or multiplayer acceptance.
+
 The [balance and animation research](DESIGN.md) records the hanging-stamina and IK work. The minimum hanging effort is implemented in this test candidate. Surface IK remains under development and is not enabled.
 
 ## First play test
@@ -158,7 +160,7 @@ The client and server use the same plugin and settings. Test multiplayer only af
 ## Limits
 
 - Automatic natural-wall top-outs are unavailable. This includes a valid-looking flat top; use Jump to leave the wall. Whole-body landing and animation-path checks must be proven before this feature can be enabled. The staged prevention does not establish the cause of a different mod's reported terrain/spawn recovery.
-- Sharp perpendicular outside corners can still stop movement before the next face is sampled. Rounded-surface steering is supported; this build does not grant a corner transfer from missing geometry.
+- Static vertical inside and outside corners up to 90 degrees now have a bounded runtime transfer path. It requests velocity, recasts at the exact candidate chosen by the native move check, and changes facing only after native success. Three distinct noncollinear real hits on one face remain required. Sloping, overhanging, dynamic and unavailable corner geometry can still stop movement. Gameplay feel and reliability need a later offline test.
 - Seam forgiveness is unavailable. A complete loss of the hold rays drops the climber without a timed grace period. The pure proposed grace model needs proven initialization and lifecycle ownership before a later build can enable it.
 
 - A surface must reach 2 m above your feet to start a climb. A lower wall starts nothing, and neither does a ledge you jump at when it is less than 2 m above your feet at that moment. Use the game's jump there. This may change after the first play test.

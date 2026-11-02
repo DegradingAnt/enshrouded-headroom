@@ -2785,3 +2785,27 @@ Accessor full body, native call displacement masked:
 
 Receipt: private observation-boundary/OBSERVATION-BOUNDARY.md SHA256
 BA572176FF5F337753D361DD0DA97C2B418D82D7D253B040031FC34C058BCABF.
+
+
+### W52 velocity-only corner integration
+
+[IMPLEMENTATION] The runtime corner adapter uses the already verified ordinary MoveCheck and
+Probe callbacks; no additional native address, layout, patch or hook is introduced. The existing
+four-image NATIVE-CORNER-MOTION contract establishes current feet, full/vertical/horizontal
+Probe candidates, status-only movement admission, caller-side AL-failure zeroing, and subsequent
+native Velocity/ActorResolve collision ownership. It is not a coherent whole-capsule oracle.
+
+The adapter requests velocity only, samples fresh one-face support at actual native Probe Q,
+and preserves original successful native Probe answers byte-for-byte. After native success,
+unchanged current identity/feet and final native velocity must match that actual Q before a
+finite eased Climb normal is written under the existing Climb write owner. No target position
+or Lerp transform is written. Natural automatic top-outs retain their separate disabled gate.
+
+All per-move state is copied scalar data. Opaque context/world addresses are equality keys,
+never dereferenced from saved state. Native owner pointers are read only through live callback
+arguments and the existing context helpers. A shared counted ray boundary caps actual calls at36;
+denial refuses the whole candidate. Nested calls suspend custom work and restore baseline TLS;
+Rust unwind preserves spent counts. This changes no foreign-unwind/trampoline assumption.
+
+Offline analytic and native-shaped fixture tests are source evidence only. They do not establish
+the behavior of native collision, streamed geometry, animation, controller input or multiplayer.

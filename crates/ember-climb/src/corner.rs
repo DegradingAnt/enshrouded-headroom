@@ -8,6 +8,14 @@ use crate::surface::{
     Capsule, Caster, Fit, Frame, Hit, Tuning, GAME_STANDOFF, NORMAL_TIME, RAY_ROWS, RAY_SIDE,
 };
 
+mod velocity;
+pub(crate) use velocity::Usage;
+
+pub use velocity::{
+    fresh_support, prepare_from_patch, BudgetCaster, FreshPatch, NativeBudget, Supported,
+    VelocityPlan, MAX_NATIVE_RAYS,
+};
+
 /// Maximum ray casts shared by one outer move-check call, including failed attempts and retries.
 pub const MAX_RAYS: u8 = 24;
 /// Maximum complete motion checks shared by that call.
@@ -403,29 +411,15 @@ impl<C: Caster, O: MotionOracle> Query<'_, C, O> {
         if !from.is_finite() || !to.is_finite() {
             return Err(Reject::Invalid);
         }
-        let direction = delta.normalized().ok_or(Reject::Invalid)?;
+        delta.normalized().ok_or(Reject::Invalid)?;
         if self.budget.rays >= MAX_RAYS {
             return Err(Reject::Budget);
         }
         self.budget.rays = self.budget.rays.saturating_add(1);
-        let Some(mut hit) = self.caster.cast(from, to, mask) else {
+        let Some(hit) = self.caster.cast(from, to, mask) else {
             return Ok(None);
         };
-        let Some(normal) = hit.normal.normalized() else {
-            return Ok(None);
-        };
-        let offset = hit.point - from;
-        let along = offset.dot(direction);
-        if !hit.point.is_finite()
-            || along < -EPS
-            || along > delta.length() + EPS
-            || (offset - direction * along).length() > CROSS
-            || normal.dot(direction) >= -EPS
-        {
-            return Ok(None);
-        }
-        hit.normal = normal;
-        Ok(Some(hit))
+        Ok(ray_hit(from, to, hit))
     }
 
     /// A direct inside witness or finite visibility-checked outside scouts. No scout grants a hold.
@@ -483,46 +477,11 @@ impl<C: Caster, O: MotionOracle> Query<'_, C, O> {
 
     /// A fresh angular patch at the actual destination, on one physical face only.
     fn support(&mut self, feature: Feature, position: Vec3) -> Result<Fit, Reject> {
-        let a_gap = (position - feature.first.point).dot(feature.first.normal);
-        let b_gap = (position - feature.second.point).dot(feature.second.normal);
-        let first = if feature.route == Route::Convex {
-            a_gap >= b_gap
-        } else {
-            a_gap <= b_gap
-        };
-        let (face, along) = if first {
-            (
-                feature.first,
-                -UP.cross(feature.first.normal) * feature.sign,
-            )
-        } else {
-            (
-                feature.second,
-                UP.cross(feature.second.normal) * feature.sign,
-            )
-        };
-        let edge = feature.edge(position.y).ok_or(Reject::NoSupport)?;
-        let mut hits = [None; 4];
-        let samples = RAY_ROWS.into_iter().flat_map(|height| {
-            [RAY_SIDE * 0.5, RAY_SIDE]
-                .into_iter()
-                .map(move |side| (height, side))
-        });
-        for (slot, (height, side)) in hits.iter_mut().zip(samples) {
-            let from = position + UP * height;
-            let target = edge + UP * height + along * side;
-            let delta = target - from;
-            let Some(direction) = delta.normalized() else {
-                continue;
-            };
-            if delta.length() + CROSS > self.reach() {
-                continue;
-            }
-            *slot = self
-                .ray(from, target + direction * CROSS, self.tuning.mask)?
-                .filter(|hit| hit.entity == face.entity && hit.normal.dot(face.normal) >= ALIGN);
-        }
-        fit(&hits, self.tuning).ok_or(Reject::NoSupport)
+        let tuning = *self.tuning;
+        let reach = self.reach();
+        support_at(feature, position, &tuning, reach, |from, to, mask| {
+            self.ray(from, to, mask)
+        })
     }
 
     /// Physical support and complete motion are checked before returning any proposal.
@@ -540,15 +499,7 @@ impl<C: Caster, O: MotionOracle> Query<'_, C, O> {
             Clearance::Unknown => return Err(Reject::Unknown),
             Clearance::Clear => {}
         }
-        let target = guide
-            .feature
-            .facing(position, self.radius())
-            .ok_or(Reject::NoSupport)?;
-        let old = guide.request.normal.normalized().ok_or(Reject::Invalid)?;
-        let share = 1.0 - (-guide.request.dt / NORMAL_TIME).exp();
-        let facing = (old + (target - old) * share)
-            .normalized()
-            .ok_or(Reject::Invalid)?;
+        let facing = facing_at(guide, position, self.radius())?;
         Ok(Step {
             position,
             velocity: (position - guide.request.position) * (1.0 / guide.request.dt),
@@ -560,8 +511,92 @@ impl<C: Caster, O: MotionOracle> Query<'_, C, O> {
     }
 }
 
+/// Validate one real answer against its finite ray segment before using it as geometry.
+fn ray_hit(from: Vec3, to: Vec3, mut hit: Hit) -> Option<Hit> {
+    let delta = to - from;
+    if !from.is_finite() || !to.is_finite() {
+        return None;
+    }
+    let direction = delta.normalized()?;
+    let normal = hit.normal.normalized()?;
+    let offset = hit.point - from;
+    let along = offset.dot(direction);
+    if !hit.point.is_finite()
+        || along < -EPS
+        || along > delta.length() + EPS
+        || (offset - direction * along).length() > CROSS
+        || normal.dot(direction) >= -EPS
+    {
+        return None;
+    }
+    hit.normal = normal;
+    Some(hit)
+}
+
+/// Obtain three-hit support with the caller's actual ray boundary, never a cached guide fit.
+fn support_at(
+    feature: Feature,
+    position: Vec3,
+    tuning: &Tuning,
+    reach: f32,
+    mut ray: impl FnMut(Vec3, Vec3, u32) -> Result<Option<Hit>, Reject>,
+) -> Result<Fit, Reject> {
+    let a_gap = (position - feature.first.point).dot(feature.first.normal);
+    let b_gap = (position - feature.second.point).dot(feature.second.normal);
+    let first = if feature.route == Route::Convex {
+        a_gap >= b_gap
+    } else {
+        a_gap <= b_gap
+    };
+    let (face, along) = if first {
+        (
+            feature.first,
+            -UP.cross(feature.first.normal) * feature.sign,
+        )
+    } else {
+        (
+            feature.second,
+            UP.cross(feature.second.normal) * feature.sign,
+        )
+    };
+    let edge = feature.edge(position.y).ok_or(Reject::NoSupport)?;
+    let mut hits = [None; 4];
+    let samples = RAY_ROWS.into_iter().flat_map(|height| {
+        [RAY_SIDE * 0.5, RAY_SIDE]
+            .into_iter()
+            .map(move |side| (height, side))
+    });
+    for (slot, (height, side)) in hits.iter_mut().zip(samples) {
+        let from = position + UP * height;
+        let target = edge + UP * height + along * side;
+        let delta = target - from;
+        let Some(direction) = delta.normalized() else {
+            continue;
+        };
+        if delta.length() + CROSS > reach {
+            continue;
+        }
+        *slot = ray(from, target + direction * CROSS, tuning.mask)?
+            .filter(|hit| hit.entity == face.entity && hit.normal.dot(face.normal) >= ALIGN);
+    }
+    fit(&hits, tuning).ok_or(Reject::NoSupport)
+}
+
+/// Eased facing for an exact feet position; this is never physical support permission.
+fn facing_at(guide: Guide, position: Vec3, radius: f32) -> Result<Vec3, Reject> {
+    let target = guide
+        .feature
+        .facing(position, radius)
+        .ok_or(Reject::NoSupport)?;
+    let old = guide.request.normal.normalized().ok_or(Reject::Invalid)?;
+    let share = 1.0 - (-guide.request.dt / NORMAL_TIME).exp();
+    (old + (target - old) * share)
+        .normalized()
+        .ok_or(Reject::Invalid)
+}
+
 /// Validate the finite, static vertical-wall movement domain before any scene calls.
-fn valid(request: &Request, tuning: &Tuning, capsule: Capsule) -> Result<(), Reject> {
+pub(crate) fn valid(request: &Request, tuning: &Tuning, capsule: Capsule) -> Result<(), Reject> {
     let length = request.velocity.length();
     if !request.position.is_finite()
         || !request.velocity.is_finite()
@@ -1575,5 +1610,595 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The same actual-call boundary charges ordinary scans and later retries.
+    #[test]
+    fn native_corner_budget_is_shared_by_ordinary_scans() {
+        let world = Convex {
+            calls: Cell::new(0),
+        };
+        let budget = NativeBudget::new();
+        let counted = BudgetCaster::new(&world, &budget);
+        for _ in 0..MAX_NATIVE_RAYS / 4 {
+            assert!(counted
+                .scan(
+                    Vec3::new(-0.55, 0.0, -1.0),
+                    Vec3::new(1.0, 0.0, 0.0),
+                    crate::surface::Mode::Move,
+                    &tuning(),
+                    Capsule::FALLBACK
+                )
+                .unwrap()
+                .verdict
+                .is_ok());
+        }
+        assert_eq!(budget.rays(), MAX_NATIVE_RAYS);
+        assert_eq!(world.calls.get(), u32::from(MAX_NATIVE_RAYS));
+        assert_eq!(
+            counted.scan(
+                Vec3::new(-0.55, 0.0, -1.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                crate::surface::Mode::Move,
+                &tuning(),
+                Capsule::FALLBACK
+            ),
+            Err(Reject::Budget)
+        );
+        assert!(budget.denied());
+        assert_eq!(world.calls.get(), u32::from(MAX_NATIVE_RAYS));
+    }
+
+    /// Three real hits do not authorize a patch when the fourth query was denied.
+    #[test]
+    fn native_corner_denied_fourth_ray_refuses_whole_scan() {
+        let world = Convex {
+            calls: Cell::new(0),
+        };
+        let budget = NativeBudget::new();
+        let counted = BudgetCaster::new(&world, &budget);
+        for _ in 0..MAX_NATIVE_RAYS - 3 {
+            let _ = counted.cast(
+                Vec3::new(-0.55, 1.0, -1.0),
+                Vec3::new(0.45, 1.0, -1.0),
+                tuning().mask,
+            );
+        }
+        assert_eq!(
+            counted.scan(
+                Vec3::new(-0.55, 0.0, -1.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                crate::surface::Mode::Move,
+                &tuning(),
+                Capsule::FALLBACK
+            ),
+            Err(Reject::Budget)
+        );
+        assert!(budget.denied());
+        assert_eq!(budget.rays(), MAX_NATIVE_RAYS);
+        assert_eq!(world.calls.get(), u32::from(MAX_NATIVE_RAYS));
+    }
+
+    /// A same-update seed can request finite velocity without invoking a motion oracle.
+    #[test]
+    fn native_corner_convex_seeds_request_only_bounded_velocity() {
+        let world = Convex {
+            calls: Cell::new(0),
+        };
+        let input = approach();
+        let scan = crate::surface::scan(
+            &world,
+            input.position,
+            -input.normal,
+            crate::surface::Mode::Stay,
+            &tuning(),
+            Capsule::FALLBACK,
+        );
+        let before = world.calls.get();
+        let budget = NativeBudget::new();
+        let counted = BudgetCaster::new(&world, &budget);
+        let plan = prepare_from_patch(
+            &counted,
+            &input,
+            FreshPatch {
+                position: input.position,
+                hits: scan.samples,
+            },
+            true,
+            &tuning(),
+            Capsule::FALLBACK,
+        )
+        .unwrap();
+        let copy = plan;
+        assert_eq!(copy, plan);
+        assert_eq!(plan.route, Route::Convex);
+        assert!(plan.position.z > input.position.z);
+        assert!(plan.position.is_finite() && plan.velocity.is_finite() && plan.facing.is_finite());
+        assert!(plan.velocity.length() <= input.velocity.length() + 1e-4);
+        assert_eq!(u32::from(budget.rays()), world.calls.get() - before);
+        assert!(budget.rays() <= 5);
+    }
+
+    /// An inside junction must be discovered before a four-hit ordinary patch loses coverage.
+    #[test]
+    fn native_corner_concave_direct_witness_works_with_four_stay_hits() {
+        let world = Concave {
+            calls: Cell::new(0),
+        };
+        let input = Request {
+            position: Vec3::new(-0.55, 0.0, -0.9),
+            ..approach()
+        };
+        let stay = crate::surface::scan(
+            &world,
+            input.position,
+            -input.normal,
+            crate::surface::Mode::Stay,
+            &tuning(),
+            Capsule::FALLBACK,
+        );
+        assert_eq!(stay.hits, 4);
+        assert!(stay.verdict.is_ok());
+        let budget = NativeBudget::new();
+        let counted = BudgetCaster::new(&world, &budget);
+        let plan = prepare_from_patch(
+            &counted,
+            &input,
+            FreshPatch {
+                position: input.position,
+                hits: stay.samples,
+            },
+            false,
+            &tuning(),
+            Capsule::FALLBACK,
+        )
+        .unwrap();
+        assert_eq!(plan.route, Route::Concave);
+        assert!(plan.position.x < input.position.x && plan.position.z > input.position.z);
+        assert_eq!(budget.rays(), 1);
+    }
+
+    /// A native vertical fallback gets fresh real support and ignores public proposal mutations.
+    #[test]
+    fn native_corner_actual_fallback_is_fresh_and_private_envelope_is_authority() {
+        let world = Convex {
+            calls: Cell::new(0),
+        };
+        let input = Request {
+            velocity: Vec3::new(0.0, 0.3, 1.0),
+            ..approach()
+        };
+        let strict = propose(
+            &world,
+            &mut Clear,
+            &mut Budget::new(),
+            &input,
+            &tuning(),
+            Capsule::FALLBACK,
+        )
+        .unwrap();
+        let plan = VelocityPlan {
+            position: Vec3::new(f32::NAN, 0.0, 0.0),
+            velocity: Vec3::new(99.0, 0.0, 0.0),
+            facing: Vec3::default(),
+            route: Route::Concave,
+            guide: strict.guide,
+        };
+        let budget = NativeBudget::new();
+        let counted = BudgetCaster::new(&world, &budget);
+        let q = input.position + UP * (input.velocity.y * input.dt);
+        let answer = fresh_support(&counted, &plan, q, &tuning(), Capsule::FALLBACK).unwrap();
+        assert!(answer.fit.hits >= 3 && answer.facing.is_finite());
+        assert_eq!(budget.rays(), 4);
+        let used = budget.rays();
+        assert_eq!(
+            fresh_support(
+                &counted,
+                &plan,
+                input.position + UP,
+                &tuning(),
+                Capsule::FALLBACK
+            ),
+            Err(Reject::Invalid)
+        );
+        assert_eq!(budget.rays(), used);
+    }
+
+    /// A previous strict step is not support when geometry disappears or only two rays survive.
+    #[test]
+    fn native_corner_missing_actual_geometry_never_uses_old_fit() {
+        struct Limited<'a> {
+            world: &'a Convex,
+            left: Cell<u8>,
+        }
+        impl Caster for Limited<'_> {
+            fn cast(&self, from: Vec3, to: Vec3, mask: u32) -> Option<Hit> {
+                let left = self.left.get();
+                self.left.set(left.saturating_sub(1));
+                (left > 0)
+                    .then(|| self.world.cast(from, to, mask))
+                    .flatten()
+            }
+        }
+        let world = Convex {
+            calls: Cell::new(0),
+        };
+        let input = approach();
+        let strict = propose(
+            &world,
+            &mut Clear,
+            &mut Budget::new(),
+            &input,
+            &tuning(),
+            Capsule::FALLBACK,
+        )
+        .unwrap();
+        let plan = VelocityPlan {
+            position: strict.position,
+            velocity: strict.velocity,
+            facing: strict.facing,
+            route: strict.route,
+            guide: strict.guide,
+        };
+        for left in [0, 2] {
+            let missing = Limited {
+                world: &world,
+                left: Cell::new(left),
+            };
+            let budget = NativeBudget::new();
+            let counted = BudgetCaster::new(&missing, &budget);
+            assert_eq!(
+                fresh_support(&counted, &plan, plan.position, &tuning(), Capsule::FALLBACK),
+                Err(Reject::NoSupport)
+            );
+            assert_eq!(budget.rays(), 4);
+        }
+    }
+
+    /// Matching feet and initialized finite witnesses are required before discovery.
+    #[test]
+    fn native_corner_stale_or_malformed_seeds_refuse_without_queries() {
+        let world = Convex {
+            calls: Cell::new(0),
+        };
+        let input = approach();
+        let budget = NativeBudget::new();
+        let counted = BudgetCaster::new(&world, &budget);
+        assert_eq!(
+            prepare_from_patch(
+                &counted,
+                &input,
+                FreshPatch {
+                    position: input.position + UP,
+                    hits: [None; 4]
+                },
+                true,
+                &tuning(),
+                Capsule::FALLBACK
+            ),
+            Err(Reject::Invalid)
+        );
+        let broken = Some(Hit {
+            point: Vec3::new(f32::NAN, 0.0, 0.0),
+            normal: -input.normal,
+            entity: 0,
+        });
+        assert_eq!(
+            prepare_from_patch(
+                &counted,
+                &input,
+                FreshPatch {
+                    position: input.position,
+                    hits: [broken; 4]
+                },
+                true,
+                &tuning(),
+                Capsule::FALLBACK
+            ),
+            Err(Reject::NoSupport)
+        );
+        assert_eq!(budget.rays(), 0);
+    }
+
+    /// Full turns exercise fresh Stay witnesses, independent native motion and real actual-Q rays.
+    #[test]
+    fn native_corner_full_turns_keep_fresh_stay_and_actual_support() {
+        use crate::surface::{scan, Mode};
+        let capsule = Capsule {
+            radius: 0.5,
+            height: 2.0,
+        };
+        for dt in [1.0 / 120.0, 1.0 / 60.0, 1.0 / 20.0] {
+            for route in [Route::Convex, Route::Concave] {
+                for sign in [-1.0, 1.0] {
+                    let outside = Convex {
+                        calls: Cell::new(0),
+                    };
+                    let inside = Concave {
+                        calls: Cell::new(0),
+                    };
+                    let (mut position, mut facing, new_normal) = match (route, sign > 0.0) {
+                        (Route::Convex, true) => (
+                            Vec3::new(-0.55, 0.0, -0.35),
+                            Vec3::new(-1.0, 0.0, 0.0),
+                            Vec3::new(0.0, 0.0, 1.0),
+                        ),
+                        (Route::Convex, false) => (
+                            Vec3::new(0.35, 0.0, 0.55),
+                            Vec3::new(0.0, 0.0, 1.0),
+                            Vec3::new(-1.0, 0.0, 0.0),
+                        ),
+                        (Route::Concave, true) => (
+                            Vec3::new(-0.55, 0.0, -0.99),
+                            Vec3::new(-1.0, 0.0, 0.0),
+                            Vec3::new(0.0, 0.0, -1.0),
+                        ),
+                        (Route::Concave, false) => (
+                            Vec3::new(-0.99, 0.0, -0.55),
+                            Vec3::new(0.0, 0.0, -1.0),
+                            Vec3::new(-1.0, 0.0, 0.0),
+                        ),
+                    };
+                    let mut handoff = false;
+                    for tick in 0..500 {
+                        let input = Request {
+                            position,
+                            velocity: UP.cross(facing) * (1.95 * sign),
+                            normal: facing,
+                            dt,
+                        };
+                        let budget = NativeBudget::new();
+                        let mut oracle = WallMotion { route };
+                        let result = if route == Route::Convex {
+                            let before = outside.calls.get();
+                            let counted = BudgetCaster::new(&outside, &budget);
+                            let stay = counted
+                                .scan(position, -facing, Mode::Stay, &tuning(), capsule)
+                                .unwrap();
+                            assert!(stay.verdict.is_ok(), "lost Stay {route:?}/{sign}/{dt} tick{tick} P={position:?} N={facing:?}: {stay:?}");
+                            let plan = prepare_from_patch(
+                                &counted,
+                                &input,
+                                FreshPatch {
+                                    position,
+                                    hits: stay.samples,
+                                },
+                                true,
+                                &tuning(),
+                                capsule,
+                            );
+                            let step = plan.and_then(|plan| {
+                                let supported = fresh_support(&counted, &plan, plan.position, &tuning(), capsule)?;
+                                assert_eq!(oracle.check(position, plan.position, capsule), Clearance::Clear,
+                                    "requested native motion must fit this independent analytic capsule");
+                                Ok(Step { position: plan.position, velocity: plan.velocity,
+                                    facing: supported.facing, support: supported.fit, route: plan.route, guide: plan.guide })
+                            });
+                            assert_eq!(u32::from(budget.rays()), outside.calls.get() - before);
+                            step
+                        } else {
+                            let before = inside.calls.get();
+                            let counted = BudgetCaster::new(&inside, &budget);
+                            let stay = counted
+                                .scan(position, -facing, Mode::Stay, &tuning(), capsule)
+                                .unwrap();
+                            assert!(stay.verdict.is_ok(), "lost Stay {route:?}/{sign}/{dt} tick{tick} P={position:?} N={facing:?}: {stay:?}");
+                            let plan = prepare_from_patch(
+                                &counted,
+                                &input,
+                                FreshPatch {
+                                    position,
+                                    hits: stay.samples,
+                                },
+                                true,
+                                &tuning(),
+                                capsule,
+                            );
+                            let step = plan.and_then(|plan| {
+                                let supported = fresh_support(&counted, &plan, plan.position, &tuning(), capsule)?;
+                                assert_eq!(oracle.check(position, plan.position, capsule), Clearance::Clear,
+                                    "requested native motion must fit this independent analytic capsule");
+                                Ok(Step { position: plan.position, velocity: plan.velocity,
+                                    facing: supported.facing, support: supported.fit, route: plan.route, guide: plan.guide })
+                            });
+                            assert_eq!(u32::from(budget.rays()), inside.calls.get() - before);
+                            step
+                        };
+                        assert!(budget.rays() <= MAX_NATIVE_RAYS);
+                        let accepted = result.is_ok();
+                        let failure = result.as_ref().err().copied();
+                        if let Ok(step) = result {
+                            assert!(step.position.is_finite() && step.facing.is_finite());
+                            assert!(
+                                (step.position - position).length() > 1e-6,
+                                "stalled {route:?}/{sign}/{dt} tick{tick}: {step:?}"
+                            );
+                            position = step.position;
+                            facing = step.facing;
+                        } else if failure != Some(Reject::NoSupport) {
+                            panic!("{route:?}/{sign}/{dt} tick{tick}: {failure:?} P={position:?} N={facing:?}");
+                        }
+                        // This is an independent baseline-handoff check, outside the measured
+                        // policy invocation. It supplies no cached geometry to the next tick.
+                        let candidate = position + UP.cross(facing) * (1.95 * sign * dt);
+                        let ordinary = if route == Route::Convex {
+                            scan(&outside, candidate, -facing, Mode::Move, &tuning(), capsule)
+                        } else {
+                            scan(&inside, candidate, -facing, Mode::Move, &tuning(), capsule)
+                        };
+                        if ordinary.verdict.is_ok()
+                            && ordinary
+                                .fit
+                                .is_some_and(|fit| fit.normal.dot(new_normal) > 0.995)
+                            && oracle.check(position, candidate, capsule) == Clearance::Clear
+                        {
+                            handoff = true;
+                            break;
+                        }
+                        assert!(accepted, "lost transfer {route:?}/{sign}/{dt} tick{tick} P={position:?} N={facing:?}");
+                    }
+                    assert!(
+                        handoff,
+                        "no ordinary handoff: {route:?}/{sign}/{dt} P={position:?} N={facing:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Per-move state is owned data and all nesting/unwind paths restore the exact outer scope.
+    #[test]
+    fn native_corner_call_scopes_restore_after_nesting_and_unwind() {
+        use crate::corner_call as call;
+        assert!(!call::inside_move());
+        call::with_move(None, || {
+            assert!(call::inside_move() && !call::blocked());
+            call::with_move(None, || assert!(call::inside_move() && call::blocked()));
+            assert!(!call::blocked());
+            let failure =
+                std::panic::catch_unwind(|| call::with_move(None, || panic!("nested scope")));
+            assert!(failure.is_err());
+            assert!(call::inside_move() && !call::blocked());
+        });
+        assert!(!call::inside_move() && !call::blocked());
+    }
+
+    /// Only fresh actual support followed by native success can commit a facing.
+    #[test]
+    fn native_corner_call_commits_only_matching_actual_q_after_native_success() {
+        use crate::corner_call::{self as call, Answer, Call, Key};
+        let world = Convex {
+            calls: Cell::new(0),
+        };
+        let input = approach();
+        let stay = crate::surface::scan(
+            &world,
+            input.position,
+            -input.normal,
+            crate::surface::Mode::Stay,
+            &tuning(),
+            Capsule::FALLBACK,
+        );
+        let key = Key {
+            context: 1,
+            entity: 2,
+            world: 3,
+        };
+        let owned = Call::new(
+            key,
+            input,
+            FreshPatch {
+                position: input.position,
+                hits: stay.samples,
+            },
+            stay.fit.filter(|_| stay.steady),
+            tuning(),
+            Capsule::FALLBACK,
+        )
+        .unwrap();
+        call::with_move(Some(owned), || {
+            let velocity = call::prepare(&world, -input.normal, input.velocity).unwrap();
+            let q = input.position + velocity * input.dt;
+            assert!(matches!(call::answer(&world, key, q), Answer::Supported(_)));
+            assert_eq!(
+                call::finish(key, input.position, velocity, 0x1234_5678_0000_0000),
+                None
+            );
+            assert!(matches!(call::answer(&world, key, q), Answer::Supported(_)));
+            assert!(call::finish(key, input.position, velocity, 0x1234_5678_0000_0001).is_some());
+            assert!(matches!(call::answer(&world, key, q), Answer::Supported(_)));
+            assert_eq!(call::finish(key, input.position, Vec3::default(), 1), None);
+            assert!(matches!(call::answer(&world, key, q), Answer::Supported(_)));
+            call::native_success();
+            assert_eq!(call::finish(key, input.position, velocity, 1), None);
+            assert!(matches!(
+                call::answer(&world, Key { world: 4, ..key }, q),
+                Answer::Refused
+            ));
+            assert_eq!(call::finish(key, input.position, velocity, 1), None);
+        });
+    }
+
+    /// A panic in a scene query restores its flag but cannot refund the actual call already spent.
+    #[test]
+    fn native_corner_query_unwind_preserves_spent_budget_and_clears_reentry_flag() {
+        use crate::corner_call::{self as call, Call, Key};
+        struct PanicRay;
+        impl Caster for PanicRay {
+            fn cast(&self, _a: Vec3, _b: Vec3, _mask: u32) -> Option<Hit> {
+                panic!("scene fixture");
+            }
+        }
+        let world = Convex {
+            calls: Cell::new(0),
+        };
+        let input = Request {
+            position: Vec3::new(-0.55, 0.0, -1.0),
+            ..approach()
+        };
+        let stay = crate::surface::scan(
+            &world,
+            input.position,
+            -input.normal,
+            crate::surface::Mode::Stay,
+            &tuning(),
+            Capsule::FALLBACK,
+        );
+        let key = Key {
+            context: 1,
+            entity: 2,
+            world: 3,
+        };
+        let owner = Call::new(
+            key,
+            input,
+            FreshPatch {
+                position: input.position,
+                hits: stay.samples,
+            },
+            stay.fit,
+            tuning(),
+            Capsule::FALLBACK,
+        )
+        .unwrap();
+        call::with_move(Some(owner), || {
+            let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                call::ordinary(&PanicRay, key, |counted| {
+                    crate::surface::scan(
+                        counted,
+                        input.position,
+                        -input.normal,
+                        crate::surface::Mode::Move,
+                        &tuning(),
+                        Capsule::FALLBACK,
+                    )
+                });
+            }));
+            assert!(failure.is_err());
+            assert!(!call::querying() && call::has_call());
+            let before = world.calls.get();
+            let mut refused = false;
+            for _ in 0..12 {
+                let scan = call::ordinary(&world, key, |counted| {
+                    crate::surface::scan(
+                        counted,
+                        input.position,
+                        -input.normal,
+                        crate::surface::Mode::Move,
+                        &tuning(),
+                        Capsule::FALLBACK,
+                    )
+                });
+                refused |= scan.is_none();
+            }
+            assert!(refused);
+            assert_eq!(
+                world.calls.get() - before + 1,
+                u32::from(MAX_NATIVE_RAYS),
+                "the panicking ray spent one of the shared actual calls"
+            );
+            assert!(!call::querying());
+        });
+        assert!(!call::inside_move());
     }
 }

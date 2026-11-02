@@ -42,6 +42,57 @@ static EXIT_NY: AtomicU32 = AtomicU32::new(0);
 /// surface that reads walkable at the height of a player's rays.
 static WALL_NY: AtomicU32 = AtomicU32::new(0);
 
+/// Zero uses the legacy plane; one/two select explicit convex/concave test geometry.
+static CORNER_KIND: AtomicU32 = AtomicU32::new(0);
+/// Calls of the original native-shaped movement fixture, counted independently of custom work.
+static MOVE_CALLS: AtomicU32 = AtomicU32::new(0);
+/// Outer native calls which observe a real optional corner scope.
+static CORNER_CALLS: AtomicU32 = AtomicU32::new(0);
+/// Force the native fixture to reject after one custom successful probe.
+static CORNER_REJECT: AtomicBool = AtomicBool::new(false);
+/// Select a vertical fallback despite full-candidate support, then rewrite velocity as native does.
+static CORNER_VERTICAL: AtomicBool = AtomicBool::new(false);
+/// Reenter once from an original movement call.
+static CORNER_NEST: AtomicBool = AtomicBool::new(false);
+/// Reenter once from a real scene-ray boundary, while the outer custom query is on the stack.
+static CORNER_RAY_NEST: AtomicBool = AtomicBool::new(false);
+/// Current leaked fixture context for a deliberately reentrant test callback.
+static CORNER_CTX: AtomicUsize = AtomicUsize::new(0);
+
+/// Nearest hit in two explicit vertical half-plane fixtures. This is test geometry only.
+fn corner_hit(from: Vec3, to: Vec3, kind: u32) -> Option<Hit> {
+    let second = if kind == 1 { 1.0 } else { -1.0 };
+    let delta = to - from;
+    let mut best: Option<(f32, Hit)> = None;
+    for normal in [Vec3::new(-1.0, 0.0, 0.0), Vec3::new(0.0, 0.0, second)] {
+        let gap = from.dot(normal);
+        let closing = delta.dot(normal);
+        if gap <= 1e-6 || closing >= -1e-6 {
+            continue;
+        }
+        let t = -gap / closing;
+        let point = from + delta * t;
+        let on_face = if normal.x < 0.0 {
+            point.z <= 1e-6
+        } else if kind == 1 {
+            point.x >= -1e-6
+        } else {
+            point.x <= 1e-6
+        };
+        if (0.0..=1.0).contains(&t) && on_face && best.is_none_or(|(old, _)| t < old) {
+            best = Some((
+                t,
+                Hit {
+                    point,
+                    normal,
+                    entity: 0,
+                },
+            ));
+        }
+    }
+    best.map(|(_, hit)| hit)
+}
+
 /// A raycast with the game's signature, against the wall.
 ///
 /// # Safety
@@ -59,12 +110,70 @@ unsafe extern "system" fn plane_raycast(
     _arg8: u64,
 ) -> *mut u8 {
     RAYS.fetch_add(1, Ordering::Relaxed);
+    if CORNER_RAY_NEST.swap(false, Ordering::Relaxed) {
+        assert!(
+            corner_call::querying(),
+            "nested ray test must occur inside a custom query"
+        );
+        let ctx = CORNER_CTX.load(Ordering::Relaxed) as *mut u8;
+        let saved = (
+            get(&MODE, None),
+            get(&HOLD, None),
+            get(&NESTED, None),
+            get(&STUCK, false),
+        );
+        // SAFETY: the leaked initialized fixture context and complete local float buffers live
+        // for this synchronous callback; no real native/game code is invoked.
+        unsafe {
+            let p = Ctx(ctx).position();
+            let p = [p.x, p.y, p.z];
+            let mut v = [0.0, 0.0, 1.0];
+            let result = move_check_detour(v.as_mut_ptr(), ctx, p.as_ptr(), DT);
+            assert_eq!(result & !0xff, RAX_ABOVE_AL);
+        }
+        assert_eq!(
+            (
+                get(&MODE, None),
+                get(&HOLD, None),
+                get(&NESTED, None),
+                get(&STUCK, false)
+            ),
+            saved
+        );
+        assert!(corner_call::querying());
+    }
     // SAFETY: the function's contract.
     let [fx, fy, fz, _, tx, ty, tz, _] = unsafe { ray.cast::<[f32; 8]>().read_unaligned() };
     let mut bytes = [0u8; 0x70];
     bytes[0] = MISS;
     let mut hit = None;
     let mut entity = 0;
+    let kind = CORNER_KIND.load(Ordering::Relaxed);
+    if kind != 0 {
+        if let Some(hit) = corner_hit(Vec3::new(fx, fy, fz), Vec3::new(tx, ty, tz), kind) {
+            bytes[0] = OK;
+            bytes[0x0c..0x10].copy_from_slice(&hit.entity.to_le_bytes());
+            let values = [
+                hit.point.x,
+                hit.point.y,
+                hit.point.z,
+                hit.normal.x,
+                hit.normal.y,
+                hit.normal.z,
+            ];
+            for (slot, value) in bytes[0x14..0x2c]
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(values)
+            {
+                *slot = value.to_le_bytes();
+            }
+        }
+        // SAFETY: native-shaped output owns the complete initialized0x70-byte fixture buffer.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len()) };
+        return out;
+    }
     if WALL_THERE.load(Ordering::Relaxed) && fx < WALL_X && tx >= WALL_X {
         let t = (WALL_X - fx) / (tx - fx);
         let ny = WALL_NY.load(Ordering::Relaxed) as f32 / 100.0;
@@ -165,6 +274,56 @@ unsafe extern "system" fn game_move_check(
     pos: *const f32,
     dt: f32,
 ) -> u64 {
+    MOVE_CALLS.fetch_add(1, Ordering::Relaxed);
+    let kind = CORNER_KIND.load(Ordering::Relaxed);
+    if kind != 0 {
+        if corner_call::has_call() {
+            CORNER_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+        if CORNER_NEST.swap(false, Ordering::Relaxed) {
+            let saved = (
+                get(&MODE, None),
+                get(&HOLD, None),
+                get(&NESTED, None),
+                get(&STUCK, false),
+            );
+            // SAFETY: the exact same complete fixture buffers stay live throughout reentry.
+            let nested = unsafe { move_check_detour(velocity, ctx, pos, dt) };
+            assert_eq!(nested & !0xff, RAX_ABOVE_AL);
+            assert_eq!(
+                (
+                    get(&MODE, None),
+                    get(&HOLD, None),
+                    get(&NESTED, None),
+                    get(&STUCK, false)
+                ),
+                saved
+            );
+        }
+        // SAFETY: exact initialized context and three-float buffers supplied by this fixture.
+        let (v, p, normal) = unsafe {
+            (
+                read_vec3(velocity),
+                read_vec3(pos),
+                read_vec3(Ctx(ctx).normal_at()),
+            )
+        };
+        let mut full = true;
+        for candidate_v in [v, UP * v.y, v.flat()] {
+            // SAFETY: the whole live fixture context and copied finite local coordinates.
+            let result = unsafe { call_probe(ctx, p + candidate_v * dt, -normal, 0.0) };
+            if CORNER_REJECT.load(Ordering::Relaxed) {
+                return RAX_ABOVE_AL;
+            }
+            if result[0] == OK && (!full || !CORNER_VERTICAL.load(Ordering::Relaxed)) {
+                // SAFETY: original native movement may rewrite its own live float3 velocity.
+                unsafe { write_vec3(velocity, candidate_v) };
+                return RAX_ABOVE_AL | 1;
+            }
+            full = false;
+        }
+        return RAX_ABOVE_AL;
+    }
     // SAFETY: the function's contract.
     let (velocity, pos, normal) = unsafe {
         (
@@ -316,6 +475,25 @@ impl Player {
         self.transform[1] = (f64::from(y) * 4_294_967_296.0) as i64;
     }
 
+    /// Exact finite fixture feet, in the native fixed-point storage.
+    fn set_position(&mut self, p: Vec3) {
+        self.set_x(p.x);
+        self.set_y(p.y);
+        self.transform[2] = (f64::from(p.z) * 4_294_967_296.0) as i64;
+    }
+    /// Set initialized ordinary wall/actor/collider state, without using padding bytes.
+    fn ordinary_wall(&mut self) {
+        self.climb[0] = 1;
+        self.climb[1] = 2;
+        self.actor[0xbf8..0xc00].copy_from_slice(&(1_u64 << 34).to_le_bytes());
+        let collider = self.ctx[4] as *mut u8;
+        // SAFETY: Player::new leaks the complete initialized0x54-byte collider allocation.
+        unsafe {
+            collider.add(4).write(1);
+            collider.add(5).write(1);
+        }
+    }
+
     /// Store a climb normal.
     fn set_normal(&mut self, normal: Vec3) {
         let at = self.climb[4..16].as_mut_ptr().cast::<f32>();
@@ -365,13 +543,17 @@ impl Player {
     /// Run the hooked move check on this velocity, and give back the velocity and `al`. The rest
     /// of `rax` must come back as the game left it.
     fn move_check(&mut self, velocity: Vec3) -> (Vec3, u8) {
+        self.move_check_dt(velocity, DT)
+    }
+    /// Invoke the actual move detour at a chosen simulation rate.
+    fn move_check_dt(&mut self, velocity: Vec3, dt: f32) -> (Vec3, u8) {
         let mut v = [velocity.x, velocity.y, velocity.z];
         let ctx = self.ctx();
         // SAFETY: the context lives through the call.
         let pos = unsafe { Ctx(ctx).position() };
         let pos = [pos.x, pos.y, pos.z];
         // SAFETY: all buffers live through the call.
-        let passed = unsafe { move_check_detour(v.as_mut_ptr(), ctx, pos.as_ptr(), DT) };
+        let passed = unsafe { move_check_detour(v.as_mut_ptr(), ctx, pos.as_ptr(), dt) };
         assert_eq!(passed & !0xff, RAX_ABOVE_AL);
         (Vec3::new(v[0], v[1], v[2]), passed as u8)
     }
@@ -762,6 +944,7 @@ fn a_climb_runs_through_the_detours() {
             natural: true,
             fit: None,
             steady: false,
+            patch: None,
         }),
     );
     let mut result = encode_result(OK, UP, UP, 7);
@@ -783,6 +966,7 @@ fn a_climb_runs_through_the_detours() {
             natural: false,
             fit: None,
             steady: false,
+            patch: None,
         }),
     );
     let mut lattice = encode_result(OK, UP, UP, 7);
@@ -794,6 +978,8 @@ fn a_climb_runs_through_the_detours() {
         "an ordinary lattice retains its native exit"
     );
 
+    exercise_corner_hooks();
+
     // With the mod off the detours only forward: rock is the game's "no" again, and no byte of the
     // game's component moves.
     deactivate();
@@ -804,4 +990,135 @@ fn a_climb_runs_through_the_detours() {
     assert_eq!(player.climb[2], grace::HOLDING + 1);
     // SAFETY: the fake reads nothing.
     assert_eq!(unsafe { stamina_detour(std::ptr::null_mut()) }, 8.0);
+}
+
+/// Real Rust detours and native-shaped initialized buffers across both corner directions/rates.
+/// This does not run the native engine or simulate its exact climbing capsule/animation solver.
+fn exercise_corner_hooks() {
+    for kind in [1, 2] {
+        CORNER_KIND.store(kind, Ordering::Relaxed);
+        for sign in [-1.0, 1.0] {
+            for dt in [1.0 / 120.0, 1.0 / 60.0, 1.0 / 20.0] {
+                let mut player = Player::new();
+                player.ordinary_wall();
+                let (mut p, n, target) = match (kind, sign > 0.0) {
+                    (1, true) => (
+                        Vec3::new(-0.55, 0.0, -0.35),
+                        Vec3::new(-1.0, 0.0, 0.0),
+                        Vec3::new(0.0, 0.0, 1.0),
+                    ),
+                    (1, false) => (
+                        Vec3::new(0.35, 0.0, 0.55),
+                        Vec3::new(0.0, 0.0, 1.0),
+                        Vec3::new(-1.0, 0.0, 0.0),
+                    ),
+                    (2, true) => (
+                        Vec3::new(-0.55, 0.0, -0.99),
+                        Vec3::new(-1.0, 0.0, 0.0),
+                        Vec3::new(0.0, 0.0, -1.0),
+                    ),
+                    _ => (
+                        Vec3::new(-0.99, 0.0, -0.55),
+                        Vec3::new(0.0, 0.0, -1.0),
+                        Vec3::new(-1.0, 0.0, 0.0),
+                    ),
+                };
+                player.set_normal(n);
+                let initial_calls = CORNER_CALLS.load(Ordering::Relaxed);
+                let mut finished = false;
+                for tick in 0..500 {
+                    player.set_position(p);
+                    assert_eq!(
+                        player.wall_lost(),
+                        HELD,
+                        "hold kind{kind} sign{sign} dt{dt} tick{tick} p{p:?} n{:?}",
+                        player.normal()
+                    );
+                    let before = RAYS.load(Ordering::Relaxed);
+                    let calls = MOVE_CALLS.load(Ordering::Relaxed);
+                    let raw = UP.cross(player.normal()) * (1.95 * sign);
+                    let (v, al) = player.move_check_dt(raw, dt);
+                    assert_eq!(MOVE_CALLS.load(Ordering::Relaxed), calls + 1);
+                    assert_eq!(
+                        al,
+                        1,
+                        "move kind{kind} sign{sign} dt{dt} tick{tick} p{p:?} n{:?}",
+                        player.normal()
+                    );
+                    assert!(v.is_finite() && player.normal().is_finite());
+                    assert!(
+                        v.length() <= raw.length() + 1.21,
+                        "baseline gap correction remains separately bounded"
+                    );
+                    assert!(
+                        RAYS.load(Ordering::Relaxed) - before
+                            <= u32::from(crate::corner::MAX_NATIVE_RAYS)
+                    );
+                    assert!(!corner_call::inside_move() && !corner_call::querying());
+                    p = p + v * dt;
+                    if player.normal().dot(target) > 0.995 {
+                        // Reaching the new direction is followed by more real hold/move calls.
+                        for _ in 0..5 {
+                            player.set_position(p);
+                            assert_eq!(player.wall_lost(), HELD);
+                            let (v, al) =
+                                player.move_check_dt(UP.cross(player.normal()) * (1.95 * sign), dt);
+                            assert_eq!(al, 1);
+                            p = p + v * dt;
+                        }
+                        finished = true;
+                        break;
+                    }
+                }
+                assert!(
+                    finished,
+                    "no handoff kind{kind} sign{sign} dt{dt} p{p:?} n{:?}",
+                    player.normal()
+                );
+                assert!(
+                    CORNER_CALLS.load(Ordering::Relaxed) > initial_calls,
+                    "this test must enter the new integrated corner path"
+                );
+            }
+        }
+    }
+    // Original false AL cannot commit the trial corner-facing update.
+    CORNER_KIND.store(2, Ordering::Relaxed);
+    let mut player = Player::new();
+    player.ordinary_wall();
+    player.set_position(Vec3::new(-0.55, 0.0, -0.9));
+    assert_eq!(player.wall_lost(), HELD);
+    let normal = player.normal();
+    CORNER_REJECT.store(true, Ordering::Relaxed);
+    assert_eq!(player.move_check(Vec3::new(0.0, 0.3, 1.95)).1, 0);
+    assert_eq!(
+        player.normal(),
+        normal,
+        "false AL must not commit a corner-facing trial"
+    );
+    CORNER_REJECT.store(false, Ordering::Relaxed);
+    // The native vertical fallback uses a different actual Q and its rewritten velocity.
+    assert_eq!(player.wall_lost(), HELD);
+    CORNER_VERTICAL.store(true, Ordering::Relaxed);
+    let (v, al) = player.move_check(Vec3::new(0.0, 0.3, 1.95));
+    assert_eq!(al, 1);
+    assert!(v.x.abs() < 1e-6 && v.z.abs() < 1e-6 && v.y > 0.0);
+    CORNER_VERTICAL.store(false, Ordering::Relaxed);
+    // Original-call reentry and scene-query reentry both forward with all custom work suspended.
+    for from_ray in [false, true] {
+        player.set_normal(Vec3::new(-1.0, 0.0, 0.0));
+        assert_eq!(player.wall_lost(), HELD);
+        CORNER_CTX.store(player.ctx() as usize, Ordering::Relaxed);
+        let calls = MOVE_CALLS.load(Ordering::Relaxed);
+        if from_ray {
+            CORNER_RAY_NEST.store(true, Ordering::Relaxed);
+        } else {
+            CORNER_NEST.store(true, Ordering::Relaxed);
+        }
+        assert_eq!(player.move_check(Vec3::new(0.0, 0.3, 1.95)).1, 1);
+        assert_eq!(MOVE_CALLS.load(Ordering::Relaxed), calls + 2);
+        assert!(!corner_call::inside_move() && !corner_call::querying());
+    }
+    CORNER_KIND.store(0, Ordering::Relaxed);
+    CORNER_CTX.store(0, Ordering::Relaxed);
 }
