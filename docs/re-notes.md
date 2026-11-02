@@ -2565,3 +2565,144 @@ write, event marker or runtime behavior is admitted; native push-off remains. No
 code or game process was used. Receipt: private zelda-jump-followup/FEASIBILITY.md SHA256
 FCFDAA9F0042C1D690660612C3565678C01DA0F2B092E397D8AD6480933D8EE0; native-jump-contract.json SHA256
 FFCE80EA16EA4C62FB3C617E16501A62DA64F8D9F3AA3CDF59CAFCABED39483E.
+
+
+### W52 first offline acceptance and ordinary movement ownership
+
+[OBSERVED] The first offline test of source820df8b loaded the supported1283531 client, matched all15
+signatures and enabled10 hooks. The author reported climbing a few metres, falling, and an outward
+push regardless of Jump input. The failed session log was preserved and the previous installation
+was restored. Aggregate/replayed counters and last sampled gap values do not identify the cause.
+Green fixture/native-file/build/review checks are not gameplay acceptance.
+
+[VERIFIED] The existing MoveCheck receives actual CurrentTransform feet converted from32.32 to
+float metres. Its801-byte body tests the full velocity candidate, then vertical-only and horizontal-only
+candidates through fresh probe calls. It writes only the supplied velocity. Its sole caller zeros
+velocity if AL is false. Current native420ab0 is a capped vector blend, with no position/normal
+read or independent wall-distance spring. The full directly relevant bodies match across all four
+pinned images after relocation.
+
+Native velocity283830 integrates Velocity into CurrentTransform. ActorResolve283ac0 retains the
+ordinary native shape-motion/slide correction path. It intentionally skips a disabled MovementCollider
+or an active LerpTransform collider override; world-not-ready restores LastTransform. Measured
+movement2799c0 runs from transform deltas and is not the requested velocity. A finite velocity-only
+corner proposal can preserve that ordinary collision pipeline without a new placement oracle.
+It must preserve native fallback/AL, obtain support at each actual probe candidate, and never write
+a target position or restore rejected velocity. This is preservation of native behavior, not a
+promise that the engine cannot clip. The separate exit-query point is cached before MoveCheck;
+corner support cannot authorize it. Automatic natural mantles remain disabled.
+
+Zero STOP/Exit counters do not exclude the native FreeClimbing exit: current26b9b0 ->426670
+->24e1c0 sets Exit3 and the375ms re-grab deadline. Accepted jumps can add an outward impulse via
+42295b..422980. This identifies an unobserved path, not an input diagnosis.
+Receipt: private corner-native-move/NATIVE-CORNER-MOTION.md SHA256
+D249E1D597A972FEB58E1837310EC02641D8EBA931CD3CCF01C02DE67939F923.
+
+### W52 typed shape query, native phase and missing-geometry status
+
+[VERIFIED] The immediate native climb continuation after EXIT_QUERY calls the existing head query,
+which reaches the same typed shape API. No extra outer world reader belongs around that API:
+a pending writer between outer and nested reader acquisition can deadlock. The high-level native
+API owns its normal world/body/broadphase locking and cleanup. Native internal waits/allocations
+are not independently a safety rejection or a caller wall-clock guarantee.
+
+| Boundary | Previous client | Current client | Previous server | Current server |
+|---|---:|---:|---:|---:|
+| EXIT_QUERY call |419302|420252|1ba252|1bfb12|
+| Following head-query call |419326|420276|1ba276|1bfb36|
+| ColliderSystem typed entry |9999a0|9a5450|63a220|6413a0|
+| QueryWorld typed core |999a10|9a54c0|63a290|641410|
+
+The typed core has eight Windows x64 arguments: a writable40-byte output header, borrowed QueryWorld,
+two u32 exclusions, u32 shape hash, pointer to a16-byte payload span, pointer to a64-byte pair of
+float pose records, and u8 flags. Its byte result is0 or1. The existing climb caller supplies the
+full self ID, second exclusion0, checkAgainst0x9 and flags0x80. CapsuleColliderData has reflected
+size0x5c/hashc6bc5c62. A fully zero40-byte output header makes an overlap conservatively return0
+for any raw contact or incomplete collection, before an external backing-buffer write. Return1
+means completed zero observed filtered contacts. Do not transfer this overlap result to motion,
+whose contact finalizer differs. No processed-output allocator/destructor is required.
+
+[VERIFIED] Actual capsule3-to-voxel15 registration is now identified. Current45740 installs callback
+45620 in the34-column overlap matrix; it reaches45360 ->10b4df0 ->10bd9a0. Four-image bootstrap,
+registration, dispatcher and cache edges were checked. Failed VoxelRangeRead returns null geometry;
+the region helper skips it and the handler does not propagate that failure into typed completion.
+Consequently even return1 does not prove that all terrain was present. Full-volume publication/
+readiness and complete mantle path coverage remain required before a natural mantle guard.
+
+[VERIFIED] The old WorldNormalsNotDisplaced4 position claim is now independently rechecked: World1
+uses position/normal flags(1,1), World4(1,0), WorldNotDisplaced2(0,0), in every pinned image. Both
+World1 and World4 retain the same displaced packed vertex positions; only the normal selection
+differs. A hypothetical undisplaced World4 position proxy does not explain the live separation.
+This does not establish an alternative cause or identical ray/overlap behavior.
+Receipts: private native-lock-phase-contract.md SHA256
+6190F20A1087A5E51D71F6C7110AA04B8EB44B4B23AD9ABE914FA15B58337C70;
+geometry-publication/GEOMETRY-PUBLICATION.md SHA256
+A8426AB0339711A80332886FD917D0FAEB077C59B1910B45EB520EEACC5F67A8.
+
+### W52 accepted Jump owner and remaining paid-upward request bridge
+
+[VERIFIED] The earlier unknown accepted-cost owner is now mapped. Current player_control_action_sequence
+uniquely calls bool helper2c8f60 at2dff2e. It owns ActorInput and Stamina writes. Resolver425490
+can return native NoPermission30 before publishing the request. Successful FreeClimbing13 publishes
+externalTriggerJumpType+179 and time+180, consumes native Jump32/Glider37, and has no sequence cost
+resource. Native attribute add21fbc0 performs property lookup and recomputation after the owner's
+write accessor. A same-invocation billing/refusal transaction is concrete; no raw stamina store is
+needed. Its ErrorId and JumpType are byte fields; padding must not be copied/read as initialized data.
+
+Actor_jump consumes the external request by clearing its type after application. However processed
+desiredLocalMoveInput.z+194 is refreshed by locomotion, and triggerContext.directionOverride+64 is
+cleared with the input context. Neither is a proved frozen paid-UP request. Mountain14 selects a
+different resource/physics path. Registration census ordinals are not runtime IDs or dispatch order.
+The required next artifact is bounded actual dispatch order correlated with same-entity/native-time
+acceptance and impulse snapshots. Keep native free push-off while that semantic bridge is missing;
+do not charge every13 request or use borrowed padding/process-local persistence as a substitute.
+Receipts: private accepted-cost/COST-OWNER-CONTRACT.md SHA256
+D717B143D04A255F889D0D1D931B0E1661625E9F36ED5CAB43391C54A6868815;
+request-bridge/REQUEST-BRIDGE.md SHA256
+EFEFBB117D6F914228C6C45942684CA01F5F46603A6A1CB236897109973CCF82.
+
+### W52 actual entry/exit resources and player collider envelope
+
+[VERIFIED] Owned sequence payloads supply real event schedules. Bottom entry a17e05ee has one End
+position/orientation lerp for200000004ns. Its native builder24f500 copies Probe.stand into all three
+targets, without an additional normal offset. All four builder bodies match after relocation.
+Thus the entry builder does not add another0.55/1.05m outward translation. The separate animation
+track/root-motion linkage remains untraced; event flag names alone do not prove it absent.
+
+Top exit c83e5552 selects position Intermediate for500000010ns, then position/orientation End for
+the same duration. These are discrete timed targets, not a Bezier curve. Sequence mismatch disables
+interpolation without snapping to a target. Tick/interruption ordering still prevents treating only
+the two ideal edges as complete trajectory coverage. The native collider override can already place
+the body at End while the visible root interpolates, bypassing ordinary motion resolution.
+
+Both player templates have identical stock root solid proxies. Default capsule radius0.5 has
+vertical sphere endpoints0.5..1.5; ClimbingWall radius0.550000012 has endpoints0.449999988..1.449999988.
+The latter extends about0.10m below the feet, with top at2m. Native construction adds rotated
+half-cylinder length to the resource's endpoint anchor. Config-derived radius0.5/height2 is not the
+exact climbing proxy. This is a geometry difference, not a live cause claim. A2m root-centered
+sphere conservatively covers these stock unit-scale root proxies under arbitrary rotation; it
+does not bound skinned limbs/equipment or prove a useful clear mantle route.
+Receipt: private mantle-events/FEASIBILITY.md SHA256
+0C0802415EA7CE76B103ECA2EF08454670FE9A7A820ECF80228DFC3D5C5D3E43.
+
+
+### W52 physical-plane velocity follow-up
+
+[VERIFIED] Two pure-source regressions exposed a second orientation/geometry coupling. At a
+correctly spaced15-degree yaw bend,120Hz, the previous eased-plane projection returned
+velocity(-1.9497048,0,0.033931594), about0.472m/s outward relative to the fresh plane, despite
+negligible gap error. This is analytical/source evidence, not a captured native velocity.
+
+Movement projection and the gap-correction direction now use the fresh fitted normal. The returned
+Climb normal still eases/clamps for body orientation. No-fit fallback keeps its existing behavior.
+New tests fail before and pass after at120/60/20Hz over bends, real gap errors, contact suppression
+and overhangs. The older overhang test now checks tangency to the fresh plane while still requiring
+body easing. No rays, native offsets, ABI, persistent decisions or collision bypass were added.
+This corrects a reproducible source defect, but the full cause of the offline failure is unconfirmed.
+
+Paired movement telemetry reuses the already-read SteerInput and one synchronous MoveCheck result.
+The full native RAX is saved before post-capture; panic cannot invoke the original twice. One
+nonblocking atomic claim protects copies by both readers and writers, dropping busy observations.
+Only the existing log thread formats output, at most one latest movement record per second. The
+native check output precedes caller-side AL=false zeroing and ordinary collision resolution.
+Telemetry state never feeds gameplay, and no component pointer is retained by these observations.

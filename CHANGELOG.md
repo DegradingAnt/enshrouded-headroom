@@ -28,7 +28,7 @@ These notes cover implemented work on `feat/v1`, not a released artifact. The ru
 
 #### Climbing
 
-- `ember-climb`, a separate ASI for free climbing on any steep surface, with no button and the game's own moves, stamina and collision. It is a first test build for the client and the dedicated server. It has not run in the game or on a server. Its signatures and hooked functions were checked against both exes.
+- `ember-climb`, a separate ASI for free climbing on any steep surface, with no button and the game's own moves, stamina and collision. It is a first test build for the client and the dedicated server. Its first offline client test failed with grip loss and outward separation; investigation continues. It has not run on a server. Its signatures and hooked functions were checked against both exes.
 
 #### Development and packaging
 

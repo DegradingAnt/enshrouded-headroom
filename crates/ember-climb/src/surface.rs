@@ -671,8 +671,8 @@ fn standoff_speed(error: f32, dt: f32, contact: bool) -> f32 {
 /// One frame of steering, or `None` when the input is unusable and the game's velocity stands.
 ///
 /// The game moves a climber along world up. On a surface that leans, that walks straight off it.
-/// So the normal eases toward the surface, the velocity turns into the surface with its speed
-/// kept, and a small pull holds the stand-off.
+/// Movement follows the fresh physical plane with its speed kept, and a small correction holds
+/// the stand-off. Body orientation eases separately, so its lag cannot push across that plane.
 pub fn steer(input: &SteerInput, t: &Tuning, capsule: Capsule) -> Option<Steered> {
     let SteerInput {
         velocity,
@@ -693,8 +693,11 @@ pub fn steer(input: &SteerInput, t: &Tuning, capsule: Capsule) -> Option<Steered
         None => normal.normalized()?,
     };
     let normal = clamp_ny(eased, t.overhang_ny, t.hold_ny)?;
+    // The visible orientation may lag a bend. Movement belongs to the physical plane;
+    // projecting onto the eased normal can manufacture outward velocity even at the correct gap.
+    let motion_normal = fit.map_or(normal, |fit| fit.normal).normalized()?;
     let speed = velocity.length();
-    let along_surface = velocity - normal * velocity.dot(normal);
+    let along_surface = velocity - motion_normal * velocity.dot(motion_normal);
     let tangent = along_surface
         .normalized()
         .map_or(Vec3::default(), |direction| direction * speed);
@@ -708,7 +711,7 @@ pub fn steer(input: &SteerInput, t: &Tuning, capsule: Capsule) -> Option<Steered
         None => (0.0, 0.0),
     };
     Some(Steered {
-        velocity: tangent + normal * pull,
+        velocity: tangent + motion_normal * pull,
         normal,
         error,
     })
@@ -1877,7 +1880,8 @@ mod tests {
             let fit = fit_at(normal, gap);
             let out = steer(&input(UP * 1.95, face(90.0), Some(fit)), &t, CAPSULE).unwrap();
             assert!(out.error.abs() < 1e-5, "{angle}: {out:?}");
-            assert!(out.velocity.dot(out.normal).abs() < 1e-5);
+            // Motion follows the fresh wall while the body normal still eases.
+            assert!(out.velocity.dot(normal).abs() < 1e-5);
             assert!(
                 out.normal.y > normal.y,
                 "body still eases rather than snapping"
@@ -1889,6 +1893,65 @@ mod tests {
                     "clamped direction still uses physical clearance"
                 );
                 assert!((capped.normal.y - t.overhang_ny).abs() < 1e-5);
+            }
+        }
+    }
+
+    /// A changing physical plane must not turn lateral input into an outward push while the
+    /// character's visible orientation is still catching up.
+    #[test]
+    fn motion_on_a_bend_has_no_outward_component_from_eased_facing() {
+        let old = Vec3::new(0.0, 0.0, -1.0);
+        let velocity = UP.cross(old) * 1.95;
+        for degrees in [15.0_f32, 30.0, 45.0, 60.0] {
+            let yaw = degrees.to_radians();
+            let physical = Vec3::new(-yaw.sin(), 0.0, -yaw.cos());
+            for dt in [1.0 / 120.0, 1.0 / 60.0, 1.0 / 20.0] {
+                for contact in [false, true] {
+                    let mut frame = input(velocity, old, Some(fit_at(physical, GAME_STANDOFF)));
+                    frame.dt = dt;
+                    frame.contact = contact;
+                    let out = steer(&frame, &tuning(), CAPSULE).unwrap();
+                    assert!(
+                        out.velocity.dot(physical).abs() < 1e-5,
+                        "orientation lag pushed across the physical wall: yaw={degrees} dt={dt} contact={contact} output={out:?}"
+                    );
+                    assert!((out.velocity.length() - velocity.length()).abs() < 2e-5);
+                    assert!(
+                        (out.normal - physical).length() > 0.01,
+                        "visible facing must still ease"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Movement and the gap correction on one physical plane are invariant under a different
+    /// visual facing. This also covers real gap errors, contact suppression and overhangs.
+    #[test]
+    fn motion_on_one_plane_is_independent_of_facing_lag() {
+        for degrees in [60.0_f32, 90.0, 110.0, 115.0] {
+            let angle = degrees.to_radians();
+            let physical = Vec3::new(-angle.sin(), angle.cos(), 0.0);
+            for error in [-0.18, 0.0, 0.18] {
+                let fit = fit_at(physical, standoff_target(physical.y, CAPSULE) + error);
+                for dt in [1.0 / 120.0, 1.0 / 60.0, 1.0 / 20.0] {
+                    for contact in [false, true] {
+                        let velocity = UP * 1.95 + Vec3::new(0.0, 0.0, 0.35);
+                        let mut reference = input(velocity, physical, Some(fit));
+                        reference.dt = dt;
+                        reference.contact = contact;
+                        let mut lagged = reference;
+                        lagged.normal = Vec3::new(0.0, 0.0, -1.0);
+                        let expected = steer(&reference, &tuning(), CAPSULE).unwrap();
+                        let actual = steer(&lagged, &tuning(), CAPSULE).unwrap();
+                        assert!(
+                            (actual.velocity - expected.velocity).length() < 1e-4,
+                            "one plane changed movement with visual facing: slope={degrees} error={error} dt={dt} contact={contact} expected={expected:?} actual={actual:?}"
+                        );
+                        assert!((actual.normal - expected.normal).length() > 0.01);
+                    }
+                }
             }
         }
     }

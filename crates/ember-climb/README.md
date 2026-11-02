@@ -2,7 +2,7 @@
 
 Free climbing for Enshrouded, in the style of Breath of the Wild. Climb any steep rock, cliff or wall. There is no button. A climb starts when you walk, sprint or jump into a steep surface. The mod uses the game's own climb moves, stamina and collision.
 
-**This is a first test build for Patch 1.0.1.0 (internal build 1283531).** It has never run in the game. The geometry is tested in simulated worlds, and the hooks are tested against fakes. Nobody knows yet how it feels. The diagnostics line is on so that one play session shows which step fails.
+**This is an experimental build for Patch 1.0.1.0 (internal build 1283531). Its first offline play test failed acceptance.** Grabs and climbing started, but the climber fell and was pushed away after a few metres. The cause is under investigation. The earlier installation was restored. Keep this build out of a shared client/server setup until a later offline test passes. Fixture, native-file and startup checks do not establish gameplay reliability.
 
 ## Install
 
@@ -64,7 +64,9 @@ If a surface was near and no climb started, the log gets one line at most every 
 
 The counts add up over the session. `natural entry 3/90` means 90 tries to start a climb on natural rock and 3 that could start. Only `updates` is per second.
 
-About a second into each climb that moves, the log gets one more line, once per climb:
+With diagnostics on, the existing log thread also writes at most one latest `climb motion:` record per second. One invocation supplies its feet, fresh fit, raw velocity, steered velocity, native check output, duration, contact flag and native AL. The line distinguishes missing and non-finite fits. `check output V` is captured before the native caller zeros a rejected velocity; it is not measured post-collision movement. Busy records are dropped without waiting. These observations never make movement decisions.
+
+About a second into each climb that moves, the log gets one body line, once per climb:
 
 ```text
 climb body: entity 1, rotation speed 8.00 mode 1 (ExponentialLerp), normal -0.940 0.342 0.000, body up 0.342 0.940 0.000, surface leans 20.0 degrees, body leans 20.0 degrees
@@ -106,7 +108,7 @@ All settings are in `ember-climb.ini`, and all need a restart. A value that is n
 | Tuning | EntryReach | 0.95 | 0.6 to 1.4 | How close you must be to start a climb, in metres. |
 | Tuning | HoldReach | 1 | 0.8 to 1.6 | How far the mod looks for the surface during a climb, in metres. Under an overhang you hang farther out, and it looks that much farther. |
 | Tuning | GraceSeconds | 0 | 0 to 1 | Reserved. Native seam forgiveness is unavailable; nonzero values warn and remain inactive. |
-| Debug | Diagnostics | 1 | 0 or 1 | The one-line-a-second log. It also adds five small hooks. |
+| Debug | Diagnostics | 1 | 0 or 1 | Per-second counters and paired movement records. It also adds five small hooks. |
 
 `SurfaceMask` is a sum of these bits, in hex or decimal: `0x4` terrain and player walls, `0x20` rock props, `0x100` iron lattices, `0x8` other solid props such as trees. Other bits are refused. Bits 0 and 1 are other copies of the terrain, and asking for them gives a different surface per ray.
 

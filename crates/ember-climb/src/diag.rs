@@ -1,17 +1,19 @@
 //! The per-second diagnostics line.
 //!
 //! The first in-game test of climbing failed and its log was lost, so nobody knows which step
-//! failed. This keeps that from happening again. The hooks only bump atomic counters: they do not
-//! allocate, take a lock or log on a game thread. A `climb-diag` thread wakes once a second and
+//! failed. This keeps that from happening again. The hooks update atomic counters and can copy
+//! one movement observation. They do not allocate, wait or log on a game thread. A busy movement
+//! record drops the observation after one atomic claim attempt. A `climb-diag` thread wakes once a second and
 //! writes one `climb diag:` line when a climb moved a count. A surface that was near with no climb
 //! writes one much less often, because a start that failed must leave a trace too. Once per climb
 //! it also writes one `climb body:` line, which shows whether the body really tilted.
+//! Its latest coherent `climb move:` record is written at most once per tick, after its claim ends.
 //!
 //! No decision reads anything here, so these statics cannot make a replayed tick decide differently.
 //! A replay does move the counts: each run of the climb update counts, which is how the log shows
 //! the live replay length.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use emberkit::guard::guard;
@@ -215,6 +217,30 @@ pub struct LastValues {
     pub height: f32,
 }
 
+/// One native move check, with all velocities from that same invocation.
+/// The native output is captured before its caller handles a false AL result.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MoveSample {
+    /// The climber.
+    pub entity: u32,
+    /// The feet passed to the move check, in metres.
+    pub pos: Vec3,
+    /// The fresh physical fit's point and normal, or no fit. Non-finite values remain observable.
+    pub fit: Option<(Vec3, Vec3)>,
+    /// The velocity before this mod steered it.
+    pub raw_velocity: Vec3,
+    /// The velocity after steering, before the native check and its fallbacks.
+    pub steered_velocity: Vec3,
+    /// The velocity after the native check, before its caller handles a false result.
+    pub native_velocity: Vec3,
+    /// The native update's duration, in seconds.
+    pub dt: f32,
+    /// The collision-contact flag seen by steering.
+    pub contact: bool,
+    /// The native check's AL answer. Upper RAX bits are not a Boolean.
+    pub native_al: u8,
+}
+
 /// How a climber's body lies, as one move check saw it.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct BodySample {
@@ -244,6 +270,92 @@ struct Body {
     orientation: [AtomicU32; 4],
 }
 
+/// One nonblocking claim of a diagnostic record. A busy record is skipped, never waited for.
+struct SampleClaim<'a> {
+    /// Released on every return, before any formatting or logging.
+    busy: &'a AtomicBool,
+}
+
+impl<'a> SampleClaim<'a> {
+    /// Claim once. Readers and writers use this same flag.
+    fn take(busy: &'a AtomicBool) -> Option<SampleClaim<'a>> {
+        busy.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| SampleClaim { busy })
+    }
+}
+
+impl Drop for SampleClaim<'_> {
+    fn drop(&mut self) {
+        self.busy.store(false, Ordering::Release);
+    }
+}
+
+/// The latest completed same-call movement record. The claim covers only atomic copies.
+struct Movement {
+    /// One reader or writer may copy the record; every other caller drops its attempt.
+    busy: AtomicBool,
+    /// Completed records. It wraps only after an unreachable number of session updates.
+    sequence: AtomicU64,
+    /// The climber.
+    entity: AtomicU32,
+    /// Current feet, as float bits.
+    pos: [AtomicU32; 3],
+    /// Whether this invocation supplied a fresh physical fit.
+    fit_present: AtomicBool,
+    /// The fresh fit point, as float bits; read only when present.
+    fit_point: [AtomicU32; 3],
+    /// The fresh physical normal, as float bits; read only when present.
+    fit_normal: [AtomicU32; 3],
+    /// The velocity before steering, as float bits.
+    raw_velocity: [AtomicU32; 3],
+    /// The velocity after steering, as float bits.
+    steered_velocity: [AtomicU32; 3],
+    /// Native MoveCheck's output, as float bits, before its caller handles false AL.
+    native_velocity: [AtomicU32; 3],
+    /// The native duration, as float bits.
+    dt: AtomicU32,
+    /// The contact flag used by steering.
+    contact: AtomicBool,
+    /// The native low-byte answer.
+    native_al: AtomicU32,
+}
+
+impl Movement {
+    /// No completed record yet.
+    const fn new() -> Movement {
+        Movement {
+            busy: AtomicBool::new(false),
+            sequence: AtomicU64::new(0),
+            entity: AtomicU32::new(0),
+            pos: [const { AtomicU32::new(0) }; 3],
+            fit_present: AtomicBool::new(false),
+            fit_point: [const { AtomicU32::new(0) }; 3],
+            fit_normal: [const { AtomicU32::new(0) }; 3],
+            raw_velocity: [const { AtomicU32::new(0) }; 3],
+            steered_velocity: [const { AtomicU32::new(0) }; 3],
+            native_velocity: [const { AtomicU32::new(0) }; 3],
+            dt: AtomicU32::new(0),
+            contact: AtomicBool::new(false),
+            native_al: AtomicU32::new(0),
+        }
+    }
+}
+
+/// Copy a vector into a claimed diagnostic record. No native memory is accessed.
+fn store_vector(slots: &[AtomicU32; 3], value: Vec3) {
+    for (slot, value) in slots.iter().zip([value.x, value.y, value.z]) {
+        slot.store(value.to_bits(), Ordering::Relaxed);
+    }
+}
+
+/// Copy a vector out of a claimed diagnostic record.
+fn load_vector(slots: &[AtomicU32; 3]) -> Vec3 {
+    let [x, y, z] = slots;
+    let value = |slot: &AtomicU32| f32::from_bits(slot.load(Ordering::Relaxed));
+    Vec3::new(value(x), value(y), value(z))
+}
+
 /// All the diagnostics of this process.
 pub struct Diag {
     /// The counts.
@@ -252,6 +364,8 @@ pub struct Diag {
     lasts: Lasts,
     /// The latest body.
     body: Body,
+    /// The latest complete movement invocation.
+    movement: Movement,
 }
 
 /// Add one to `counter`. It wraps at `u64::MAX`, which a session never reaches.
@@ -281,6 +395,7 @@ impl Diag {
                 normal: [const { AtomicU32::new(0) }; 3],
                 orientation: [const { AtomicU32::new(0) }; 4],
             },
+            movement: Movement::new(),
         }
     }
 
@@ -443,6 +558,62 @@ impl Diag {
             normal: Vec3::new(float(nx), float(ny), float(nz)),
             orientation: [float(x), float(y), float(z), float(w)],
         }
+    }
+
+    /// Publish a complete movement observation. A busy record drops telemetry, never movement.
+    pub fn movement(&self, sample: &MoveSample) {
+        let movement = &self.movement;
+        let Some(_claim) = SampleClaim::take(&movement.busy) else {
+            return;
+        };
+        movement.entity.store(sample.entity, Ordering::Relaxed);
+        store_vector(&movement.pos, sample.pos);
+        if let Some((point, normal)) = sample.fit {
+            store_vector(&movement.fit_point, point);
+            store_vector(&movement.fit_normal, normal);
+        }
+        movement
+            .fit_present
+            .store(sample.fit.is_some(), Ordering::Relaxed);
+        store_vector(&movement.raw_velocity, sample.raw_velocity);
+        store_vector(&movement.steered_velocity, sample.steered_velocity);
+        store_vector(&movement.native_velocity, sample.native_velocity);
+        movement.dt.store(sample.dt.to_bits(), Ordering::Relaxed);
+        movement.contact.store(sample.contact, Ordering::Relaxed);
+        movement
+            .native_al
+            .store(u32::from(sample.native_al), Ordering::Relaxed);
+        movement.sequence.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Read one coherent completed record. A busy record is skipped until the next thread tick.
+    fn movement_sample(&self) -> Option<(u64, MoveSample)> {
+        let movement = &self.movement;
+        let _claim = SampleClaim::take(&movement.busy)?;
+        let sequence = movement.sequence.load(Ordering::Relaxed);
+        if sequence == 0 {
+            return None;
+        }
+        let fit = movement.fit_present.load(Ordering::Relaxed).then(|| {
+            (
+                load_vector(&movement.fit_point),
+                load_vector(&movement.fit_normal),
+            )
+        });
+        Some((
+            sequence,
+            MoveSample {
+                entity: movement.entity.load(Ordering::Relaxed),
+                pos: load_vector(&movement.pos),
+                fit,
+                raw_velocity: load_vector(&movement.raw_velocity),
+                steered_velocity: load_vector(&movement.steered_velocity),
+                native_velocity: load_vector(&movement.native_velocity),
+                dt: f32::from_bits(movement.dt.load(Ordering::Relaxed)),
+                contact: movement.contact.load(Ordering::Relaxed),
+                native_al: movement.native_al.load(Ordering::Relaxed) as u8,
+            },
+        ))
     }
 
     /// One stop-climbing call.
@@ -654,6 +825,55 @@ pub fn body_text(sample: &BodySample) -> String {
     )
 }
 
+/// One same-call movement record. This function allocates only on the diagnostic thread.
+fn movement_text(sample: &MoveSample) -> String {
+    let fit = match sample.fit {
+        None => "fit missing".to_owned(),
+        Some((point, normal)) => {
+            let validity = if point.is_finite() && normal.is_finite() {
+                "fit"
+            } else {
+                "fit invalid"
+            };
+            format!(
+                "{validity} point {:.3} {:.3} {:.3}, physical normal {:.3} {:.3} {:.3}",
+                point.x, point.y, point.z, normal.x, normal.y, normal.z
+            )
+        }
+    };
+    format!(
+        "climb move: entity {}, dt {:.5}, contact {}, native AL 0x{:02x} | p {:.3} {:.3} {:.3} | \
+         {} | raw v {:.3} {:.3} {:.3} | steered v {:.3} {:.3} {:.3} | check output v {:.3} {:.3} {:.3}",
+        sample.entity,
+        sample.dt,
+        sample.contact,
+        sample.native_al,
+        sample.pos.x,
+        sample.pos.y,
+        sample.pos.z,
+        fit,
+        sample.raw_velocity.x,
+        sample.raw_velocity.y,
+        sample.raw_velocity.z,
+        sample.steered_velocity.x,
+        sample.steered_velocity.y,
+        sample.steered_velocity.z,
+        sample.native_velocity.x,
+        sample.native_velocity.y,
+        sample.native_velocity.z,
+    )
+}
+
+/// Format at most one new movement record per diagnostic-thread tick, after its claim is released.
+fn changed_movement(last: &mut u64, now: Option<(u64, MoveSample)>) -> Option<String> {
+    let (sequence, sample) = now?;
+    if sequence == *last {
+        return None;
+    }
+    *last = sequence;
+    Some(movement_text(&sample))
+}
+
 /// Where the log thread is in a climb, for the `climb body:` line.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BodyPace {
@@ -693,6 +913,8 @@ pub struct Pace {
     quiet: u32,
     /// Where the current climb is, for the body line.
     body: BodyPace,
+    /// The last movement record written by this thread.
+    movement: u64,
 }
 
 impl Pace {
@@ -703,6 +925,7 @@ impl Pace {
             logged: Snapshot::default(),
             quiet: NEAR_TICKS,
             body: BodyPace::default(),
+            movement: 0,
         }
     }
 }
@@ -739,6 +962,9 @@ fn tick(pace: &mut Pace) {
         log::info!("{text}");
     }
     if let Some(text) = changed_body(&mut pace.body, &now, &DIAG.body_sample()) {
+        log::info!("{text}");
+    }
+    if let Some(text) = changed_movement(&mut pace.movement, DIAG.movement_sample()) {
         log::info!("{text}");
     }
 }
@@ -993,6 +1219,89 @@ mod tests {
         diag.body(&tilted());
         assert_eq!(diag.body_sample(), tilted());
         assert_eq!(diag.snapshot().body_samples, 1);
+    }
+
+    /// A complete native fallback observation with independent before/after values.
+    fn movement_fixture() -> MoveSample {
+        MoveSample {
+            entity: 17,
+            pos: Vec3::new(10.0, 5.0, -2.0),
+            fit: Some((Vec3::new(10.55, 6.0, -2.0), Vec3::new(-1.0, 0.0, 0.0))),
+            raw_velocity: Vec3::new(1.0, 2.0, 3.0),
+            steered_velocity: Vec3::new(0.5, 2.0, 0.25),
+            native_velocity: Vec3::new(0.0, 1.5, 0.0),
+            dt: 0.05,
+            contact: true,
+            native_al: 1,
+        }
+    }
+
+    /// A completed record preserves every before/after field from the same invocation.
+    #[test]
+    fn movement_record_round_trips_the_paired_values() {
+        let diag = Diag::new();
+        assert_eq!(diag.movement_sample(), None);
+        diag.movement(&movement_fixture());
+        assert_eq!(diag.movement_sample(), Some((1, movement_fixture())));
+    }
+
+    /// Contention only drops observability, and every successful copy releases its claim.
+    #[test]
+    fn busy_movement_record_drops_instead_of_waiting() {
+        let diag = Diag::new();
+        let first = movement_fixture();
+        let second = MoveSample {
+            entity: 29,
+            native_al: 0,
+            ..first
+        };
+        diag.movement(&first);
+        let claim = SampleClaim::take(&diag.movement.busy).unwrap();
+        assert_eq!(diag.movement_sample(), None);
+        diag.movement(&second);
+        drop(claim);
+        assert_eq!(diag.movement_sample(), Some((1, first)));
+        diag.movement(&second);
+        assert_eq!(diag.movement_sample(), Some((2, second)));
+    }
+
+    /// A missing fit stays absent, while a corrupt fit is explicitly labeled invalid.
+    #[test]
+    fn movement_text_distinguishes_missing_and_invalid_fits() {
+        let diag = Diag::new();
+        let missing = MoveSample {
+            fit: None,
+            ..movement_fixture()
+        };
+        diag.movement(&missing);
+        assert_eq!(diag.movement_sample(), Some((1, missing)));
+        let missing_text = movement_text(&missing);
+        assert!(missing_text.contains("fit missing"));
+        assert!(!missing_text.contains("physical normal"));
+        let invalid = MoveSample {
+            fit: Some((Vec3::new(f32::NAN, 1.0, 2.0), Vec3::new(-1.0, 0.0, 0.0))),
+            ..movement_fixture()
+        };
+        assert!(movement_text(&invalid).contains("fit invalid"));
+    }
+
+    /// Only a new completed record produces a line; a skipped busy read leaves it pending.
+    #[test]
+    fn movement_thread_writes_each_latest_record_only_once() {
+        let diag = Diag::new();
+        let mut last = 0;
+        assert_eq!(changed_movement(&mut last, diag.movement_sample()), None);
+        diag.movement(&movement_fixture());
+        let claim = SampleClaim::take(&diag.movement.busy).unwrap();
+        assert_eq!(changed_movement(&mut last, diag.movement_sample()), None);
+        drop(claim);
+        let text = changed_movement(&mut last, diag.movement_sample()).unwrap();
+        assert!(text.contains("raw v 1.000 2.000 3.000"));
+        assert!(text.contains("steered v 0.500 2.000 0.250"));
+        assert!(text.contains("check output v 0.000 1.500 0.000"));
+        assert_eq!(changed_movement(&mut last, diag.movement_sample()), None);
+        diag.movement(&movement_fixture());
+        assert!(changed_movement(&mut last, diag.movement_sample()).is_some());
     }
 
     /// One tick of the log thread with this many move checks in it.

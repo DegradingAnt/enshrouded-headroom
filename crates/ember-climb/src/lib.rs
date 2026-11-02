@@ -14,6 +14,7 @@
 
 pub mod coexist;
 pub mod config;
+pub mod corner;
 pub mod diag;
 pub mod effort;
 pub mod exit;

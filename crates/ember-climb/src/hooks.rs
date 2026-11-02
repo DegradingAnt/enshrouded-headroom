@@ -9,8 +9,8 @@
 //! All of that happens in one call on one thread, so both live in thread-locals. State that
 //! must last between ticks lives in the game's own Climb component: the climb normal and the grace
 //! count. The client replays old ticks, and only component bytes come back, so nothing here may
-//! carry a decision from one tick to the next any other way. Nothing here allocates, takes a lock
-//! or logs.
+//! carry a decision from one tick to the next any other way. These Rust hooks do not allocate or
+//! log. Movement telemetry tries its atomic claim once and drops a busy record without waiting.
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -19,7 +19,7 @@ use std::sync::OnceLock;
 use emberkit::guard::{guard, FeatureId};
 
 use crate::config::Settings;
-use crate::diag::{BodySample, DIAG};
+use crate::diag::{BodySample, MoveSample, DIAG};
 use crate::exit::{self, Exit};
 use crate::game::{
     self, encode_result, failed_result, read_vec3, result_code, result_entity, result_hit,
@@ -634,20 +634,55 @@ unsafe fn note_body(ctx: Ctx) {
     DIAG.body(&sample);
 }
 
+/// Carry one stack-local observation through one native move-check invocation.
+///
+/// # Safety
+///
+/// The velocity pointer contains three native floats and remains valid through the original.
+/// The before closure preserves the existing native argument and steering contracts.
+unsafe fn observed_move(
+    feature: impl FeatureId,
+    velocity: *const f32,
+    before: impl FnOnce() -> Option<MoveSample>,
+    original: impl Fn() -> u64,
+    publish: impl FnOnce(MoveSample),
+) -> u64 {
+    let ran = Cell::new(None);
+    guard(
+        feature,
+        || ran.get().unwrap_or_else(&original),
+        || {
+            let sample = before();
+            let value = original();
+            // Save the complete native RAX before any observation or publication can fail.
+            ran.set(Some(value));
+            if let Some(mut sample) = sample {
+                // SAFETY: the same native velocity buffer remains alive after the synchronous
+                // original. This reads only the three floats the original may have rewritten.
+                sample.native_velocity = unsafe { read_vec3(velocity) };
+                sample.native_al = value as u8;
+                publish(sample);
+            }
+            value
+        },
+    )
+}
+
 /// One frame of steering, for a natural surface only.
 ///
 /// # Safety
 ///
 /// `velocity`, `ctx` and `pos` are the game's arguments to the move check.
-unsafe fn steer_frame(velocity: *mut f32, ctx: Ctx, pos: *const f32, dt: f32) {
-    let Some(runtime) = runtime() else {
-        return;
-    };
+unsafe fn steer_frame(
+    velocity: *mut f32,
+    ctx: Ctx,
+    pos: *const f32,
+    dt: f32,
+) -> Option<MoveSample> {
+    let runtime = runtime()?;
     // SAFETY: the function's contract.
     let entity = unsafe { ctx.entity() };
-    let Some(hold) = get(&HOLD, None).filter(|hold| hold.natural && hold.entity == entity) else {
-        return;
-    };
+    let hold = get(&HOLD, None).filter(|hold| hold.natural && hold.entity == entity)?;
     let normal_at = {
         // SAFETY: the function's contract.
         unsafe { ctx.normal_at() }
@@ -667,15 +702,32 @@ unsafe fn steer_frame(velocity: *mut f32, ctx: Ctx, pos: *const f32, dt: f32) {
             ctx.capsule(),
         )
     };
+    // These values are already needed by steering. Disabled diagnostics makes no sample and
+    // adds no native reads. The physical fit normal is distinct from the eased body direction.
+    let mut sample = runtime.diagnostics.then(|| MoveSample {
+        entity,
+        pos: input.pos,
+        fit: input.fit.map(|fit| (fit.point, fit.normal)),
+        raw_velocity: input.velocity,
+        steered_velocity: input.velocity,
+        native_velocity: input.velocity,
+        dt: input.dt,
+        contact: input.contact,
+        native_al: 0,
+    });
     let Some(out) = steer(&input, &runtime.tuning, capsule) else {
-        return;
+        return sample;
     };
-    // SAFETY: as above. `steer` gives finite numbers for finite input, and checks the input.
+    // SAFETY: as above. Steering gives finite numbers for finite input and checks the input.
     unsafe {
         write_vec3(velocity, out.velocity);
         write_vec3(normal_at, out.normal);
     }
+    if let Some(sample) = sample.as_mut() {
+        sample.steered_velocity = out.velocity;
+    }
     DIAG.steered(out.error);
+    sample
 }
 
 /// Run the move check with the probe in [`Mode::Move`].
@@ -713,13 +765,23 @@ unsafe extern "system" fn move_check_detour(
 ) -> u64 {
     // SAFETY: the game's own arguments.
     let original = || unsafe { move_check_original(velocity, ctx, pos, dt) };
-    guard(Feature::Steer, original, || {
-        // SAFETY: the game's own context. The log must not be able to stop the steering.
-        guard(Feature::Diag, || (), || unsafe { note_body(Ctx(ctx)) });
-        // SAFETY: the game's own arguments.
-        unsafe { steer_frame(velocity, Ctx(ctx), pos, dt) };
-        original()
-    })
+    // SAFETY: the native velocity and context remain alive through this one move-check call.
+    // Observations reuse steering's inputs and cannot feed a movement decision.
+    unsafe {
+        observed_move(
+            Feature::Steer,
+            velocity,
+            || {
+                // SAFETY: the game's own context. Diagnostics cannot stop the steering.
+                guard(Feature::Diag, || (), || note_body(Ctx(ctx)));
+                steer_frame(velocity, Ctx(ctx), pos, dt)
+            },
+            original,
+            |sample| {
+                guard(Feature::Diag, || (), || DIAG.movement(&sample));
+            },
+        )
+    }
 }
 
 /// The hit a fit stands for, to hand to the exit decision.
@@ -1169,6 +1231,86 @@ mod tests {
         );
         assert_eq!(result, 7);
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    /// The observation preserves the requested velocity and the native fallback's different output.
+    #[test]
+    fn movement_observation_keeps_native_fallback_rewrite() {
+        let mut velocity = [1.0_f32, 2.0, 3.0];
+        let ptr = velocity.as_mut_ptr();
+        let calls = Cell::new(0_u32);
+        let published = Cell::new(None);
+        let before = MoveSample {
+            entity: 17,
+            pos: Vec3::new(10.0, 5.0, -2.0),
+            fit: Some((Vec3::new(10.55, 6.0, -2.0), Vec3::new(-1.0, 0.0, 0.0))),
+            raw_velocity: Vec3::new(1.0, 2.0, 3.0),
+            steered_velocity: Vec3::new(0.5, 2.0, 0.25),
+            native_velocity: Vec3::new(1.0, 2.0, 3.0),
+            dt: 0.05,
+            contact: true,
+            native_al: 0,
+        };
+        let native_result = 0xa5a5_0000_0000_0001;
+        // SAFETY: this inert buffer contains three floats and outlives every supplied closure.
+        let result = unsafe {
+            observed_move(
+                TestFeature(23),
+                ptr,
+                || {
+                    // SAFETY: the same live inert buffer; no game function is called.
+                    write_vec3(ptr, before.steered_velocity);
+                    Some(before)
+                },
+                || {
+                    calls.set(calls.get() + 1);
+                    // SAFETY: the fake native fallback writes only the supplied inert buffer.
+                    write_vec3(ptr, Vec3::new(0.0, 1.5, 0.0));
+                    native_result
+                },
+                |sample| published.set(Some(sample)),
+            )
+        };
+        assert_eq!(result, native_result);
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            published.get(),
+            Some(MoveSample {
+                native_velocity: Vec3::new(0.0, 1.5, 0.0),
+                native_al: 1,
+                ..before
+            })
+        );
+        assert_eq!(velocity, [0.0, 1.5, 0.0]);
+    }
+
+    /// Failed post-capture must not call native movement twice or replace its original RAX.
+    #[test]
+    fn movement_observation_post_failure_keeps_one_original_call() {
+        let mut velocity = [0.0_f32, 2.0, 0.0];
+        let calls = Cell::new(0_u32);
+        let published = Cell::new(false);
+        let native_result = 0xb6b6_0000_0000_0000;
+        // SAFETY: the inert three-float buffer outlives this call and no game code runs.
+        let result = unsafe {
+            observed_move(
+                TestFeature(24),
+                velocity.as_mut_ptr(),
+                || Some(MoveSample::default()),
+                || {
+                    calls.set(calls.get() + 1);
+                    native_result
+                },
+                |_| {
+                    published.set(true);
+                    panic!("post-capture failed");
+                },
+            )
+        };
+        assert!(published.get(), "the failing post-capture must have run");
+        assert_eq!(result, native_result);
+        assert_eq!(calls.get(), 1);
+        assert_eq!(velocity, [0.0, 2.0, 0.0]);
     }
 
     /// Native padding is not proven initialized, so no player setting can enable its reads.
