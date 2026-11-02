@@ -415,7 +415,11 @@ fn install() {
         ..Settings::default()
     };
     // SAFETY: `raycast` has the type `Runtime` needs.
-    prepare(unsafe { Runtime::new(&settings, raycast as usize) });
+    let mut runtime = unsafe { Runtime::new(&settings, raycast as usize) };
+    // This fixture initializes every Climb byte. It can exercise the proposed persistent model;
+    // actual native startup keeps it unavailable until initialization is proven.
+    runtime.grace_ticks = settings.grace_ticks();
+    prepare(runtime);
     activate();
 }
 

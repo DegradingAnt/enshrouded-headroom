@@ -69,7 +69,7 @@ const BUILTIN: Settings = Settings {
     overhang_angle: 110.0,
     entry_reach: 0.95,
     hold_reach: 1.0,
-    grace_seconds: 0.15,
+    grace_seconds: 0.0,
     diagnostics: true,
 };
 
@@ -332,8 +332,8 @@ pub fn schema() -> &'static [Setting] {
             "Tuning",
             "GraceSeconds",
             (0.0, 1.0),
-            "0.15",
-            "How long a lost surface is forgiven, in seconds.",
+            "0",
+            "Reserved grace model in seconds; unavailable in native runtime until state initialization is proven.",
         ),
         flag(
             "Debug",
@@ -534,7 +534,7 @@ mod tests {
     /// The grace time stays in seconds in the file and becomes ticks at 60 a second.
     #[test]
     fn the_grace_time_becomes_ticks() {
-        assert_eq!(Settings::default().grace_ticks(), 9);
+        assert_eq!(Settings::default().grace_ticks(), 0);
         let ticks = |grace_seconds| {
             let settings = Settings {
                 grace_seconds,

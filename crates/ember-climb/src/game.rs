@@ -474,15 +474,23 @@ impl Actor {
     /// `self` is the game's Actor, alive for this call.
     unsafe fn state(self, bit: u8) -> bool {
         // SAFETY: the caller's contract. The fields are inside the Actor, which runs past +0xc00.
-        let (state, added, removed, sequence) = unsafe {
+        let (state, sequence) = unsafe {
             (
                 u64::from_le_bytes(bytes_at::<8>(self.0, ACTOR_STATE)),
-                u64::from_le_bytes(bytes_at::<8>(self.0, ACTOR_STATE_ADD)),
-                u64::from_le_bytes(bytes_at::<8>(self.0, ACTOR_STATE_REMOVE)),
                 self.0.add(ACTOR_SEQUENCE).read(),
             )
         };
-        state_bit(state, added, removed, sequence & 1 != 0, bit)
+        if sequence & 1 == 0 {
+            return state_bit(state, 0, 0, false, bit);
+        }
+        // SAFETY: the native predicate reads these masks only during an active sequence.
+        let (added, removed) = unsafe {
+            (
+                u64::from_le_bytes(bytes_at::<8>(self.0, ACTOR_STATE_ADD)),
+                u64::from_le_bytes(bytes_at::<8>(self.0, ACTOR_STATE_REMOVE)),
+            )
+        };
+        state_bit(state, added, removed, true, bit)
     }
 
     /// Is the player on the ground?

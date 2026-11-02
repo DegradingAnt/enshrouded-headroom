@@ -69,7 +69,9 @@ impl Runtime {
     pub unsafe fn new(settings: &Settings, raycast: usize) -> Runtime {
         Runtime {
             tuning: settings.tuning(),
-            grace_ticks: settings.grace_ticks(),
+            // Native Climb padding has no proven initialization contract. A setting must not
+            // enable its reads. Initialized simulation fixtures may test the pure grace model.
+            grace_ticks: 0,
             diagnostics: settings.diagnostics,
             walk: settings.walk,
             jump: settings.jump,
@@ -442,8 +444,13 @@ fn after_wall_lost(id: u32, probed: bool, state: u8, limit: u8, entity: u32) -> 
     (0, grace::NOT_NATURAL)
 }
 
+/// Read persistent grace only when a proven backend has enabled it. Zero must not touch padding.
+fn grace_state(limit: u8, read: impl FnOnce() -> u8) -> Option<u8> {
+    (limit != 0).then(read)
+}
+
 /// Hook on the wall-lost check. The patched return already turns a voxel hit into [`HELD`]. This
-/// adds the grace time, counted in the Climb component.
+/// has an initialized-state grace model for inert fixtures. Native runtime gates that model off.
 ///
 /// # Safety
 ///
@@ -457,17 +464,19 @@ unsafe extern "system" fn wall_lost_detour(ctx: *mut u8) -> u32 {
         };
         let ctx = Ctx(ctx);
         // SAFETY: the game's own context, alive for this call. The check just read this Climb.
-        let (entity, at, state) = unsafe {
-            let at = ctx.grace_at();
-            (ctx.entity(), at, at.read())
-        };
+        let entity = unsafe { ctx.entity() };
         let limit = runtime.grace_ticks;
-        let (id, next) = after_wall_lost(id, nested.is_some(), state, limit, entity);
-        if next != state {
-            // SAFETY: a padding byte of this entity's Climb. The check's one caller is the climb
-            // update, which runs only inside program 244. That program has Climb in its write
-            // list, and it marked this entity before the update (`FUN_1404188c0`).
-            unsafe { at.write(next) };
+        let state = grace_state(limit, || {
+            // SAFETY: native runtime construction always sets limit=0, so this read is disabled.
+            // Inert hook-flow fixtures explicitly supply initialized Climb bytes and a positive
+            // limit. A future native backend must prove initialization before enabling it.
+            unsafe { ctx.grace_at().read() }
+        });
+        let (id, next) = after_wall_lost(id, nested.is_some(), state.unwrap_or(0), limit, entity);
+        if state.is_some_and(|state| next != state) {
+            // SAFETY: only the initialized fixture/backend above enables a persistent write.
+            // The native caller's program also owns Climb for writing.
+            unsafe { ctx.grace_at().write(next) };
         }
         (id, nested)
     })
@@ -881,7 +890,7 @@ unsafe extern "system" fn stop_detour(ctx: *mut u8, time: i64) {
         unsafe { stop(ctx, time) }
     };
     post_hook(Feature::Surface, original, |()| {
-        if runtime().is_some() {
+        if runtime().is_some_and(|runtime| runtime.grace_ticks != 0) {
             // SAFETY: the native stop writes Climb in every path and leaves the context alive.
             // All callers already hold writable Climb in their ECS program. The W52 native
             // receipt verifies this on both client and server, including action-sequence exits.
@@ -1030,8 +1039,10 @@ pub fn wanted(settings: &Settings) -> Vec<Site> {
             Site::on(&sigs::EXIT_LOW_FN, exit_low as usize, &EXIT_LOW),
         ]);
     }
-    let stop: StopFn = stop_detour;
-    sites.push(Site::on(&sigs::STOP_FN, stop as usize, &STOP));
+    if settings.diagnostics {
+        let stop: StopFn = stop_detour;
+        sites.push(Site::on(&sigs::STOP_FN, stop as usize, &STOP));
+    }
     if settings.stamina_multiplier != 1.0 {
         let stamina: StaminaFn = stamina_detour;
         sites.push(Site {
@@ -1109,6 +1120,22 @@ mod tests {
         assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
+    /// Native padding is not proven initialized, so no player setting can enable its reads.
+    #[test]
+    fn native_grace_is_gated_off_and_zero_never_reads_state() {
+        let settings = Settings {
+            grace_seconds: 1.0,
+            ..Settings::default()
+        };
+        // SAFETY: this test only checks the runtime and never calls the fake raycast address.
+        let runtime = unsafe { Runtime::new(&settings, stamina_detour as *const () as usize) };
+        assert_eq!(runtime.grace_ticks, 0);
+        assert_eq!(
+            grace_state(0, || panic!("disabled grace must not read padding")),
+            None
+        );
+    }
+
     /// The default build has the five hooks that climb, plus the diagnostics, and no stamina hook.
     #[test]
     fn the_defaults_hook_what_they_need() {
@@ -1140,8 +1167,8 @@ mod tests {
             diagnostics: false,
             ..Settings::default()
         };
-        assert_eq!(wanted(&settings).len(), 6);
-        assert!(wanted(&settings)
+        assert_eq!(wanted(&settings).len(), 5);
+        assert!(!wanted(&settings)
             .iter()
             .any(|site| site.sig.name == "STOP_FN"));
     }

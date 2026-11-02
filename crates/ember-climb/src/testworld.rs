@@ -1444,7 +1444,7 @@ mod replay {
 
     impl Clocked for NoGrace {}
 
-    /// The default `GraceSeconds`, in ticks.
+    /// A proposed 0.15-second grace model over initialized simulation state, in ticks.
     const LIMIT: u8 = 9;
 
     /// The grace as the hook keeps it: a count in the component's bytes.

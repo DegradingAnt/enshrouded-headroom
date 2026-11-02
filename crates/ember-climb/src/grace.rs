@@ -1,18 +1,8 @@
-//! A short hold when the surface is lost for a moment.
+//! Pure tick-based seam-forgiveness model for initialized simulation state.
 //!
-//! Rock has seams. A ray can slip through one for a frame, and dropping the player for that is the
-//! "latch, drop, latch" the old mod is known for. So on a natural surface a failed hold is
-//! forgiven for a fraction of a second.
-//!
-//! The client rolls back and replays up to 20 ticks, and only component bytes come back. So the
-//! state here is one byte in the game's own Climb component (`game::Ctx::grace_at`), and it counts
-//! ticks. Nothing here reads a clock or keeps state of its own, so a replayed tick with the same
-//! rays decides what its first run decided. Client and server agree only if their rays do.
-//!
-//! A hold on a lattice clears the byte, and a failed hold after that is the game's own drop.
-//! The native committed stop also clears it. Endings that bypass that stop can still leave the
-//! previous count; see the README's limits. A fresh zero count gets no grace before a confirmed
-//! natural hold.
+//! Native runtime currently disables this model: initialization of Climb padding is unproven.
+//! A future native binding needs a valid state-lifetime and replay contract before enabling it.
+//! The initialized test fixtures exercise the previous proposal, including its bounded exit gaps.
 
 /// The ticks in one second. The tick is 0xfe502b ns in both exes.
 pub const TICKS_PER_SECOND: f32 = 60.0;

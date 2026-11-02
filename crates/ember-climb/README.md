@@ -105,7 +105,7 @@ All settings are in `ember-climb.ini`, and all need a restart. A value that is n
 | Tuning | OverhangAngle | 110 | 90 to 135 | The farthest a face may hang over to start a climb, in degrees. 90 is a sheer wall. A running climb gets 15 degrees more, so that one rough patch does not stop it. |
 | Tuning | EntryReach | 0.95 | 0.6 to 1.4 | How close you must be to start a climb, in metres. |
 | Tuning | HoldReach | 1 | 0.8 to 1.6 | How far the mod looks for the surface during a climb, in metres. Under an overhang you hang farther out, and it looks that much farther. |
-| Tuning | GraceSeconds | 0.15 | 0 to 1 | How long a lost surface is forgiven before you fall. The game counts it in ticks, 60 a second, so 0.15 is 9 ticks. |
+| Tuning | GraceSeconds | 0 | 0 to 1 | Reserved. Native seam forgiveness is unavailable; nonzero values warn and remain inactive. |
 | Debug | Diagnostics | 1 | 0 or 1 | The one-line-a-second log. It also adds five small hooks. |
 
 `SurfaceMask` is a sum of these bits, in hex or decimal: `0x4` terrain and player walls, `0x20` rock props, `0x100` iron lattices, `0x8` other solid props such as trees. Other bits are refused. Bits 0 and 1 are other copies of the terrain, and asking for them gives a different surface per ray.
@@ -122,12 +122,12 @@ Movement uses the game's own processed input, including an analogue stick. No ke
 
 The game already climbs, but only on flat iron lattices. Its wall probe wants four rays with one exact normal. Rock never gives that.
 
-- The game's probe always runs first, so a lattice stays exactly as it was. No mask or tolerance in the game is changed.
+- The game's probe always runs first, so its successful lattice answer is kept. No mask or tolerance in the game is changed. The attachment patch skips only the synthetic voxel-hold marker; ordinary IDs, including high-bit IDs, use the native accessor/store. That store also runs when the ID is unchanged.
 - When the probe fails, the mod casts four rays of its own at the surface, averages what they hit, and asks whether it is steep and flat enough.
 - The game moves a climber along world up, which walks straight off any face that leans. The mod turns the movement into the surface, keeps the speed, and holds the game's 0.55 m distance.
 - The game has no exit where a wall turns into a slope, and it mantles onto steep rock. The mod refuses the second and finds the first. One triangle of rough rock can look like a floor, so the mod judges a floor as an area, and it looks whether the face goes on ahead of your head.
 - A half-pressed stick fails the game's start test however straight you run at a wall. The mod tests only the heading.
-- After a confirmed natural hold, a surface lost for a moment is forgiven. The count is in ticks, in one spare byte of the game's own climb data. The native stop clears it, including when diagnostics are off. A new climb's first unconfirmed miss is not forgiven. A client replays old ticks, and this way a replay decides what the server decided, as long as the rays on both sides see the same rock.
+- The persistent seam-forgiveness model is tested on initialized simulated state, but its native binding stays unavailable. This build never reads or writes the game's spare grace byte. The hold and movement fits still use their longer reach and relaxed surface checks.
 
 Evidence for every game fact is in [docs/re-notes.md](../../docs/re-notes.md), "Free climbing".
 
@@ -139,7 +139,7 @@ The client and server use the same plugin and settings. Test multiplayer only af
 
 ## Limits
 
-- The native stop clears the grace byte. Some mantle/jump endings bypass that function and can leave up to the configured grace allowance for a later climb's first missed hold. This known limit is bounded by `GraceSeconds` (default 0.15 s); it is not a wall-clock timer or an accumulated movement boost.
+- Seam forgiveness is unavailable. A complete loss of the hold rays drops the climber without a timed grace period. The pure proposed grace model needs proven initialization and lifecycle ownership before a later build can enable it.
 
 - A surface must reach 2 m above your feet to start a climb. A lower wall starts nothing, and neither does a ledge you jump at when it is less than 2 m above your feet at that moment. Use the game's jump there. This may change after the first play test.
 - A short walkable shelf in a face can stop you while the stick is up. In the simulation a flat shelf of 0.2 to 0.8 m in a 60 degree face does this, and so does one of 0.5 to 0.9 m in a sheer wall. On the 60 degree face a shelf of 1 m or more ends in a mantle. Go sideways or go down, or jump off.

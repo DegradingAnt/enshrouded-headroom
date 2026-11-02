@@ -258,6 +258,9 @@ fn start_in_game(settings: &Settings, build: &Build) {
         }
     };
     log::info!("build {label}");
+    if settings.grace_seconds > 0.0 {
+        log::warn!("GraceSeconds is unavailable in this test build; seam forgiveness stays off");
+    }
     let preflight = || -> Result<(), String> {
         let exe =
             std::env::current_exe().map_err(|error| format!("cannot locate the game: {error}"))?;

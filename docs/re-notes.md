@@ -2303,3 +2303,40 @@ hit fields, and stop grace cleanup through the inert hook-flow fixture.
 been observed. The candidate still has the disclosed low-wall and rough-shelf limits. Native-file
 checks and simulated worlds are insufficient to call it reliable in play. Gliding stays experimental
 and disabled by default. First acceptance is an offline climbing session before server deployment.
+
+
+### W52 final safety gates and exact attachment filter
+
+The candidate disables native persistent grace unconditionally. `Runtime::new` sets its limit to
+zero even if `GraceSeconds` is positive; the setting warns and remains inactive. The zero-limit
+branch does not read or write Climb+2. `GraceSeconds` defaults to zero. The native type metadata,
+copy/replication paths and reset stores did not prove initialization of that padding. The previous
+stop-reset and replay-model tests use explicitly initialized inert fixtures; they are not proof
+that native grace is available. Complete state initialization and all-exit lifecycle coverage remain
+required before a future binding enables it.
+
+The Actor-state reader also follows the native conditional: the added/removed state masks are
+read only while the sequence flag is active. It does not assume sequence-only fields initialized
+when the native predicate does not read them.
+
+[CORRECTION] The earlier hypothesis that a real EntityId never has its high bit set is unsupported.
+Current CreateEntity (client0x987d90/server0x623ce0) separately counts successfully created signed
+negative IDs; its automatic counter increments a full u32 without a 0x7fffffff mask. Current component
+lookup also uses all32bits. A bound on live entity count does not bound the ID domain.
+
+The final 19-byte attachment replacement therefore uses `cmp ebx,-1; je skip; lea rcx,[rdi+0xa0]`
+and seven NOPs. The branch target remains original-site+27; the original call at+19 and store at+24
+are unchanged. It skips only the exact synthetic marker0xffffffff, instead of all signed-negative
+IDs. Non-sentinel IDs also use the native helper/store when the attachment ID is unchanged.
+
+[VERIFIED] The accessor helper (current client0x41eca0/server0x1be560) returns the accessor's existing
+pointer and optionally marks its dirty tick. It does not compare attachment values, allocate,
+copy-on-write or change ownership. The dirty helpers explicitly early-out when already marked for
+the current tick. The wall update already marks Climb before this store; a repeated mark is supported.
+The common block reloads RCX and calls another function before any flags are used, so the replacement
+comparison's flags do not leak. The synthetic marker's skip still reaches the proven common block.
+
+Regression evidence includes an inert Windowsx64 machine-code harness containing only our replacement
+and a fake accessor. It fails on the old sign-bit filter for ID0x80000000 and passes for unchanged and
+changed non-sentinel IDs through0xfffffffe, plus marker no-call/no-write behavior. No game instruction
+is executed by that harness. Full native-file patch-plan checks still guard the original19-byte span.

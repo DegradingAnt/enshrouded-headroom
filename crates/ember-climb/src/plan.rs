@@ -36,16 +36,16 @@ pub const ATTACH_GAME: [u8; 19] = [
     0x48, 0x8b, 0x87, 0xa0, 0x00, 0x00, 0x00, 0x39, 0x58, 0x18, 0x74, 0x0f, 0x48, 0x8d, 0x8f, 0xa0,
     0x00, 0x00, 0x00,
 ];
-/// The replacement: `lea rcx,[rdi+0xa0]`, `mov rax,[rcx]`, `cmp [rax+0x18],ebx`, `je skip`,
-/// `test ebx,ebx`, `js skip`.
+/// The replacement rejects only [`HELD`], then prepares the original accessor call.
 ///
-/// The same work in the same 19 bytes, with the `lea` moved up to make room for one more test.
-/// A real id is treated exactly as the game treats it, so a lattice adds no write. [`HELD`] has
-/// its top bit set, so it skips the store and no stand-in value enters the game's data. The `lea`
-/// is safe on the skip path too: the instruction at `skip` loads `rcx` again.
+/// Real entity IDs may have their top bit set. `cmp ebx,-1; je skip` compares the exact synthetic
+/// sentinel, instead of filtering every signed-negative ID. The native helper and following
+/// store stay in place. Valid IDs also take that helper when unchanged; it only marks the
+/// already-writable accessor and returns its pointer, so no ID-domain assumption is needed.
+/// Seven NOPs preserve the original call's address and all following instruction boundaries.
 pub const ATTACH_HOLD: [u8; 19] = [
-    0x48, 0x8d, 0x8f, 0xa0, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x01, 0x39, 0x58, 0x18, 0x74, 0x0c, 0x85,
-    0xdb, 0x78, 0x08,
+    0x83, 0xfb, 0xff, 0x74, 0x16, 0x48, 0x8d, 0x8f, 0xa0, 0x00, 0x00, 0x00, 0x90, 0x90, 0x90, 0x90,
+    0x90, 0x90, 0x90,
 ];
 
 /// Where the layer byte is in an [`ENTER_LAYER`] match.
@@ -376,8 +376,72 @@ mod tests {
         assert_eq!(run(0x7fff_ffff), 0x7fff_ffff);
     }
 
-    /// The new attachment bytes do the same work as the game's, and both branches land after the
-    /// store. This is what keeps a lattice exactly vanilla.
+    /// Execute only our replacement bytes in a private inert harness, never game code.
+    /// Valid IDs span all 32 bits; only the exact synthetic sentinel may skip the native store.
+    #[test]
+    fn the_attachment_filter_preserves_full_width_entity_ids() {
+        use emberkit::patch::test_support::Mem;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static WRITES: AtomicU32 = AtomicU32::new(0);
+        /// Inert stand-in for the native accessor's writable-pointer helper.
+        ///
+        /// # Safety
+        ///
+        /// `slot` points to an initialized data pointer for this fixture.
+        unsafe extern "system" fn writable(slot: *const *mut u8) -> *mut u8 {
+            emberkit::guard::guard(crate::Feature::Startup, std::ptr::null_mut, || {
+                WRITES.fetch_add(1, Ordering::Relaxed);
+                // SAFETY: the fixture supplies one initialized pointer at this argument.
+                unsafe { slot.read_unaligned() }
+            })
+        }
+        // Save the two nonvolatile registers used at the real patch site, and reserve shadow
+        // space with the Windows x64 stack alignment before calling the inert helper.
+        let mut code = vec![
+            0x53, 0x57, 0x48, 0x83, 0xec, 0x28, 0x48, 0x89, 0xcf, 0x89, 0xd3,
+        ];
+        code.extend_from_slice(&ATTACH_HOLD);
+        let call = code.len();
+        code.extend_from_slice(&[0xe8, 0, 0, 0, 0, 0x89, 0x58, 0x18]);
+        code.extend_from_slice(&[
+            0x48, 0x8b, 0x0f, // original common block: reload RCX
+            0x48, 0x8b, 0x87, 0xa0, 0, 0, 0, // load fixture component
+            0x8b, 0x40, 0x18, // return its attachment ID
+            0x48, 0x83, 0xc4, 0x28, 0x5f, 0x5b, 0xc3,
+        ]);
+        let thunk = code.len();
+        code.extend_from_slice(&[0x48, 0xb8]);
+        code.extend_from_slice(&(writable as *const () as u64).to_le_bytes());
+        code.extend_from_slice(&[0xff, 0xe0]);
+        let delta = i32::try_from(thunk - (call + 5)).unwrap();
+        code[call + 1..call + 5].copy_from_slice(&delta.to_le_bytes());
+        let memory = Mem::new(4096, 0x3000, 0x40);
+        // SAFETY: fresh private executable pages owned by this test, with an all-zero initial
+        // range. The checked write also flushes the instruction cache before any execution.
+        unsafe { emberkit::patch::write_checked(memory.base, &vec![0; code.len()], &code) }
+            .unwrap();
+        type Harness = unsafe extern "system" fn(*mut u8, u32) -> u32;
+        // SAFETY: the reviewed inert wrapper above implements this exact ABI, preserves its
+        // nonvolatile registers and stack, and its allocation lasts through every call.
+        let run = unsafe { std::mem::transmute::<usize, Harness>(memory.base) };
+        for id in [0x8000_0000, 0x8000_0001, 0xffff_fffe, 1, 0x7fff_fffe, HELD] {
+            for old in [0x1234, id] {
+                let mut component = [0u8; 32];
+                component[0x18..0x1c].copy_from_slice(&old.to_le_bytes());
+                let mut context = [0usize; 22];
+                context[20] = component.as_mut_ptr() as usize;
+                WRITES.store(0, Ordering::Relaxed);
+                // SAFETY: the context's initialized accessor at +0xa0 points to a complete
+                // writable fixture component, and only this synchronous call uses it.
+                let stored = unsafe { run(context.as_mut_ptr().cast(), id) };
+                let expected = if id == HELD { old } else { id };
+                assert_eq!(stored, expected, "id {id:#x}, old {old:#x}");
+                assert_eq!(WRITES.load(Ordering::Relaxed), u32::from(id != HELD));
+            }
+        }
+    }
+
+    /// The exact sentinel branch skips the preserved call/store, with every boundary unchanged.
     #[test]
     fn the_attachment_store_decodes_as_documented() {
         let ip = 0x1_4041_8db8u64;
@@ -385,18 +449,13 @@ mod tests {
         let new = decode(&ATTACH_HOLD, ip);
         let code: Vec<Code> = new.iter().map(Instruction::code).collect();
         assert_eq!(
-            code,
-            [
-                Code::Lea_r64_m,
-                Code::Mov_r64_rm64,
-                Code::Cmp_rm32_r32,
-                Code::Je_rel8_64,
-                Code::Test_rm32_r32,
-                Code::Js_rel8_64
-            ]
+            code[..3],
+            [Code::Cmp_rm32_imm8, Code::Je_rel8_64, Code::Lea_r64_m]
         );
-        assert_eq!(new[3].near_branch_target(), skip);
-        assert_eq!(new[5].near_branch_target(), skip);
+        assert_eq!(new[0].immediate8to32(), -1);
+        assert_eq!(new[1].near_branch_target(), skip);
+        assert_eq!(new[2].memory_displacement64(), 0xa0);
+        assert!(code[3..].iter().all(|code| *code == Code::Nopd));
         let old = decode(&ATTACH_GAME, ip);
         assert_eq!(old[2].near_branch_target(), skip);
     }
