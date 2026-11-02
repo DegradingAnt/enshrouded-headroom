@@ -1,0 +1,27 @@
+# The plugin and its dependencies target Windows x64.
+[graph]
+targets = ["x86_64-pc-windows-msvc"]
+all-features = true
+
+[advisories]
+# Vulnerability advisories fail unconditionally in cargo-deny 0.20.2.
+# This selects all unmaintained advisories. Use `check --warn unmaintained`
+# (as CI does) to report them as warnings rather than errors.
+unmaintained = "all"
+
+[licenses]
+# Unlisted licences fail. For MIT OR LGPL, only the MIT branch is allowed.
+allow = ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "Unicode-3.0", "ISC", "Zlib"]
+
+# W45 uses the pinned watcher under its upstream CC0 dedication.
+[[licenses.exceptions]]
+crate = "notify@8.2.1"
+allow = ["CC0-1.0"]
+
+[bans]
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

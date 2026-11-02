@@ -1,0 +1,12 @@
+[package]
+name = "ember-building"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99"
+license = "MIT"
+publish = false
+description = "Bounded pure per-session area-build commands; native execution remains unavailable."
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"

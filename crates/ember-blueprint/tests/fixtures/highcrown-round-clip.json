@@ -1,0 +1,280 @@
+{
+  "version": "3.0",
+  "name": "Highcrown Citadel",
+  "block_m": 0.5,
+  "altar": {
+    "x": 60,
+    "y": 60,
+    "abs": 5,
+    "measure_origin": "edge",
+    "measure_width": 2,
+    "measure_depth": 2
+  },
+  "levels": [
+    {
+      "id": "L0",
+      "name": "Cliff Quarters",
+      "elev": 0
+    },
+    {
+      "id": "W",
+      "name": "The Lake",
+      "elev": -20
+    }
+  ],
+  "zones": [
+    {
+      "id": "z_q_sw",
+      "name": "Song Corner",
+      "level": "L0",
+      "kind": "square",
+      "x": 38,
+      "y": 34,
+      "w": 14,
+      "d": 13,
+      "floor_openings": [
+        {
+          "x": 42,
+          "y": 34,
+          "w": 5,
+          "d": 6,
+          "object_id": "b_gatehousehouse",
+          "label": "Valory's House",
+          "kind": "building"
+        },
+        {
+          "x": 47,
+          "y": 34,
+          "w": 5,
+          "d": 6,
+          "object_id": "b_reed",
+          "label": "Reed Cottage",
+          "kind": "building"
+        },
+        {
+          "x": 38,
+          "y": 34,
+          "w": 4,
+          "d": 4,
+          "object_id": "t_cs_sw",
+          "label": "Song Stair",
+          "shape": "round",
+          "clip": true,
+          "kind": "stair tower"
+        }
+      ]
+    },
+    {
+      "id": "z_q_se",
+      "name": "Rose Corner",
+      "level": "L0",
+      "kind": "square",
+      "x": 70,
+      "y": 34,
+      "w": 14,
+      "d": 13,
+      "floor_openings": [
+        {
+          "x": 70,
+          "y": 34,
+          "w": 5,
+          "d": 6,
+          "object_id": "b_gibson",
+          "label": "Gibson House",
+          "kind": "building"
+        },
+        {
+          "x": 75,
+          "y": 34,
+          "w": 5,
+          "d": 6,
+          "object_id": "b_spare2",
+          "label": "Conway House",
+          "kind": "building"
+        },
+        {
+          "x": 80,
+          "y": 34,
+          "w": 4,
+          "d": 4,
+          "object_id": "t_cs_se",
+          "label": "Rose Stair",
+          "shape": "round",
+          "clip": true,
+          "kind": "stair tower"
+        }
+      ]
+    },
+    {
+      "id": "z_q_nw",
+      "name": "Mason's Corner",
+      "level": "L0",
+      "kind": "square",
+      "x": 38,
+      "y": 67,
+      "w": 14,
+      "d": 13,
+      "floor_openings": [
+        {
+          "x": 42,
+          "y": 74,
+          "w": 5,
+          "d": 6,
+          "object_id": "b_oscar",
+          "label": "Mason's House",
+          "kind": "building"
+        },
+        {
+          "x": 47,
+          "y": 74,
+          "w": 5,
+          "d": 6,
+          "object_id": "b_anton",
+          "label": "Anton's Cottage",
+          "kind": "building"
+        },
+        {
+          "x": 38,
+          "y": 76,
+          "w": 4,
+          "d": 4,
+          "object_id": "t_cs_nw",
+          "label": "Mason's Stair",
+          "shape": "round",
+          "clip": true,
+          "kind": "stair tower"
+        }
+      ]
+    },
+    {
+      "id": "z_q_ne",
+      "name": "Steam Corner",
+      "level": "L0",
+      "kind": "square",
+      "x": 70,
+      "y": 67,
+      "w": 14,
+      "d": 13,
+      "floor_openings": [
+        {
+          "x": 70,
+          "y": 74,
+          "w": 5,
+          "d": 6,
+          "object_id": "b_vanderhall",
+          "label": "Vanderhall House",
+          "kind": "building"
+        },
+        {
+          "x": 75,
+          "y": 74,
+          "w": 5,
+          "d": 6,
+          "object_id": "b_bath",
+          "label": "Bathhouse",
+          "kind": "building"
+        },
+        {
+          "x": 80,
+          "y": 76,
+          "w": 4,
+          "d": 4,
+          "object_id": "t_cs_ne",
+          "label": "Steam Stair",
+          "shape": "round",
+          "clip": true,
+          "kind": "stair tower"
+        }
+      ]
+    }
+  ],
+  "content": {
+    "guide": {
+      "measurements": [
+        {
+          "id": "measure_lakewalk_s",
+          "name": "Lake Walk — south",
+          "level": "W",
+          "x": 38,
+          "y": 34,
+          "w": 46,
+          "d": 2.5,
+          "abs_floor": -19.5,
+          "floor_openings": [
+            {
+              "x": 38,
+              "y": 34,
+              "w": 4,
+              "d": 4,
+              "object_id": "t_cs_sw",
+              "label": "Song Stair",
+              "shape": "round",
+              "clip": true,
+              "kind": "stair tower"
+            },
+            {
+              "x": 80,
+              "y": 34,
+              "w": 4,
+              "d": 4,
+              "object_id": "t_cs_se",
+              "label": "Rose Stair",
+              "shape": "round",
+              "clip": true,
+              "kind": "stair tower"
+            }
+          ]
+        }
+      ],
+      "phases": [
+        {
+          "id": "quarters",
+          "name": "The Cliff Quarters",
+          "num": 11,
+          "sessions": [
+            {
+              "steps": [
+                {
+                  "id": "z_q_sw.pave",
+                  "block_picture": {
+                    "object_id": "z_q_sw",
+                    "view": "floor",
+                    "layer": 0.5,
+                    "title": "Song Corner — paving layer"
+                  }
+                },
+                {
+                  "id": "z_q_se.pave",
+                  "block_picture": {
+                    "object_id": "z_q_se",
+                    "view": "floor",
+                    "layer": 0.5,
+                    "title": "Rose Corner — paving layer"
+                  }
+                },
+                {
+                  "id": "z_q_nw.pave",
+                  "block_picture": {
+                    "object_id": "z_q_nw",
+                    "view": "floor",
+                    "layer": 0.5,
+                    "title": "Mason's Corner — paving layer"
+                  }
+                },
+                {
+                  "id": "z_q_ne.pave",
+                  "block_picture": {
+                    "object_id": "z_q_ne",
+                    "view": "floor",
+                    "layer": 0.5,
+                    "title": "Steam Corner — paving layer"
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

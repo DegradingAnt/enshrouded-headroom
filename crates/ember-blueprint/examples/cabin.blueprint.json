@@ -1,0 +1,69 @@
+{
+  "schema_version": "1.0",
+  "title": "Independent cabin adapter",
+  "source": {
+    "id": "example:centimetre-cabin",
+    "adapter": "example-cabin-v1",
+    "content_version": "1",
+    "revision": {
+      "sequence": 1,
+      "content_sha256": "22365d6d466746201ec7cbf888901203a41d71eaee5ca8259b0795424d97e86d"
+    }
+  },
+  "frame": {
+    "units": "metres",
+    "axes": "right_handed_x_east_y_up_z_south",
+    "source_mapping": "Source is east/north/height in declared centimetres; canonical (X,Y,Z)=(east,height,-north)/100. Local origin (0,0,0), without engine/world mapping."
+  },
+  "stages": [],
+  "layers": [
+    {
+      "id": "ground",
+      "name": "Reference ground plane",
+      "elevation": 0.0
+    }
+  ],
+  "anchors": [
+    {
+      "id": "origin",
+      "name": "Guide-local origin",
+      "point": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    }
+  ],
+  "objects": [
+    {
+      "id": "cabin",
+      "name": "A cabin authored in centimetres",
+      "source_ref": "structures/cabin",
+      "stages": [],
+      "primitives": [
+        {
+          "id": "cabin/envelope",
+          "layer": "ground",
+          "fidelity": "recorded_envelope",
+          "note": "Source outer bounds converted from centimetres. Openings and block placement are unspecified.",
+          "geometry": {
+            "kind": "box",
+            "min": [
+              1.0,
+              0.0,
+              -6.0
+            ],
+            "size": [
+              6.0,
+              3.0,
+              4.0
+            ]
+          }
+        }
+      ],
+      "omissions": [
+        "Doors, windows, roof and individual blocks are not recorded."
+      ]
+    }
+  ]
+}

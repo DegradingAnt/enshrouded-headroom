@@ -1,0 +1,36 @@
+name: Mutation tests
+
+# GitHub requires this file on the default branch before manual dispatch is available.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mutants:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - name: Toolchain
+        run: rustup show active-toolchain
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --version 27.1.0 --locked
+      - name: Mutation tests
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          cargo mutants --workspace --timeout 30 --build-timeout 180 --jobs 4
+          $mutantsExitCode = $LASTEXITCODE
+          # Compare missed mutants (2) and timeouts (3) with docs/mutation-audit.md.
+          if ($mutantsExitCode -notin @(0, 2, 3)) {
+            exit $mutantsExitCode
+          }
+          exit 0
+      - name: Upload mutation evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mutants-${{ github.run_id }}-${{ github.run_attempt }}
+          path: mutants.out/
+          if-no-files-found: warn

@@ -1,0 +1,64 @@
+name: Bug report
+description: Report a problem with enshrouded-headroom.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe one problem per report. Keep the log from the affected run before restarting the game.
+  - type: textarea
+    id: plugin-log
+    attributes:
+      label: Plugin log
+      description: |
+        Attach enshrouded-headroom.log by dragging it into this field.
+        If no log was created, say which log locations you checked.
+    validations:
+      required: true
+  - type: input
+    id: game-build
+    attributes:
+      label: Game build
+      description: 'Copy the complete "game build:" line from the log, or say that it was not logged.'
+      placeholder: "game build: ..."
+    validations:
+      required: true
+  - type: input
+    id: gpu-driver
+    attributes:
+      label: GPU and driver version
+      description: Include the graphics card model and the installed driver version.
+    validations:
+      required: true
+  - type: textarea
+    id: ini-changes
+    attributes:
+      label: INI changes
+      description: Paste the sections and keys you changed, or write "unchanged".
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: List the steps, where the problem occurs, and how often it happens.
+      placeholder: |
+        1. Start the game.
+        2.
+        3.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened?
+      description: Describe what you saw. Include any relevant error message.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+      description: Describe the result you expected.
+    validations:
+      required: true

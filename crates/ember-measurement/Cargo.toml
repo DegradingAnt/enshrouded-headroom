@@ -1,0 +1,15 @@
+[package]
+name = "ember-measurement"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99"
+license = "MIT"
+publish = false
+description = "Pure measurement, world freshness and input planning core. No native bindings."
+
+[dependencies]
+ember-blueprint = { path = "../ember-blueprint" }
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"

@@ -1,0 +1,917 @@
+{
+  "schema_version": "1.0",
+  "title": "Highcrown Citadel",
+  "source": {
+    "id": "highcrown:fixture",
+    "adapter": "highcrown-v1",
+    "content_version": "3.0",
+    "revision": {
+      "sequence": 1,
+      "content_sha256": "7b851da7d3210c98b0df4a103674a84718f295d46576291828b58cc8c7dfc94d"
+    }
+  },
+  "frame": {
+    "units": "metres",
+    "axes": "right_handed_x_east_y_up_z_south",
+    "source_mapping": "Source x is east, source y is north, height is up; canonical (X,Y,Z)=(x,height,-y), metres. Origin is source plan (0,0,0), independent of any engine/save frame."
+  },
+  "stages": [
+    {
+      "id": "pit",
+      "name": "Excavate and seal the pit",
+      "order": 2,
+      "unresolved": [
+        "measure_deep_ne",
+        "measure_deep_nw",
+        "measure_deep_se"
+      ]
+    },
+    {
+      "id": "walls",
+      "name": "Gate Ward and the walls",
+      "order": 14,
+      "unresolved": [
+        "w_outer_e",
+        "w_outer_s"
+      ]
+    },
+    {
+      "id": "tall",
+      "name": "Keep and Spire to full height",
+      "order": 15,
+      "unresolved": [
+        "b_keep.stage",
+        "keep_upper_ne",
+        "keep_upper_sw"
+      ]
+    },
+    {
+      "id": "alive",
+      "name": "Bring it to life",
+      "order": 20,
+      "unresolved": []
+    },
+    {
+      "id": "flame",
+      "name": "Complete the outer defences and exhibitions",
+      "order": 22,
+      "unresolved": [
+        "xp_exhibition_stair"
+      ]
+    }
+  ],
+  "layers": [
+    {
+      "id": "B",
+      "name": "Cellars",
+      "elevation": 1.0
+    },
+    {
+      "id": "C",
+      "name": "Under-Halls",
+      "elevation": -10.0
+    },
+    {
+      "id": "D",
+      "name": "The Deep",
+      "elevation": -20.0
+    },
+    {
+      "id": "E",
+      "name": "Undervault",
+      "elevation": -35.0
+    },
+    {
+      "id": "F",
+      "name": "Sealed Well",
+      "elevation": -50.0
+    },
+    {
+      "id": "L0",
+      "name": "Cliff Quarters",
+      "elevation": 0.0
+    },
+    {
+      "id": "L1",
+      "name": "Main Level",
+      "elevation": 5.0
+    },
+    {
+      "id": "L2",
+      "name": "Upper Ward",
+      "elevation": 10.0
+    },
+    {
+      "id": "S",
+      "name": "Ember Isle",
+      "elevation": 48.0
+    },
+    {
+      "id": "U",
+      "name": "Vaults",
+      "elevation": 5.0
+    },
+    {
+      "id": "W",
+      "name": "The Lake",
+      "elevation": -20.0
+    },
+    {
+      "id": "floor/keep_roof31/31",
+      "name": "Keep lower roof walk and K5 slab floor at 31 m",
+      "elevation": 31.0
+    },
+    {
+      "id": "floor/keep_stage36/36",
+      "name": "K6 floor at plan +36 floor at 36 m",
+      "elevation": 36.0
+    },
+    {
+      "id": "floor/measure_deep_sw/-40",
+      "name": "Southwest Deep floor floor at -40 m",
+      "elevation": -40.0
+    },
+    {
+      "id": "floor/xp_exhibition_loft/9",
+      "name": "Exhibition upper gallery floor at 9 m",
+      "elevation": 9.0
+    }
+  ],
+  "anchors": [
+    {
+      "id": "altar-support",
+      "name": "Altar supporting floor centre",
+      "point": [
+        60.0,
+        5.0,
+        -60.0
+      ]
+    }
+  ],
+  "objects": [
+    {
+      "id": "b_garrison",
+      "name": "Garrison Hall",
+      "source_ref": "buildings/b_garrison",
+      "stages": [
+        "alive"
+      ],
+      "primitives": [
+        {
+          "id": "b_garrison/footprint",
+          "layer": "L1",
+          "fidelity": "reference_outline",
+          "note": "Recorded footprint bounds at the declared floor. Special shapes remain bounds only; this outline does not prescribe a solid floor.",
+          "geometry": {
+            "kind": "polyline",
+            "points": [
+              [
+                24.0,
+                5.0,
+                -6.0
+              ],
+              [
+                39.0,
+                5.0,
+                -6.0
+              ],
+              [
+                39.0,
+                5.0,
+                -13.0
+              ],
+              [
+                24.0,
+                5.0,
+                -13.0
+              ]
+            ],
+            "closed": true
+          }
+        },
+        {
+          "id": "b_garrison/envelope",
+          "layer": "L1",
+          "fidelity": "recorded_envelope",
+          "note": "Recorded outer bounds before doors, windows, circulation or other openings. This is an envelope, not a solid building or block assembly.",
+          "geometry": {
+            "kind": "box",
+            "min": [
+              24.0,
+              5.0,
+              -13.0
+            ],
+            "size": [
+              15.0,
+              8.0,
+              7.0
+            ]
+          }
+        },
+        {
+          "id": "b_garrison/roof-profile",
+          "layer": "L1",
+          "fidelity": "reference_outline",
+          "note": "Recorded roofgeo.prof cross-section at the southwest edge. x/y axes use eaves-relative heights; the measured NS/EW convention records absolute plan heights. It is not extruded into a guessed hip, complete roof, overhang, thickness or voxel recipe.",
+          "geometry": {
+            "kind": "polyline",
+            "points": [
+              [
+                24.0,
+                13.0,
+                -6.0
+              ],
+              [
+                24.0,
+                16.5,
+                -9.5
+              ],
+              [
+                24.0,
+                13.0,
+                -13.0
+              ]
+            ],
+            "closed": false
+          }
+        }
+      ],
+      "omissions": [
+        "This adapter exports recorded envelopes, reference outlines and supported rectangular layers. Openings in walls, interiors, roof assembly, props, raster circles and other source drawing systems remain unmodelled."
+      ]
+    },
+    {
+      "id": "keep_roof31",
+      "name": "Keep lower roof walk and K5 slab",
+      "source_ref": "measurements/keep_roof31",
+      "stages": [
+        "tall"
+      ],
+      "primitives": [
+        {
+          "id": "keep_roof31/footprint",
+          "layer": "L2",
+          "fidelity": "reference_outline",
+          "note": "Recorded footprint bounds at the declared floor. Special shapes remain bounds only; this outline does not prescribe a solid floor.",
+          "geometry": {
+            "kind": "polyline",
+            "points": [
+              [
+                77.0,
+                31.0,
+                -92.0
+              ],
+              [
+                99.0,
+                31.0,
+                -92.0
+              ],
+              [
+                99.0,
+                31.0,
+                -114.0
+              ],
+              [
+                77.0,
+                31.0,
+                -114.0
+              ]
+            ],
+            "closed": true
+          }
+        },
+        {
+          "id": "keep_roof31/floor/31",
+          "layer": "floor/keep_roof31/31",
+          "fidelity": "exact_layer",
+          "note": "Recorded rectangular floor surface and applicable openings. Slab extends downward by the drawing's layer thickness, or the guide's declared one-small (0.5 m) thin-floor rule. Other drawing systems and unpositioned openings are outside this mask.",
+          "geometry": {
+            "kind": "slab",
+            "min": [
+              77.0,
+              30.5,
+              -114.0
+            ],
+            "size": [
+              22.0,
+              0.5,
+              22.0
+            ],
+            "openings": [
+              {
+                "min": [
+                  83.0,
+                  -102.0
+                ],
+                "size": [
+                  4.0,
+                  4.0
+                ]
+              },
+              {
+                "min": [
+                  89.0,
+                  -108.0
+                ],
+                "size": [
+                  4.0,
+                  4.0
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "omissions": [
+        "No declared envelope top; no body height was invented.",
+        "This adapter exports recorded envelopes, reference outlines and supported rectangular layers. Openings in walls, interiors, roof assembly, props, raster circles and other source drawing systems remain unmodelled."
+      ]
+    },
+    {
+      "id": "keep_stage36",
+      "name": "K6 floor at plan +36",
+      "source_ref": "measurements/keep_stage36",
+      "stages": [
+        "tall"
+      ],
+      "primitives": [
+        {
+          "id": "keep_stage36/footprint",
+          "layer": "L2",
+          "fidelity": "reference_outline",
+          "note": "Recorded footprint bounds at the declared floor. Special shapes remain bounds only; this outline does not prescribe a solid floor.",
+          "geometry": {
+            "kind": "polyline",
+            "points": [
+              [
+                80.0,
+                36.0,
+                -95.0
+              ],
+              [
+                96.0,
+                36.0,
+                -95.0
+              ],
+              [
+                96.0,
+                36.0,
+                -111.0
+              ],
+              [
+                80.0,
+                36.0,
+                -111.0
+              ]
+            ],
+            "closed": true
+          }
+        },
+        {
+          "id": "keep_stage36/floor/36",
+          "layer": "floor/keep_stage36/36",
+          "fidelity": "exact_layer",
+          "note": "Recorded rectangular floor surface and applicable openings. Slab extends downward by the drawing's layer thickness, or the guide's declared one-small (0.5 m) thin-floor rule. Other drawing systems and unpositioned openings are outside this mask.",
+          "geometry": {
+            "kind": "slab",
+            "min": [
+              80.0,
+              35.5,
+              -111.0
+            ],
+            "size": [
+              16.0,
+              0.5,
+              16.0
+            ],
+            "openings": [
+              {
+                "min": [
+                  83.0,
+                  -102.0
+                ],
+                "size": [
+                  4.0,
+                  4.0
+                ]
+              },
+              {
+                "min": [
+                  89.0,
+                  -108.0
+                ],
+                "size": [
+                  4.0,
+                  4.0
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "omissions": [
+        "No declared envelope top; no body height was invented.",
+        "This adapter exports recorded envelopes, reference outlines and supported rectangular layers. Openings in walls, interiors, roof assembly, props, raster circles and other source drawing systems remain unmodelled."
+      ]
+    },
+    {
+      "id": "measure_deep_sw",
+      "name": "Southwest Deep floor",
+      "source_ref": "measurements/measure_deep_sw",
+      "stages": [
+        "pit"
+      ],
+      "primitives": [
+        {
+          "id": "measure_deep_sw/footprint",
+          "layer": "W",
+          "fidelity": "reference_outline",
+          "note": "Recorded footprint bounds at the declared floor. Special shapes remain bounds only; this outline does not prescribe a solid floor.",
+          "geometry": {
+            "kind": "polyline",
+            "points": [
+              [
+                40.5,
+                -40.0,
+                -36.5
+              ],
+              [
+                53.0,
+                -40.0,
+                -36.5
+              ],
+              [
+                53.0,
+                -40.0,
+                -46.0
+              ],
+              [
+                40.5,
+                -40.0,
+                -46.0
+              ]
+            ],
+            "closed": true
+          }
+        },
+        {
+          "id": "measure_deep_sw/floor/-40",
+          "layer": "floor/measure_deep_sw/-40",
+          "fidelity": "exact_layer",
+          "note": "Recorded rectangular floor surface and applicable openings. Slab extends downward by the drawing's layer thickness, or the guide's declared one-small (0.5 m) thin-floor rule. Other drawing systems and unpositioned openings are outside this mask.",
+          "geometry": {
+            "kind": "slab",
+            "min": [
+              40.5,
+              -40.5,
+              -46.0
+            ],
+            "size": [
+              12.5,
+              0.5,
+              9.5
+            ],
+            "openings": []
+          }
+        }
+      ],
+      "omissions": [
+        "No declared envelope top; no body height was invented.",
+        "This adapter exports recorded envelopes, reference outlines and supported rectangular layers. Openings in walls, interiors, roof assembly, props, raster circles and other source drawing systems remain unmodelled."
+      ]
+    },
+    {
+      "id": "p_upper_s1",
+      "name": "Upper Ward parapet",
+      "source_ref": "walls/p_upper_s1",
+      "stages": [],
+      "primitives": [
+        {
+          "id": "p_upper_s1/wall-path",
+          "layer": "L2",
+          "fidelity": "reference_outline",
+          "note": "Source polyline is the wall centreline. height_total is an absolute plan top, as in the guide. Segment joins and openings remain an envelope.",
+          "geometry": {
+            "kind": "polyline",
+            "points": [
+              [
+                49.0,
+                10.0,
+                -84.5
+              ],
+              [
+                52.0,
+                10.0,
+                -84.5
+              ]
+            ],
+            "closed": false
+          }
+        }
+      ],
+      "omissions": [
+        "Wall thickness/absolute top is absent, or legacy parapet/revetment height semantics are mixed. Only the centreline is exported; no wall volume was invented.",
+        "This adapter exports recorded envelopes, reference outlines and supported rectangular layers. Openings in walls, interiors, roof assembly, props, raster circles and other source drawing systems remain unmodelled."
+      ]
+    },
+    {
+      "id": "r_upper",
+      "name": "Upper Ward terrace face",
+      "source_ref": "walls/r_upper",
+      "stages": [],
+      "primitives": [
+        {
+          "id": "r_upper/wall-path",
+          "layer": "L1",
+          "fidelity": "reference_outline",
+          "note": "Source polyline is the wall centreline. height_total is an absolute plan top, as in the guide. Segment joins and openings remain an envelope.",
+          "geometry": {
+            "kind": "polyline",
+            "points": [
+              [
+                36.5,
+                5.0,
+                -114.0
+              ],
+              [
+                36.5,
+                5.0,
+                -84.0
+              ],
+              [
+                99.5,
+                5.0,
+                -84.0
+              ],
+              [
+                99.5,
+                5.0,
+                -114.0
+              ]
+            ],
+            "closed": false
+          }
+        }
+      ],
+      "omissions": [
+        "Wall thickness/absolute top is absent, or legacy parapet/revetment height semantics are mixed. Only the centreline is exported; no wall volume was invented.",
+        "This adapter exports recorded envelopes, reference outlines and supported rectangular layers. Openings in walls, interiors, roof assembly, props, raster circles and other source drawing systems remain unmodelled."
+      ]
+    },
+    {
+      "id": "w_outer_w",
+      "name": "Outer curtain (west & north-west)",
+      "source_ref": "walls/w_outer_w",
+      "stages": [
+        "walls"
+      ],
+      "primitives": [
+        {
+          "id": "w_outer_w/wall-path",
+          "layer": "L1",
+          "fidelity": "recorded_envelope",
+          "note": "Source polyline is the wall centreline. height_total is an absolute plan top, as in the guide. Segment joins and openings remain an envelope.",
+          "geometry": {
+            "kind": "wall_path",
+            "points": [
+              [
+                20.5,
+                5.0,
+                -4.5
+              ],
+              [
+                4.5,
+                5.0,
+                -4.5
+              ],
+              [
+                4.5,
+                5.0,
+                -115.5
+              ],
+              [
+                36.5,
+                5.0,
+                -115.5
+              ]
+            ],
+            "thickness": 3.0,
+            "height": 12.0
+          }
+        }
+      ],
+      "omissions": [
+        "This adapter exports recorded envelopes, reference outlines and supported rectangular layers. Openings in walls, interiors, roof assembly, props, raster circles and other source drawing systems remain unmodelled."
+      ]
+    },
+    {
+      "id": "xp_barn",
+      "name": "Outer barn and fodder store",
+      "source_ref": "measurements/xp_barn",
+      "stages": [],
+      "primitives": [
+        {
+          "id": "xp_barn/footprint",
+          "layer": "L1",
+          "fidelity": "reference_outline",
+          "note": "Recorded footprint bounds at the declared floor. Special shapes remain bounds only; this outline does not prescribe a solid floor.",
+          "geometry": {
+            "kind": "polyline",
+            "points": [
+              [
+                -10.0,
+                5.0,
+                -40.0
+              ],
+              [
+                -2.0,
+                5.0,
+                -40.0
+              ],
+              [
+                -2.0,
+                5.0,
+                -58.0
+              ],
+              [
+                -10.0,
+                5.0,
+                -58.0
+              ]
+            ],
+            "closed": true
+          }
+        },
+        {
+          "id": "xp_barn/envelope",
+          "layer": "L1",
+          "fidelity": "recorded_envelope",
+          "note": "Recorded outer bounds before doors, windows, circulation or other openings. This is an envelope, not a solid building or block assembly.",
+          "geometry": {
+            "kind": "box",
+            "min": [
+              -10.0,
+              5.0,
+              -58.0
+            ],
+            "size": [
+              8.0,
+              5.5,
+              18.0
+            ]
+          }
+        },
+        {
+          "id": "xp_barn/roof-profile",
+          "layer": "L1",
+          "fidelity": "reference_outline",
+          "note": "Recorded roofgeo.prof cross-section at the southwest edge. x/y axes use eaves-relative heights; the measured NS/EW convention records absolute plan heights. It is not extruded into a guessed hip, complete roof, overhang, thickness or voxel recipe.",
+          "geometry": {
+            "kind": "polyline",
+            "points": [
+              [
+                -10.0,
+                10.5,
+                -40.0
+              ],
+              [
+                -6.0,
+                14.5,
+                -40.0
+              ],
+              [
+                -2.0,
+                10.5,
+                -40.0
+              ]
+            ],
+            "closed": false
+          }
+        }
+      ],
+      "omissions": [
+        "This adapter exports recorded envelopes, reference outlines and supported rectangular layers. Openings in walls, interiors, roof assembly, props, raster circles and other source drawing systems remain unmodelled."
+      ]
+    },
+    {
+      "id": "xp_exhibition",
+      "name": "Hall of Embervale · exhibition hall",
+      "source_ref": "measurements/xp_exhibition",
+      "stages": [],
+      "primitives": [
+        {
+          "id": "xp_exhibition/footprint",
+          "layer": "L1",
+          "fidelity": "reference_outline",
+          "note": "Recorded footprint bounds at the declared floor. Special shapes remain bounds only; this outline does not prescribe a solid floor.",
+          "geometry": {
+            "kind": "polyline",
+            "points": [
+              [
+                66.0,
+                5.0,
+                -122.0
+              ],
+              [
+                78.0,
+                5.0,
+                -122.0
+              ],
+              [
+                78.0,
+                5.0,
+                -130.0
+              ],
+              [
+                66.0,
+                5.0,
+                -130.0
+              ]
+            ],
+            "closed": true
+          }
+        },
+        {
+          "id": "xp_exhibition/envelope",
+          "layer": "L1",
+          "fidelity": "recorded_envelope",
+          "note": "Recorded outer bounds before doors, windows, circulation or other openings. This is an envelope, not a solid building or block assembly.",
+          "geometry": {
+            "kind": "box",
+            "min": [
+              66.0,
+              5.0,
+              -130.0
+            ],
+            "size": [
+              12.0,
+              8.5,
+              8.0
+            ]
+          }
+        },
+        {
+          "id": "xp_exhibition/roof-profile",
+          "layer": "L1",
+          "fidelity": "reference_outline",
+          "note": "Recorded roofgeo.prof cross-section at the southwest edge. x/y axes use eaves-relative heights; the measured NS/EW convention records absolute plan heights. It is not extruded into a guessed hip, complete roof, overhang, thickness or voxel recipe.",
+          "geometry": {
+            "kind": "polyline",
+            "points": [
+              [
+                66.0,
+                13.5,
+                -122.0
+              ],
+              [
+                66.0,
+                17.5,
+                -126.0
+              ],
+              [
+                66.0,
+                13.5,
+                -130.0
+              ]
+            ],
+            "closed": false
+          }
+        }
+      ],
+      "omissions": [
+        "This adapter exports recorded envelopes, reference outlines and supported rectangular layers. Openings in walls, interiors, roof assembly, props, raster circles and other source drawing systems remain unmodelled."
+      ]
+    },
+    {
+      "id": "xp_exhibition_loft",
+      "name": "Exhibition upper gallery",
+      "source_ref": "measurements/xp_exhibition_loft",
+      "stages": [
+        "flame"
+      ],
+      "primitives": [
+        {
+          "id": "xp_exhibition_loft/footprint",
+          "layer": "L1",
+          "fidelity": "reference_outline",
+          "note": "Recorded footprint bounds at the declared floor. Special shapes remain bounds only; this outline does not prescribe a solid floor.",
+          "geometry": {
+            "kind": "polyline",
+            "points": [
+              [
+                66.0,
+                9.0,
+                -122.0
+              ],
+              [
+                78.0,
+                9.0,
+                -122.0
+              ],
+              [
+                78.0,
+                9.0,
+                -130.0
+              ],
+              [
+                66.0,
+                9.0,
+                -130.0
+              ]
+            ],
+            "closed": true
+          }
+        },
+        {
+          "id": "xp_exhibition_loft/floor/9",
+          "layer": "floor/xp_exhibition_loft/9",
+          "fidelity": "exact_layer",
+          "note": "Recorded rectangular floor surface and applicable openings. Slab extends downward by the drawing's layer thickness, or the guide's declared one-small (0.5 m) thin-floor rule. Other drawing systems and unpositioned openings are outside this mask.",
+          "geometry": {
+            "kind": "slab",
+            "min": [
+              66.0,
+              8.5,
+              -130.0
+            ],
+            "size": [
+              12.0,
+              0.5,
+              8.0
+            ],
+            "openings": [
+              {
+                "min": [
+                  68.5,
+                  -127.5
+                ],
+                "size": [
+                  7.0,
+                  5.0
+                ]
+              },
+              {
+                "min": [
+                  66.5,
+                  -126.5
+                ],
+                "size": [
+                  2.0,
+                  4.0
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "omissions": [
+        "No declared envelope top; no body height was invented.",
+        "This adapter exports recorded envelopes, reference outlines and supported rectangular layers. Openings in walls, interiors, roof assembly, props, raster circles and other source drawing systems remain unmodelled."
+      ]
+    },
+    {
+      "id": "z_lane_jog",
+      "name": "z_lane_jog",
+      "source_ref": "zones/z_lane_jog",
+      "stages": [],
+      "primitives": [
+        {
+          "id": "z_lane_jog/footprint",
+          "layer": "L1",
+          "fidelity": "reference_outline",
+          "note": "Recorded footprint bounds at the declared floor. Special shapes remain bounds only; this outline does not prescribe a solid floor.",
+          "geometry": {
+            "kind": "polyline",
+            "points": [
+              [
+                22.0,
+                5.0,
+                -80.0
+              ],
+              [
+                36.0,
+                5.0,
+                -80.0
+              ],
+              [
+                36.0,
+                5.0,
+                -84.0
+              ],
+              [
+                22.0,
+                5.0,
+                -84.0
+              ]
+            ],
+            "closed": true
+          }
+        }
+      ],
+      "omissions": [
+        "No declared envelope top; no body height was invented.",
+        "This adapter exports recorded envelopes, reference outlines and supported rectangular layers. Openings in walls, interiors, roof assembly, props, raster circles and other source drawing systems remain unmodelled."
+      ]
+    }
+  ]
+}
