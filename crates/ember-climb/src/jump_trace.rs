@@ -22,6 +22,9 @@ static ENTITY_TABLE: AtomicUsize = AtomicUsize::new(0);
 static RECORDS: Ring = Ring::new();
 /// Records dropped at a busy/full queue or unavailable TLS. This diagnostic count may wrap.
 static DROPPED: AtomicU64 = AtomicU64::new(0);
+/// Intentionally omitted checks: zero native AL and no matching publication accessor.
+/// Atomic addition is defined to wrap; this counter never drives gameplay or queue admission.
+static UNPUBLISHED: AtomicU64 = AtomicU64::new(0);
 /// Copied scalar records retained between drain calls.
 const CAPACITY: usize = 32;
 /// Native recursion never requires an unbounded observer stack.
@@ -167,6 +170,11 @@ pub fn take() -> Option<Record> {
 /// Take and reset the diagnostic loss count with one atomic operation.
 pub fn take_dropped() -> u64 {
     DROPPED.swap(0, Ordering::Relaxed)
+}
+
+/// Take the count of deliberately omitted checks with no acceptance or observed publication.
+pub fn take_unpublished() -> u64 {
+    UNPUBLISHED.swap(0, Ordering::Relaxed)
 }
 
 /// One successful nonblocking claim; its release also runs on a Rust unwind.
@@ -448,6 +456,14 @@ unsafe fn observe_accepted(iterator: *mut u8, original: impl FnOnce() -> u8) -> 
         return native_al;
     }
     let frame = scope.frame();
+    if native_al == 0 && scope.missing.is_none() && frame.is_some_and(|frame| frame.calls == 0) {
+        // No native publication was observed. Keep informative accepted/missing/error cases,
+        // but do not fill the event queue or add native identity reads for these empty checks.
+        // This does not infer whether the player was idle or why the native helper refused.
+        drop(scope);
+        UNPUBLISHED.fetch_add(1, Ordering::Relaxed);
+        return native_al;
+    }
     let mut status = scope.missing.unwrap_or(SampleStatus::NoAccessor);
     let mut copied = None;
     if let Some(frame) = frame.filter(|frame| frame.calls != 0) {
@@ -710,6 +726,7 @@ mod tests {
         set_enabled(false);
         while take().is_some() {}
         take_dropped();
+        take_unpublished();
         ENTITY_TABLE.store(0, Ordering::Release);
         CURRENT.with(|current| {
             assert_eq!(current.get().depth, 0);
@@ -831,6 +848,19 @@ mod tests {
             observe_accepted(iterator, || {
                 observe_accessor(other_view, std::ptr::null_mut);
                 0
+            })
+        };
+        assert_eq!(take(), None);
+        assert_eq!(
+            take_unpublished(),
+            1,
+            "an unrelated accessor is not a publication"
+        );
+        // SAFETY: the same live owned fixture; accepted-but-missing data remains visible.
+        unsafe {
+            observe_accepted(iterator, || {
+                observe_accessor(other_view, std::ptr::null_mut);
+                1
             })
         };
         let ignored = accepted_record();
@@ -1162,5 +1192,88 @@ mod tests {
         );
         assert_eq!(result, 0xe1);
         assert_eq!(calls.get(), 1);
+    }
+
+    /// Empty rejected checks must not consume the bounded queue before an actionable event.
+    #[test]
+    fn unpublished_checks_cannot_fill_the_jump_record_queue() {
+        let _serial = reset();
+        let mut owner = Owner::new();
+        let (iterator, view, input) = owner.pointers();
+        let before_input = owner.input.clone();
+        let before_iterator = owner.iterator.clone();
+        let calls = Cell::new(0);
+        for _ in 0..128 {
+            // SAFETY: this synchronous fixture owns the whole iterator/view/input storage.
+            assert_eq!(
+                unsafe {
+                    observe_accepted(iterator, || {
+                        calls.set(calls.get() + 1);
+                        0
+                    })
+                },
+                0
+            );
+        }
+        assert_eq!(calls.get(), 128);
+        assert_eq!(
+            take(),
+            None,
+            "checks without publication must not flood the queue"
+        );
+        assert_eq!(
+            take_dropped(),
+            0,
+            "intentional omissions are distinct from lost events"
+        );
+        assert_eq!(take_unpublished(), 128);
+        assert_eq!(take_unpublished(), 0);
+        assert_eq!(owner.input, before_input);
+        assert_eq!(owner.iterator, before_iterator);
+        // A rejected helper which did invoke its publication accessor is still informative.
+        // SAFETY: matching initialized native-shaped owner; no real native function executes.
+        let result = unsafe {
+            observe_accepted(iterator, || {
+                observe_accessor(view, || input);
+                0
+            })
+        };
+        assert_eq!(result, 0);
+        let record = accepted_record();
+        assert!(!record.accepted && record.accessor_calls == 1);
+        assert_eq!(record.status, SampleStatus::Captured);
+        assert_eq!(take_unpublished(), 0);
+        // Accepted results without an accessor remain visible as missing-field observations.
+        // SAFETY: the same owned iterator remains live until this call completes.
+        assert_eq!(unsafe { observe_accepted(iterator, || 1) }, 1);
+        assert_eq!(accepted_record().status, SampleStatus::NoAccessor);
+        assert_eq!(take(), None);
+    }
+
+    /// Omission releases the inner lexical borrow before restoring an outer matching accessor.
+    #[test]
+    fn omitted_nested_check_restores_outer_publication_scope() {
+        let _serial = reset();
+        let mut outer = Owner::new();
+        let mut inner = Owner::new();
+        let (iterator, view, input) = outer.pointers();
+        let (nested, _, _) = inner.pointers();
+        // SAFETY: both fully initialized owned native-shaped owners remain alive and distinct.
+        let result = unsafe {
+            observe_accepted(iterator, || {
+                observe_accessor(view, || input);
+                assert_eq!(observe_accepted(nested, || 0), 0);
+                std::ptr::write_unaligned(input.add(REQUEST_TYPE), 13_u8);
+                std::ptr::write_unaligned(input.add(REQUEST_TIME).cast(), 77_i64);
+                1
+            })
+        };
+        assert_eq!(result, 1);
+        let record = accepted_record();
+        assert_eq!(record.status, SampleStatus::Captured);
+        assert_eq!(record.accessor_calls, 1);
+        assert_eq!(record.request.unwrap().time, 77);
+        assert_eq!(take(), None);
+        assert_eq!(take_unpublished(), 1);
     }
 }

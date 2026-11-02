@@ -983,6 +983,10 @@ fn drain_jump_observations() {
         };
         log::info!("{}", jump_observation_text(&record));
     }
+    let unpublished = crate::jump_trace::take_unpublished();
+    if unpublished != 0 {
+        log::info!("climb jump observations: omitted {unpublished} checks without accepted return or observed request publication");
+    }
     let dropped = crate::jump_trace::take_dropped();
     if dropped != 0 {
         log::info!("climb jump observations: {dropped} records dropped; correlation is incomplete");
