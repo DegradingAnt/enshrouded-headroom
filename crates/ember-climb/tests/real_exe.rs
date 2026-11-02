@@ -128,13 +128,54 @@ fn every_signature_matches_once(exe: &Exe) {
 /// the plan itself would refuse. So it cannot be applied twice.
 fn the_plan_applies(exe: &Exe) {
     let snapshot = exe.snapshot();
-    assert_eq!(plan::plan(&snapshot, false).unwrap().len(), 2);
+    assert_eq!(plan::plan(&snapshot, false).unwrap().len(), 3);
     let writes = plan::plan(&snapshot, true).unwrap();
-    assert_eq!(writes.len(), 3);
+    assert_eq!(writes.len(), 4);
     for write in &writes {
         let found = exe.read(write.addr, write.old.len()).unwrap();
         assert_eq!(found, write.old, "{}", write.what);
     }
+    // Pin the larger inline math range to its owned four-image locations and native unwind row.
+    let expected = match exe.label {
+        "1283531-steam" => 0x1_402f_0789,
+        "1283531-server" => 0x1_400d_c809,
+        "d7baa768-server" => 0x1_400d_8899,
+        _ => 0x1_402e_b5a9,
+    };
+    assert_eq!(snapshot.effort.addr, expected);
+    let (_, pdata) = exe.pe.section_va_bytes(&exe.bytes, ".pdata").unwrap();
+    let (begin, end, unwind) = pdata
+        .as_chunks::<12>()
+        .0
+        .iter()
+        .find_map(|entry| {
+            let begin = u32::from_le_bytes(entry[0..4].try_into().unwrap()) as usize
+                + exe.pe.image_base as usize;
+            let end = u32::from_le_bytes(entry[4..8].try_into().unwrap()) as usize
+                + exe.pe.image_base as usize;
+            let unwind = u32::from_le_bytes(entry[8..12].try_into().unwrap()) as usize
+                + exe.pe.image_base as usize;
+            (begin <= expected && expected + ember_climb::effort::SIZE <= end)
+                .then_some((begin, end, unwind))
+        })
+        .expect("inline span must remain in the original function's unwind range");
+    let header = exe.read(unwind, 4).unwrap();
+    assert!(expected >= begin + usize::from(header[1]));
+    assert!(end > expected);
+    let branches = |bytes: &[u8]| {
+        Decoder::with_ip(64, bytes, expected as u64, DecoderOptions::NONE)
+            .iter()
+            .filter(|instruction| instruction.op0_kind() == OpKind::NearBranch64)
+            .map(|instruction| instruction.near_branch_target())
+            .collect::<Vec<_>>()
+    };
+    let original_targets = branches(&ember_climb::effort::GAME);
+    let new_targets = branches(&ember_climb::effort::HOLD);
+    assert_eq!(
+        new_targets[1],
+        expected as u64 + ember_climb::effort::SIZE as u64
+    );
+    assert_eq!(new_targets[2], *original_targets.last().unwrap());
     let mut applied = snapshot;
     applied.wall_lost.bytes = plan::WALL_LOST_HOLD;
     assert!(plan::plan(&applied, false).is_err());

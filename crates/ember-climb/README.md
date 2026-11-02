@@ -14,7 +14,7 @@ The mod needs [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-L
 
 **No `plugins\ember-climb.log` after a game start?** The loader did not load the plugin. Check that `dinput8.dll` in the game folder is Ultimate ASI Loader. Other mods ship a file with the same name.
 
-ember-climb refuses to patch while it finds a conflicting installed binary name in the standard loader folders or sees ClimbAnywhere loaded, and the log says why. It goes by the names of loaded modules: anything with "climb anywhere" in its name in any spelling, `dinput8Hooked.dll`, or a `dinput8.dll` inside `plugins\`. If another mod uses one of those names, the log names the file. It looks again ten seconds after start-up, because a plugin can load after this one. It only reads directory and module names. It never opens another mod's binary. An unreadable module list refuses startup. The late check disables custom climbing, but the startup code patches remain until exit; restart after resolving a late conflict. Arbitrary hot-loading of another climbing mod is unsupported.
+ember-climb refuses to patch while it finds a conflicting installed binary name in the standard loader folders or sees ClimbAnywhere loaded, and the log says why. It goes by the names of loaded modules: anything with "climb anywhere" in its name in any spelling, `dinput8Hooked.dll`, or a `dinput8.dll` inside `plugins\`. If another mod uses one of those names, the log names the file. It looks again ten seconds after start-up, because a plugin can load after this one. It only reads directory and module names. It never opens another mod's binary. An unreadable module list refuses startup. The late check disables custom climbing, but the startup code patches, including the hanging-stamina floor, remain until exit; restart after resolving a late conflict. Arbitrary hot-loading of another climbing mod is unsupported.
 
 To remove the mod, delete those two files and the log.
 
@@ -38,9 +38,9 @@ ember-climb 0.1.0 loaded
 settings: <game folder>\plugins\ember-climb.ini
 build 1283531-steam
 all 15 signatures matched once
-wrote the wall-lost return at exe+0x24f4e5, the attachment store at exe+0x41fd08
+wrote the wall-lost return at exe+0x24f4e5, the attachment store at exe+0x41fd08, the wall-climb effort at exe+0x2f0789
 hooks: 10 enabled
-climbing is on: surface mask 0x124, plane tolerance 0.45 m, walkable below 50 degrees, stamina x1, a climb starts by walk, jump, sprint, diagnostics on
+climbing is on: surface mask 0x124, plane tolerance 0.45 m, walkable below 50 degrees, stamina x1, idle effort 0.5 m/s, a climb starts by walk, jump, sprint, diagnostics on
 ```
 
 If the mod stays off, the log says why in one line:
@@ -96,7 +96,7 @@ All settings are in `ember-climb.ini`, and all need a restart. A value that is n
 | Climb | Enabled | 1 | 0 or 1 | 0 leaves the game untouched. |
 | Climb | SurfaceMask | 0x124 | see below | Which colliders can be climbed. |
 | Climb | PlaneTolerance | 0.45 | 0.05 to 1 | How uneven a patch of surface may be to start a climb, in metres. |
-| Climb | StaminaMultiplier | 1 | 0 to 10 | Climbing stamina cost, as a multiple of the game's. 1 hooks nothing. |
+| Climb | StaminaMultiplier | 1 | 0 to 10 | Multiplier on the native climbing cost, including the minimum hanging effort. 1 keeps the base cost per metre. |
 | Start | Walk | 1 | 0 or 1 | Walking into a surface starts a climb. |
 | Start | Jump | 1 | 0 or 1 | Jumping or falling into one starts a climb. |
 | Start | Sprint | 1 | 0 or 1 | Sprinting into one starts a climb. |
@@ -109,6 +109,15 @@ All settings are in `ember-climb.ini`, and all need a restart. A value that is n
 | Debug | Diagnostics | 1 | 0 or 1 | The one-line-a-second log. It also adds five small hooks. |
 
 `SurfaceMask` is a sum of these bits, in hex or decimal: `0x4` terrain and player walls, `0x20` rock props, `0x100` iron lattices, `0x8` other solid props such as trees. Other bits are refused. Bits 0 and 1 are other copies of the terrain, and asking for them gives a different surface per ray.
+
+
+## Stamina
+
+Stationary clinging now has a minimum effort equivalent to moving at 0.5 m/s. At the unmodified native cost of 8 points/metre, that is 4 stamina points/second before the game's food, equipment, skill and cost modifiers. Slow movement pays at least this effort. Normal movement above the minimum keeps its existing charge, without an extra hanging fee. The mod does not increase movement speed or replace the stamina bar.
+
+This uses the game's simulation duration and its existing depletion accumulator, fractional carry, exhaustion and recharge rules. It does not write the movement component or current stamina directly. The same rule applies to ordinary wall lattices; ladders and other stamina programs stay unchanged. Normal stop/cooldown clears the native wall-climb state, so it no longer pays the hanging cost. A possible native exit-cleanup scheduling edge is not separately overridden.
+
+The inline calculation needs SSE4.1. Startup refuses every climbing patch on a CPU without it. The whole native calculation is checked against the four admitted executable images before any write. Gameplay balance and client/server stamina agreement still need the first test.
 
 ## Controller input
 
@@ -131,9 +140,11 @@ The game already climbs, but only on flat iron lattices. Its wall probe wants fo
 
 Evidence for every game fact is in [docs/re-notes.md](../../docs/re-notes.md), "Free climbing".
 
+The [balance and animation research](DESIGN.md) records the hanging-stamina and IK work. The minimum hanging effort is implemented in this test candidate. Surface IK remains under development and is not enabled.
+
 ## First play test
 
-Start with a private offline world. Check a tall vertical wall, a leaning rock face, sideways movement, jump-off near a flat top, stamina, and an ordinary iron lattice. Natural rock must not trigger an automatic climb-up animation; leave it with the normal Jump control. Lattices should still top out normally. Repeat with the controller. Keep `ember-climb.log`, especially if a grab fails, a hold drops, or the character tries to mantle too soon. Failed entry attempts are logged at most once every thirty seconds; idle checks stay quiet.
+Start with a private offline world. Check a tall vertical wall, a leaning rock face, sideways movement, jump-off near a flat top, and an ordinary iron lattice. Near the ground, verify that the stamina bar drains while still, that slow and normal movement cost appropriately, that exhaustion releases the hold, and that food/equipment modifiers and recovery behave normally. Natural rock must not trigger an automatic climb-up animation; leave it with the normal Jump control. Lattices should still top out normally. Repeat with the controller. Keep `ember-climb.log`, especially if a grab fails, a hold drops, or the character tries to mantle too soon. Failed entry attempts are logged at most once every thirty seconds; idle checks stay quiet.
 
 The client and server use the same plugin and settings. Test multiplayer only after the offline session works. This package is a candidate; native-file checks and simulated climbs do not establish runtime reliability.
 
@@ -143,7 +154,7 @@ The client and server use the same plugin and settings. Test multiplayer only af
 - Seam forgiveness is unavailable. A complete loss of the hold rays drops the climber without a timed grace period. The pure proposed grace model needs proven initialization and lifecycle ownership before a later build can enable it.
 
 - A surface must reach 2 m above your feet to start a climb. A lower wall starts nothing, and neither does a ledge you jump at when it is less than 2 m above your feet at that moment. Use the game's jump there. This may change after the first play test.
-- Rough or short shelves can still stop upward movement; the native controller/collision test remains authoritative. The former 1.2 m hold/move reach mismatch is corrected, including the clean 0.7–0.8 m bench cases in the model. Further geometry limits need a play test.
+- Rough or short shelves can still stop upward movement; the native controller/collision test remains authoritative. The former 1.2 m hold/move reach mismatch is corrected, including the clean 0.7 to 0.8 m bench cases in the model. Further geometry limits need a play test.
 - Earlier model observations before the reach correction: a short walkable shelf in a face can stop you while the stick is up. In the simulation a flat shelf of 0.2 to 0.8 m in a 60 degree face does this, and so does one of 0.5 to 0.9 m in a sheer wall. On the 60 degree face a shelf of 1 m or more ends in a mantle. Go sideways or go down, or jump off.
 - A long slope close to `WalkableAngle` does not end the climb. With the default of 50 that is a slope of 47 to 50 degrees. You can walk on it, but the mod reads it as the face going on, so no mantle comes. Go sideways, go down or jump off.
 

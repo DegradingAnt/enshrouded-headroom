@@ -3,7 +3,7 @@
 //! gliding into a steep surface.
 //!
 //! The game already climbs, but only on flat iron lattices. Its wall probe wants four rays with
-//! one exact normal. This mod lets that probe run first, so a lattice stays exactly vanilla. When
+//! one exact normal. This mod lets that probe run first, so a lattice keeps its native geometry answer. When
 //! the probe fails it fits a patch of the surface instead ([`surface`]), and steers the climber
 //! along it, because the game moves a climber along world up. [`exit`] ends a climb cleanly where a
 //! wall turns walkable.
@@ -15,6 +15,7 @@
 pub mod coexist;
 pub mod config;
 pub mod diag;
+pub mod effort;
 pub mod exit;
 pub mod game;
 pub mod geom;

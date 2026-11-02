@@ -2395,7 +2395,7 @@ There is no new persistent state, native offset, setting, collision bypass or ti
 
 The inert hook-flow regression exercises the actual movement/probe detours. Closed-loop tests cover
 up/down/side input at120/60/20Hz, convergence within the existing0.03m stand-off deadband, and the
-formerly trapped clean leaning benches0.7–0.8m wide. Fresh invalid slopes, rough fits, missing geometry
+formerly trapped clean leaning benches0.7 to 0.8m wide. Fresh invalid slopes, rough fits, missing geometry
 and the ordinary range limit remain refusals. These are algorithm/fixture results, not live physics
 or controller acceptance. Native grace and automatic natural top-outs remain unavailable.
 
@@ -2403,3 +2403,126 @@ This supersedes the earlier current-stall claim and historical receipt name
 `a_bench_in_a_leaning_face_can_hold_the_climber`; the new regression is
 `a_leaning_bench_no_longer_traps_all_movement`. Earlier rough-bench outcome counts are not a new
 performance or behavior measurement for this candidate.
+
+### W52 native IK feasibility follow-up
+
+[VERIFIED] The current client contains a complete target-table and generic chain-solver path.
+Dispatcher0x926d00 sends node type60 to0x929d10, which consumes the instance target table and calls
+shared solver0x9427c0 -> FABRIK0x934340. Twenty target/setup/retarget functions have complete matching
+previous-build instruction shapes after relocation. The solver path has additional cold/generated
+code differences; its location is corroborated by current dispatch/calls, not claimed exact old/new
+body equivalence. No arbitrary-target ABI is admitted by this finding.
+
+[VERIFIED] The target table is a pointer at instance+0x1a0, with0x90-byte entries. Entry+0x60 selects
+coordinate space; it is not an activation flag. Indexed setters check the chain count, but some
+argument payloads are dereferenced before that check. Their optional payload layouts, matrix source,
+pose ownership and scheduler phase still need typed caller proof.
+
+[VERIFIED] Both retained resource snapshots have2944 nodes, six valid chain declarations and102-joint
+hierarchies. Chains70->74 and40->44 end at the reflected PalmR/PalmL slots. Neither graph declares a
+type60 generic IK node. Their single BipedFeet node selects the four leg/foot chains, excluding the
+arms. Three Retarget nodes carry hand index pairs44/95 and74/65, but native AutoHandIK is bone-to-bone
+retargeting. Ground-foot correction uses downward probes and model up. Neither path establishes
+wall-oriented contact placement. Writing target slots alone has no demonstrated hand consumer here.
+
+[UNKNOWN] These old on-disk resource dumps lack an executable/entity/role/timing envelope. Their
+exact local-player/climb-active provenance and executed-node phases are uncorroborated. The graph
+census does not establish that every live player graph lacks a generic solver. A bounded read-only
+sample tying actor, graph, chain/cache ownership and final pose phase is the next evidence step.
+No live sampling, pose writes, new library or production IK binding occurred in this investigation.
+Keep native animations until those contracts and a finite contact/solver budget are established.
+
+Receipt: private W52 ik-followup/FEASIBILITY.md SHA256
+BA4E9D449C37C9022B355463BFC9E403DB992C7010D29E49CD48A106224C4144;
+native-ik-map.json1882894FEAB4AE9863F0B5B55AB1A4FE447A0708BB251660D8C2BC4DC56DFF06;
+captured-graph-facts.json6EA1B866994A3263AEAC3C009AE6766F9CAE5D2A5846C3CB2A753FFDC9FC0C5A;
+current-flow.jsonF9816C215852C58BD2CFA237B8D207DBA2E91268182FF26D366D6EDF1AE08CE1.
+The current image identity is the W52 client0403981f... pinned above. Only owned-game artifacts were
+examined. No third-party climbing code or assets were used.
+
+### W52 capsule-query frontier follow-up
+
+[VERIFIED] Native capsule overlap core0x31e70 (server0x146d0,832 bytes) and motion core0x307f0
+(server0x13050,1221 bytes) normalize across all four owned images. The overlap collector increments
+an observed-hit counter before capacity checks. A zero-capacity result vector with no growth callback
+can count contacts without storing/enriching them. The native wrapper constructs an embedded capsule
+with radius and half-cylinder-length, then uses the native broadphase/body filter interfaces.
+
+[UNKNOWN] The high-level query retries its world-reader lock without a deadline. Calling the lower
+core still needs actual body/broadphase lock-interface, reentrancy and climb-thread ownership proof.
+Zero observed contacts describes the available physics scene; it has no unloaded/pending-mesh status.
+A translation sweep also does not establish clearance for an entire curved or rotating mantle path.
+No query binding is admitted. Natural-wall automatic top-outs remain disabled.
+Receipt: private W52 capsule-narrow-frontier.md SHA256
+7E52723B4A53CA6BD4A2A44221EBB0100B87307E2365D57960CE7AB5BBD460DD.
+
+### W52 hanging-stamina calculation contract
+
+[VERIFIED] The owned wall-climb stamina program gates on Climb.type=Wall(1), a nonzero climb state,
+and absence of Actor.ClimbingTransition(35). Ladders do not enter its debit. It reads Velocity and
+the simulation tick duration, multiplies each velocity component by dt, and skips debit AND the
+Exhausted stop branch when all three distances are at most1e-20 in magnitude. Its normal movement
+charge is8 points/metre times the native attribute modifier; native finalize/exhaustion handling
+remains downstream. An idle floor therefore belongs before the motion-only early-out, not in the
+optional cost-getter multiplier hook.
+
+[VERIFIED] The duration getter returns the context's signed int64 nanoseconds. Native conversion is
+double(ns)*1e-9, then float. Any nonzero input is a finite normal float with absolute value between
+about1e-9 and9.22e9 seconds. Subtracting0x00800000 from its IEEE754 exponent bits therefore halves it
+exactly. Zero must branch before that subtraction. Squared half-dt is at least about2.5e-19 for any
+nonzero duration; it exceeds the existing1e-20 early-out tolerance. Negative duration uses abs(dt)
+for charged distance, matching the native distance-length sign behavior.
+
+[VERIFIED] An82-byte calculation span begins0x1d5 bytes before the existing STAMINA_CALL signature.
+The entire original span, including its last JAE displacement0x223, is identical in all four images.
+No decoded direct branch/call targets any interior byte; the program has no indirect transfer. The
+span remains inside its existing function-body unwind region, past the147-byte prologue. EAX is dead
+on both exits until a metadata reload or a native call overwrites it. The upper lanes of XMM6/9/10
+are not externally stored; downstream uses their scalar values, and the epilogue restores their
+original caller values. XMM0/1 and flags are scratch across this boundary. RSP and all other GPRs
+must remain unchanged.
+
+| Image | Span start | Native debit body | Next-entity block |
+|---|---|---|---|
+| Previous client | 0x2eb5a9 | 0x2eb5fb | 0x2eb81e |
+| Current client | 0x2f0789 | 0x2f07db | 0x2f09fe |
+| Previous server | 0xd8899 | 0xd88eb | 0xd8b0e |
+| Current server | 0xdc809 | 0xdc85b | 0xdca7e |
+
+The proposed owned replacement stays within these82 bytes. It computes the native squared distance
+order(y*y+x*x)+z*z with DPPS, then compares it with squared half-dt. Fast or unordered movement keeps
+the original local distances. Below the floor it sets a local distance of abs(dt)*0.5 and clears the
+other two local scalar distances. It never writes Velocity, current Stamina, or a persistent marker.
+The original native attribute, accumulator, exhaustion, UI and authority paths still run. This
+chosen minimum effort also applies to ordinary wall lattices. It does not change ladders or other
+stamina programs. Default StaminaMultiplier remains1.
+
+DPPS needs SSE4.1. Startup must refuse all climbing writes on a CPU without it. All original bytes
+must match before any write, and the existing checked-write rollback must include the entire span.
+The new next-entity JAE ends15 bytes earlier, so its displacement becomes0x232. The branch for zero
+duration goes directly to that JAE with CF cleared by TEST. There is no new mid-function call,
+external assembly adapter, stack change, unwind registration or Rust extern body.
+
+The balance choice is4 stamina points/second while motionless before native modifiers, equivalent to
+0.5m/s at the existing8points/m. It is not a discovered vanilla idle cost. Gameplay balance and live
+client/server exhaustion acceptance still require the author's later play test.
+Receipt: private W52 stamina-followup full four-image program/iterator/attribute evidence and site
+contracts. This is static owned-game evidence; no game or third-party mod was executed.
+
+The completed private stamina-native-contract.md has SHA256
+FA3184785769A653C45F979B5BB3E7D40256EB99389EE3245B2EE9AC5FFBEECB.
+Its verifier checks all324 interior absolute addresses, overlapping direct-transfer positions and
+eight successor paths. Native STOP clears type/state immediately; state3 is Exit, not cooldown.
+Enter/Exit animations are gated by ClimbingTransition35. A possible Exit3/flag-cleared scheduling
+edge before native wall cleanup is not separately overridden or claimed zero-cost.
+
+The native finalizer keeps fractional depletion remainder before subtracting integer stamina through
+its property. Recharge compares its cached previous stamina with current stamina; an observed debit
+resets its timestamp, fractional recharge and cache. CanRecharge25 and inventory gates remain native.
+No fixed recharge-delay value or unconditional ban on recharge is invented here.
+
+The inline effort patch is a startup code patch. Runtime ACTIVE=false does not restore its math;
+it remains until exit after a late conflict, like the existing startup hold patches. Enabled=0 and
+startup refusals install none of these bytes. Checked rollback now also attempts the failed range
+when a write's read-back is unconfirmed; any failed restoration is named instead of claiming that
+the range was never written. The read-back regression failed before this correction.

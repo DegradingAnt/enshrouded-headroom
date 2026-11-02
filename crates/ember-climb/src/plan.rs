@@ -1,16 +1,18 @@
 //! The bytes this mod writes into the game, and the check that each site holds what it should.
 //!
-//! Almost everything here is a hook, which leaves the game's own climb bytes alone. Three sites are
-//! written, because no hook can reach them:
+//! Almost everything here is a hook, which leaves the game's own climb bytes alone. Four sites are
+//! written at startup, because no function hook reaches them:
 //! - the wall-lost return, so a voxel surface (hit id 0) does not read as "wall lost";
 //! - the attachment store, so that return's stand-in value never enters the game's data;
-//! - with `Glide = 1` only, the layer of the request to start climbing.
+//! - with `Glide = 1` only, the layer of the request to start climbing;
+//! - the local distance calculation, to give stationary clinging a small native stamina cost.
 //!
 //! The plan is pure. It runs the same on the bytes of a running game and on the bytes of an exe
 //! file on disk, so the real-exe tests prove the plan the game will run.
 
 use emberkit::patch::{rel32_target, PatchError, Patched};
 
+use crate::effort;
 use crate::sigs::{Found, Sig, ATTACH_STORE, ENTER_LAYER, WALL_LOST_RET};
 
 /// The length of a `call rel32`.
@@ -75,6 +77,8 @@ pub struct Snapshot {
     pub attach: Site<19>,
     /// The layer byte.
     pub layer: Site<1>,
+    /// The native wall-climb distance calculation.
+    pub effort: Site<{ effort::SIZE }>,
 }
 
 /// One checked write.
@@ -118,6 +122,16 @@ pub fn snapshot(
         wall_lost: site(found, &WALL_LOST_RET, WALL_LOST_AT, &read)?,
         attach: site(found, &ATTACH_STORE, 0, &read)?,
         layer: site(found, &ENTER_LAYER, LAYER_AT, &read)?,
+        effort: {
+            let addr = found
+                .address(&crate::sigs::STAMINA_CALL)?
+                .checked_sub(effort::BEFORE_COST)
+                .ok_or("the wall-climb effort address underflows")?;
+            let bytes = read(addr, effort::SIZE)
+                .and_then(|bytes| <[u8; effort::SIZE]>::try_from(bytes).ok())
+                .ok_or_else(|| format!("cannot read the wall-climb effort at {addr:#x}"))?;
+            Site { addr, bytes }
+        },
     })
 }
 
@@ -187,6 +201,13 @@ pub fn plan(snapshot: &Snapshot, glide: bool) -> Result<Vec<Write>, String> {
             &snapshot.layer.bytes,
         );
     }
+    if snapshot.effort.bytes != effort::GAME {
+        return refuse(
+            "the wall-climb effort",
+            snapshot.effort.addr,
+            &snapshot.effort.bytes,
+        );
+    }
     let mut writes = vec![
         Write {
             what: "the wall-lost return",
@@ -209,11 +230,17 @@ pub fn plan(snapshot: &Snapshot, glide: bool) -> Result<Vec<Write>, String> {
             new: vec![LAYER_GLIDE],
         });
     }
+    writes.push(Write {
+        what: "the wall-climb effort",
+        addr: snapshot.effort.addr,
+        old: effort::GAME.to_vec(),
+        new: effort::HOLD.to_vec(),
+    });
     Ok(writes)
 }
 
-/// Make `writes` in order with `write(addr, old, new)`. If one fails, the writes before it are put
-/// back, last first. `Err` names the write that failed and says what was put back.
+/// Make `writes` in order with `write(addr, old, new)`. If one fails, preceding writes are put
+/// back, last first. A failed read-back also attempts to restore that range. `Err` names failures.
 pub fn apply_with(
     writes: &[Write],
     mut write: impl FnMut(usize, &[u8], &[u8]) -> Result<Patched, PatchError>,
@@ -222,9 +249,22 @@ pub fn apply_with(
         let Err(error) = write(failed.addr, &failed.old, &failed.new) else {
             continue;
         };
-        let back = undo_with(writes.get(..done).unwrap_or_default(), &mut write);
+        // ReadBack means the failed range may already hold our bytes. Include it in checked
+        // rollback; an unexpected range is named by undo_with rather than overwritten blindly.
+        let unconfirmed = matches!(error, PatchError::ReadBack);
+        let restore = if unconfirmed {
+            writes.get(..=done)
+        } else {
+            writes.get(..done)
+        };
+        let back = undo_with(restore.unwrap_or_default(), &mut write);
+        let status = if unconfirmed {
+            "not confirmed"
+        } else {
+            "not written"
+        };
         return Err(format!(
-            "{} at {:#x} was not written: {error}; {back}",
+            "{} at {:#x} was {status}: {error}; {back}",
             failed.what, failed.addr
         ));
     }
@@ -243,7 +283,7 @@ pub fn undo_with(
         }
     }
     if stuck.is_empty() {
-        format!("the {} writes before it were put back", writes.len())
+        format!("the {} checked writes were put back", writes.len())
     } else {
         format!("could not put back: {}", stuck.join(", "))
     }
@@ -267,6 +307,10 @@ mod tests {
                 addr: 0x1_4041_8db8,
                 bytes: ATTACH_GAME,
             },
+            effort: Site {
+                addr: 0x1_402e_b5a9,
+                bytes: effort::GAME,
+            },
             layer: Site {
                 addr: 0x1_4041_9947,
                 bytes: [LAYER_GAME],
@@ -281,11 +325,11 @@ mod tests {
             .collect()
     }
 
-    /// Without the glider, exactly the two hold sites are written, with the planned bytes.
+    /// The default plan writes the two hold sites and the native idle effort.
     #[test]
-    fn the_plan_writes_the_two_hold_sites() {
+    fn the_plan_writes_the_hold_sites_and_idle_effort() {
         let writes = plan(&game(), false).unwrap();
-        assert_eq!(writes.len(), 2);
+        assert_eq!(writes.len(), 3);
         assert_eq!(writes[0].addr, 0x1_4024_b4a5);
         assert_eq!(writes[0].old, WALL_LOST_GAME);
         assert_eq!(writes[0].new, WALL_LOST_HOLD);
@@ -294,11 +338,23 @@ mod tests {
         assert_eq!(writes[1].new, ATTACH_HOLD);
     }
 
+    /// The default installation must include the idle effort in its checked, reversible writes.
+    #[test]
+    fn the_plan_includes_idle_effort() {
+        let writes = plan(&game(), false).unwrap();
+        let effort = writes
+            .iter()
+            .find(|write| write.what == "the wall-climb effort")
+            .expect("idle effort must be part of the actual install plan");
+        assert_eq!(effort.old, crate::effort::GAME);
+        assert_eq!(effort.new, crate::effort::HOLD);
+    }
+
     /// The layer changes only when the player asked for the glider.
     #[test]
     fn the_layer_is_written_only_for_the_glider() {
         let writes = plan(&game(), true).unwrap();
-        assert_eq!(writes.len(), 3);
+        assert_eq!(writes.len(), 4);
         assert_eq!(writes[2].addr, 0x1_4041_9947);
         assert_eq!(writes[2].old, [0x13]);
         assert_eq!(writes[2].new, [0x10]);
@@ -498,6 +554,7 @@ mod tests {
             "WALL_LOST_RET" => Ok(1000),
             "ATTACH_STORE" => Ok(2000),
             "ENTER_LAYER" => Ok(3000),
+            "STAMINA_CALL" => Ok(4000),
             _ => Ok(0),
         })
         .unwrap();
@@ -505,6 +562,7 @@ mod tests {
         assert_eq!(snap.wall_lost.addr, 1026);
         assert_eq!(snap.attach.addr, 2000);
         assert_eq!(snap.layer.addr, 3018);
+        assert_eq!(snap.effort.addr, 4000 - effort::BEFORE_COST);
     }
 
     /// A site that cannot be read refuses the plan and names it.
@@ -535,7 +593,7 @@ mod tests {
             })
         })
         .unwrap();
-        assert_eq!(seen.len(), 3);
+        assert_eq!(seen.len(), 4);
         assert_eq!(seen[1].1, ATTACH_GAME);
         assert_eq!(seen[1].2, ATTACH_HOLD);
     }
@@ -548,7 +606,7 @@ mod tests {
         let error = apply_with(&writes, |addr, old, new| {
             log.push((addr, new.to_vec()));
             if addr == 0x1_4041_9947 {
-                Err(PatchError::ReadBack)
+                Err(PatchError::Protect(5))
             } else {
                 Ok(Patched {
                     addr,
@@ -562,7 +620,7 @@ mod tests {
         assert_eq!(log[4], (0x1_4024_b4a5, WALL_LOST_GAME.to_vec()));
         assert!(error.contains("the enter layer"), "{error}");
         assert!(
-            error.contains("the 2 writes before it were put back"),
+            error.contains("the 2 checked writes were put back"),
             "{error}"
         );
     }
@@ -624,5 +682,88 @@ mod tests {
         assert_eq!(in_exe(0x1_4000_0000, 0x1_4000_1000), "exe+0x1000");
         assert_eq!(in_exe(0x1_4000_0000, 0x1000), "0x1000");
         assert_eq!(in_exe(0, 0x1000), "0x1000");
+    }
+
+    /// A change anywhere in the native calculation refuses every write, including hold patches.
+    #[test]
+    fn every_effort_byte_is_guarded_before_any_write() {
+        for index in 0..effort::SIZE {
+            let mut changed = game();
+            changed.effort.bytes[index] ^= 1;
+            let error = plan(&changed, false).unwrap_err();
+            assert!(error.contains("wall-climb effort") && error.contains("nothing was changed"));
+        }
+    }
+
+    /// Failure at the effort write restores the preceding glider and hold writes in reverse order.
+    #[test]
+    fn a_failed_effort_write_rolls_back_the_whole_install() {
+        let writes = plan(&game(), true).unwrap();
+        let mut calls = Vec::new();
+        let error = apply_with(&writes, |addr, old, new| {
+            calls.push((addr, new.to_vec()));
+            if addr == game().effort.addr {
+                Err(PatchError::Protect(5))
+            } else {
+                Ok(Patched {
+                    addr,
+                    original: old.to_vec(),
+                })
+            }
+        })
+        .unwrap_err();
+        assert_eq!(calls.len(), 7);
+        assert_eq!(calls[4], (game().layer.addr, vec![LAYER_GAME]));
+        assert_eq!(calls[5], (game().attach.addr, ATTACH_GAME.to_vec()));
+        assert_eq!(calls[6], (game().wall_lost.addr, WALL_LOST_GAME.to_vec()));
+        assert!(error.contains("the 3 checked writes were put back"));
+    }
+
+    /// A failed confirmation may already have changed the failed range, so restore that one too.
+    #[test]
+    fn a_readback_failure_also_attempts_to_restore_the_failed_effort_site() {
+        let writes = plan(&game(), true).unwrap();
+        let mut calls = Vec::new();
+        let mut rejected = false;
+        let error = apply_with(&writes, |addr, old, new| {
+            calls.push((addr, new.to_vec()));
+            if addr == game().effort.addr && !rejected {
+                rejected = true;
+                Err(PatchError::ReadBack)
+            } else {
+                Ok(Patched {
+                    addr,
+                    original: old.to_vec(),
+                })
+            }
+        })
+        .unwrap_err();
+        assert_eq!(
+            calls.len(),
+            8,
+            "failed range must be included in checked rollback"
+        );
+        assert_eq!(calls[4], (game().effort.addr, effort::GAME.to_vec()));
+        assert!(error.contains("not confirmed"), "{error}");
+    }
+
+    /// If the failed range cannot be restored, the error must name it instead of claiming success.
+    #[test]
+    fn an_unrestorable_effort_range_is_reported() {
+        let writes = plan(&game(), false).unwrap();
+        let error = apply_with(&writes, |addr, old, _| {
+            if addr == game().effort.addr {
+                Err(PatchError::ReadBack)
+            } else {
+                Ok(Patched {
+                    addr,
+                    original: old.to_vec(),
+                })
+            }
+        })
+        .unwrap_err();
+        assert!(error.contains("not confirmed") && error.contains("could not put back"));
+        assert!(error.contains("wall-climb effort"));
+        assert!(!error.contains("checked writes were put back"));
     }
 }

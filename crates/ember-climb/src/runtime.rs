@@ -23,6 +23,7 @@ use windows_sys::Win32::System::LibraryLoader::{
 use crate::coexist;
 use crate::config::{self, Settings, INI_FILE_NAME};
 use crate::diag;
+use crate::effort;
 use crate::hooks as detours;
 use crate::plan;
 use crate::sigs;
@@ -132,7 +133,7 @@ pub fn summary(settings: &Settings) -> String {
     };
     format!(
         "climbing is on: surface mask {:#x}, plane tolerance {} m, walkable below {} degrees, \
-         stamina x{}, a climb starts by {starts}, diagnostics {}",
+         stamina x{}, idle effort 0.5 m/s, a climb starts by {starts}, diagnostics {}",
         settings.surface_mask,
         settings.plane_tolerance,
         settings.walkable_angle,
@@ -157,12 +158,13 @@ fn find_signatures() -> Result<sigs::Found, String> {
 /// queue is enabled last, and the detours only act after that, so a failure at any point leaves
 /// them forwarding to the game.
 fn install(settings: &Settings) -> Result<String, String> {
+    effort::require_cpu(std::is_x86_feature_detected!("sse4.1"))?;
     let found = find_signatures()?;
     log::info!("all {} signatures matched once", sigs::ALL.len());
     let base = main_module().base;
     let snapshot = plan::snapshot(&found, base, |addr, len| {
         // SAFETY: start-up only, on one thread, before the game runs. Each address is inside a
-        // signature match or just past it, in `.text`, and `read_checked` checks the range.
+        // signature match or its proven offset in `.text`. `read_checked` checks the full range.
         unsafe { read_checked(addr, len) }.ok()
     })?;
     let writes = plan::plan(&snapshot, settings.glide)?;
@@ -408,7 +410,7 @@ mod tests {
         assert_eq!(
             summary(&Settings::default()),
             "climbing is on: surface mask 0x124, plane tolerance 0.45 m, walkable below 50 \
-             degrees, stamina x1, a climb starts by walk, jump, sprint, diagnostics on"
+             degrees, stamina x1, idle effort 0.5 m/s, a climb starts by walk, jump, sprint, diagnostics on"
         );
     }
 

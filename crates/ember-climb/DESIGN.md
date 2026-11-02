@@ -1,0 +1,55 @@
+# Climbing balance and animation
+
+The author wants reliable climbing that feels like part of Enshrouded. Hanging must cost stamina. Existing food, skills, equipment, movement speed and fall risk must still matter. This is a design and research record, not a claim that the unfinished native bindings work.
+
+## Lessons from other games
+
+| Primary source | Useful lesson | Choice for ember-climb |
+|---|---|---|
+| [Nintendo's Breath of the Wild adventure guide, tip 6](https://www.nintendo.com/jp/zelda/botw/guide/index.html) | Intermediate footholds, stamina food and a different route can make a climb possible. | Preserve Enshrouded's stamina progression. Rest on safe footing through its normal systems. This source does not establish a stationary hanging cost. |
+| [Jusant's creative directors on the climbing system](https://dont-nod.com/en/scaling-new-heights-learn-more-about-jusants-innovative-climbing-system/) | Route choice, clear control and finite stamina make climbing readable. Its ropes and pitons reduce the cost of falling. | Keep the game's existing stick and Jump controls. Use visible native stamina pressure. New ropes, checkpoints and per-hand buttons are outside this change. |
+| [Funcom's original Conan Exiles climbing update](https://www.conanexiles.com/blog/update-28-climbing-exploration-system/) | Stamina limits height; exhaustion ends a climb, while equipment affects endurance. | Keep meaningful endurance and native exhaustion. Do not import its armor penalties or new crafting recipes. The article describes its 2017 design, not current balance values. |
+
+These are design references. No code, animations or assets from those games are included.
+
+## Stamina rule in the test candidate
+
+The owned executable's climbing program charges for distance moved. At zero movement it skips both the debit and the exhaustion check. Raising the existing per-metre cost cannot fix free stationary hanging because that cost getter is never called on an idle tick.
+
+The implemented rule is a minimum climbing effort. Each simulation tick charges for the greater of actual movement and a small reference movement over that tick:
+
+```text
+charged distance = max(native movement distance, idle reference speed * native tick duration)
+```
+
+A reference speed of 0.5 metres per second is the first test tuning point. With the game's unmodified base cost of 8 stamina points per metre, that is 4 points per second before its normal modifiers. The floor is a chosen balance value, not a discovered vanilla idle rule. Normal full-speed movement keeps its existing cost. Slow movement pays at least the hanging cost, without adding a second charge on top of movement.
+
+The native stamina accumulator, attribute modifiers, exhaustion transition and UI must remain authoritative. Tick replay must reproduce the same debit. A timer in the plugin or a direct replacement of current stamina is unsuitable. The climbing program reads movement; the mod must not change that read-only component to manufacture a debit.
+
+No persistent natural-wall marker has been admitted. The change uses the native wall-climb gate, so it also affects ordinary climbing lattices. Ladders, running, gliding, crafting and building are untouched. The native depletion carries fractional cost and its recharge cache reacts to actual decreases; CanRecharge and other native rules remain authoritative. Stop clears the native wall state immediately. An exit-cleanup scheduling edge is not separately overridden. A natural-wall-only policy would need its own proven per-entity classification.
+
+Default movement speed and stamina multiplier stay vanilla. No new stamina bar, perk, consumable, flight ability or unlimited grip is planned. The first play test must check hanging, slow and normal movement, exhaustion, stamina food/equipment, normal lattices and client/server agreement.
+
+## Inverse kinematics
+
+IK is suitable for small visual corrections to hands and feet after the native climbing animation has supplied the main pose. Prefer the game's existing target and solver path if a safe per-character interface can be proven.
+
+[Naughty Dog's account of Uncharted 4's climbing](https://www.naughtydog.com/blog/uncharted_4_climbing_legacy_of_thieves_collection_pc) describes coordinated limb and root IK, foot contacts and analogue reach layered with authored animations. It supports using IK to fit a pose to uneven rock. It also shows why a limb solver alone is not a complete traversal system. The first ember-climb integration should keep the existing root motion and limit corrections to the limbs.
+
+[ozz-animation's two-bone IK sample](https://guillaumeblanc.github.io/ozz-animation/samples/two_bone_ik/) provides a public alternative. It computes rotation corrections for a limb, with a pole vector, reach softening and a blend weight. Its [foot IK sample](https://guillaumeblanc.github.io/ozz-animation/samples/foot_ik/) demonstrates contact rays and surface-normal alignment, and explicitly leaves contact phases and unreachable targets to the integrator. The project uses the [MIT license](https://github.com/guillaumeblanc/ozz-animation/blob/master/LICENSE.md). It is a reference and fallback candidate; no dependency or borrowed code has been added.
+
+Current owned-image research confirms native solvers and target controls, but the retained graph snapshots have no generic hand-target consumer. Their actor/phase provenance is not established. A safe climbing implementation still needs all of these:
+
+- Identify the correct character instance and its limb chains without assuming bone indices across models.
+- Establish the skeleton's local, model and world transforms and the native animation scheduling stage.
+- Use reachable contact points and surface normals near the animated hands and feet.
+- Preserve elbow and knee directions, blend corrections with the climbing pose, and release contacts during steps or loss of the wall.
+- Bound raycasts and solver work. Avoid allocations, locks and unbounded searches on the animation path.
+- Prove instance lifetime and write ownership. Clear targets when climbing stops, the actor changes or a world unloads.
+- Keep physics and server-authoritative movement unchanged. Visual limb placement must never grant a hold or a top-out.
+
+A solver alone does not supply a native integration. A ray or a planted hand does not prove that the body or the mantle animation can fit. Automatic natural-wall top-outs remain unavailable until their separate whole-body and path checks are proven.
+
+## Acceptance boundary
+
+Recovery from the hold/move reach mismatch is implemented and covered by inert tests. Native seam grace and natural-wall automatic top-outs remain disabled. The minimum hanging cost is implemented and exercised by owned native-code fixtures; gameplay balance is untested. IK remains research work. Simulated geometry, native-file checks and an inert plugin load do not establish gameplay, controller or multiplayer reliability.
