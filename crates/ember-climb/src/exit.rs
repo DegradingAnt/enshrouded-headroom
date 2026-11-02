@@ -147,7 +147,9 @@ impl<C: Caster> Search<'_, C> {
     fn floor(&self, hit: Option<Hit>) -> Option<Hit> {
         let query = self.query;
         hit.filter(|hit| {
-            (query.stuck || hit.normal.y >= query.walkable_ny) && self.walkable_around(hit.point)
+            hit.point.y > query.pos.y
+                && (query.stuck || hit.normal.y >= query.walkable_ny)
+                && self.walkable_around(hit.point)
         })
     }
 
@@ -242,7 +244,9 @@ pub fn decide<C: Caster>(caster: &C, query: &Query) -> Exit {
         // sideways, so it can land on a vertical face with flat ground just above it. A stopped
         // player gets no pass here: the hit's own normal must be walkable.
         if let Some(hit) = caster.cast(head, reach, MASK_HEAD) {
-            let slope = hit.normal.y >= query.walkable_ny && search.walkable_around(hit.point);
+            let slope = hit.point.y > query.pos.y
+                && hit.normal.y >= query.walkable_ny
+                && search.walkable_around(hit.point);
             return if slope { Exit::Take(hit) } else { Exit::Keep };
         }
     }
@@ -300,6 +304,26 @@ mod tests {
     /// The answers of a clear level ray, then of a ring on this ground.
     fn clear_then_ring(ground: Hit) -> [Option<Hit>; 5] {
         [None, Some(ground), Some(ground), Some(ground), Some(ground)]
+    }
+
+    /// A longer downward search must not start an up-mantle onto ground below the feet.
+    #[test]
+    fn a_top_exit_never_chooses_ground_below_the_feet() {
+        let ground = Hit {
+            point: Vec3::new(1.05, -0.25, 0.0),
+            normal: UP,
+            entity: 0,
+        };
+        let world = Scripted::new(&[
+            None,
+            None,
+            Some(ground),
+            Some(ground),
+            Some(ground),
+            Some(ground),
+            Some(ground),
+        ]);
+        assert!(!matches!(decide(&world, &query(None)), Exit::Take(_)));
     }
 
     /// The default level ray reaches a plane past the walkable limit, and stops short of one the

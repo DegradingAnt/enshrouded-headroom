@@ -43,7 +43,9 @@ pub struct Runtime {
     /// The surface limits.
     pub tuning: Tuning,
     /// The grace time, in game ticks.
-    pub grace_ticks: u8,
+    grace_ticks: u8,
+    /// Whether native whole-body and path clearance has been proven for natural top-outs.
+    natural_mantles: bool,
     /// Does the log get the per-second lines?
     pub diagnostics: bool,
     /// Does walking start a climb?
@@ -72,6 +74,9 @@ impl Runtime {
             // Native Climb padding has no proven initialization contract. A setting must not
             // enable its reads. Initialized simulation fixtures may test the pure grace model.
             grace_ticks: 0,
+            // The native helper checks only the head sphere. Whole-body placement and the
+            // animation's path are unproven, so natural-wall automatic mantles stay unavailable.
+            natural_mantles: false,
             diagnostics: settings.diagnostics,
             walk: settings.walk,
             jump: settings.jump,
@@ -710,11 +715,32 @@ unsafe fn correct_exit(result: *mut u8, ctx: Ctx, pos: *const f32) {
     let Some(runtime) = runtime() else {
         return;
     };
+    // SAFETY: the caller supplies the native result and borrowed context for this call.
+    unsafe { correct_exit_for(runtime, result, ctx, pos) };
+}
+
+/// Apply the runtime's exit admission. Initialized inert fixtures may exercise the proposed model;
+/// native startup must refuse natural automatic mantles until body/path clearance is proven.
+///
+/// # Safety
+///
+/// `result`, `ctx` and `pos` satisfy the same native-call contract as `correct_exit`.
+unsafe fn correct_exit_for(runtime: &Runtime, result: *mut u8, ctx: Ctx, pos: *const f32) {
     // SAFETY: the function's contract.
     let entity = unsafe { ctx.entity() };
     let Some(hold) = get(&HOLD, None).filter(|hold| hold.natural && hold.entity == entity) else {
         return;
     };
+    if !runtime.natural_mantles {
+        // SAFETY: native query initializes the status byte; a successful result may be rewritten
+        // in its caller-provided result buffer. Native failures are left byte-for-byte alone.
+        if unsafe { result_code(result) } == OK {
+            DIAG.exit_refused();
+            // SAFETY: the caller supplied a complete writable result, as documented above.
+            unsafe { write_result(result, &failed_result(MISS)) };
+        }
+        return;
+    }
     // SAFETY: the function's contract.
     let (code, pos, current, normal, caster) = unsafe {
         (
@@ -1134,6 +1160,15 @@ mod tests {
             grace_state(0, || panic!("disabled grace must not read padding")),
             None
         );
+    }
+
+    /// Ray-only floor and head checks cannot admit a natural-wall mantle animation.
+    #[test]
+    fn native_top_outs_wait_for_body_and_path_clearance() {
+        // SAFETY: the fake address is not called by this construction test.
+        let runtime =
+            unsafe { Runtime::new(&Settings::default(), stamina_detour as *const () as usize) };
+        assert!(!runtime.natural_mantles);
     }
 
     /// The default build has the five hooks that climb, plus the diagnostics, and no stamina hook.

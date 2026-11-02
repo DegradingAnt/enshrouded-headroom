@@ -2340,3 +2340,39 @@ Regression evidence includes an inert Windowsx64 machine-code harness containing
 and a fake accessor. It fails on the old sign-bit filter for ID0x80000000 and passes for unchanged and
 changed non-sentinel IDs through0xfffffffe, plus marker no-call/no-write behavior. No game instruction
 is executed by that harness. Full native-file patch-plan checks still guard the original19-byte span.
+
+
+### W52 terrain-penetration/top-out acceptance gate
+
+The author reported climb-up animation followed by terrain penetration and recovery to a spawn.
+This report concerns the installed third-party mod. It is not evidence of execution or a known
+cause in the staged owned replacement.
+
+[VERIFIED] The owned synthetic exit model could choose flat ground below the predicted feet:
+with no native floor, the longer downward search returned an up-exit at y=-0.25 from feet y=0.
+The regression failed before the floor-height admission check. Floor candidates now must be
+above the query feet; a rising control input alone does not justify an up-mantle onto lower ground.
+
+[VERIFIED] The native chain remains ExitQuery -> HeadQuery -> ExitTop -> MantleBuilder. Current
+client/server helper RVAs: head query0x24ffa0/0x63e20; mantle builder0x24fcd0/0x63b50; sphere runner
+0x23ff80/0x5cf30. Their complete old/new function groups normalize identically. The head query checks
+only the upper sphere at candidate+UP*(height-width/2). The builder's first two control points are
+candidate+ClimbNormal*1.05 and its third is candidate; it performs no capsule-overlap/sweep itself.
+The query result's DWORD+4 is explicitly zero on both success and failure.
+
+Ground-mask0x24 ray rings can miss a Solid-only obstacle beneath the head sphere. Thus neither a
+walkable floor nor the retained head check proves a clear body or animation path. The sphere runner
+also mutates Climb flags/results and owns a typed query/output vector; it is not an admitted
+standalone arbitrary-radius overlap API. No capsule/sweep binding is invented here.
+
+The staged native constructor therefore hard-disables ALL automatic natural-wall top-outs,
+including native successes on newly climbable geometry, until a complete placement/path contract
+exists. For a current natural hold, ExitQuery OK becomes MISS before the native animation gate;
+existing failures remain byte-identical. A lattice hold retains its original native answer.
+No setting can enable this gate. Jump-off remains the game's own action.
+
+Initialized fixtures separately exercise the proposed top-out model and are not a native feature.
+The inert hook-flow regression checks natural-success refusal, failure preservation and unchanged
+lattice results. This is a first-test prevention policy, not proof that every collision/warp cause
+has been solved. Receipts: private W52 mantle-safety-boundary.md, owned-exit-safety.json and full
+head/query/builder assembly; no game or third-party mod was executed or modified.

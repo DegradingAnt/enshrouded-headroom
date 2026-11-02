@@ -1,5 +1,6 @@
 //! The real detours, called through their real signatures, with the game's functions and raycast
-//! replaced by small fakes that behave like them.
+//! replaced by small fakes that behave like them. Explicit initialized-fixture overrides exercise
+//! proposed grace/top-out models that native startup keeps unavailable.
 //!
 //! This tests the joints between the hooks: which mode each probe runs in, what the wall-lost check
 //! leaves for the move check, and that a lattice is left alone. It runs as one test, because the
@@ -419,6 +420,7 @@ fn install() {
     // This fixture initializes every Climb byte. It can exercise the proposed persistent model;
     // actual native startup keeps it unavailable until initialization is proven.
     runtime.grace_ticks = settings.grace_ticks();
+    runtime.natural_mantles = true;
     prepare(runtime);
     activate();
 }
@@ -578,6 +580,10 @@ fn a_climb_runs_through_the_detours() {
     assert_eq!(sample.normal, player.normal());
     assert_eq!(sample.orientation, [0.0, 0.0, 0.0, 1.0]);
 
+    // The native up-exit candidate is above the feet. Put the fake climber below the fixture's
+    // ground plane; an equal/lower floor must no longer pass this model as an up-mantle.
+    let old_y = player.transform[1];
+    player.set_y(-1.0);
     // Steep rock is no exit for a climber, and a real floor stays the game's exit. The hook hands
     // over where the game's floor lies: with no ground around that spot it is one stray triangle.
     assert_eq!(player.wall_lost(), HELD);
@@ -593,6 +599,8 @@ fn a_climb_runs_through_the_detours() {
     FLOOR_THERE.store(false, Ordering::Relaxed);
     EXIT_NY.store(0, Ordering::Relaxed);
     assert_eq!(player.exit_query(0.03)[0], MISS);
+
+    player.transform[1] = old_y;
 
     // A hold belongs to its climber. Another entity's exit stays the game's, even on steep rock.
     EXIT_NY.store(30, Ordering::Relaxed);
@@ -704,6 +712,51 @@ fn a_climb_runs_through_the_detours() {
         "the next failed hold cannot borrow the old climb's grace"
     );
     WALL_THERE.store(true, Ordering::Relaxed);
+
+    // Real startup does not admit natural-wall top-outs without a complete body/path check.
+    // This checks the actual result rewrite, including existing native successes, not just config.
+    // SAFETY: the typed inert raycast is supplied; no real game function is called.
+    let native = unsafe { Runtime::new(&Settings::default(), plane_raycast as RaycastFn as usize) };
+    let ctx = player.ctx();
+    let pos = [0.0f32, 0.0, 0.0];
+    set(
+        &HOLD,
+        Some(Hold {
+            entity: PLAYER as u32,
+            natural: true,
+            fit: None,
+            steady: false,
+        }),
+    );
+    let mut result = encode_result(OK, UP, UP, 7);
+    // SAFETY: complete writable result, initialized position and the live fixture context.
+    unsafe { correct_exit_for(&native, result.as_mut_ptr(), Ctx(ctx), pos.as_ptr()) };
+    assert_eq!(
+        result[0], MISS,
+        "a natural-wall success must not launch an unsafe animation"
+    );
+    let mut failed = failed_result(NOT_NOW);
+    let original_failed = failed;
+    // SAFETY: the same complete fixture buffers.
+    unsafe { correct_exit_for(&native, failed.as_mut_ptr(), Ctx(ctx), pos.as_ptr()) };
+    assert_eq!(failed, original_failed, "native failures remain unchanged");
+    set(
+        &HOLD,
+        Some(Hold {
+            entity: PLAYER as u32,
+            natural: false,
+            fit: None,
+            steady: false,
+        }),
+    );
+    let mut lattice = encode_result(OK, UP, UP, 7);
+    let original_lattice = lattice;
+    // SAFETY: the same complete fixture buffers.
+    unsafe { correct_exit_for(&native, lattice.as_mut_ptr(), Ctx(ctx), pos.as_ptr()) };
+    assert_eq!(
+        lattice, original_lattice,
+        "an ordinary lattice retains its native exit"
+    );
 
     // With the mod off the detours only forward: rock is the game's "no" again, and no byte of the
     // game's component moves.

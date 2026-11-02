@@ -125,7 +125,7 @@ The game already climbs, but only on flat iron lattices. Its wall probe wants fo
 - The game's probe always runs first, so its successful lattice answer is kept. No mask or tolerance in the game is changed. The attachment patch skips only the synthetic voxel-hold marker; ordinary IDs, including high-bit IDs, use the native accessor/store. That store also runs when the ID is unchanged.
 - When the probe fails, the mod casts four rays of its own at the surface, averages what they hit, and asks whether it is steep and flat enough.
 - The game moves a climber along world up, which walks straight off any face that leans. The mod turns the movement into the surface, keeps the speed, and holds the game's 0.55 m distance.
-- The game has no exit where a wall turns into a slope, and it mantles onto steep rock. The mod refuses the second and finds the first. One triangle of rough rock can look like a floor, so the mod judges a floor as an area, and it looks whether the face goes on ahead of your head.
+- Automatic climb-up animations on natural rock and walls are disabled in this test build. The current native head-sphere check does not prove that the whole character or animation path is clear. Use the game's jump-off to leave the surface. Ordinary iron lattices keep their native exits. The proposed area-based top-out model remains in inert tests for later integration with a proven body/path guard.
 - A half-pressed stick fails the game's start test however straight you run at a wall. The mod tests only the heading.
 - The persistent seam-forgiveness model is tested on initialized simulated state, but its native binding stays unavailable. This build never reads or writes the game's spare grace byte. The hold and movement fits still use their longer reach and relaxed surface checks.
 
@@ -133,12 +133,13 @@ Evidence for every game fact is in [docs/re-notes.md](../../docs/re-notes.md), "
 
 ## First play test
 
-Start with a private offline world. Check a tall vertical wall, a leaning rock face, sideways movement, a real flat top, jump-off, stamina, and an ordinary iron lattice. Repeat with the controller. Keep `ember-climb.log`, especially if a grab fails, a hold drops, or the character tries to mantle too soon. Failed entry attempts are logged at most once every thirty seconds; idle checks stay quiet.
+Start with a private offline world. Check a tall vertical wall, a leaning rock face, sideways movement, jump-off near a flat top, stamina, and an ordinary iron lattice. Natural rock must not trigger an automatic climb-up animation; leave it with the normal Jump control. Lattices should still top out normally. Repeat with the controller. Keep `ember-climb.log`, especially if a grab fails, a hold drops, or the character tries to mantle too soon. Failed entry attempts are logged at most once every thirty seconds; idle checks stay quiet.
 
 The client and server use the same plugin and settings. Test multiplayer only after the offline session works. This package is a candidate; native-file checks and simulated climbs do not establish runtime reliability.
 
 ## Limits
 
+- Automatic natural-wall top-outs are unavailable. This includes a valid-looking flat top; use Jump to leave the wall. Whole-body landing and animation-path checks must be proven before this feature can be enabled. The staged prevention does not establish the cause of a different mod's reported terrain/spawn recovery.
 - Seam forgiveness is unavailable. A complete loss of the hold rays drops the climber without a timed grace period. The pure proposed grace model needs proven initialization and lifecycle ownership before a later build can enable it.
 
 - A surface must reach 2 m above your feet to start a climb. A lower wall starts nothing, and neither does a ledge you jump at when it is less than 2 m above your feet at that moment. Use the game's jump there. This may change after the first play test.
