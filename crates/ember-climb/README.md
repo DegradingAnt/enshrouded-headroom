@@ -109,7 +109,7 @@ All settings are in `ember-climb.ini`, and all need a restart. A value that is n
 | Start | Sprint | 1 | 0 or 1 | Sprinting into one starts a climb. |
 | Start | Glide | 0 | 0 or 1 | Gliding into one starts a climb. Experimental, see below. |
 | Tuning | WalkableAngle | 50 | 30 to 75 | Surfaces less steep than this, in degrees, can be walked on. They start no climb, and a climb can end on them. |
-| Tuning | OverhangAngle | 110 | 90 to 135 | The farthest a face may hang over to start a climb, in degrees. 90 is a sheer wall. A running climb gets 15 degrees more, so that one rough patch does not stop it. |
+| Tuning | OverhangAngle | 110 | 90 to 160 | The farthest a face may hang over to start a climb, in degrees. 90 is a sheer wall. A running climb gets up to 15 degrees more, capped at 160. Values above 135 are experimental; native body clearance and gameplay acceptance remain pending. |
 | Tuning | EntryReach | 0.95 | 0.6 to 1.4 | How close you must be to start a climb, in metres. |
 | Tuning | HoldReach | 1 | 0.8 to 1.6 | How far the mod looks for the surface during a climb, in metres. Under an overhang you hang farther out, and it looks that much farther. |
 | Tuning | GraceSeconds | 0 | 0 to 1 | Reserved. Native seam forgiveness is unavailable; nonzero values warn and remain inactive. |
