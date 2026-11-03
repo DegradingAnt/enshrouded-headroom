@@ -1,8 +1,8 @@
 # ember-climb
 
-Free climbing for Enshrouded, in the style of Breath of the Wild. Climb any steep rock, cliff or wall. There is no button. A climb starts when you walk, sprint or jump into a steep surface. The mod uses the game's own climb moves, stamina and collision.
+Free climbing for Enshrouded, in the style of Breath of the Wild. This experimental build grabs automatically when you walk, sprint or jump into a steep rock, cliff or wall. Deliberate hold-to-grab and a separate optional climb binding are requested follow-ups; they are not implemented yet. The mod uses the game's own climb moves, stamina and collision.
 
-**This is an experimental build for Patch 1.0.1.0 (internal build 1283531). Its first offline play test failed acceptance.** Grabs and climbing started, but the climber fell and was pushed away after a few metres. The cause is under investigation. The earlier installation was restored. Keep this build out of a shared client/server setup until a later offline test passes. Fixture, native-file and startup checks do not establish gameplay reliability.
+**This is an experimental build for Patch 1.0.1.0 (internal build 1283531). Its first offline play test failed acceptance.** Grabs and climbing started, but the climber fell and was pushed away after a few metres. The cause is under investigation. A later offline test also found overly easy grabs beside a wall, intermittent perpendicular corner transfers and inaccessible overhead ledges. Natural top-outs are deliberately disabled. The previous installation was restored after both tests. Keep this build out of a shared client/server setup until offline acceptance passes. Fixture, native-file and startup checks do not establish gameplay reliability.
 
 ## Install
 

@@ -9,7 +9,7 @@ use configparser::ini::Ini;
 use emberkit::config::{Reader, Setting, SettingType};
 
 use crate::grace::TICKS_PER_SECOND;
-use crate::surface::Tuning;
+use crate::surface::{Tuning, MAX_OVERHANG_DEGREES};
 
 /// The settings file's name.
 pub const INI_FILE_NAME: &str = "ember-climb.ini";
@@ -178,7 +178,7 @@ pub fn parse(text: &str) -> (Settings, Vec<String>) {
             ("Tuning", "OverhangAngle"),
             d.overhang_angle,
             90.0,
-            135.0,
+            f64::from(MAX_OVERHANG_DEGREES),
         ),
         entry_reach: float(&mut r, ("Tuning", "EntryReach"), d.entry_reach, 0.6, 1.4),
         hold_reach: float(&mut r, ("Tuning", "HoldReach"), d.hold_reach, 0.8, 1.6),
@@ -310,9 +310,9 @@ pub fn schema() -> &'static [Setting] {
         number(
             "Tuning",
             "OverhangAngle",
-            (90.0, 135.0),
+            (90.0, MAX_OVERHANG_DEGREES as f64),
             "110",
-            "The farthest a face may hang over to start a climb, in degrees.",
+            "The farthest a face may hang over to start a climb, in degrees. Above 135 is experimental; native acceptance is pending.",
         ),
         number(
             "Tuning",
@@ -509,6 +509,21 @@ mod tests {
             assert!(low[0].contains(&format!("using {min}")), "{low:?}");
             assert!(high[0].contains(&format!("using {max}")), "{high:?}");
         }
+    }
+
+    /// The development overhang setting accepts the requested range without changing defaults.
+    #[test]
+    fn overhang_parser_accepts_160_and_keeps_the_110_default() {
+        assert_eq!(Settings::default().overhang_angle, 110.0);
+        for angle in [135.0, 145.0, 155.0, 160.0] {
+            let (settings, warnings) = parse(&format!("[Tuning]\nOverhangAngle={angle}\n"));
+            assert_eq!(settings.overhang_angle, angle, "{warnings:?}");
+            assert!(warnings.is_empty(), "{angle}: {warnings:?}");
+        }
+        let (settings, warnings) = parse("[Tuning]\nOverhangAngle=175\n");
+        assert_eq!(settings.overhang_angle, 160.0);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("using 160"), "{warnings:?}");
     }
 
     /// The angles turn into the limits the surface code compares with.

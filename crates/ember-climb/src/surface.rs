@@ -44,6 +44,8 @@ const HOLD_MARGIN_DEGREES: f32 = 15.0;
 /// Degrees of overhang a running climb may pass the limit for starting one. A rough patch can read
 /// this much steeper than the rock as a whole, and a hard limit would stop the climb there.
 const OVERHANG_MARGIN_DEGREES: f32 = 15.0;
+/// The steepest development overhang. Native body and traversal acceptance remain pending.
+pub const MAX_OVERHANG_DEGREES: f32 = 160.0;
 /// The collider flag Solid (bit 3). The default surface mask does not ask for it.
 const MASK_SOLID: u32 = 0x08;
 /// How far short of its own hit a corner clearance ray stops, in metres. A rock prop can be Solid
@@ -162,7 +164,9 @@ impl Tuning {
         let (entry_reach, hold_reach) = reach;
         let walkable = walkable_angle.to_radians();
         let hold = (walkable_angle - HOLD_MARGIN_DEGREES).to_radians();
-        let past_overhang = (overhang_angle + OVERHANG_MARGIN_DEGREES).to_radians();
+        let past_overhang = (overhang_angle + OVERHANG_MARGIN_DEGREES)
+            .min(MAX_OVERHANG_DEGREES)
+            .to_radians();
         let [top, _] = RAY_ROWS;
         Tuning {
             mask,
@@ -729,7 +733,9 @@ pub fn steer(input: &SteerInput, t: &Tuning, capsule: Capsule) -> Option<Steered
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testworld::{face, tuning, Ball, Cylinder, Empty, Faceted, Plane, Scripted};
+    use crate::testworld::{
+        face, tuning, Ball, Cylinder, Empty, Faceted, Plane, Profile, Scripted,
+    };
 
     /// A player standing with the wall 0.8 m ahead along +x.
     const AHEAD: Vec3 = Vec3::new(1.0, 0.0, 0.0);
@@ -1748,13 +1754,57 @@ mod tests {
         }
     }
 
+    /// Fresh analytic scans keep the old running allowance, but never admit past 160 degrees.
+    #[test]
+    fn configured_overhang_caps_move_admission_at_160() {
+        for (configured, move_limit) in [
+            (90.0_f32, 105.0_f32),
+            (110.0, 125.0),
+            (125.0, 140.0),
+            (135.0, 150.0),
+            (145.0, 160.0),
+            (155.0, 160.0),
+            (160.0, 160.0),
+        ] {
+            let (settings, warnings) =
+                crate::config::parse(&format!("[Tuning]\nOverhangAngle={configured}\n"));
+            assert!(warnings.is_empty(), "{configured}: {warnings:?}");
+            let t = settings.tuning();
+            for (angle, mode, allowed) in [
+                (configured - 0.1, Mode::Entry, true),
+                (configured + 0.1, Mode::Entry, false),
+                (move_limit - 0.1, Mode::Move, true),
+                (move_limit + 0.1, Mode::Move, false),
+            ] {
+                let normal = face(angle);
+                let gap = standoff_target(normal.y, CAPSULE);
+                let rock = Plane::through(-normal * gap, normal);
+                let result = scan(&rock, Vec3::default(), -normal, mode, &t, CAPSULE);
+                if allowed {
+                    assert!(
+                        result.verdict.is_ok(),
+                        "{configured}/{angle}/{mode:?}: {result:?}"
+                    );
+                    assert!(result.steady, "{configured}/{angle}: {result:?}");
+                } else {
+                    assert_eq!(
+                        result.verdict,
+                        Err(Reject::Overhang),
+                        "{configured}/{angle}/{mode:?}: {result:?}"
+                    );
+                }
+            }
+            assert!((t.move_overhang_ny - move_limit.to_radians().cos()).abs() < 1e-6);
+        }
+    }
+
     /// Whatever the settings, the climb normal stays a direction a ray patch can be built from.
     /// At `WalkableAngle` 30 the hold limit alone would pass the limit of the rays, and the next
     /// hold would drop the player.
     #[test]
     fn the_normal_limits_stay_inside_the_ray_limit() {
         for walkable_angle in [30.0, 33.0, 40.0, 50.0, 75.0] {
-            for overhang_angle in [90.0, 110.0, 135.0] {
+            for overhang_angle in [90.0, 110.0, 135.0, 145.0, 155.0, 160.0] {
                 let settings = crate::config::Settings {
                     walkable_angle,
                     overhang_angle,
@@ -1774,7 +1824,7 @@ mod tests {
     /// with the same margin as on a sheer wall, whatever the capsule.
     #[test]
     fn the_rays_reach_an_overhang_at_the_limit() {
-        for overhang in [100.0, 110.0, 125.0, 135.0] {
+        for overhang in [100.0, 110.0, 125.0, 135.0, 145.0, 155.0, 160.0] {
             let settings = crate::config::Settings {
                 overhang_angle: overhang,
                 ..Default::default()
@@ -1787,6 +1837,271 @@ mod tests {
                 let rock = Plane::through(Vec3::default() - normal * out, normal);
                 let scan = scan(&rock, Vec3::default(), -normal, Mode::Move, &t, capsule);
                 assert!(scan.verdict.is_ok(), "{overhang}/{capsule:?}: {scan:?}");
+            }
+        }
+    }
+
+    /// Read the development limit through the real settings boundary.
+    fn development_overhang_tuning() -> Tuning {
+        let (settings, warnings) = crate::config::parse("[Tuning]\nOverhangAngle=160\n");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        settings.tuning()
+    }
+
+    /// The pure steering model preserves native input speed along the fresh plane, adding only
+    /// the bounded normal correction. This does not model native body shape or collision.
+    fn assert_overhang_motion(out: Steered, raw: Vec3, physical: Vec3, dt: f32) {
+        assert!(out.velocity.is_finite() && out.normal.is_finite() && out.error.is_finite());
+        let correction = out.velocity.dot(physical);
+        let tangent = out.velocity - physical * correction;
+        if out.error.abs() <= STANDOFF_DEADBAND {
+            assert!(
+                correction.abs() < 2e-5,
+                "fresh-plane motion must be tangent: {out:?}"
+            );
+        }
+        assert!((tangent.length() - raw.length()).abs() < 2e-4, "{out:?}");
+        assert!(correction.abs() <= STANDOFF_SPEED + 2e-5, "{out:?}");
+        assert!(
+            correction.abs() * dt <= (out.error.abs() - STANDOFF_DEADBAND).max(0.0) + 2e-5,
+            "normal correction must not overshoot: {out:?}"
+        );
+        assert!(
+            out.velocity.length() <= raw.length().hypot(STANDOFF_SPEED) + 2e-4,
+            "{out:?}"
+        );
+        let basis = Frame::along(-out.normal).expect("steered direction keeps a finite ray basis");
+        for axis in [basis.along, basis.up, basis.right] {
+            assert!(axis.is_finite() && (axis.length() - 1.0).abs() < 1e-5);
+        }
+        assert!(basis.along.dot(basis.up).abs() < 1e-5);
+        assert!(basis.along.dot(basis.right).abs() < 1e-5);
+        assert!(basis.up.dot(basis.right).abs() < 1e-5);
+    }
+
+    /// Repeated scans and accepted velocity steps retain a high overhang at each frame rate.
+    /// Both capsules are configuration models; neither is a stock-body clearance oracle.
+    #[test]
+    fn overhang_closed_loops_keep_fresh_support() {
+        let t = development_overhang_tuning();
+        let raw = UP * 1.95;
+        for angle in [135.0, 145.0, 155.0, 160.0] {
+            let physical = face(angle);
+            for dt in [1.0 / 120.0, 1.0 / 60.0, 1.0 / 20.0] {
+                for capsule in [CAPSULE, Capsule::from_config(1.0, 2.2)] {
+                    let gap = standoff_target(physical.y, capsule);
+                    let rock = Plane::through(Vec3::default(), physical);
+                    let start = physical * (gap + 0.18);
+                    let mut pos = start;
+                    let mut normal = physical;
+                    for step in 0..(4.0 / dt) as u32 {
+                        let hold = scan(&rock, pos, -normal, Mode::Stay, &t, capsule);
+                        assert!(
+                            hold.verdict.is_ok() && hold.steady,
+                            "{angle}/{dt}/{step}: {hold:?}"
+                        );
+                        let out = steer(
+                            &SteerInput {
+                                velocity: raw,
+                                normal,
+                                fit: hold.fit,
+                                pos,
+                                dt,
+                                contact: false,
+                            },
+                            &t,
+                            capsule,
+                        )
+                        .unwrap();
+                        assert_overhang_motion(out, raw, physical, dt);
+                        let candidate = pos + out.velocity * dt;
+                        let movement = scan(&rock, candidate, -out.normal, Mode::Move, &t, capsule);
+                        assert!(
+                            movement.verdict.is_ok(),
+                            "{angle}/{dt}/{step}: {movement:?}"
+                        );
+                        pos = candidate;
+                        normal = out.normal;
+                    }
+                    let error = pos.dot(physical) - gap;
+                    assert!(
+                        error.abs() <= STANDOFF_DEADBAND + 1e-4,
+                        "{angle}/{dt}: {error}"
+                    );
+                    let along = Frame::along(-physical).unwrap().up;
+                    assert!((pos - start).dot(along) > 7.0, "{angle}/{dt}: {pos:?}");
+                }
+            }
+        }
+    }
+
+    /// A gradually changing static profile must still be rediscovered from the updated pose.
+    /// Its ray fit is geometry evidence only, not native volume or mantle-path clearance.
+    #[test]
+    fn overhang_smooth_inclination_loop_keeps_fresh_support() {
+        let t = development_overhang_tuning();
+        for target in [135.0_f32, 145.0, 155.0, 160.0] {
+            let mut points = vec![(0.0, -100.0), (0.0, 0.0)];
+            let (mut x, mut y) = (0.0_f32, 0.0_f32);
+            let arc_step = (target - 90.0).to_radians() * 20.0 / 140.0;
+            for step in 1..=140 {
+                let angle = (90.0 + (target - 90.0) * step as f32 / 140.0).to_radians();
+                x += angle.cos() * arc_step;
+                y += angle.sin() * arc_step;
+                points.push((x, y));
+            }
+            let end = target.to_radians();
+            points.push((x + end.cos() * 100.0, y + end.sin() * 100.0));
+            let rock = Profile::new(points);
+            for dt in [1.0 / 120.0, 1.0 / 60.0, 1.0 / 20.0] {
+                let mut pos = Vec3::new(-GAME_STANDOFF, -3.0, 0.0);
+                let mut normal = face(90.0);
+                let mut reached = false;
+                for step in 0..(20.0 / dt) as u32 {
+                    let hold = scan(&rock, pos, -normal, Mode::Stay, &t, CAPSULE);
+                    assert!(
+                        hold.verdict.is_ok() && hold.steady,
+                        "{target}/{dt}/{step}: {hold:?}"
+                    );
+                    let physical = hold.fit.unwrap().normal;
+                    reached |= physical.y < face(target - 0.1).y;
+                    let out = steer(
+                        &SteerInput {
+                            velocity: UP * 1.95,
+                            normal,
+                            fit: hold.fit,
+                            pos,
+                            dt,
+                            contact: false,
+                        },
+                        &t,
+                        CAPSULE,
+                    )
+                    .unwrap();
+                    assert_overhang_motion(out, UP * 1.95, physical, dt);
+                    let candidate = pos + out.velocity * dt;
+                    let movement = scan(&rock, candidate, -out.normal, Mode::Move, &t, CAPSULE);
+                    assert!(
+                        movement.verdict.is_ok(),
+                        "{target}/{dt}/{step}: {movement:?}"
+                    );
+                    pos = candidate;
+                    normal = out.normal;
+                }
+                assert!(
+                    reached,
+                    "never reached the {target} degree part at dt={dt}: {pos:?}"
+                );
+            }
+        }
+    }
+
+    /// High-overhang movement belongs to the physical fit even while the visual normal eases.
+    #[test]
+    fn overhang_motion_bounds_ignore_facing_lag() {
+        let t = development_overhang_tuning();
+        let raw = UP * 1.95 + Vec3::new(0.0, 0.0, 0.35);
+        for angle in [135.0, 145.0, 155.0, 160.0] {
+            let physical = face(angle);
+            for error in [-0.18, 0.0, 0.18] {
+                let fit = fit_at(physical, standoff_target(physical.y, CAPSULE) + error);
+                for dt in [1.0 / 120.0, 1.0 / 60.0, 1.0 / 20.0] {
+                    for contact in [false, true] {
+                        let mut reference = input(raw, physical, Some(fit));
+                        reference.dt = dt;
+                        reference.contact = contact;
+                        let mut lagged = reference;
+                        lagged.normal = face(90.0);
+                        let expected = steer(&reference, &t, CAPSULE).unwrap();
+                        let actual = steer(&lagged, &t, CAPSULE).unwrap();
+                        assert_overhang_motion(actual, raw, physical, dt);
+                        assert!((actual.error - error).abs() < 1e-5);
+                        assert!((actual.velocity - expected.velocity).length() < 1e-5);
+                        assert!(
+                            (actual.normal - physical).length() > 0.01,
+                            "visual facing still eases"
+                        );
+                        let correction = actual.velocity.dot(physical);
+                        if error > STANDOFF_DEADBAND && !contact {
+                            assert!(correction < 0.0, "{actual:?}");
+                        } else if error < -STANDOFF_DEADBAND {
+                            assert!(correction > 0.0, "{actual:?}");
+                        } else {
+                            assert!(correction.abs() < 1e-5, "{actual:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Extending the development limit does not grant missing support or near-vertical rays.
+    #[test]
+    fn overhang_support_loss_and_near_vertical_directions_remain_refused() {
+        let t = development_overhang_tuning();
+        for angle in [135.0, 145.0, 155.0, 160.0] {
+            let physical = face(angle);
+            let rock = Plane::through(-physical * standoff_target(physical.y, CAPSULE), physical);
+            let basis = Frame::along(-physical).unwrap();
+            let hits = basis.origins(Vec3::default()).map(|origin| {
+                rock.cast(
+                    origin + physical * RAY_BACK,
+                    origin - physical * 4.0,
+                    t.mask,
+                )
+            });
+            assert!(hits.iter().all(Option::is_some));
+            let only_two = [hits[0], hits[1], None, None];
+            let moving = scan(
+                &Scripted::new(&only_two),
+                Vec3::default(),
+                -physical,
+                Mode::Move,
+                &t,
+                CAPSULE,
+            );
+            assert_eq!(moving.verdict, Err(Reject::Hits));
+            let held = scan(
+                &Scripted::new(&only_two),
+                Vec3::default(),
+                -physical,
+                Mode::Stay,
+                &t,
+                CAPSULE,
+            );
+            assert!(held.verdict.is_ok() && !held.steady);
+            let only_one = [hits[0], None, None, None];
+            let lost = scan(
+                &Scripted::new(&only_one),
+                Vec3::default(),
+                -physical,
+                Mode::Stay,
+                &t,
+                CAPSULE,
+            );
+            assert_eq!(lost.verdict, Err(Reject::Hits));
+            assert!(lost.fit.is_none());
+        }
+        let ceiling = Plane::through(UP * 2.5, -UP);
+        for mode in [Mode::Entry, Mode::Move] {
+            let result = scan(&ceiling, Vec3::default(), -face(160.0), mode, &t, CAPSULE);
+            assert_eq!(result.verdict, Err(Reject::Overhang));
+        }
+        let held_ceiling = scan(
+            &ceiling,
+            Vec3::default(),
+            -face(160.0),
+            Mode::Stay,
+            &t,
+            CAPSULE,
+        );
+        assert!(held_ceiling.verdict.is_ok() && !held_ceiling.steady);
+        for angle in [162.0, 175.0, 180.0] {
+            for mode in [Mode::Entry, Mode::Move, Mode::Stay] {
+                let world = Scripted::new(&[]);
+                let result = scan(&world, Vec3::default(), -face(angle), mode, &t, CAPSULE);
+                assert_eq!(result.verdict, Err(Reject::Direction));
+                assert_eq!(world.casts(), 0);
             }
         }
     }

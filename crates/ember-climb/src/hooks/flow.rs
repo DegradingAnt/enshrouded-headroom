@@ -1009,7 +1009,10 @@ fn exercise_corner_hooks() {
     for kind in [1, 2] {
         CORNER_KIND.store(kind, Ordering::Relaxed);
         for sign in [-1.0, 1.0] {
-            for dt in [1.0 / 120.0, 1.0 / 60.0, 1.0 / 20.0] {
+            for (dt, hint_y) in [1.0 / 120.0, 1.0 / 60.0, 1.0 / 20.0]
+                .into_iter()
+                .flat_map(|dt| [-0.03, 0.0, 0.03].map(|hint_y| (dt, hint_y)))
+            {
                 let mut player = Player::new();
                 player.ordinary_wall();
                 let (mut p, n, target) = match (kind, sign > 0.0) {
@@ -1034,7 +1037,9 @@ fn exercise_corner_hooks() {
                         Vec3::new(-1.0, 0.0, 0.0),
                     ),
                 };
-                player.set_normal(n);
+                // A prior rough patch can leave a slightly tilted eased facing, even though
+                // all current physical corner faces and their fresh support are vertical.
+                player.set_normal(Vec3::new(n.x, hint_y, n.z).normalized().unwrap());
                 let initial_calls = CORNER_CALLS.load(Ordering::Relaxed);
                 let mut finished = false;
                 for tick in 0..500 {

@@ -5,8 +5,8 @@
 //! The game already climbs, but only on flat iron lattices. Its wall probe wants four rays with
 //! one exact normal. This mod lets that probe run first, so a lattice keeps its native geometry answer. When
 //! the probe fails it fits a patch of the surface instead ([`surface`]), and steers the climber
-//! along it, because the game moves a climber along world up. [`exit`] ends a climb cleanly where a
-//! wall turns walkable.
+//! along it, because the game moves a climber along world up. [`exit`] models natural exit targets;
+//! automatic natural top-outs remain disabled until their body/path guard is established.
 //!
 //! The same code runs in the client and in the dedicated server. Every game fact it relies on is in
 //! docs/re-notes.md, "Free climbing". It runs on four exact client/server builds. Any other build, a signature that

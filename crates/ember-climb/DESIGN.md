@@ -14,7 +14,7 @@ These are design references. No code, animations or assets from those games are 
 
 ## Zelda-like movement direction
 
-The author wants the freedom and predictable controls of Breath of the Wild climbing while keeping Enshrouded's balance. This means automatic grabs, continuous analogue movement over rock, smooth changes in orientation, clear exhaustion, and the normal Jump control to leave a wall.
+The author wants the freedom and predictable controls of Breath of the Wild climbing while keeping Enshrouded's balance. The updated control requirement is a deliberate hold of Jump or a separate optional climb binding, continuous analogue movement over rock, smooth changes in orientation, clear exhaustion, and the normal Jump control to leave a wall. The current automatic-grab implementation does not yet satisfy that control requirement.
 
 [Nintendo's Eldin climbing advice](https://www.nintendo.com/ph/zelda/botw/discovery/eldin.html) explicitly says that remaining still on a cliff does not consume stamina in Breath of the Wild. The author separately requested stamina drain while clinging here. The candidate therefore retains its minimum hanging effort as a deliberate balance difference.
 
@@ -23,6 +23,28 @@ The implemented movement correction separates geometry from animation easing. A 
 The original wide, parallel patch can lose enough support before seeing the next face at a sharp perpendicular convex corner. The correction does not relax all movement to two hits or fabricate a hold. The pure corner policy now tests fresh directional support, full-turn rediscovery and actual-candidate revalidation with an explicit motion oracle. A separate velocity-only adapter is now connected to the runtime hooks for static vertical faces up to 90 degrees. It retains native movement admission and collision; it does not implement or impersonate the strict whole-capsule motion oracle. Source and analytic fixtures do not establish gameplay or the exact stock climbing capsule.
 
 A deliberate upward climbing hop is a separate follow-up. The native game currently supplies a detached push-off and a 375 ms re-grab block. Its input, accepted impulse and stamina ownership are separate. Charging at a convenient Jump hook could bill a refused request or repeat on replay. Preserve native push-off until a proven accepted-action cost transaction is available. Automatic natural top-outs and surface IK retain their existing gates.
+## Full feature acceptance
+
+The author requests the following behavior. The reference is the published [Climb Anywhere feature description](https://www.nexusmods.com/enshrouded/mods/214?tab=description), used as a behavior checklist. No third-party code or assets are included. A source implementation or a simulated test is not gameplay acceptance.
+
+| Requested behavior | Development status and remaining acceptance |
+|---|---|
+| Hold Jump for 0.25 seconds to grab; keep a short tap and double jump native. | Not implemented. The current automatic grabs are too permissive in the latest offline test. |
+| Optional keyboard, mouse or gamepad climb binding, chosen per player. | Not implemented. The server must use that player's replicated intent, including for a joining player in a hosted world. A host's local key state is not that intent. |
+| Adjustable natural-wall stamina cost and stamina drain while hanging. | Native cost scaling and the hanging floor are implemented. The floor also affects lattices; a natural-wall-only policy needs a proven classification and matching client/server behavior. |
+| Smooth movement over rough rock and a body that follows it. | Multi-ray fitting, fresh-plane movement and native body rotation are present. Rough geometry, stationary animation and controller feel still need acceptance. |
+| Body lean limited to 45 degrees, with consistent remote appearance. | No separate visual cap is implemented. Entry interpolation and native rotation both write orientation; changing the physical probe normal is not a visual-only control. |
+| Continuous inside and outside 90-degree corner traversal. | Runtime support exists, but the latest offline test is intermittent. Regressions must cover rough facets and eased facing separately from current physical support. |
+| Overhangs through 160 degrees. | Configurable geometry now admits up to 160 degrees, with the default still 110. Values above 135 are experimental. Horizontal ceilings, native body clearance and wall-to-overhang transitions remain separate limits. |
+| Minimum wall clearance and collision throughout traversal. | Ordinary native movement/collision remains authoritative. The config-derived capsule and a surface fit do not establish clearance for the actual climbing body or an animated mantle. |
+| Safe transition onto walkable terrain and overhead ledges. | Natural top-outs remain disabled. Full geometry availability and actual body/path coverage are required before restoring them. A supported-ground walking handoff is a separate operation. |
+| Offline, hosted co-op and dedicated Windows/Wine/Proton servers. | Exact client/server identity and file contracts are implemented. Matching real multiplayer behavior has not passed acceptance. |
+| Refuse unsupported game updates and climbing conflicts. | Exact-build, unique-signature and conflict checks are implemented. New native bindings must preserve startup refusal and original-call guarantees. |
+
+Native entry already receives simulation time, but its owner does not borrow raw PlayerInput or ServerConsumedPlayerInput. The raw digital Jump bit and logical input consumer are identified elsewhere. Their existence does not establish a held-button bridge, press duration, a custom replicated action or replay-owned state. Do not implement a dwell timer in persistent TLS, steal component padding or infer a unique action from repeated request timestamps.
+
+The latest offline log confirms the owned build loaded. It records repeated intentional natural-exit refusals, matching the disabled top-out gate. The report of grabbing while standing beside a wall does not prove exactly zero processed input. Native low entry already refuses zero input, while the custom heading normalization can admit very small input. Both the raw intent and its owner must be established before selecting a deadzone or claiming the cause.
+
 ## Stamina rule in the test candidate
 
 The owned executable's climbing program charges for distance moved. At zero movement it skips both the debit and the exhaustion check. Raising the existing per-metre cost cannot fix free stationary hanging because that cost getter is never called on an idle tick.
@@ -77,4 +99,4 @@ The interrupted corner draft is retained for provenance. The implemented runtime
 
 One lexical move shares at most 36 actual custom rays, including ordinary prechecks, recovery, misses and failed discovery. A denied query latches refusal for the whole candidate; a partial three-hit scan cannot pass after a fourth denied ray. Native callbacks cannot reset that count. Rust return/unwind restores owned query usage and the previous lexical scope. Scene-query reentry and nested moves suspend custom work and restore baseline MODE/HOLD/NESTED/STUCK. No native or stack pointer is stored by the call-state module; opaque context/world addresses are equality keys only.
 
-The offline tests exercise both corner types/directions at 120/60/20 Hz, actual Rust hook wiring, final-velocity fallback, false native AL, native-call counts and reentry. Their analytic geometry/configuration is not the native engine or its exact climbing capsule. The real ActorResolve/collision step, streamed geometry, animation/controller feel and client/server agreement need later gameplay validation. Independent reviews cleared the observer checkpoint eb42368; the new runtime integration needs its own review before installation. Paid upward hops, whole-path natural exits and surface IK remain unfinished.
+The offline tests exercise both corner types/directions at 120/60/20 Hz, actual Rust hook wiring, final-velocity fallback, false native AL, native-call counts and reentry. Their analytic geometry/configuration is not the native engine or its exact climbing capsule. The real ActorResolve/collision step, streamed geometry, animation/controller feel and client/server agreement need later gameplay validation. Independent reviews cleared the observer and corner-runtime checkpoints through 0e4804f. That build was installed for an offline test, then removed after the incomplete acceptance above. Each subsequent behavior change needs its own review before installation. Paid upward hops, whole-path natural exits and surface IK remain unfinished.

@@ -157,8 +157,8 @@ pub fn prepare_from_patch<C: Caster>(
             Some(hit)
         })
     });
-    let (first, second) = witnesses(&hits).ok_or(Reject::NoSupport)?;
     let normal = input.normal.flat().normalized().ok_or(Reject::Invalid)?;
+    let (first, second) = witnesses(&hits, normal).ok_or(Reject::NoSupport)?;
     let signed = input.velocity.dot(UP.cross(normal));
     let query = Rays {
         caster,

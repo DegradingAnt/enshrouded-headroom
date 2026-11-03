@@ -141,8 +141,8 @@ pub fn propose<C: Caster, O: MotionOracle>(
     for (slot, origin) in hits.iter_mut().zip(frame.origins(request.position)) {
         *slot = query.ray(origin, origin + frame.along * query.reach(), tuning.mask)?;
     }
-    let (first, second) = witnesses(&hits).ok_or(Reject::NoSupport)?;
     let hint = request.normal.flat().normalized().ok_or(Reject::Invalid)?;
+    let (first, second) = witnesses(&hits, hint).ok_or(Reject::NoSupport)?;
     let signed = request.velocity.dot(UP.cross(hint));
     let sign = signed.signum();
     let adjacent = match second {
@@ -595,7 +595,7 @@ fn facing_at(guide: Guide, position: Vec3, radius: f32) -> Result<Vec3, Reject> 
         .ok_or(Reject::Invalid)
 }
 
-/// Validate the finite, static vertical-wall movement domain before any scene calls.
+/// Validate finite movement and a usable orientation reference before any scene calls.
 pub(crate) fn valid(request: &Request, tuning: &Tuning, capsule: Capsule) -> Result<(), Reject> {
     let length = request.velocity.length();
     if !request.position.is_finite()
@@ -604,7 +604,7 @@ pub(crate) fn valid(request: &Request, tuning: &Tuning, capsule: Capsule) -> Res
         || !(request.dt > 0.0 && request.dt.is_finite())
         || !length.is_finite()
         || length * request.dt > RAY_SIDE
-        || request.normal.y.abs() > VERTICAL
+        || Frame::along(-request.normal).is_none()
         || request.normal.flat().normalized().is_none()
         || !(capsule.radius > 0.0 && capsule.radius.is_finite())
         || !(capsule.height >= capsule.radius * 2.0 && capsule.height.is_finite())
@@ -622,13 +622,17 @@ pub(crate) fn valid(request: &Request, tuning: &Tuning, capsule: Capsule) -> Res
         .ok_or(Reject::Invalid)
 }
 
-/// Two plane witnesses inferred from fresh rays. They do not grant movement permission.
-fn witnesses(hits: &[Option<Hit>]) -> Option<(Hit, Option<Hit>)> {
-    let first = *hits.iter().flatten().next()?;
+/// Select real witnesses near the facing hint and a distinct corner angle, not ordinary roughness.
+/// These guide discovery only and never grant movement permission.
+fn witnesses(hits: &[Option<Hit>], hint: Vec3) -> Option<(Hit, Option<Hit>)> {
+    let first = *hits
+        .iter()
+        .flatten()
+        .max_by(|a, b| a.normal.dot(hint).total_cmp(&b.normal.dot(hint)))?;
     let second = hits
         .iter()
         .flatten()
-        .find(|hit| hit.normal.dot(first.normal) < ALIGN)
+        .find(|hit| (-EPS..0.95).contains(&hit.normal.dot(first.normal)))
         .copied();
     let mean = |normal: Vec3| {
         let mut sum = Vec3::default();
@@ -1065,6 +1069,10 @@ mod tests {
             },
             Request {
                 normal: UP,
+                ..approach()
+            },
+            Request {
+                normal: Vec3::new(0.001, 1.0, 0.0),
                 ..approach()
             },
             Request {
@@ -2200,6 +2208,318 @@ mod tests {
             assert!(!call::querying());
         });
         assert!(!call::inside_move());
+    }
+
+    /// A real horizontal rock profile extruded vertically, reusing the existing triangle caster.
+    struct VerticalProfile {
+        /// Actual piecewise planar geometry, including its normal changes.
+        mesh: crate::testworld::Faceted,
+        /// Independent underlying-call count.
+        calls: Cell<u32>,
+        /// Mirror the profile so the wall-relative traversal direction is reversed.
+        reverse: bool,
+    }
+    impl Caster for VerticalProfile {
+        fn cast(&self, from: Vec3, to: Vec3, mask: u32) -> Option<Hit> {
+            self.calls.set(self.calls.get() + 1);
+            let mirror = |v: Vec3| {
+                if self.reverse {
+                    Vec3::new(v.z, v.y, v.x)
+                } else {
+                    v
+                }
+            };
+            let swap = |v: Vec3| Vec3::new(v.x, v.z, v.y);
+            self.mesh
+                .cast(swap(mirror(from)), swap(mirror(to)), mask)
+                .map(|hit| Hit {
+                    point: mirror(swap(hit.point)),
+                    normal: mirror(swap(hit.normal)),
+                    entity: hit.entity,
+                })
+        }
+    }
+
+    /// Current roughness is not a second corner plane. Discovery still needs an actual adjacent face.
+    #[test]
+    fn native_corner_rough_current_facet_does_not_hide_real_adjacent_face() {
+        use crate::corner_call::{self as call, Answer, Call, Key};
+        use crate::surface::{scan, Mode};
+        let key = Key {
+            context: 1,
+            entity: 2,
+            world: 3,
+        };
+        for route in [Route::Convex, Route::Concave] {
+            for reverse in [false, true] {
+                let (bump, exit) = if route == Route::Convex {
+                    (-0.6, 6.0)
+                } else {
+                    (-1.2, -6.0)
+                };
+                let world = VerticalProfile {
+                    mesh: crate::testworld::Faceted::new(
+                        &[
+                            (0.0, -4.0),
+                            (0.0, bump - 0.2),
+                            (0.04, bump),
+                            (0.0, bump + 0.2),
+                            (0.0, 0.0),
+                            (exit, 0.0),
+                        ],
+                        0.0,
+                        0.1,
+                        1,
+                    ),
+                    calls: Cell::new(0),
+                    reverse,
+                };
+                let mirror = |v: Vec3| if reverse { Vec3::new(v.z, v.y, v.x) } else { v };
+                for dt in [1.0 / 120.0, 1.0 / 60.0, 1.0 / 20.0] {
+                    for speed in [0.2, 0.75] {
+                        for vertical in [-0.4, 0.0, 0.4] {
+                            for tilt in [-0.03, 0.03] {
+                                let z = if route == Route::Convex {
+                                    -RAY_SIDE - speed * dt * 0.5
+                                } else {
+                                    -0.9
+                                };
+                                let input = Request {
+                                    position: mirror(Vec3::new(-0.55, 0.0, z)),
+                                    velocity: mirror(Vec3::new(0.0, vertical, speed)),
+                                    normal: (mirror(Vec3::new(-1.0, 0.0, 0.0)) + UP * tilt)
+                                        .normalized()
+                                        .unwrap(),
+                                    dt,
+                                };
+                                let stay = scan(
+                                    &world,
+                                    input.position,
+                                    -input.normal,
+                                    Mode::Stay,
+                                    &tuning(),
+                                    Capsule::FALLBACK,
+                                );
+                                assert!(
+                                    stay.verdict.is_ok() && stay.hits == 4,
+                                    "{route:?}/{reverse}/{dt}/{speed}/{vertical}/{tilt}: {stay:?}"
+                                );
+                                assert!(stay.samples.iter().flatten().any(|a| stay
+                                    .samples
+                                    .iter()
+                                    .flatten()
+                                    .any(|b| a.normal.dot(b.normal) < ALIGN
+                                        && a.normal.dot(b.normal) > 0.95)));
+                                let owner = Call::new(
+                                    key,
+                                    input,
+                                    FreshPatch {
+                                        position: input.position,
+                                        hits: stay.samples,
+                                    },
+                                    stay.fit.filter(|_| stay.steady),
+                                    tuning(),
+                                    Capsule::FALLBACK,
+                                )
+                                .unwrap();
+                                let before = world.calls.get();
+                                call::with_move(Some(owner), || {
+                                    let velocity = call::prepare(&world, -input.normal, input.velocity)
+                                        .unwrap_or_else(|| panic!("rough discovery {route:?}/{reverse}/{dt}/{speed}/{vertical}/{tilt}"));
+                                    let q = input.position + velocity * dt;
+                                    assert!(
+                                        (q - input.position).dot(mirror(Vec3::new(0.0, 0.0, 1.0)))
+                                            > 0.0
+                                    );
+                                    assert!(velocity.length() <= input.velocity.length() + EPS);
+                                    assert!((velocity.y - vertical).abs() < EPS);
+                                    let supported = match call::answer(&world, key, q) {
+                                        Answer::Supported(supported) => supported,
+                                        other => panic!("actual Q needs fresh support: {other:?}"),
+                                    };
+                                    assert!(
+                                        supported.fit.hits >= 3 && supported.fit.normal.y == 0.0
+                                    );
+                                    assert!(
+                                        call::finish(key, input.position, velocity, 1).is_some()
+                                    );
+                                });
+                                assert!(world.calls.get() - before <= u32::from(MAX_NATIVE_RAYS));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// An eased hint from rough rock must not veto actual fresh vertical corner support.
+    #[test]
+    fn native_corner_tilted_facing_keeps_real_vertical_support() {
+        use crate::corner_call::{self as call, Answer, Call, Key};
+        use crate::surface::{scan, Mode};
+        let key = Key {
+            context: 1,
+            entity: 2,
+            world: 3,
+        };
+        for sign in [-1.0, 1.0] {
+            for tilt in [-0.03, 0.03] {
+                for speed in [0.2, 0.75] {
+                    for vertical in [-0.4, 0.4] {
+                        let world = Convex {
+                            calls: Cell::new(0),
+                        };
+                        let (position, flat) = if sign > 0.0 {
+                            (Vec3::new(-0.55, 0.0, -0.35), Vec3::new(-1.0, 0.0, 0.0))
+                        } else {
+                            (Vec3::new(0.35, 0.0, 0.55), Vec3::new(0.0, 0.0, 1.0))
+                        };
+                        let normal = (flat + UP * tilt).normalized().unwrap();
+                        let input = Request {
+                            position,
+                            velocity: UP.cross(flat) * (speed * sign) + UP * vertical,
+                            normal,
+                            dt: 1.0 / 60.0,
+                        };
+                        let stay = scan(
+                            &world,
+                            position,
+                            -normal,
+                            Mode::Stay,
+                            &tuning(),
+                            Capsule::FALLBACK,
+                        );
+                        assert!(
+                            stay.verdict.is_ok(),
+                            "current fresh hold must exist: {stay:?}"
+                        );
+                        assert!(stay.samples.iter().flatten().all(|hit| hit.normal.y == 0.0));
+                        let owner = Call::new(
+                            key,
+                            input,
+                            FreshPatch {
+                                position,
+                                hits: stay.samples,
+                            },
+                            stay.fit.filter(|_| stay.steady),
+                            tuning(),
+                            Capsule::FALLBACK,
+                        )
+                        .unwrap();
+                        let before = world.calls.get();
+                        call::with_move(Some(owner), || {
+                            let velocity = call::prepare(&world, -normal, input.velocity).expect(
+                                "orientation hint cannot invalidate real current vertical faces",
+                            );
+                            let q = position + velocity * input.dt;
+                            assert!(velocity.length() <= input.velocity.length() + EPS);
+                            assert!((velocity.y - vertical).abs() < EPS);
+                            assert!((q - position).dot(UP.cross(flat) * sign) > 0.0);
+                            let supported = match call::answer(&world, key, q) {
+                                Answer::Supported(supported) => supported,
+                                other => panic!("actual Q needs fresh one-face support: {other:?}"),
+                            };
+                            assert!(supported.fit.hits >= 3 && supported.fit.normal.y == 0.0);
+                            assert!(call::finish(key, position, velocity, 1).is_some());
+                        });
+                        assert!(world.calls.get() - before <= u32::from(MAX_NATIVE_RAYS));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Missing this update's hint, idle input and reversal never borrow another call's permission.
+    #[test]
+    fn native_corner_intermittent_current_hints_idle_and_reverse_keep_call_ownership() {
+        use crate::corner_call::{self as call, Answer, Call, Key};
+        use crate::surface::{scan, Mode};
+        let world = Convex {
+            calls: Cell::new(0),
+        };
+        let key = Key {
+            context: 1,
+            entity: 2,
+            world: 3,
+        };
+        for tick in 0..16 {
+            let reverse = tick % 2 != 0;
+            let idle = tick % 5 == 3;
+            let missing = tick % 5 == 1;
+            let stale = tick % 5 == 4;
+            let mut input = if reverse {
+                Request {
+                    position: Vec3::new(0.35, 0.0, 0.55),
+                    velocity: Vec3::new(-0.75, 0.2, 0.0),
+                    normal: Vec3::new(0.0, 0.02, 1.0).normalized().unwrap(),
+                    ..approach()
+                }
+            } else {
+                Request {
+                    velocity: Vec3::new(0.0, 0.2, 0.75),
+                    normal: Vec3::new(-1.0, -0.02, 0.0).normalized().unwrap(),
+                    ..approach()
+                }
+            };
+            if idle {
+                input.velocity = Vec3::default();
+            }
+            let stay = scan(
+                &world,
+                input.position,
+                -input.normal,
+                Mode::Stay,
+                &tuning(),
+                Capsule::FALLBACK,
+            );
+            assert!(stay.verdict.is_ok());
+            let patch = FreshPatch {
+                position: if stale {
+                    input.position + UP
+                } else {
+                    input.position
+                },
+                hits: if missing { [None; 4] } else { stay.samples },
+            };
+            let owner = Call::new(
+                key,
+                input,
+                patch,
+                stay.fit.filter(|_| stay.steady),
+                tuning(),
+                Capsule::FALLBACK,
+            );
+            assert_eq!(owner.is_none(), stale);
+            let before = world.calls.get();
+            call::with_move(owner, || {
+                let velocity = call::prepare(&world, -input.normal, input.velocity);
+                if stale {
+                    assert_eq!(velocity, None);
+                    assert_eq!(call::answer(&world, key, input.position), Answer::Refused);
+                    assert_eq!(call::finish(key, input.position, input.velocity, 1), None);
+                    assert_eq!(world.calls.get(), before);
+                } else if idle || missing {
+                    assert!(velocity.is_none());
+                    assert_eq!(call::answer(&world, key, input.position), Answer::Ordinary);
+                    assert_eq!(call::finish(key, input.position, input.velocity, 1), None);
+                    if idle {
+                        assert_eq!(world.calls.get(), before);
+                    }
+                } else {
+                    let velocity =
+                        velocity.expect("a new real hint must regain its own current plan");
+                    let q = input.position + velocity * input.dt;
+                    assert!(matches!(call::answer(&world, key, q), Answer::Supported(_)));
+                    assert_eq!(call::finish(key, input.position, velocity, 0), None);
+                    assert!(matches!(call::answer(&world, key, q), Answer::Supported(_)));
+                    assert!(call::finish(key, input.position, velocity, 1).is_some());
+                }
+            });
+            assert!(!call::inside_move() && !call::has_call());
+            assert_eq!(call::answer(&world, key, input.position), Answer::Refused);
+            assert!(world.calls.get() - before <= u32::from(MAX_NATIVE_RAYS));
+        }
     }
 
     /// Analogue magnitude and vertical intent remain inside the original native movement budget.
