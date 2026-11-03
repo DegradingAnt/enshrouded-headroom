@@ -840,6 +840,278 @@ These are the spike's proposed steps, including its then-pending documentation p
 - [HYPOTHESIS] The climbing spike left kfc-parser's licence UNVERIFIED and its submodule empty. The separate glass spike records a read-only clone and GPL-3.0-or-later evidence. These are different spike observations; the earlier unknown is retained.
   - Receipt: Climbing P4/open question and glass kfc-parser HEAD db1580a receipt.
 
+## Free climbing (ember-climb)
+
+Every game fact `crates/ember-climb` relies on is here. Addresses are the client's. All of them come from the reference exe sha256 `b28b448a…`, whose `.text` is identical to the Steam exe sha256 `d64966e2…`. `crates/ember-climb/tests/real_exe.rs` re-checks the signatures on the Steam exe file and on the server exe.
+
+**Nothing below has run in the game.** VERIFIED means read from the exe. It does not mean the mod works. Every statement about feel is a HYPOTHESIS until a play test says otherwise.
+
+**The server exe has been checked, and nothing has run on a server.** See "Server exe checks". How the mod behaves on a server is a HYPOTHESIS. If a signature does not match exactly once in that exe, the mod logs which one and installs nothing.
+
+### Server exe checks
+
+The file is `enshrouded_server.exe`, build 26083076, sha256 `d7baa768eb00aa895d9f5a1cd8747ccf66858c7b542f50983092b2e3261588ee`. Its image base is 0x140000000, the same as the client's.
+
+- [VERIFIED] All 15 signatures match exactly once in the server's `.text`, and every real-exe test passes on both exes.
+  - Receipt: `cargo test -p ember-climb --test real_exe -- --ignored` with `ENSHROUDED_SERVER_EXE` set gives 11 passed, 0 failed. The addresses below come from the same run, with `--nocapture`.
+- [VERIFIED] 17 functions are the same in both exes, instruction by instruction, with addresses masked: probe (344 instructions), wall-lost check (65), exit query (173), bottom entry (133), top entry (324), bottom exit (63), exit-top check (28), stop (52), move check (173), start check (223), raycast (57), raycast backend (261), climb update (478), state reader (15), ability reader (29), spark test (3), `FUN_14024c040` (33).
+  - Receipt: Each pair disassembled with iced, addresses replaced by one token, then diffed: 0 lines differ.
+- [VERIFIED] `ecs.Climb`, `ecs.MovementColliderConfig`, `ecs.MovementCollider` and `ecs.MovementCollisionResults` have the same fields at the same offsets in both exes.
+  - Receipt: `python -I rtype.py <exe> ecs.Climb ecs.MovementColliderConfig ecs.MovementCollider ecs.MovementCollisionResults` on each exe, descriptor addresses masked: `diff` is empty over 86 lines.
+- [VERIFIED] The server imports `DINPUT8.dll`, so Ultimate ASI Loader can load there under that name.
+  - Receipt: The PE import directory lists 17 DLLs, `DINPUT8.dll` among them.
+- [HYPOTHESIS] `world+0x1a0` is set on the server. The code that reads it is the same, and nobody has seen its value at run time.
+- [VERIFIED] The server needs the mod, and so does every player who climbs, with the same `ember-climb.ini`. A player who only watches does not. The server decides from its own probe, and a client sends only stick and buttons. A player entity is predicted only by its owner, because every player is created with `createFlags` 2 and the mask `1 << playerIndex`. A viewer gets the id and the transform from the server.
+  - Receipt: `FUN_140981b30` (server `0x1406223b0`, same bytes): `mov eax,1; shl ax,cl`, `mov byte [rsp+0x4c],2`, `mov word [rsp+0x4a],ax`. `FUN_14097cad0` lines 807-819. `FUN_140a17830`: flag 2 with the player's bit clear culls that player from prediction. `ecs.ClientPlayerInputData` holds camera and cursor transforms, no character position and no wall data.
+- [HYPOTHESIS] A client with the mod on a vanilla server gets a stuck start and a snap back at natural walls. Lattices stay vanilla.
+  - Receipt: No test. Replay restores the server's Climb, whose state stays 0 there.
+- [HYPOTHESIS] `dinput8.dll` next to `enshrouded_server.exe` is Ultimate ASI Loader. `coexist.rs` cannot tell it from ClimbAnywhere's server build, which has the same name in the same place. That build normally keeps the loader out, so this mod does not start at all. The overlap needs a second proxy.
+  - Receipt: Public README text only. No third-party DLL was opened.
+
+| Site | Client | Server |
+|---|---|---|
+| `PROBE_FN` | 0x14024abc0 | 0x14005f390 |
+| `WALL_LOST_FN` | 0x14024b390 | 0x14005fb60 |
+| `WALL_LOST_RET` match | 0x14024b48b | 0x14005fc5b |
+| `ATTACH_STORE` | 0x140418db8 | 0x1401b9d08 |
+| `MOVE_CHECK_FN` | 0x140417d90 | 0x1401b8ce0 |
+| `EXIT_QUERY_FN` | 0x14024a6f0 | 0x14005eec0 |
+| `START_FN` | 0x140419570 | 0x1401ba4c0 |
+| `ENTER_LAYER` match | 0x140419935 | 0x1401ba885 |
+| `RAYCAST_FN` | 0x1409fff60 | 0x1406a18e0 |
+| `LOW_ENTRY_FN` | 0x14024c0d0 | 0x1400608a0 |
+| `TOP_ENTRY_FN` | 0x14024c320 | 0x140060af0 |
+| `STOP_FN` | 0x14024a090 | 0x14005e860 |
+| `EXIT_TOP_FN` | 0x14024c9f0 | 0x1400611c0 |
+| `EXIT_LOW_FN` | 0x14024c8f0 | 0x1400610c0 |
+| `STAMINA_CALL` | 0x1402eb77e | 0x1400d8a6e |
+
+### Corrections to the climbing spike
+
+- [VERIFIED] The live ray goes through Jolt, not through `FUN_1409ff1e0`. That function is the fallback for a null `world+0x1a0`, and `FUN_14099d670` returns no collision in that case, so the live game must have it set. The path is `FUN_1409fff60` to `FUN_140a00070` to `FUN_140967c70` to `FUN_14003a520` (a Jolt cast with filters) to the shape `VoxelWorldShape`.
+  - Receipt: Decompiles of those functions. Strings 'VoxelWorldShape::CollidePoint not implemented' 0x1413b58a0 and 'JPH_DOUBLE_PRECISION' 0x14151fc10. Vtable 0x1413b5770.
+- [VERIFIED] `FUN_140967e80` is the water plane, not a voxel layer. The mask table of the pin stays valid. Its voxel path does not.
+  - Receipt: `FUN_140967c70` calls it after the Jolt cast. It serves mask bit 4, Fluid.
+- [VERIFIED] The 20 m/s gate reads `param_1[4]`, which is `MovementVector.velocity.y`, not the Velocity component.
+  - Receipt: Program read-list order [2] CurrentTransform [3] MovementCollider [4] MovementVector. `ecs.MovementVector` desc 0x141820250: velocity +0, movement +0xc.
+- [VERIFIED] CanClimb is read a third time: `FUN_140213260` case 0x13 at 0x1402133c5, when the request to start climbing is consumed.
+  - Receipt: Decompile of `FUN_140213260`. The layer 0x13 case calls `FUN_140218200(actor, 0x10)`. Layers 0x10, 0x15, 0x17 and 0x1a always pass.
+- [VERIFIED] The call of `FUN_14024a360` in the stamina program is at 0x1402eb788. The spike's 0x1402eb789 is its rel32.
+  - Receipt: Bytes at 0x1402eb786: `33 c9 e8 d3 eb f5 ff`. rel32 0xfff5ebd3 from 0x1402eb78d gives 0x14024a360.
+
+### Why the old approach failed
+
+The first experiment widened the wall-probe mask and the plane tolerance. Its test log was not saved, so which step failed is a HYPOTHESIS. The code gives these causes.
+
+- [VERIFIED] Terrain is three static Jolt bodies with one mesh and one collider flag each: flag 1 World (positions and normals displaced), flag 4 WorldNormalsNotDisplaced (positions displaced, normals not), flag 2 WorldNotDisplaced (neither). Fluid is a fourth body with flag 0x10. A mask does not widen a voxel hit. It picks which surface answers. With bits 0, 1 and 2 set, each ray returns the nearest of two different surfaces. So mask 0x12f gives a different surface per ray.
+  - Receipt: `FUN_140a10a20`: `FUN_14003c610(…,1,1)` with flag 1, stored at +0x518; `(…,1,0)` with flag 4, +0x51c; `(…,0,0)` with flag 2, +0x520. Ctor `FUN_1400438f0`: param_6 to shape+0x38, param_7 to shape+0x39. Body filter `FUN_1400379b0`: accept when `mask & record+0` is not 0.
+- [VERIFIED] A voxel hit normal is the flat normal of one triangle. It is not smoothed.
+  - Receipt: `FUN_141097b70`: cross product of three packed vertices, no interpolation. With normalsDisplaced 0 it first moves each vertex back by `d * vn`, with `d = i8 * 0.0078125` m.
+- [VERIFIED] The four corner rays of `FUN_14024abc0` cannot pass on rock. They sit 1.0 m apart sideways and 0.75 m apart up and down, so they land on different triangles, and each normal must match the forward normal within 0.001. Status 0x15.
+  - Receipt: `FUN_14024abc0` decompile lines 119-145 and 166-173.
+- [VERIFIED] The wall probe has a depth margin of 0.10 m. Every ray is 0.65 m long during a climb and the player stands 0.55 m off. A corner on a surface that recedes more misses, status 0x1f.
+  - Receipt: `FUN_14024abc0`: `param_5 + 0.65000004`, `* 0.55`. `FUN_14024b390` passes length 0.
+- [VERIFIED] Climb motion is world up plus sideways, not along the wall: `up * input.z - right * input.x`, with `right = (nz, 0, -nx)`. On a wall with normal up part `ny`, each metre up moves the player `ny` metres off the surface. With the 0.10 m margin the climb stalls after `0.10 / ny` metres.
+  - Receipt: `FUN_140418c50`, `FUN_14023c080`, `FUN_14024a600`.
+- [VERIFIED] The exit query has no walkable test. For a plane, ray A (2.1 m up, 1.05 m along `-n`) misses when `ny > 0.238`, and ray B (1.35 m down) hits when `ny < 0.667`. So faces 48 to 76 degrees steep pass, and the first up input plays the mantle on the rock itself.
+  - Receipt: `FUN_14024a6f0` lines 56-78, masks 0x129 and 0x21. The band is arithmetic from those constants. `crates/ember-climb/src/testworld.rs`, `the_games_own_exit_misfires_on_a_steep_face`.
+- [VERIFIED] Nothing ends a climb where a wall turns walkable. With a fixed normal the head ray stops hitting within 0.65 m, so the move check blocks up, while ray A with its 1.05 m reach still hits the slope. The player stops with no fall and no exit.
+  - Receipt: `FUN_14024a6f0`, `FUN_140417d90`, `FUN_14024c9f0`.
+- [HYPOTHESIS] That is the old mod's "bugs out when a wall becomes walkable". By the clean-room rule the third-party DLL was not examined.
+  - Receipt: Author's report only.
+- [VERIFIED] The game's 45 degree test uses the raw stick and the full normal. A half-pressed stick aimed straight at a wall fails it: `dot(-n, input) = 0.5`. So does a stick more than 23 degrees off on a 50 degree face.
+  - Receipt: `FUN_14024c0d0` lines 62-70: `acos(-n.x * input.x - n.y * input.y - n.z * input.z) <= 0.7853982` on `ActorInput+0x198`.
+- [HYPOTHESIS] That raw test is part of the author's "starting a climb is inconsistent".
+  - Receipt: The code above. The mod was not inspected.
+- [VERIFIED] A drop feeds a retry loop. Wall lost stops the climb and blocks a re-grab for 375 ms, and a held stick then latches again.
+  - Receipt: `FUN_14024a090`: `param_2 + 375000000` into Climb+0x10. `FUN_14024c0d0` line 26.
+
+### Game layouts the crate reads and writes
+
+- [VERIFIED] The climb context, built in `FUN_140419570` and `FUN_140418c50`: +0 Actor, +8 Climb, +0x10 CurrentTransform, +0x18 MovementColliderConfig, +0x20 MovementCollider, +0x28 PlayerState (may be null), +0x30 entity id (u32), +0x38 ColliderSystem.
+  - Receipt: `local_f8 = param_1[8]; local_f0 = param_1[0x14]; local_e8 = param_1[2]; local_e0 = param_1[1]; local_d8 = param_1[3]; local_d0 = param_1[5]; local_c8 = entity; local_c0 = param_1[0x27]`.
+- [VERIFIED] `CurrentTransform` starts with three i64 in 32.32 fixed point.
+  - Receipt: `(float)plVar2[0] * 2.3283064e-10`, `FUN_14024b390`.
+- [VERIFIED] Raycast `FUN_1409fff60(out, world, ray, ignore, 0, mask, flags, 0)`. Stack arguments at the caller: arg5 `[rsp+0x20]`, mask `[rsp+0x28]`, flags byte `[rsp+0x30]`, arg8 `[rsp+0x38]`. `ray` is two float4, origin then end. `out` is 0x70 bytes, copied with `movups`.
+  - Receipt: `FUN_1409fff60` assembly: `SUB RSP, 0xb0` after `PUSH RBX`, then reads at `[RSP+0xe0]`, `+0xe8`, `+0xf0`, `+0xf8`. Call site 0x14024acc8.
+- [VERIFIED] Raycast result: +0 status (0 is a hit), +0xc id, +0x14 point, +0x20 normal, +0x64 squared distance.
+  - Receipt: `FUN_140a00070` lines 197-218.
+- [VERIFIED] Ray flags: 0x20 skips hits whose normal does not face the ray. 0x40 skips ids 1 to 0x3ff. Bits 4 and 7 change the filter. Bits 5 and 6 do nothing else, so 0x60 is safe to pass.
+  - Receipt: `FUN_140a00070` lines 157-162. `FUN_1409a48b0(filter, flags, mask)` reads only `flags & 0x10` and the sign bit.
+- [VERIFIED] Mask 0x124 goes to the all-layers path of the filter, because bit 8 is outside the list {0,1,2,3,5,6,9,19}.
+  - Receipt: `FUN_1409a48b0`: `(mask & ~0x8026f) != 0` sets `filter+0x40 = 0x3f`.
+- [HYPOTHESIS] Ids 1 to 0x3ff are players.
+  - Receipt: The range only. `FUN_14023c0e0` tests the same range when it splits non-player results.
+- [VERIFIED] Probe result, 0x24 bytes: +0 code, +8 position, +0x14 normal, +0x20 entity. The exit query uses the same layout.
+  - Receipt: `FUN_14024abc0` lines 201-205, `FUN_14024a6f0` lines 82-86, `FUN_140419570` lines 106-108.
+- [VERIFIED] The probe's position is `hit - corner offset + n * 0.55`. Its first corner sits 2.0 m up, so the game's stand-off is measured near the head.
+  - Receipt: `FUN_14024abc0` lines 174-178.
+- [VERIFIED] `FUN_140417d90(velocity, ctx, pos, dt)` receives the Velocity pointer from the accessor, in `rcx`, and `dt` in `xmm3`. It has one caller, 0x1404192a4. The exit prediction is computed before it runs, from the velocity before the check.
+  - Receipt: `FUN_140418c50`: `uVar15 = FUN_14031e8f0(puVar10)`, then `FUN_140417d90(uVar15,&local_168,&local_188,fVar20)`, then `local_188 = fVar18 * fVar20 + …` from values read earlier.
+- [VERIFIED] The exit check `FUN_14024c9f0` needs `ActorInput+0x194 > 0`. The mantle's first two points are `hit + n * 1.05`, and the third is the hit.
+  - Receipt: `FUN_14024c9f0`, `FUN_14024bc90`.
+- [VERIFIED] The climb normal has no reader in the probes other than `-n` as the ray direction. `actor_rotation` reads it every frame and builds a full 3D rotation with `view = -n` and `up = (0,1,0)`.
+  - Receipt: `FUN_14026a1e0`, branch "%s (%u): Climbing": `FUN_14021c730(&local_1288,local_1728,local_1738,…)`, stored at +0xec4.
+- [HYPOTHESIS] So the body lies along a leaning surface. Correction: the rotation above is only a target, and a body can only tilt if the interpolation mode allows it. See "Body tilt". The tilt log settles this. Until then the stand-off at the feet and the ray patch on a plane parallel to the surface rest on this hypothesis. With the game's world-up offsets a 1 m reach loses every face less steep than about 66 degrees.
+  - Receipt: The rotation above. The figure is arithmetic: `0.55 + 2.0 * ny` must stay under the reach.
+- [VERIFIED] Writes to ECS components go through `FUN_140417d50`, `FUN_14031e8f0` and `FUN_140417d10` to `FUN_1409c75e0`, which marks the change. A direct write skips the mark.
+  - Receipt: Decompiles of those accessors.
+- [VERIFIED] Skipping the mark is harmless for a raw write inside program 244. The body `FUN_1404188c0` calls `FUN_1409c75e0` for Climb at the top of each entity's turn, before it reads Climb, and `FUN_140418c50` calls it again on entry. The mark is per entity, and the prediction stream does not use it.
+  - Receipt: `FUN_1404188c0` lines 27-29, `FUN_140418c50` lines 61-65. Accessor cell `chunk + [chunk+0x1c] + index*4` at 0x1409b3f57 is the cell `FUN_140983c20` reads.
+- [VERIFIED] `MovementColliderConfig`: width +0 (the diameter), height +4. `MovementCollider`: results +0x10, `m_isSet` +0x50, `hasSpheroidCollision` +0x4b.
+  - Receipt: `python -I rtype.py <exe> ecs.MovementColliderConfig ecs.MovementCollider ecs.OptionalMovementCollisionResults ecs.MovementCollisionResults`. `FUN_14023c0e0`: sphere centre `height - width * 0.5`, radius `(width - 0.005) * 0.5`.
+- [VERIFIED] Actor state: `FUN_14021aaa0` reads +0xbf8, and while +0x1b1 bit 0 is set it applies `(state | +0xbd0) & ~+0xbd8`. `StateFlag`: 0 Grounded, 1 Jumping, 32 Falling, 34 Climbing, 35 ClimbingTransition, 37 HangGliding. There is no sprint flag.
+  - Receipt: Decompile of `FUN_14021aaa0`. Enum desc 0x1417fe9b0, 63 members at 0x1417f4960.
+- [VERIFIED] Sprint is `ActorInput+0x1c4 == 4`: `locomotionSpeed`, `ecs.LocomotionSpeedSelector`, member 4 Sprint.
+  - Receipt: `rtype.py` on `ecs.ActorInput` and `ecs.LocomotionSpeedSelector`. `FUN_140431270` compares the same byte with 4.
+- [VERIFIED] `FUN_140218200(actor, 16)` reads +0xc00 when no sequence runs and +0xbc8 when one does. The climb iterator holds the Actor at `param_1[8]`.
+  - Receipt: Decompile of `FUN_140218200`. `FUN_140419570` line 60. Signature `48 8b 4f 40 b2 10 e8`.
+- [VERIFIED] `FUN_14024a360` has two twins with the same body and another key, so no pattern on the function matches once. Its only caller is the stamina program.
+  - Receipt: A 113-byte pattern with the two rel32s as wildcards still matches 3 times in the Steam exe. `procedure_callers 0x14024a360` gives 0x1402eb420.
+
+### The exit
+
+- [VERIFIED] The exit query's result has two readers, both right behind it in the climb update: `FUN_14024bf60`, which runs the head sphere, and `FUN_14024bc90`, which builds the mantle. So a refused result changes nothing else.
+  - Receipt: `FUN_140418c50`: `FUN_14024a6f0(&local_e8,…)`, then `FUN_14024bf60(&local_168,local_118)`, then `FUN_14024c9f0` and `FUN_14024bc90(&local_168,uVar15,&local_188)`. No other use of `local_e8`.
+- [VERIFIED] The head sphere runs in the same frame. A failed result casts nothing and blocks the exit.
+  - Receipt: `FUN_14023c0e0`: `FUN_1409999a0` inline, flag byte +0x1d. `cVar6 != 0` stores flag 1. `FUN_14023c0b0` passes only with flags 1 and 2 clear.
+- [VERIFIED] The mantle's first two points use the climb normal, not the normal in the result. The result gives only the position.
+  - Receipt: `FUN_14024bc90`: `uVar1 = *(climb + 4)`, then `fVar2 + uVar1 * 1.05`.
+- [VERIFIED] The exit needs `ActorInput+0x194 > 0`, the stick, and not movement. After going down the stick is up while the velocity still points down, for up to 39 ms. A one-triangle floor can fire in those frames unless the exit is refused while the player does not rise.
+  - Receipt: `FUN_14024c9f0`. The time is arithmetic: 1.95 m/s at the 50 m/s² in `FUN_140418c50`.
+- [VERIFIED] Mask 0x24 reaches the same positions as the game's floor mask 0x21, and it gets normals from before displacement.
+  - Receipt: Bodies and flags under "Why the old approach failed": flag 1 and flag 4 both have displaced positions, and only flag 1 has displaced normals.
+- [VERIFIED] On a smooth face under a flat top, the upper ray row lands on the top first. Then the move check sees two rays on the flat and two on the face, and refuses with Walkable. The hold still sees the face, one frame behind. For faces below about 62 degrees every exit ray of the first build stayed short of the corner, so the player stopped for good: at 60 degrees the search reached 0.83 m past the feet and the corner lay 0.87 m on.
+  - Receipt: Arithmetic from the ray rows and `FUN_14024a6f0`. `crates/ember-climb/src/testworld.rs`, `a_leaning_face_with_a_flat_top_ends_in_a_mantle`, fails on the first build.
+- [HYPOTHESIS] How rough the undisplaced mesh is. The tests run with clean undisplaced normals and with normals as rough as the positions. Nobody has measured the game's triangles.
+
+What the crate does, in order, when the player rises:
+
+1. A level ray from 0.5 m above ray A's end looks ahead. With the ground under its start it gives the slope of the rock over a metre or more, from positions alone. A steep rise on the plane of the climb means the face goes on, and there is no exit.
+2. A floor must be walkable as an area: at least 3 of 4 rays, 0.35 m around it, and their averaged normal.
+3. The candidates are the game's floor, the ground under a walkable patch, a slope at head height, and four columns from 0 to 1.2 m past ray A's end.
+4. A player the move check stopped gets no second look at the same spot, so one triangle does not decide there, and a walkable patch overrides step 1. This holds for the game's floor and for the rays that look straight down. The head ray runs sideways, so a hit at head height must have a walkable normal of its own, stopped or not. On rough rock a down ray can also land on a sheer undisplaced triangle, so "looks straight down" is no guarantee: in 9000 rough climbs 8 of 8619 mantles landed on a hit with less than 0.1 up in its normal, all of them for a stopped player.
+
+Limits of the exit. These come from the closed-loop model, so all of them are HYPOTHESIS for the game until a play test. The model has the head sphere, with its centre at the capsule's `height - radius`. It has no jump and no animation.
+
+- [HYPOTHESIS] A short walkable shelf in a face stops the climber while the stick is up. The move check refuses the shelf as walkable. The level ray reads the wall behind it as steep and on the plane of the climb, so the answer is no exit. On clean rock a flat shelf of 0.2 to 0.8 m in a 60 degree face stalls, and so does one of 0.5 to 0.9 m in a sheer wall. On the 60 degree face a shelf of 1 m or more ends in a mantle. The climber does not fall, and can go sideways, go down or jump off.
+  - Receipt: `crates/ember-climb/src/testworld.rs`, `a_short_shelf_stops_the_climber`. On a fine map of 12600 climbs 141 stalled, and none dropped. The exact count moves by a few: two builds of the same code differed on shelves about 0.45 to 0.5 m wide, where ray A's end reaches the wall behind the shelf.
+- [HYPOTHESIS] A narrow bench tips the climb normal, and the ray patch swings up against the rock above the bench. At a bench of 10 degrees and 0.3 m in a sheer wall the normal reaches 0.46 up. At feet (-0.61, 4.04) the upper row's origins lie at x 0.313, and the wall is at x 0.295. A ray from inside the rock meets no front face in the model, so the move check gets too few hits in every direction. On rough rock the hold fails there too. So the hold and move rays start 0.3 m behind their origins and end where they did. That climb now goes on up the wall to the top. What the game's ray returns from inside rock is not known. The late start needs no answer to that, because such a ray starts in the air. A start keeps its rays at the origins, because its frame does not tip.
+  - Receipt: `a_narrow_bench_in_a_sheer_wall_lets_the_climber_past`, `a_rough_bench_drops_nobody`, `a_running_climb_starts_its_rays_behind_their_origins`. Rough benches, 7200 climbs: 0.25 to 0.75 m wide, tilted 0 to 20 degrees, in faces of 60 to 90 degrees, +-0.05 to +-0.2 m, 6 seeds, clean and rough normals, stick straight up, 60 ticks a second, grace 9 ticks. Rays from the origins give 5578 mantles, 74 drops, 621 stops where a stick moves the player, 22 where a stick only drops them, and 905 where no stick moves them 0.5 m in 2 s. Rays from 0.3 m back give 6470, 0, 609, 0 and 121. The last number is 167 at 0.2 m and 116 at 0.5 m. Of the 609 stops, 254 keep shaking at about 0.1 m/s, because the move check still passes the flat part of the steered velocity. Those feet stay within millimetres, and all 254 can go down.
+- [HYPOTHESIS] Some stops still leave only the jump, and they have other causes. On clean rock that is a bench of 15 degrees and 0.7 to 0.8 m in a 60 degree face. The climber stands 1.2 m from the wall behind the bench, with the normal on that wall. The hold reaches the wall and the move check does not. On rough benches it is the 121 of 7200 above. At 111 of those no origin lies behind rock. A step up reads bumpy at 77 of them, and too few rays hit at 38.
+  - Receipt: `a_bench_in_a_leaning_face_can_hold_the_climber`. How often: of the 30 stalls on 4000 random rock lines, 28 could go both ways and 2 could not move. On the fine map of shelves 2 of the 141 stalls could not move. On rough rock that turns walkable, with the stick straight up, none of 480 climbs stalled at +-0.15 m, and 30 of 480 did at +-0.25 m, most of them with normals as rough as the positions. With a slanted stick 12 of 768 stalled at +-0.15 m, and 19 of 384 at +-0.05 m with rough normals, all near tops of 35 to 47 degrees. The late start does not change those two. Whether real rock has such benches was not measured.
+- [VERIFIED] The jump ends a stopped climb. Stamina does not. `actor_jump_abort_climbing` calls `FUN_14041f710`, which tests `FUN_14024b360`. `FUN_14024a180` then sets Climb+1 to 3 and blocks a re-grab for 375 ms. None of them reads a position. A failed move check zeroes the velocity, and the stamina program skips a tick with at most 1e-20 of velocity times dt on every axis.
+  - Receipt: REA decompiles: ev_76343b66… (FUN_140267650), ev_9d2fad7b… (FUN_14041f710), ev_a4e5ceb1… (FUN_14024b360), ev_b046c1f7… (FUN_14024a180), ev_149b3d58… (`FUN_140418c50`, the zero write after `FUN_140417d90` returns 0), ev_2800f695… (`FUN_1402eb420`, the jump to `LAB_1402eb81e`).
+- [HYPOTHESIS] A long slope within `FACE_REACH_MARGIN_DEGREES` of the walkable limit does not end the climb. The level ray reaches planes 3 degrees flatter than the limit, so with `WalkableAngle` 50 a slope from 47 to 50 degrees reads as the face going on, though the setting calls it walkable. The band is deliberate: rock just past the limit reads walkable as often as not. Slopes of 47.5, 48 and 49.5 degrees gave no exit in 30 s and more than 30 m of climbing. A slope of 45 degrees ends in a mantle. The climber can go sideways, go down or jump off.
+  - Receipt: `a_long_slope_near_the_walkable_limit_does_not_end_the_climb`.
+
+Whether to do more about these limits is for the author to decide after the first play test.
+
+### What the crate changes
+
+| Site | Client address | Change | Signature |
+|---|---|---|---|
+| Wall probe | 0x14024abc0 | post-hook: patch fit when the game's probe fails | `PROBE_FN` |
+| Wall-lost check | 0x14024b390 | hook: mode, and the grace count in Climb +2 | `WALL_LOST_FN` |
+| Wall-lost return | 0x14024b4a5 | 12 bytes: id 0 returns 0xffffffff | `WALL_LOST_RET` +26 |
+| Attachment store | 0x140418db8 | 19 bytes: reordered, see below | `ATTACH_STORE` |
+| Move check | 0x140417d90 | pre-hook: steering, and a read of the body for the log | `MOVE_CHECK_FN` |
+| Exit query | 0x14024a6f0 | post-hook: see "The exit" | `EXIT_QUERY_FN` |
+| Bottom entry | 0x14024c0d0 | hook: trigger and cone test | `LOW_ENTRY_FN` |
+| Start check | 0x140419570 | hook: glider, diagnostics | `START_FN` |
+| Enter layer | 0x140419947 | 1 byte 0x13 to 0x10, only with `Glide = 1` | `ENTER_LAYER` +18 |
+| Stamina cost | 0x14024a360 | hook behind its call, only when the multiplier is not 1 | `STAMINA_CALL` |
+| Top entry, stop, exit-top, bottom exit | 0x14024c320, 0x14024a090, 0x14024c9f0, 0x14024c8f0 | post-hooks, counters only | see `sigs.rs` |
+| Raycast | 0x1409fff60 | called, not changed | `RAYCAST_FN` |
+
+- [VERIFIED] The attachment id is only compared and written. No code resolves it.
+  - Receipt: Uses at 0x140418dbf and 0x140418dd0, and zeroing in `FUN_14023bae0` and at 0x1404189eb. Search scope: the 19 programs that name Climb. Not covered: generic reflection replication and `debug_draw_player_jump`.
+- [VERIFIED] The stand-in value 0xffffffff must not enter the game's data, in case something replicates it. The game's bytes are `mov rax,[rdi+0xa0]; cmp [rax+0x18],ebx; je skip; lea rcx,[rdi+0xa0]`, then `call` and the store. The replacement is `lea rcx,[rdi+0xa0]; mov rax,[rcx]; cmp [rax+0x18],ebx; je skip; test ebx,ebx; js skip`. It is the same length, so the `call` does not move. A real id takes exactly the game's path, and the stand-in has its top bit set, so it skips the store.
+  - Receipt: Bytes at 0x140418db8. The code at `skip` starts `48 8b 0f`, `mov rcx,[rdi]`, so the changed `rcx` is harmless there. Both are checked on the file by `tests/real_exe.rs`, and the encoding is decoded in `plan.rs`.
+- [HYPOTHESIS] No real id has its top bit set.
+  - Receipt: `maximumEntities` is 1048576 in the ShroudForge profile.
+- [VERIFIED] Ultimate ASI Loader loads plugins in name order, so a plugin can start before a mod that loads later.
+  - Receipt: A saved `DINPUT8.log` of the first boot test lists `climb-anywhere.asi`, `enshrouded-headroom.asi` and `greeneye-loader.asi`, in that order. This is why start-up checks for ClimbAnywhere twice.
+- [HYPOTHESIS] ClimbAnywhere has shipped under three names: `climb-anywhere.asi` in `plugins\`, a chained `dinput8Hooked.dll`, and a `dinput8.dll` in `plugins\`.
+  - Receipt: The boot log above, and file names and sizes in one install. No file was opened. By the clean-room rule the third-party DLL was not examined.
+
+### Replay and the grace byte
+
+The client simulates its own player ahead of the server, and it replays old ticks on most ticks. Only component bytes come back. So anything a climb decision needs from an earlier tick must live in a component, and time must be ticks.
+
+- [VERIFIED] The client rolls back and replays at most 20 ticks. The start is the lowest `dataTick + 1` over dirty entities, clamped to `tick - 20`. `FUN_14096cec0` restores it, then `FUN_140a1bc10` runs each tick.
+  - Receipt: `FUN_1409f4400`: `0x14 < param_2 - iVar12`, `FUN_14096cec0(param_1)`, `for (...; uVar9 <= param_2; ...) FUN_140a1bc10(param_1,uVar9)`. 32 history slots.
+- [VERIFIED] The tick is 1/60 s on both exes.
+  - Receipt: `mov [rdi+0x4c0],0xfe502b` at client 0x1409866bf and server 0x140626f3f. 0xfe502b ns is 16.67 ms, so 150 ms is 9 ticks.
+- [VERIFIED] `ecs.Climb`: +0 climbType, +1 climbState, +4 climbNormal, +0x10 climbBlockingTimeEnd, +0x18 attachmentEntityId, +0x1c climbCollisionQueries, +0x8c laddersQueryId, +0x90 ladderStepPhase, size 0x98. So +2 and +3 are padding. The two exes agree.
+  - Receipt: `python -I rtype.py <exe> ecs.Climb`.
+- [VERIFIED] The padding crosses every copy, because each copy is of the whole component:
+  - History save: `FUN_140979c60` copies each sized component with `memcpy` (`FUN_1413ad610`), by the archetype's stride at `+0xa84`.
+  - History restore: `FUN_140987a30` with `param_3 = 0` is a plain `memcpy`.
+  - Server state: `FUN_140987a30` with `param_3 = 1` goes through `FUN_14096b920`, which is a `memcpy`. After that it fixes only the listed handle fields, and padding is no field.
+  - Send: `FUN_14097bb80` lists `{pointer, stride}` for each component and `memcpy`s them. `FUN_14087f0a0` then writes a byte delta against the base.
+  - Receive: `FUN_1408ae3d0` applies that byte delta to all `size` bytes.
+  - Client ECS: `FUN_14096c640` copies Climb from the history slot, by the stride.
+  - Climb has no custom coder, so both streams use the byte delta.
+- [VERIFIED] No store to +2 or +3 was found in the reach of the Climb writers. Stores near the start of Climb:
+  - `FUN_14023bae0` (the reset behind `FUN_14024a090` stop, `FUN_140246c40`, and hook shot `FUN_140423200`): `mov word ptr [rdx],0` at 0x14023baea, +0 and +1 only, and `mov dword ptr [rdx+0x18],0`.
+  - `FUN_14024a150` (start): `mov byte ptr [rax],1`, `mov byte ptr [rax+1],1`.
+  - `FUN_14024a180` and `FUN_140246d50` (exit state): `+1` byte, and `+0x10`.
+  - `FUN_1404188c0`, `FUN_140425c60` (state changes): `+0` and `+1` bytes, `+0x18` dword.
+  - `FUN_140419570` (entry): `+4` qword, `+0xc` dword.
+  - Receipt: a capstone scan walks calls to depth 3 from the 7 smaller writer programs and from `FUN_14041f620`, `FUN_14041f710`, `FUN_140246c40`: 162 functions. A hit is a store through a base register other than rsp and rbp, with no index, whose bytes overlap +2 or +3 of that base. No hit has a displacement of 1, 2 or 3. Each hit at displacement 0 was judged by its base: Velocity, ActorInput, HookShot, LerpTransform, StaminaDepletion, out buffers, events, and library helpers that are not given Climb. In `actor_jump` and `player_control_action_sequence` the Climb slot goes only to the functions named here.
+  - Scope limit: a store through a computed index is not seen, and a judged hit is a reading, not a proof. Program lists leave only 9 programs and the ECS copies above able to write Climb: `Climb` has bits 0x19, so client programs do not write it.
+- [VERIFIED] Every path to the byte write runs inside program 244. The write is in the detour on `FUN_14024b390`. That has one call site, 0x140418d7f, in `FUN_140418c50`. That has two: 0x140418a84 in `FUN_1404188c0`, the body of `player_locomotion_climb_wall`, and a `jmp` at 0x140418122 in `FUN_1404180c0`. `FUN_1404180c0` has no reference at all, direct or by pointer, beyond its own `.pdata` entry. `FUN_1404188c0` has one absolute pointer, at 0x141deff60 in that program's descriptor. The server is the same: 0x14005fb60, 0x1401b9ba0, 0x1401b9810, descriptor 0x14135c920, and the unreferenced twin 0x1401b9010.
+  - Receipt: A byte scan of each exe. Scope: `E8`, `E9` and `lea` over all of `.text`, absolute qwords and RVAs over every section. A computed address is not caught.
+- [VERIFIED] The readers of the thread-locals `HOLD` and `STUCK` run only after the wall-lost check of the same update. `FUN_140417d90` has one call site, 0x1404192a4, and `FUN_14024a6f0` has one, 0x140419302. Both sit in `FUN_140418c50` behind the wall-lost call at 0x140418d7f, and the detour clears both before it runs the check.
+  - Receipt: The same byte scan, and the `FUN_140418c50` decompile.
+- [HYPOTHESIS] The byte is 0 when a Climb is created. The default was not read. Any value is safe: a hold sets it, and a stray value can only shorten the grace.
+- [HYPOTHESIS] All of this at run time. Nothing has run in the game. The first test should watch a seam on a client with some latency.
+
+What the crate keeps in the byte: 0 for no natural hold, 1 for a natural hold, and 1 plus the ticks forgiven so far. +3 stays free. A hold that passes sets 0 or 1. The hook writes it only inside program 244, after the game's check. A drop clears it. A climb that ends another way leaves it, and the first hold of the next climb sets it. If that first hold fails, the old value can give that climb what is left of the grace, even on a lattice. The first build had the same gap.
+
+### Body tilt
+
+Whether a climber's body tilts is not settled, and `crates/ember-climb` must not assume it does.
+
+- [VERIFIED] `ecs.ActorRotation` +0x48 is `climbingRotationSpeed`, a `RotationSpeedEntry` of `rotationSpeed` +0 (float) and `interpolationMode` +4. The real value is template data, not in the exe. The C++ default is 0.0 and mode 0.
+  - Receipt: `rtype.py ecs.ActorRotation ecs.RotationSpeedEntry`. Default constructor 0x141291990 to 0x1412684e0.
+- [VERIFIED] The climb branch of `actor_rotation` stores that entry in the Actor: speed at +0xee0, mode at +0xee4, target orientation at +0xec4, axis at +0xed4. The axis is minus world up. These are `actor.RotationInterpolation` at Actor+0xeb4: targetOrientation +0x10, linearRotationAxis +0x20, speed +0x2c, interpolationMode +0x30.
+  - Receipt: `FUN_14026a1e0` lines 2491-2504: `uVar26 = local_16a0[9]`, `*(char *)(lVar33 + 0xee4) = (char)(uVar26 >> 0x20)`, `*(undefined4 *)(lVar33 + 0xee0) = ...`, `FUN_140f54fc0(lVar33 + 0xec4, ...)`. `local_16a0[0xb]` is read as `minLinearAxisRotationAngle`, which shows that `local_16a0` is ActorRotation.
+- [VERIFIED] Correction: a body can only tilt if the mode allows it. Mode 0, `LinearAxisRotation`, turns the orientation about that axis only, so it can only yaw. Modes 1 and 3, and a speed of `FLT_MAX`, reach the whole target.
+  - Receipt: `FUN_14026a1e0` lines 2814-2823 and 2884-2994, `FUN_140245810`. `actor.InterpolationMode`: 0 LinearAxisRotation, 1 ExponentialLerp, 2 SpringDamper, 3 LerpWithConstantSpeed, 4 LerpSmooth, 5 LerpSmoother, 6 to 11 Rotate variants.
+- [VERIFIED] `CurrentTransform` is a `WorldTransform`: position +0, orientation +0x18 as x, y, z, w, scale +0x28, size 0x38. The game turns a vector with `v + 2 * cross(q, cross(q, v) + w * v)`.
+  - Receipt: `rtype.py WorldTransform Quaternion`. `FUN_14021ad10`, called with `local_1708 + 3`.
+- [VERIFIED] `ecs.Actor` is 0xef8 bytes, so +0xee4 is inside it.
+  - Receipt: `rtype.py ecs.Actor`.
+- [HYPOTHESIS] Modes 2, 4 and up. Their code was not read. The tilt line reads the body's real up vector, so it catches them too.
+
+The move check gives the log thread the speed, the mode, the climb normal and the orientation. The log thread writes one `climb body:` line per climb, about a second in. To read it, climb a face near 70 degrees. If `body leans` follows `surface leans`, the body tilts. If it stays near 0, the mod must set the rotation itself, and the stand-off and the ray patch need a rethink. Under an overhang `surface leans` goes negative and `body leans` stays positive, because the second is an angle from straight up.
+
+### Numbers that are starting values
+
+All of these are HYPOTHESIS until a play test. Most are settings.
+
+- [HYPOTHESIS] `WalkableAngle` 50. The game's limit is data (`SlopeDefinition`), which was not read.
+- [HYPOTHESIS] `PlaneTolerance` 0.45 m, measured along the fitted normal.
+- [HYPOTHESIS] `HoldReach` 1.0 m, `EntryReach` 0.95 m, `GraceSeconds` 0.15, `OverhangAngle` 110.
+- [HYPOTHESIS] Ray side offset 0.35 m, late ray start 0.3 m, normal time 0.12 s, stand-off gain 6 per second, speed 1.2 m/s, deadband 0.03 m.
+- [HYPOTHESIS] The exit's numbers: ring 0.35 m and 3 of 4 rays, level ray 0.5 m above ray A's end, reaching planes 3 degrees flatter than `WalkableAngle`, a face at a rise 8 degrees flatter, 0.7 m off the climb plane for another rock. A closed-loop simulation of rough rock chose them. It proves nothing about the game's rock.
+- [HYPOTHESIS] A running climb may pass `OverhangAngle` by 15 degrees, the same margin as on the walkable side.
+- [HYPOTHESIS] Mask bit 2 covers terrain and player walls, and bit 5 covers rock props. Prop flags are data.
+- [HYPOTHESIS] Actors do not carry `Walkable`, and enemies and trees carry `Solid`. A start casts Solid-only rays, 0.02 m short of each surface hit, and once from the chest. The game's own clearance mask adds bits 1 and 5, but bit 1 is the undisplaced body, which can stand in front of the rock, and bit 5 is the surface itself.
+  - Receipt: Mask {1,3,5} at 0x14024ad54. Bits from `ecs.ColliderFlags`. The flags of a given prop are data, and were not read.
+- [HYPOTHESIS] The chest ray stops 0.2 m in front of the fit plane, along the normal. A rock prop can be Solid and Walkable at once, and rock between the four hits stands proud of the plane through them: 0.14 m on a ball of radius 1 m, and up to 0.184 m head on, on rock displaced by 0.15 m either way. So 0.2 m covers those. A real start runs up to 45 degrees off the wall. At a yaw of 44 degrees the same rock stands 0.221 m proud, and it refuses 2 of 8963 starts. A trunk that stands less than 0.2 m off the rock does not block a start. `PlaneTolerance` is no use here: at its default 0.45 m, a ray from 0.8 m off the rock ends 0.35 m out, inside a capsule of radius 0.4 m.
+  - Receipt: `crates/ember-climb/src/surface.rs`, `the_chest_ray_stops_two_tenths_off_the_fit_plane`, `rough_solid_rock_does_not_block_itself`, `a_trunk_in_the_path_starts_nothing`.
+
+### Open at the first play test
+
+- [HYPOTHESIS] Glider start: three points are unproven. A sequence may not preempt the glider on layer 0x10, HangGliding may not end when Enter replaces it, and world move input may be zero while gliding.
+- [HYPOTHESIS] The capsule width is data and was not read. The 0.55 m stand-off may leave little gap. The diagnostics line prints the real width and height.
+- [HYPOTHESIS] Rock that is Solid and Walkable at once can still block its own start: small round rock, sharp edges, and steps of about 0.4 m. Such rock starts no climb. Read the `blocked` count in the first log.
+- [HYPOTHESIS] A client without the mod that only watches sees a climber correctly. The stream and prediction rules say it does (see "Server exe checks"). Nobody has watched one.
+- Open for the author: a surface that tops out under 2 m above the feet starts no climb, because a start needs 3 of 4 rays and the upper row is at 2 m. It also covers a jump at a ledge just above the player. One option is a start on the lower row alone when a floor sits above it, so the climb goes straight to the mantle. The build keeps the limit until the author decides.
+
 
 ## Glass and window materials (2026-10-26 spike)
 
@@ -1943,3 +2215,597 @@ indirect transfers, driver behavior, shader results, and long-session stability
 are not established by this comparison. No server identity is inferred from the
 client. Headroom remains a client rendering plugin. A new server executable
 requires its own evidence for any server-targeted mod.
+
+
+## W52: clean-room climbing on Patch 1283531
+
+The author requested continuing the owned `ember-climb` implementation after unreliable starts,
+holds and exits in the installed third-party mod. This work uses the owned game and the existing
+owned climbing source. It does not inspect or copy a third-party climbing binary.
+
+Exact images: client SHA-256 `0403981fd2e8ad18bd8c5698dff03c8d505b5a46677832c496db9c645513f2a6`
+(`1283531-steam`, Steam build 26320373); dedicated server
+`4429653ac0cfa154bc08e138853caa5d8557f82129b7488031f40345816aa6dc` (`1283531-server`).
+The previous owned reference client `b28b448a...` has the same native code as `f68140a3-steam`;
+the previous server is `d7baa768-server`.
+
+- [VERIFIED] Every one of the 15 owned climbing signatures matches once in each old/new client/server
+  `.text`. The complete 11 directly used function groups, including chained unwind fragments,
+  normalize identically across each update (7,303 bytes per image). This permits relocation of
+  external calls and RIP operands; it does not claim arbitrary callees unchanged.
+- [VERIFIED] All 44 candidate hook prologues are relocatable under the existing first-five-byte rule.
+  Mandatory wall-return/attachment writes, optional entry-layer byte, and the attachment skip target's
+  RCX reload have the same guarded bytes. The existing patterns need no changes.
+
+| Owned site | Current client RVA | Current server RVA |
+|---|---:|---:|
+| Wall probe | 0x24ec00 | 0x62a80 |
+| Wall-lost function | 0x24f3d0 | 0x63250 |
+| Wall-lost return pattern | 0x24f4cb | 0x6334b |
+| Attachment store | 0x41fd08 | 0x1bf5c8 |
+| Move check | 0x41ece0 | 0x1be5a0 |
+| Exit query | 0x24e730 | 0x625b0 |
+| Start check | 0x4204c0 | 0x1bfd80 |
+| Entry-layer pattern | 0x420885 | 0x1c0145 |
+| Raycast | 0xa0c8a0 | 0x6a99d0 |
+| Low entry | 0x250110 | 0x63f90 |
+| Top entry | 0x250360 | 0x641e0 |
+| Stop | 0x24e0d0 | 0x61f50 |
+| Exit top | 0x250a30 | 0x648b0 |
+| Exit low | 0x250930 | 0x647b0 |
+| Stamina call pattern | 0x2f095e | 0xdc9de |
+| Stamina callee | 0x24e3a0 | 0x62220 |
+
+- [VERIFIED] Ten reflected schemas agree across all four images: Climb, Actor, ActorInput,
+  MovementCollider, MovementColliderConfig, CurrentTransform, WorldTransform,
+  RotationInterpolation and the two nested collision-result types. The existing context remains
+  Actor+0, Climb+8, transform+0x10, collider config+0x18, collider+0x20, PlayerState+0x28,
+  entity u32+0x30, world+0x38. Climb is 0x98 bytes; +2 remains padding, normal is +4.
+  Actor state/ability predicate bodies separately confirm the inherited Actor fields.
+- [VERIFIED] All 90 paired RIP data operands in the directly used functions retain identical data.
+  The main raycast helper and Jolt/filter boundary normalize identically. The null-world fallback's
+  fatal exception tail changed; the normal path and consumed result fields did not. No complete
+  behavioral proof of the physics engine is claimed.
+- [VERIFIED] Each image has 816 program registrations. All nine Climb writers retain their flags
+  and component lists. Four unrelated descriptors changed: area_loot, environment_effects,
+  impact_simulation and player_ui. The wall-lost/move/exit functions still run in that order in
+  one unchanged per-entity update, preserving same-call thread-local state. The action-sequence
+  body changed and is not claimed equivalent; its relevant write ownership and stop call agree.
+- [VERIFIED] The native stop keeps its borrowed context and Climb alive. Its reset leaf clears the
+  Climb type/state word and attachment, without freeing or moving the component. The stop then
+  writes Climb+0x10 on every return. All four known caller routes already own Climb and Actor for
+  writing: action-sequence control, climbing stamina, wall teleport, and the wall update. Resetting
+  the grace byte after the original stop is therefore within native ownership. This broadens the
+  previous padding-write ownership statement beyond program 244. The stop remains hooked when
+  diagnostics are off.
+- [VERIFIED] Some endings bypass the stop and the shared reset leaf: the current wall program
+  clears Climb inline at 0x41f926, 0x41f932 and 0x41f93b. The stop reset is a bounded fix, not universal
+  lifecycle coverage. A later first missed hold can retain the remaining configured grace after such
+  an ending. A fresh climb without a confirmed natural hold receives no invented grace.
+- [VERIFIED] Successful native probe/exit results initialize position+8, normal+0x14 and entity+0x20;
+  padding at +1..+3 is not guaranteed initialized. The Rust hit reader now reads the initialized
+  fields individually instead of copying the entire 0x24-byte result into a typed byte array.
+- [VERIFIED] Standard loader directory entries are checked before any patch, as well as loaded
+  module names. Failure to enumerate modules refuses startup. Late detection can disable custom
+  detour work but cannot safely undo permanent startup patches while another mod may own them;
+  the log therefore requires a restart. Arbitrary hot-loading is unsupported.
+- [VERIFIED] The exact new server hash is classified as DedicatedServer before any filename rule.
+  A renamed server, even one named `enshrouded.exe`, cannot enter a client-only renderer startup.
+  Unknown identities remain unsupported by climbing.
+
+Receipts: private W52 native ledger contains hash-pinned signature census, complete normalized
+function/caller comparisons, reflection schemas, RIP data, program registries, patch bytes, relocation
+checks and the stop ownership boundary. These scripts read only the legitimate owned images.
+Regression tests cover exact admission/server isolation, failed-entry log bounds, initialized native
+hit fields, and stop grace cleanup through the inert hook-flow fixture.
+
+[UNVERIFIED] No current-build climb, controller feel, body tilt or multiplayer reconciliation has
+been observed. The candidate still has the disclosed low-wall and rough-shelf limits. Native-file
+checks and simulated worlds are insufficient to call it reliable in play. Gliding stays experimental
+and disabled by default. First acceptance is an offline climbing session before server deployment.
+
+
+### W52 final safety gates and exact attachment filter
+
+The candidate disables native persistent grace unconditionally. `Runtime::new` sets its limit to
+zero even if `GraceSeconds` is positive; the setting warns and remains inactive. The zero-limit
+branch does not read or write Climb+2. `GraceSeconds` defaults to zero. The native type metadata,
+copy/replication paths and reset stores did not prove initialization of that padding. The previous
+stop-reset and replay-model tests use explicitly initialized inert fixtures; they are not proof
+that native grace is available. Complete state initialization and all-exit lifecycle coverage remain
+required before a future binding enables it.
+
+The Actor-state reader also follows the native conditional: the added/removed state masks are
+read only while the sequence flag is active. It does not assume sequence-only fields initialized
+when the native predicate does not read them.
+
+[CORRECTION] The earlier hypothesis that a real EntityId never has its high bit set is unsupported.
+Current CreateEntity (client0x987d90/server0x623ce0) separately counts successfully created signed
+negative IDs; its automatic counter increments a full u32 without a 0x7fffffff mask. Current component
+lookup also uses all32bits. A bound on live entity count does not bound the ID domain.
+
+The final 19-byte attachment replacement therefore uses `cmp ebx,-1; je skip; lea rcx,[rdi+0xa0]`
+and seven NOPs. The branch target remains original-site+27; the original call at+19 and store at+24
+are unchanged. It skips only the exact synthetic marker0xffffffff, instead of all signed-negative
+IDs. Non-sentinel IDs also use the native helper/store when the attachment ID is unchanged.
+
+[VERIFIED] The accessor helper (current client0x41eca0/server0x1be560) returns the accessor's existing
+pointer and optionally marks its dirty tick. It does not compare attachment values, allocate,
+copy-on-write or change ownership. The dirty helpers explicitly early-out when already marked for
+the current tick. The wall update already marks Climb before this store; a repeated mark is supported.
+The common block reloads RCX and calls another function before any flags are used, so the replacement
+comparison's flags do not leak. The synthetic marker's skip still reaches the proven common block.
+
+Regression evidence includes an inert Windowsx64 machine-code harness containing only our replacement
+and a fake accessor. It fails on the old sign-bit filter for ID0x80000000 and passes for unchanged and
+changed non-sentinel IDs through0xfffffffe, plus marker no-call/no-write behavior. No game instruction
+is executed by that harness. Full native-file patch-plan checks still guard the original19-byte span.
+
+
+### W52 terrain-penetration/top-out acceptance gate
+
+The author reported climb-up animation followed by terrain penetration and recovery to a spawn.
+This report concerns the installed third-party mod. It is not evidence of execution or a known
+cause in the staged owned replacement.
+
+[VERIFIED] The owned synthetic exit model could choose flat ground below the predicted feet:
+with no native floor, the longer downward search returned an up-exit at y=-0.25 from feet y=0.
+The regression failed before the floor-height admission check. Floor candidates now must be
+above the query feet; a rising control input alone does not justify an up-mantle onto lower ground.
+
+[VERIFIED] The native chain remains ExitQuery -> HeadQuery -> ExitTop -> MantleBuilder. Current
+client/server helper RVAs: head query0x24ffa0/0x63e20; mantle builder0x24fcd0/0x63b50; sphere runner
+0x23ff80/0x5cf30. Their complete old/new function groups normalize identically. The head query checks
+only the upper sphere at candidate+UP*(height-width/2). The builder's first two control points are
+candidate+ClimbNormal*1.05 and its third is candidate; it performs no capsule-overlap/sweep itself.
+The query result's DWORD+4 is explicitly zero on both success and failure.
+
+Ground-mask0x24 ray rings can miss a Solid-only obstacle beneath the head sphere. Thus neither a
+walkable floor nor the retained head check proves a clear body or animation path. The sphere runner
+also mutates Climb flags/results and owns a typed query/output vector; it is not an admitted
+standalone arbitrary-radius overlap API. No capsule/sweep binding is invented here.
+
+The staged native constructor therefore hard-disables ALL automatic natural-wall top-outs,
+including native successes on newly climbable geometry, until a complete placement/path contract
+exists. For a current natural hold, ExitQuery OK becomes MISS before the native animation gate;
+existing failures remain byte-identical. A lattice hold retains its original native answer.
+No setting can enable this gate. Jump-off remains the game's own action.
+
+Initialized fixtures separately exercise the proposed top-out model and are not a native feature.
+The inert hook-flow regression checks natural-success refusal, failure preservation and unchanged
+lattice results. This is a first-test prevention policy, not proof that every collision/warp cause
+has been solved. Receipts: private W52 mantle-safety-boundary.md, owned-exit-safety.json and full
+head/query/builder assembly; no game or third-party mod was executed or modified.
+
+
+### W52 follow-up: recover movement toward a confirmed hold
+
+A closed-loop regression isolated a reach deadlock with no game execution: a vertical wall at1.2m
+passes Stay's1.4m range, but Move's1.0m range rejects the small steering correction toward it. The
+native-style move check then clears velocity. Up, down and sideways input repeat the same refusal.
+No frame-count grace or collision API can fix that range mismatch on its own.
+
+Movement now tries its ordinary fresh scan first. Only a missing-hit refusal may retry, only with
+this entity's same-call confirmed steady natural hold, and only while the candidate remains in front
+of and strictly closer to that fit. The retry adds exactly the existing Stay margin to Move's range;
+it remains a fresh Move scan with the existing hit-count, slope and roughness checks. Its fresh fit
+must also show movement toward the surface. It never substitutes the old hold for new geometry.
+Missing/wrong-entity/lattice/unsteady holds and parallel/away/cross-plane steps do not extend reach.
+There is no new persistent state, native offset, setting, collision bypass or timed forgiveness.
+
+The inert hook-flow regression exercises the actual movement/probe detours. Closed-loop tests cover
+up/down/side input at120/60/20Hz, convergence within the existing0.03m stand-off deadband, and the
+formerly trapped clean leaning benches0.7 to 0.8m wide. Fresh invalid slopes, rough fits, missing geometry
+and the ordinary range limit remain refusals. These are algorithm/fixture results, not live physics
+or controller acceptance. Native grace and automatic natural top-outs remain unavailable.
+
+This supersedes the earlier current-stall claim and historical receipt name
+`a_bench_in_a_leaning_face_can_hold_the_climber`; the new regression is
+`a_leaning_bench_no_longer_traps_all_movement`. Earlier rough-bench outcome counts are not a new
+performance or behavior measurement for this candidate.
+
+### W52 native IK feasibility follow-up
+
+[VERIFIED] The current client contains a complete target-table and generic chain-solver path.
+Dispatcher0x926d00 sends node type60 to0x929d10, which consumes the instance target table and calls
+shared solver0x9427c0 -> FABRIK0x934340. Twenty target/setup/retarget functions have complete matching
+previous-build instruction shapes after relocation. The solver path has additional cold/generated
+code differences; its location is corroborated by current dispatch/calls, not claimed exact old/new
+body equivalence. No arbitrary-target ABI is admitted by this finding.
+
+[VERIFIED] The target table is a pointer at instance+0x1a0, with0x90-byte entries. Entry+0x60 selects
+coordinate space; it is not an activation flag. Indexed setters check the chain count, but some
+argument payloads are dereferenced before that check. Their optional payload layouts, matrix source,
+pose ownership and scheduler phase still need typed caller proof.
+
+[VERIFIED] Both retained resource snapshots have2944 nodes, six valid chain declarations and102-joint
+hierarchies. Chains70->74 and40->44 end at the reflected PalmR/PalmL slots. Neither graph declares a
+type60 generic IK node. Their single BipedFeet node selects the four leg/foot chains, excluding the
+arms. Three Retarget nodes carry hand index pairs44/95 and74/65, but native AutoHandIK is bone-to-bone
+retargeting. Ground-foot correction uses downward probes and model up. Neither path establishes
+wall-oriented contact placement. Writing target slots alone has no demonstrated hand consumer here.
+
+[UNKNOWN] These old on-disk resource dumps lack an executable/entity/role/timing envelope. Their
+exact local-player/climb-active provenance and executed-node phases are uncorroborated. The graph
+census does not establish that every live player graph lacks a generic solver. A bounded read-only
+sample tying actor, graph, chain/cache ownership and final pose phase is the next evidence step.
+No live sampling, pose writes, new library or production IK binding occurred in this investigation.
+Keep native animations until those contracts and a finite contact/solver budget are established.
+
+Receipt: private W52 ik-followup/FEASIBILITY.md SHA256
+BA4E9D449C37C9022B355463BFC9E403DB992C7010D29E49CD48A106224C4144;
+native-ik-map.json1882894FEAB4AE9863F0B5B55AB1A4FE447A0708BB251660D8C2BC4DC56DFF06;
+captured-graph-facts.json6EA1B866994A3263AEAC3C009AE6766F9CAE5D2A5846C3CB2A753FFDC9FC0C5A;
+current-flow.jsonF9816C215852C58BD2CFA237B8D207DBA2E91268182FF26D366D6EDF1AE08CE1.
+The current image identity is the W52 client0403981f... pinned above. Only owned-game artifacts were
+examined. No third-party climbing code or assets were used.
+
+### W52 capsule-query frontier follow-up
+
+[VERIFIED] Native capsule overlap core0x31e70 (server0x146d0,832 bytes) and motion core0x307f0
+(server0x13050,1221 bytes) normalize across all four owned images. The overlap collector increments
+an observed-hit counter before capacity checks. A zero-capacity result vector with no growth callback
+can count contacts without storing/enriching them. The native wrapper constructs an embedded capsule
+with radius and half-cylinder-length, then uses the native broadphase/body filter interfaces.
+
+[UNKNOWN] The high-level query retries its world-reader lock without a deadline. Calling the lower
+core still needs actual body/broadphase lock-interface, reentrancy and climb-thread ownership proof.
+Zero observed contacts describes the available physics scene; it has no unloaded/pending-mesh status.
+A translation sweep also does not establish clearance for an entire curved or rotating mantle path.
+No query binding is admitted. Natural-wall automatic top-outs remain disabled.
+Receipt: private W52 capsule-narrow-frontier.md SHA256
+7E52723B4A53CA6BD4A2A44221EBB0100B87307E2365D57960CE7AB5BBD460DD.
+
+### W52 hanging-stamina calculation contract
+
+[VERIFIED] The owned wall-climb stamina program gates on Climb.type=Wall(1), a nonzero climb state,
+and absence of Actor.ClimbingTransition(35). Ladders do not enter its debit. It reads MovementVector.velocity and
+the simulation tick duration, multiplies each velocity component by dt, and skips debit AND the
+Exhausted stop branch when all three distances are at most1e-20 in magnitude. Its normal movement
+charge is8 points/metre times the native attribute modifier; native finalize/exhaustion handling
+remains downstream. An idle floor therefore belongs before the motion-only early-out, not in the
+optional cost-getter multiplier hook.
+
+[VERIFIED] The duration getter returns the context's signed int64 nanoseconds. Native conversion is
+double(ns)*1e-9, then float. Any nonzero input is a finite normal float with absolute value between
+about1e-9 and9.22e9 seconds. Subtracting0x00800000 from its IEEE754 exponent bits therefore halves it
+exactly. Zero must branch before that subtraction. Squared half-dt is at least about2.5e-19 for any
+nonzero duration; it exceeds the existing1e-20 early-out tolerance. Negative duration uses abs(dt)
+for charged distance, matching the native distance-length sign behavior.
+
+[VERIFIED] An82-byte calculation span begins0x1d5 bytes before the existing STAMINA_CALL signature.
+The entire original span, including its last JAE displacement0x223, is identical in all four images.
+No decoded direct branch/call targets any interior byte; the program has no indirect transfer. The
+span remains inside its existing function-body unwind region, past the147-byte prologue. EAX is dead
+on both exits until a metadata reload or a native call overwrites it. The upper lanes of XMM6/9/10
+are not externally stored; downstream uses their scalar values, and the epilogue restores their
+original caller values. XMM0/1 and flags are scratch across this boundary. RSP and all other GPRs
+must remain unchanged.
+
+| Image | Span start | Native debit body | Next-entity block |
+|---|---|---|---|
+| Previous client | 0x2eb5a9 | 0x2eb5fb | 0x2eb81e |
+| Current client | 0x2f0789 | 0x2f07db | 0x2f09fe |
+| Previous server | 0xd8899 | 0xd88eb | 0xd8b0e |
+| Current server | 0xdc809 | 0xdc85b | 0xdca7e |
+
+The proposed owned replacement stays within these82 bytes. It computes the native squared distance
+order(y*y+x*x)+z*z with DPPS, then compares it with squared half-dt. Fast or unordered movement keeps
+the original local distances. Below the floor it sets a local distance of abs(dt)*0.5 and clears the
+other two local scalar distances. It never writes MovementVector, current Stamina, or a persistent marker.
+The original native attribute, accumulator, exhaustion, UI and authority paths still run. This
+chosen minimum effort also applies to ordinary wall lattices. It does not change ladders or other
+stamina programs. Default StaminaMultiplier remains1.
+
+DPPS needs SSE4.1. Startup must refuse all climbing writes on a CPU without it. All original bytes
+must match before any write, and the existing checked-write rollback must include the entire span.
+The new next-entity JAE ends15 bytes earlier, so its displacement becomes0x232. The branch for zero
+duration goes directly to that JAE with CF cleared by TEST. There is no new mid-function call,
+external assembly adapter, stack change, unwind registration or Rust extern body.
+
+The balance choice is4 stamina points/second while motionless before native modifiers, equivalent to
+0.5m/s at the existing8points/m. It is not a discovered vanilla idle cost. Gameplay balance and live
+client/server exhaustion acceptance still require the author's later play test.
+Receipt: private W52 stamina-followup full four-image program/iterator/attribute evidence and site
+contracts. This is static owned-image evidence; no game process or third-party mod was launched.
+
+The completed private stamina-native-contract.md has SHA256
+FA3184785769A653C45F979B5BB3E7D40256EB99389EE3245B2EE9AC5FFBEECB.
+Its verifier checks all324 interior absolute addresses, overlapping direct-transfer positions and
+eight successor paths. Native STOP clears type/state immediately; state3 is Exit, not cooldown.
+Enter/Exit animations are gated by ClimbingTransition35. A possible Exit3/flag-cleared scheduling
+edge before native wall cleanup is not separately overridden or claimed zero-cost.
+
+The native finalizer keeps fractional depletion remainder before subtracting integer stamina through
+its property. Recharge compares its cached previous stamina with current stamina; an observed debit
+resets its timestamp, fractional recharge and cache. CanRecharge25 and inventory gates remain native.
+No fixed recharge-delay value or unconditional ban on recharge is invented here.
+
+The inline effort patch is a startup code patch. Runtime ACTIVE=false does not restore its math;
+it remains until exit after a late conflict, like the existing startup hold patches. Enabled=0 and
+startup refusals install none of these bytes. Checked rollback now also attempts the failed range
+when a write's read-back is unconfirmed; any failed restoration is named instead of claiming that
+the range was never written. The read-back regression failed before this correction.
+
+### W52 Zelda-like movement: physical gap and orientation easing
+
+[VERIFIED] A pure-source regression found that steering measured a fresh fitted plane through its
+hit centroid using the eased/clamped orientation normal. At a correctly spaced30-degree yaw bend,
+four accepted ray hits produced a false0.083707m gap error and0.322244m/s inward pull. Missing one
+low corner ray leaves a valid three-hit fit on the same plane but raised that pull to0.679423m/s;
+at45degrees it could reach the1.2m/s correction cap. These are f32 analytical/fixture observations,
+not measurements of the running game.
+
+The geometric metric now uses the fresh fit normal for both distance and the upright capsule's
+standoff target. Eased direction remains authoritative for movement/body orientation and correction
+direction. Three new Rust regressions fail before the change: real analytic Plane scans with every
+single-corner omission, equivalent tangential hit-centroid shifts, and overhang clearance while
+orientation lags. They cover120/60/20Hz, retain the normal-easing/speed/step caps, and add zero rays,
+state, offsets, settings or native bindings. Existing full closed-loop/replay tests remain unchanged.
+This does not admit sharp perpendicular corner transfer, body/path clearance or automatic top-outs.
+Receipt: private W52 zelda-movement-audit.md and zelda-movement-fixture.json, with red/green Rust logs.
+
+### W52 native climbing Jump feasibility
+
+[VERIFIED] The bounded owned-image Jump family has22 equal old/current function comparisons across
+client/server and368 explicit jump-table destinations verified at matching instruction boundaries.
+Input Jump32 and jump type FreeClimbing13 feed the existing native wall gate: Wall1/state2 and no
+ClimbingTransition35. Native abort/exit clears Climbing34 and applies a375000000ns re-grab block.
+The native impulse is a detached push-off built from Climb.normal and normal jump tuning.
+
+[VERIFIED] Current client native_apply_jump0x422780 rejects a failed dispatcher result before adding
+Velocity at0x42295b..0x422980, then updates native jump time/count/type. This identifies a future
+accepted-impulse boundary; it does not establish a one-shot stamina transaction. Abort/jump programs
+have no Stamina or StaminaDepletion write ownership. Action-sequence control owns Stamina, but its
+accepted Jump/cost ownership and replay deduplication are not proven here.
+
+[UNKNOWN] A deliberate upward climbing hop needs an accepted input/impulse and native cost contract.
+Debiting at a request/abort hook risks charging failures or repeats. No new Jump binding, component
+write, event marker or runtime behavior is admitted; native push-off remains. No third-party mod
+code or game process was used. Receipt: private zelda-jump-followup/FEASIBILITY.md SHA256
+FCFDAA9F0042C1D690660612C3565678C01DA0F2B092E397D8AD6480933D8EE0; native-jump-contract.json SHA256
+FFCE80EA16EA4C62FB3C617E16501A62DA64F8D9F3AA3CDF59CAFCABED39483E.
+
+
+### W52 first offline acceptance and ordinary movement ownership
+
+[OBSERVED] The first offline test of source820df8b loaded the supported1283531 client, matched all15
+signatures and enabled10 hooks. The author reported climbing a few metres, falling, and an outward
+push regardless of Jump input. The failed session log was preserved and the previous installation
+was restored. Aggregate/replayed counters and last sampled gap values do not identify the cause.
+Green fixture/native-file/build/review checks are not gameplay acceptance.
+
+[VERIFIED] The existing MoveCheck receives actual CurrentTransform feet converted from32.32 to
+float metres. Its801-byte body tests the full velocity candidate, then vertical-only and horizontal-only
+candidates through fresh probe calls. It writes only the supplied velocity. Its sole caller zeros
+velocity if AL is false. Current native420ab0 is a capped vector blend, with no position/normal
+read or independent wall-distance spring. The full directly relevant bodies match across all four
+pinned images after relocation.
+
+Native velocity283830 integrates Velocity into CurrentTransform. ActorResolve283ac0 retains the
+ordinary native shape-motion/slide correction path. It intentionally skips a disabled MovementCollider
+or an active LerpTransform collider override; world-not-ready restores LastTransform. Measured
+movement2799c0 runs from transform deltas and is not the requested velocity. A finite velocity-only
+corner proposal can preserve that ordinary collision pipeline without a new placement oracle.
+It must preserve native fallback/AL, obtain support at each actual probe candidate, and never write
+a target position or restore rejected velocity. This is preservation of native behavior, not a
+promise that the engine cannot clip. The separate exit-query point is cached before MoveCheck;
+corner support cannot authorize it. Automatic natural mantles remain disabled.
+
+Zero STOP/Exit counters do not exclude the native FreeClimbing exit: current26b9b0 ->426670
+->24e1c0 sets Exit3 and the375ms re-grab deadline. Accepted jumps can add an outward impulse via
+42295b..422980. This identifies an unobserved path, not an input diagnosis.
+Receipt: private corner-native-move/NATIVE-CORNER-MOTION.md SHA256
+D249E1D597A972FEB58E1837310EC02641D8EBA931CD3CCF01C02DE67939F923.
+
+### W52 typed shape query, native phase and missing-geometry status
+
+[VERIFIED] The immediate native climb continuation after EXIT_QUERY calls the existing head query,
+which reaches the same typed shape API. No extra outer world reader belongs around that API:
+a pending writer between outer and nested reader acquisition can deadlock. The high-level native
+API owns its normal world/body/broadphase locking and cleanup. Native internal waits/allocations
+are not independently a safety rejection or a caller wall-clock guarantee.
+
+| Boundary | Previous client | Current client | Previous server | Current server |
+|---|---:|---:|---:|---:|
+| EXIT_QUERY call |419302|420252|1ba252|1bfb12|
+| Following head-query call |419326|420276|1ba276|1bfb36|
+| ColliderSystem typed entry |9999a0|9a5450|63a220|6413a0|
+| QueryWorld typed core |999a10|9a54c0|63a290|641410|
+
+The typed core has eight Windows x64 arguments: a writable40-byte output header, borrowed QueryWorld,
+two u32 exclusions, u32 shape hash, pointer to a16-byte payload span, pointer to a64-byte pair of
+float pose records, and u8 flags. Its byte result is0 or1. The existing climb caller supplies the
+full self ID, second exclusion0, checkAgainst0x9 and flags0x80. CapsuleColliderData has reflected
+size0x5c/hashc6bc5c62. A fully zero40-byte output header makes an overlap conservatively return0
+for any raw contact or incomplete collection, before an external backing-buffer write. Return1
+means completed zero observed filtered contacts. Do not transfer this overlap result to motion,
+whose contact finalizer differs. No processed-output allocator/destructor is required.
+
+[VERIFIED] Actual capsule3-to-voxel15 registration is now identified. Current45740 installs callback
+45620 in the34-column overlap matrix; it reaches45360 ->10b4df0 ->10bd9a0. Four-image bootstrap,
+registration, dispatcher and cache edges were checked. Failed VoxelRangeRead returns null geometry;
+the region helper skips it and the handler does not propagate that failure into typed completion.
+Consequently even return1 does not prove that all terrain was present. Full-volume publication/
+readiness and complete mantle path coverage remain required before a natural mantle guard.
+
+[VERIFIED] The old WorldNormalsNotDisplaced4 position claim is now independently rechecked: World1
+uses position/normal flags(1,1), World4(1,0), WorldNotDisplaced2(0,0), in every pinned image. Both
+World1 and World4 retain the same displaced packed vertex positions; only the normal selection
+differs. A hypothetical undisplaced World4 position proxy does not explain the live separation.
+This does not establish an alternative cause or identical ray/overlap behavior.
+Receipts: private native-lock-phase-contract.md SHA256
+6190F20A1087A5E51D71F6C7110AA04B8EB44B4B23AD9ABE914FA15B58337C70;
+geometry-publication/GEOMETRY-PUBLICATION.md SHA256
+A8426AB0339711A80332886FD917D0FAEB077C59B1910B45EB520EEACC5F67A8.
+
+### W52 accepted Jump owner and remaining paid-upward request bridge
+
+[VERIFIED] The earlier unknown accepted-cost owner is now mapped. Current player_control_action_sequence
+uniquely calls bool helper2c8f60 at2dff2e. It owns ActorInput and Stamina writes. Resolver425490
+can return native NoPermission30 before publishing the request. Successful FreeClimbing13 publishes
+externalTriggerJumpType+179 and time+180, consumes native Jump32/Glider37, and has no sequence cost
+resource. Native attribute add21fbc0 performs property lookup and recomputation after the owner's
+write accessor. A same-invocation billing/refusal transaction is concrete; no raw stamina store is
+needed. Its ErrorId and JumpType are byte fields; padding must not be copied/read as initialized data.
+
+Actor_jump consumes the external request by clearing its type after application. However processed
+desiredLocalMoveInput.z+194 is refreshed by locomotion, and triggerContext.directionOverride+64 is
+cleared with the input context. Neither is a proved frozen paid-UP request. Mountain14 selects a
+different resource/physics path. Registration census ordinals are not runtime IDs or dispatch order.
+The required next artifact is bounded actual dispatch order correlated with same-entity/native-time
+acceptance and impulse snapshots. Keep native free push-off while that semantic bridge is missing;
+do not charge every13 request or use borrowed padding/process-local persistence as a substitute.
+Receipts: private accepted-cost/COST-OWNER-CONTRACT.md SHA256
+D717B143D04A255F889D0D1D931B0E1661625E9F36ED5CAB43391C54A6868815;
+request-bridge/REQUEST-BRIDGE.md SHA256
+EFEFBB117D6F914228C6C45942684CA01F5F46603A6A1CB236897109973CCF82.
+
+### W52 actual entry/exit resources and player collider envelope
+
+[VERIFIED] Owned sequence payloads supply real event schedules. Bottom entry a17e05ee has one End
+position/orientation lerp for200000004ns. Its native builder24f500 copies Probe.stand into all three
+targets, without an additional normal offset. All four builder bodies match after relocation.
+Thus the entry builder does not add another0.55/1.05m outward translation. The separate animation
+track/root-motion linkage remains untraced; event flag names alone do not prove it absent.
+
+Top exit c83e5552 selects position Intermediate for500000010ns, then position/orientation End for
+the same duration. These are discrete timed targets, not a Bezier curve. Sequence mismatch disables
+interpolation without snapping to a target. Tick/interruption ordering still prevents treating only
+the two ideal edges as complete trajectory coverage. The native collider override can already place
+the body at End while the visible root interpolates, bypassing ordinary motion resolution.
+
+Both player templates have identical stock root solid proxies. Default capsule radius0.5 has
+vertical sphere endpoints0.5..1.5; ClimbingWall radius0.550000012 has endpoints0.449999988..1.449999988.
+The latter extends about0.10m below the feet, with top at2m. Native construction adds rotated
+half-cylinder length to the resource's endpoint anchor. Config-derived radius0.5/height2 is not the
+exact climbing proxy. This is a geometry difference, not a live cause claim. A2m root-centered
+sphere conservatively covers these stock unit-scale root proxies under arbitrary rotation; it
+does not bound skinned limbs/equipment or prove a useful clear mantle route.
+Receipt: private mantle-events/FEASIBILITY.md SHA256
+0C0802415EA7CE76B103ECA2EF08454670FE9A7A820ECF80228DFC3D5C5D3E43.
+
+
+### W52 physical-plane velocity follow-up
+
+[VERIFIED] Two pure-source regressions exposed a second orientation/geometry coupling. At a
+correctly spaced15-degree yaw bend,120Hz, the previous eased-plane projection returned
+velocity(-1.9497048,0,0.033931594), about0.472m/s outward relative to the fresh plane, despite
+negligible gap error. This is analytical/source evidence, not a captured native velocity.
+
+Movement projection and the gap-correction direction now use the fresh fitted normal. The returned
+Climb normal still eases/clamps for body orientation. No-fit fallback keeps its existing behavior.
+New tests fail before and pass after at120/60/20Hz over bends, real gap errors, contact suppression
+and overhangs. The older overhang test now checks tangency to the fresh plane while still requiring
+body easing. No rays, native offsets, ABI, persistent decisions or collision bypass were added.
+This corrects a reproducible source defect, but the full cause of the offline failure is unconfirmed.
+
+Paired movement telemetry reuses the already-read SteerInput and one synchronous MoveCheck result.
+The full native RAX is saved before post-capture; panic cannot invoke the original twice. One
+nonblocking atomic claim protects copies by both readers and writers, dropping busy observations.
+Only the existing log thread formats output, at most one latest movement record per second. The
+native check output precedes caller-side AL=false zeroing and ordinary collision resolution.
+Telemetry state never feeds gameplay, and no component pointer is retained by these observations.
+
+
+### W52 ordinary corner eligibility
+
+[VERIFIED] Climb type/state are initialized bytes at+0/+1: Wall1 and steady state2.
+Actor Climbing34 and ClimbingTransition35 use the existing sequence-aware native state predicate.
+MovementCollider isWorldColliderReady and isEnabled are bytes+4/+5. These fields and the ordinary
+motion/collision consumers are checked across all four supported images. A conservative optional
+corner gate requires those native wall/actor states, no transition, and ready/enabled values1.
+It does not disable baseline climbing when optional components or that gate are absent.
+Reference: the existing four-image NATIVE-CORNER-MOTION.md and accepted Jump predicate evidence.
+No padding or collider-position override is read or changed by that gate.
+
+### W52 diagnostic request and impulse observation
+
+[VERIFIED] A read-only three-observer set can observe acceptance and calculated impulse under
+normal native return. All addresses in this subsection are hexadecimal image-relative values.
+
+| Boundary | Previous client | Current client | Previous server | Current server |
+|---|---:|---:|---:|---:|
+| Accepted helper |2c3f90|2c8f60|b08a0|b4590|
+| Native ActorInput accessor |213220|216b70|30a00|33ba0|
+| Jump dispatcher |41a5c0|421510|1bb510|1c0dd0|
+| Native EntityId getter |9b4230|9bf920|654ab0|65b870|
+
+Accepted has ABI u8(iterator*); accessor is pointer(view*); dispatcher is
+out20*(out20*,context*,JumpType_u8), under Windows x64. Native originals and all output bytes
+must remain unchanged and execute exactly once. Whole-set preflight precedes installation.
+
+The accepted iterator's ActorInput view is+0xe8. Native accessor returns[view+0] after its native
+history bookkeeping. Both direct calls at accepted+0x730 and+0x79f must resolve to the same
+verified accessor; a generic accessor pattern is not unique (87 client,82 server matches).
+The first accessor post precedes native type publication and the second precedes time publication.
+Final scalars belong in the accepted helper's post, before its suspended caller advances the
+owner iterator. Require the expected view and matching current view[0], copy scalars, then discard
+all native pointers and restore lexical TLS before returning. Reentry/unwind may drop observations;
+it must never change the native invocation or leave a cross-frame pointer.
+
+Initialized ActorInput fields are type u8+0x179, time i64+0x180 and processed local Z f32+0x194.
+Dispatcher context+0x20 supplies its live ActorInput. Result ErrorId is u8+0 and calculated
+delta float3+8 is readable only on ErrorId0; error padding/payload must not be sampled.
+This is before native application/collision, not measured displacement.
+
+Both phases supply ProgramContext through their slot+0. The native EntityId leaf reads one-based
+index u32 at ProgramContext+8. Index0 gives EntityId0. Otherwise registry=[ProgramContext+0],
+table=[registry+tableOffset], ID=u32[table+(index-1)*16]. Table offset is0x828 in both previous
+images and0x830 in both current images. A read-only mirror needs checked address arithmetic and
+the live native owner's index/table contract. It makes no added native call. Unknown identity and
+repeated entity/type/time keys remain ambiguous, especially under replay; no gameplay deduplication
+or paid-UP marker is admitted. Observer storage contains copied scalars only.
+
+Complete initial entry-copy spans are5/6/7 bytes for accepted/accessor/dispatcher; they contain no
+relative transfer or RIP operand. Original unwind prologues are32/6/101 bytes. This supports the
+existing MinHook/no-foreign-unwind contract, not new SEH/foreign-exception or generated-trampoline
+unwind guarantees. Rust guards/RAII cover Rust return/unwind paths only.
+
+The following exact patterns have the stated four-image receipts. The first two are unique;
+the accessor pattern is a full-body verification after call-following, never a unique scanner.
+
+Accepted unique prefix:
+
+```text
+48 89 4c 24 08 55 53 56 57 41 54 41 55 41 56 41 57 48 8d ac 24 a8 fe ff ff 48 81 ec 58 02 00 00 4c 8b 81 18 04 00 00 4c 8b f1 48 8b 91 88 00 00 00
+```
+
+Dispatcher unique prefix:
+
+```text
+48 8b c4 48 89 58 08 55 56 57 41 54 41 55 41 56 41 57 48 8d 68 98 48 81 ec 30 01 00 00 0f 29 70 b8 48 8b f2 0f 29 78 a8 48 8b f9 44 0f 29 40 98 44 0f 29 48 88 44 0f 29 90 78 ff ff ff 44 0f 29 98 68 ff ff ff 44 0f 29 a0 58 ff ff ff 44 0f 29 a8 48 ff ff ff 44 0f 29 b0 38 ff ff ff 44 0f 29 b8 28 ff ff ff 45 0f b6 f8
+```
+
+Accessor full body, native call displacement masked:
+
+```text
+40 53 48 83 ec 30 48 8b d9 48 8b 49 28 48 85 c9 74 22 0f b6 43 22 4c 8b 4b 18 4c 8b 43 10 48 8b 53 08 88 44 24 28 0f b7 43 20 66 89 44 24 20 e8 ?? ?? ?? ?? 48 8b 03 48 83 c4 30 5b c3
+```
+
+Receipt: private observation-boundary/OBSERVATION-BOUNDARY.md SHA256
+BA572176FF5F337753D361DD0DA97C2B418D82D7D253B040031FC34C058BCABF.
+
+
+### W52 velocity-only corner integration
+
+[IMPLEMENTATION] The runtime corner adapter uses the already verified ordinary MoveCheck and
+Probe callbacks; no additional native address, layout, patch or hook is introduced. The existing
+four-image NATIVE-CORNER-MOTION contract establishes current feet, full/vertical/horizontal
+Probe candidates, status-only movement admission, caller-side AL-failure zeroing, and subsequent
+native Velocity/ActorResolve collision ownership. It is not a coherent whole-capsule oracle.
+
+The adapter requests velocity only, samples fresh one-face support at actual native Probe Q,
+and preserves original successful native Probe answers byte-for-byte. After native success,
+unchanged current identity/feet and final native velocity must match that actual Q before a
+finite eased Climb normal is written under the existing Climb write owner. No target position
+or Lerp transform is written. Natural automatic top-outs retain their separate disabled gate.
+
+All per-move state is copied scalar data. Opaque context/world addresses are equality keys,
+never dereferenced from saved state. Native owner pointers are read only through live callback
+arguments and the existing context helpers. A shared counted ray boundary caps actual calls at36;
+denial refuses the whole candidate. Nested calls suspend custom work and restore baseline TLS;
+Rust unwind preserves spent counts. This changes no foreign-unwind/trampoline assumption.
+
+Offline analytic and native-shaped fixture tests are source evidence only. They do not establish
+the behavior of native collision, streamed geometry, animation, controller input or multiplayer.

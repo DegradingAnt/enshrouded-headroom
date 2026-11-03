@@ -3,3 +3,4 @@ rustflags = ["-C", "target-feature=+crt-static"]
 
 [alias]
 asi = "rustc --release --lib -- -C link-arg=/OUT:target/release/enshrouded-headroom.asi"
+asi-climb = "rustc -p ember-climb --release --lib -- -C link-arg=/OUT:target/release/ember-climb.asi"

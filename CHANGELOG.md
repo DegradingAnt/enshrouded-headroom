@@ -26,6 +26,10 @@ These notes cover implemented work on `feat/v1`, not a released artifact. The ru
 - Experimental AMD Anti-Lag runtime for supported AMD devices, with Reflex precedence, matched INPUT/PRESENT markers and quiet slow-call/device-loss stops; not verified on AMD hardware.
 - Checked startup application of High decoration, distant-object and terrain-ring scales, leaving original values unchanged at their 1.0 defaults.
 
+#### Climbing
+
+- `ember-climb`, a separate ASI for free climbing on any steep surface, with no button and the game's own moves, stamina and collision. It is a first test build for the client and the dedicated server. Its first offline client test failed with grip loss and outward separation; investigation continues. It has not run on a server. Its signatures and hooked functions were checked against both exes.
+
 #### Development and packaging
 
 - An `emberkit` shared library for native guards, logging, scanning, patching, build identity, settings primitives and hook queues, with root API adapters.

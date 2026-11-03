@@ -13,7 +13,10 @@ pub enum Process {
 }
 /// Classify a process without reading a file.
 pub fn classify(path: Option<&Path>, build: Option<&Build>) -> Process {
-    if matches!(build, Some(Build::Known("d7baa768-server"))) {
+    if matches!(
+        build,
+        Some(Build::Known("d7baa768-server" | "1283531-server"))
+    ) {
         return Process::DedicatedServer;
     }
     let name = path
@@ -23,7 +26,12 @@ pub fn classify(path: Option<&Path>, build: Option<&Build>) -> Process {
     if name.eq_ignore_ascii_case("enshrouded_server.exe") {
         Process::DedicatedServer
     } else if name.eq_ignore_ascii_case("enshrouded.exe")
-        || matches!(build, Some(Build::Known("f68140a3" | "f68140a3-steam")))
+        || matches!(
+            build,
+            Some(Build::Known(
+                "f68140a3" | "f68140a3-steam" | "1283531-steam"
+            ))
+        )
     {
         Process::Client
     } else {
@@ -75,6 +83,34 @@ mod tests {
             Process::Unknown
         );
     }
+    /// Even a renamed verified server must never start a client-only rendering mod.
+    #[test]
+    fn patch_1283531_server_never_starts_client_mods() {
+        let role = classify(
+            Some(Path::new("renamed.exe")),
+            Some(&Build::Known("1283531-server")),
+        );
+        assert_eq!(role, Process::DedicatedServer);
+        for path in [None, Some(Path::new("enshrouded.exe"))] {
+            assert_eq!(
+                classify(path, Some(&Build::Known("1283531-server"))),
+                Process::DedicatedServer
+            );
+        }
+        let mut lines = Vec::new();
+        assert_eq!(
+            start_for_target(
+                role,
+                &[Process::Client],
+                "enshrouded-headroom",
+                |line| lines.push(line.to_owned()),
+                || panic!("server must not enter renderer startup")
+            ),
+            None::<()>
+        );
+        assert_eq!(lines.len(), 1);
+    }
+
     #[test]
     fn rejected_target_emits_once_without_starting() {
         let mut lines = Vec::new();

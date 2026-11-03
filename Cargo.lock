@@ -129,6 +129,17 @@ name = "ember-building"
 version = "0.1.0"
 
 [[package]]
+name = "ember-climb"
+version = "0.1.0"
+dependencies = [
+ "configparser",
+ "emberkit",
+ "iced-x86",
+ "log",
+ "windows-sys",
+]
+
+[[package]]
 name = "ember-guide-feed"
 version = "0.1.0"
 dependencies = [

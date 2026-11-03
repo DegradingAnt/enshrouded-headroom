@@ -1,0 +1,30 @@
+[package]
+name = "ember-climb"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99"
+license = "MIT"
+publish = false
+description = "Free climbing on any steep rock, cliff or wall, with the game's own moves, stamina and collision."
+
+[lib]
+name = "ember_climb"
+crate-type = ["cdylib", "rlib"]
+
+[lints.rust]
+missing_docs = "warn"
+
+[dependencies]
+emberkit = { path = "../emberkit" }
+configparser = "=3.3.0"
+log = "=0.4.34"
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+emberkit = { path = "../emberkit", features = ["test-support"] }
+iced-x86 = { version = "=1.21.0", default-features = false, features = ["std", "decoder", "intel"] }
